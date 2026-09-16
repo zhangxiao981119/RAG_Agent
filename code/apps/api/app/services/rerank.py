@@ -58,6 +58,10 @@ class RerankService:
         except (httpx.TimeoutException, asyncio.TimeoutError) as exc:
             logger.warning("rerank 超时，跳过重排: %s", exc)
             raise RerankTimeout("rerank 超时") from exc
+        except httpx.HTTPError as exc:
+            # 容器挂了/DNS 失败/连接拒绝等，也降级跳过重排
+            logger.warning("rerank 连接失败，跳过重排: %s", exc)
+            raise RerankTimeout("rerank 不可用") from exc
 
 
 def get_rerank_service() -> RerankService:

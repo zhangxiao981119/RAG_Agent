@@ -70,6 +70,7 @@ async def collect_health(engine: AsyncEngine, settings: Settings) -> HealthRespo
     )
     dependencies = dict(zip(names, checks, strict=True))
     required = (dependencies["db"], dependencies["redis"], dependencies["vector"])
-    configured_models = [dependencies[name] for name in ("llm", "embedding", "rerank") if dependencies[name].status != "not_configured"]
-    healthy = all(item.status == "ok" for item in (*required, *configured_models))
+    # rerank 是可选组件（超时自动降级），不影响整体健康
+    critical_models = [dependencies[name] for name in ("llm", "embedding") if dependencies[name].status != "not_configured"]
+    healthy = all(item.status == "ok" for item in (*required, *critical_models))
     return HealthResponse(status="ok" if healthy else "error", dependencies=dependencies)
