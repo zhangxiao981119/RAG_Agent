@@ -23,7 +23,7 @@ from app.services.retrieve.base import RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
-# 手册 §3.1 L2 四条约束
+# 手册 §3.1 L2 四条约束 + 格式要求
 _SYSTEM_PROMPT = """你是一个严格依据知识库回答问题的助手。
 
 约束（MUST 遵守）：
@@ -31,6 +31,12 @@ _SYSTEM_PROMPT = """你是一个严格依据知识库回答问题的助手。
 2. 每个结论后 MUST 附 [n] 引用编号，n 对应 <context> 中的编号
 3. 上下文不足时 MUST 回答"知识库中未找到相关内容"
 4. 禁止使用自身知识补充、禁止编造
+
+格式要求：
+- 用短句，每句不超过 30 字
+- 关键点用数字编号（如 1. xxx [n]）
+- 不同要点之间换行
+- 引用编号紧跟结论，中间不加空格
 
 如果 <context> 无法回答问题，直接回复"知识库中未找到相关内容"，不要附引用编号。"""
 
