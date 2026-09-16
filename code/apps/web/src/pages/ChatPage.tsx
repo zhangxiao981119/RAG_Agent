@@ -273,37 +273,46 @@ function MessageBubble({ msg, onOpenCitation }: { msg: Message; onOpenCitation: 
     )
   }
 
-  // 渲染答案，把 [n] 替换成可点击的引用编号
-  const parts: React.ReactNode[] = []
-  const regex = /\[(\d+)\]/g
-  let lastIndex = 0
-  let m: RegExpExecArray | null
+  // 渲染答案：按换行分段，每段内把 [n] 替换成可点击的引用编号
+  const segments = msg.text.split('\n').filter((s) => s.length > 0)
   let keyIdx = 0
-  while ((m = regex.exec(msg.text)) !== null) {
-    if (m.index > lastIndex) parts.push(msg.text.slice(lastIndex, m.index))
-    const n = Number(m[1])
-    const citation = msg.citations?.find((c) => c.n === n)
-    if (citation) {
-      parts.push(
-        <button
-          key={`ref-${keyIdx++}`}
-          onClick={() => onOpenCitation(citation)}
-          className="mx-0.5 inline-flex h-5 min-w-[1.25rem] items-center justify-center rounded-full bg-blue-100 px-1.5 text-xs font-medium text-blue-700 hover:bg-blue-200"
-        >
-          {n}
-        </button>,
-      )
-    } else {
-      parts.push(`[${n}]`)
+
+  function renderInline(text: string) {
+    const parts: React.ReactNode[] = []
+    const regex = /\[(\d+)\]/g
+    let lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = regex.exec(text)) !== null) {
+      if (m.index > lastIndex) parts.push(text.slice(lastIndex, m.index))
+      const n = Number(m[1])
+      const citation = msg.citations?.find((c) => c.n === n)
+      if (citation) {
+        parts.push(
+          <button
+            key={`ref-${keyIdx++}`}
+            onClick={() => onOpenCitation(citation)}
+            className="mx-0.5 inline-flex h-5 min-w-[1.25rem] items-center justify-center rounded-full bg-blue-100 px-1.5 text-xs font-medium text-blue-700 hover:bg-blue-200 align-baseline"
+          >
+            {n}
+          </button>,
+        )
+      } else {
+        parts.push(`[${n}]`)
+      }
+      lastIndex = m.index + m[0].length
     }
-    lastIndex = m.index + m[0].length
+    if (lastIndex < text.length) parts.push(text.slice(lastIndex))
+    return parts
   }
-  if (lastIndex < msg.text.length) parts.push(msg.text.slice(lastIndex))
 
   return (
     <div className="flex">
-      <div className="max-w-[80%] rounded-xl bg-slate-100 px-4 py-2 text-sm text-slate-800 leading-relaxed">
-        {parts}
+      <div className="max-w-[80%] whitespace-pre-wrap rounded-xl bg-slate-100 px-4 py-3 text-sm leading-relaxed text-slate-800">
+        {segments.map((seg, i) => (
+          <div key={i} className={i > 0 ? 'mt-1' : ''}>
+            {renderInline(seg)}
+          </div>
+        ))}
       </div>
     </div>
   )
