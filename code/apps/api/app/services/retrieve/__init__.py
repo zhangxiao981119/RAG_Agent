@@ -168,13 +168,15 @@ class RetrievalService:
         stages["rerank"] = int((time.perf_counter() - t0) * 1000)
 
         # ⑤ 构造 RetrievedChunk 并按 final_score 排序
+        #    final_score 优先级：rerank 分 > vector_score（rerank 超时降级）
         retrieved: list[RetrievedChunk] = []
         for cid in candidate_ids:
             row = all_chunks[cid]
             vec_score = float(row.get("vector_score") or 0.0)
             rrf_score = rrf_scores[cid]
             r_score = rerank_scores.get(cid) if use_rerank else None
-            final = r_score if r_score is not None else rrf_score
+            # rerank 超时降级：用向量余弦分（0~1），RRF 分只是排名融合不是相似度
+            final = r_score if r_score is not None else vec_score
             retrieved.append(
                 RetrievedChunk(
                     chunk_id=cid,
