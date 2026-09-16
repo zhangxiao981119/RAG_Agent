@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 
@@ -35,10 +36,27 @@ _SYSTEM_PROMPT = """你是一个严格依据知识库回答问题的助手。
 格式要求：
 - 用短句，每句不超过 30 字
 - 关键点用数字编号（如 1. xxx [n]）
-- 不同要点之间换行
+- 每个编号项 MUST 单独一行
 - 引用编号紧跟结论，中间不加空格
 
 如果 <context> 无法回答问题，直接回复"知识库中未找到相关内容"，不要附引用编号。"""
+
+# 在数字编号前自动补换行的正则：匹配 2. / 3. ... 前面没有换行的情况
+_LIST_ITEM_RE = re.compile(r"(?<!\n)\s*(\d+\.)")
+
+
+def _ensure_line_breaks(text: str) -> str:
+    """把挤在一行的 1. xxx 2. yyy 3. zzz 变成每行一个编号项。"""
+    if not text:
+        return text
+    # 先统一已有换行符
+    text = text.replace("\r\n", "\n")
+    # 在非首行的数字编号前加 \n
+    result = _LIST_ITEM_RE.sub(r"\n\1", text)
+    # 清理多余空行（3+ 空行 → 2 空行）
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    # 首尾 trim
+    return result.strip()
 
 
 def _build_context(chunks: list[RetrievedChunk]) -> str:
@@ -156,7 +174,7 @@ class GenerationService:
             )
 
         return GenerationResult(
-            text=grounding_result.text,
+            text=_ensure_line_breaks(grounding_result.text),
             raw_text=raw_text,
             stripped_sentences=grounding_result.stripped_sentences,
             refused=False,
