@@ -1,0 +1,242 @@
+"""知识库 + 文档 API（手册 §5.1 M1/M2 接口）。
+
+M2 范围：
+  GET    /kbs                      知识库列表
+  POST   /kbs                      新建知识库
+  GET    /kbs/{kb_id}              知识库详情
+  GET    /kbs/{kb_id}/documents    文档列表
+  POST   /kbs/{kb_id}/documents    上传文档（multipart）
+"""
+from __future__ import annotations
+
+import uuid
+
+from arq.connections import RedisSettings, create_pool
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import CurrentUser, get_current_user, get_db
+from app.config.settings import get_settings
+from app.models import Document, KnowledgeBase, ParseJob
+from app.schemas.documents import DocumentOut
+from app.schemas.kbs import KnowledgeBaseCreate, KnowledgeBaseDetail, KnowledgeBaseOut
+from app.services.storage import get_storage
+
+router = APIRouter(tags=["knowledge-bases"])
+
+
+@router.get("/kbs", response_model=list[KnowledgeBaseOut])
+async def list_kbs(
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> list[KnowledgeBaseOut]:
+    # M2 无权限：返回该租户所有知识库
+    stmt = select(KnowledgeBase).where(KnowledgeBase.tenant_id == user.tenant_id)
+    rows = (await session.execute(stmt)).scalars().all()
+    # 附带 doc_count
+    result: list[KnowledgeBaseOut] = []
+    for kb in rows:
+        count_stmt = (
+            select(func.count(Document.id))
+            .where(Document.kb_id == kb.id, Document.deleted_at.is_(None))
+        )
+        doc_count = (await session.execute(count_stmt)).scalar_one()
+        result.append(
+            KnowledgeBaseOut(
+                id=kb.id,
+                name=kb.name,
+                description=kb.description,
+                is_public=kb.is_public,
+                doc_count=doc_count,
+            )
+        )
+    return result
+
+
+@router.post("/kbs", response_model=KnowledgeBaseOut, status_code=status.HTTP_201_CREATED)
+async def create_kb(
+    payload: KnowledgeBaseCreate,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> KnowledgeBaseOut:
+    # 公开库互斥（手册 §3.2.4 + entities 唯一索引）
+    kb = KnowledgeBase(
+        tenant_id=user.tenant_id,
+        name=payload.name,
+        description=payload.description,
+        visibility="public" if payload.is_public else "restricted",
+        is_public=payload.is_public,
+        owner_id=user.user_id,
+    )
+    session.add(kb)
+    try:
+        await session.commit()
+    except Exception as exc:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"CONFLICT: {exc}",
+        ) from exc
+    return KnowledgeBaseOut(
+        id=kb.id,
+        name=kb.name,
+        description=kb.description,
+        is_public=kb.is_public,
+        doc_count=0,
+    )
+
+
+@router.get("/kbs/{kb_id}", response_model=KnowledgeBaseDetail)
+async def get_kb(
+    kb_id: uuid.UUID,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> KnowledgeBaseDetail:
+    kb = await session.get(KnowledgeBase, kb_id)
+    if kb is None or kb.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+    count_stmt = (
+        select(func.count(Document.id))
+        .where(Document.kb_id == kb.id, Document.deleted_at.is_(None))
+    )
+    doc_count = (await session.execute(count_stmt)).scalar_one()
+    return KnowledgeBaseDetail(
+        id=kb.id,
+        name=kb.name,
+        description=kb.description,
+        is_public=kb.is_public,
+        doc_count=doc_count,
+        created_at=kb.created_at,
+    )
+
+
+@router.get("/kbs/{kb_id}/documents", response_model=list[DocumentOut])
+async def list_documents(
+    kb_id: uuid.UUID,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> list[DocumentOut]:
+    stmt = (
+        select(Document)
+        .where(
+            Document.kb_id == kb_id,
+            Document.tenant_id == user.tenant_id,
+            Document.deleted_at.is_(None),
+            Document.is_latest.is_(True),
+        )
+        .order_by(Document.created_at.desc())
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    return [
+        DocumentOut(
+            id=d.id,
+            kb_id=d.kb_id,
+            filename=d.filename,
+            ext=d.ext,
+            size_bytes=d.size_bytes,
+            status=d.status,
+            version=d.version,
+            level_rank=d.level_rank,
+            uploaded_at=d.created_at,
+        )
+        for d in rows
+    ]
+
+
+@router.post(
+    "/kbs/{kb_id}/documents",
+    response_model=DocumentOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_document(
+    kb_id: uuid.UUID,
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> DocumentOut:
+    settings = get_settings()
+
+    # 校验 KB 存在
+    kb = await session.get(KnowledgeBase, kb_id)
+    if kb is None or kb.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+
+    # 读文件内容（限制大小，避免 OOM）
+    data = await file.read()
+    size_bytes = len(data)
+    if size_bytes > settings.max_upload_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"FILE_TOO_LARGE: 上限 {settings.max_upload_mb}MB",
+        )
+
+    # 扩展名
+    filename = file.filename or "unnamed"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in set(settings.allowed_ext):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"UNSUPPORTED_FILE_TYPE: 支持的类型 {', '.join(settings.allowed_ext)}",
+        )
+
+    # 落对象存储
+    doc_group_id = uuid.uuid4()
+    storage_key = f"{user.tenant_id}/{kb_id}/{doc_group_id}/v1/{filename}"
+    storage = await get_storage()
+    await storage.put_object(storage_key, data, file.content_type or "application/octet-stream")
+
+    # 建 document
+    document = Document(
+        tenant_id=user.tenant_id,
+        kb_id=kb_id,
+        doc_group_id=doc_group_id,
+        version=1,
+        is_latest=True,
+        filename=filename,
+        ext=ext,
+        size_bytes=size_bytes,
+        storage_key=storage_key,
+        status="pending",
+        level=1,
+        level_rank=20,
+        owner_dept_path=None,
+        acl_tags=["public"],
+        deny_subjects=[],
+        uploaded_by=user.user_id,
+    )
+    session.add(document)
+    await session.flush()
+
+    # 建 parse_job
+    parse_job = ParseJob(
+        tenant_id=user.tenant_id,
+        document_id=document.id,
+        status="queued",
+        max_attempts=settings.arq_max_attempts,
+    )
+    session.add(parse_job)
+    await session.commit()
+    await session.refresh(document)
+    await session.refresh(parse_job)
+
+    # 入队 arq 任务（必须指定与 WorkerSettings.queue_name 一致）
+    redis = await create_pool(
+        RedisSettings.from_dsn(settings.redis_url)
+    )
+    await redis.enqueue_job(
+        "run_parse_job", str(parse_job.id), _queue_name=settings.arq_queue_name
+    )
+    await redis.close()
+
+    return DocumentOut(
+        id=document.id,
+        kb_id=document.kb_id,
+        filename=document.filename,
+        ext=document.ext,
+        size_bytes=document.size_bytes,
+        status=document.status,
+        version=document.version,
+        level_rank=document.level_rank,
+        uploaded_at=document.created_at,
+    )

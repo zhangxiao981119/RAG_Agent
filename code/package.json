@@ -1,0 +1,8 @@
+{
+  "name": "knowledge-agent",
+  "private": true,
+  "workspaces": ["apps/web", "packages/shared"],
+  "scripts": {
+    "build": "npm run build --workspace apps/web"
+  }
+}
