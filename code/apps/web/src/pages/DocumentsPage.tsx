@@ -93,7 +93,7 @@ export function DocumentsPage() {
             ref={fileInputRef}
             type="file"
             className="hidden"
-            accept=".pdf,.md,.txt,.xls,.xlsx"
+            accept=".pdf,.md,.txt,.xls,.xlsx,.docx"
             onChange={(e) => {
               const f = e.target.files?.[0]
               if (f) handleUpload(f)
@@ -122,7 +122,7 @@ export function DocumentsPage() {
         >
           {uploading ? '正在上传...' : '点击或拖放文件到此处'}
         </button>
-        <div className="mt-1 text-xs text-slate-400">支持 PDF / Markdown / TXT / XLS / XLSX，单文件 ≤ 100 MB</div>
+        <div className="mt-1 text-xs text-slate-400">支持 PDF / Markdown / TXT / XLS / XLSX / DOCX，单文件 ≤ 100 MB</div>
       </div>
 
       <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">

@@ -4,10 +4,11 @@
 输出：ParsedBlock 列表（带 heading_path / page_no / is_table）
 
 分派表：
-  · .pdf  → pypdf（仅文本层 PDF；扫描件见 §8 D-04 明确不做）
-  · .md   → markdown 标题层级切分
-  · .txt  → 按空行切段
-  · .xlsx → openpyxl，按 sheet 整表输出（chunk 服务整表不切）
+  · .pdf   → pypdf（仅文本层 PDF；扫描件见 §8 D-04 明确不做）
+  · .md    → markdown 标题层级切分
+  · .txt   → 按空行切段
+  · .xlsx  → openpyxl，按 sheet 整表输出（chunk 服务整表不切）
+  · .docx  → python-docx，按标题/段落/表格切分
 
 ★ PDF 标题识别：pypdf 不带 layout，这里用行首模式匹配
   （"第 X 章/X.Y 标题/数字. 序号"），识别不到则退化为"第 N 页"。
@@ -40,6 +41,7 @@ from app.services.parse.markdown_parser import parse_markdown  # noqa: E402
 from app.services.parse.pdf_parser import parse_pdf  # noqa: E402
 from app.services.parse.text_parser import parse_text  # noqa: E402
 from app.services.parse.xlsx_parser import parse_xlsx  # noqa: E402
+from app.services.parse.docx_parser import parse_docx  # noqa: E402
 
 
 _DISPATCH = {
@@ -48,6 +50,7 @@ _DISPATCH = {
     "txt": parse_text,
     "xlsx": parse_xlsx,
     "xls": parse_xlsx,  # .xls 暂按 xlsx 处理（openpyxl 只支持新格式）
+    "docx": parse_docx,
 }
 
 
