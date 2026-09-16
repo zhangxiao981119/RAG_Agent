@@ -1,0 +1,12 @@
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+# 国内镜像源加速
+RUN npm config set registry https://registry.npmmirror.com && npm install
+COPY . .
+RUN npm run build
+
+FROM nginx:1.27-alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+RUN printf 'server {\n  listen 80;\n  root /usr/share/nginx/html;\n  index index.html;\n  location /api/ { proxy_pass http://api:8000/api/; proxy_set_header Host $host; proxy_buffering off; proxy_read_timeout 300s; }\n  location / { try_files $uri /index.html; }\n}' > /etc/nginx/conf.d/default.conf
+EXPOSE 80
