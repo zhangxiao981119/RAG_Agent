@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     rerank_model: str = "bge-reranker-v2-m3"
     max_upload_mb: int = 100
     allowed_ext: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["pdf", "md", "txt", "xls", "xlsx"]
+        default_factory=lambda: ["pdf", "md", "txt", "xls", "xlsx", "docx"]
     )
     audit_retention_days: int = 365
     multi_tenant: bool = False
