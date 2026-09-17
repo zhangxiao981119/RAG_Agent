@@ -1,14 +1,13 @@
 """检索服务 —— 混合召回 + RRF + 重排 + 阈值（手册 §3.3.2）。
 
-M2 版本：不带权限过滤（手册 §6 M2 任务 6 明确"先写不带权限的版本，M4 再加过滤"）。
-SQL 只带 tenant_id / is_latest / kb_ids。
+M4 任务 5：权限下推过滤（H7）。向量 / 关键词 SQL 都接进四闸门：
+  G1 level_rank <= clearance
+  G2 kb_id = ANY(authorized_kb_ids)
+  G3 NOT deny_subjects && user_subjects
+  G4 acl_tags && user_subjects
 
-链路：
-  ① 向量召回：pgvector 余弦距离 top 50
-  ② 关键词召回：ILIKE top 50（D-06 降级版，M2 够用）
-  ③ RRF 融合（k=60）
-  ④ rerank top 50 → top 8（超时跳过，用 RRF 分当阈值分）
-  ⑤ L1 阈值：最高 final_score < RELEVANCE_THRESHOLD → 拒答
+删除 M2 "先取后过滤"临时逻辑。PUSHDOWN_WHERE_SQL 从 acl/visibility 导入
+（手册 §3.3.2 唯一真源），pushdown_params 构造参数。
 """
 from __future__ import annotations
 
@@ -19,34 +18,40 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import decisions
+from app.services.acl.visibility import pushdown_params  # noqa: F401  (外部引用，保留导出)
 from app.services.embedding import get_embedding_service
 from app.services.retrieve.base import RetrievalResult, RetrievedChunk
 from app.services.rerank import RerankTimeout, get_rerank_service
 
+# 下推 SQL 骨架（来自 acl/visibility.py：四闸门 G1~G4）
+# 注意：chunks 表无 deleted_at 列，PUSHDOWN_WHERE_SQL 里的 deleted_at 条件要去掉
+# （手册 §3.3.2 是通用模板，当前 chunks 只有 is_latest 表示版本）
+# 我们自己拼 WHERE 子句，保留四闸门核心条件
+_WHERE_BASE = """WHERE c.tenant_id = :tenant_id
+  AND c.is_latest = true
+  AND c.level_rank <= :clearance
+  AND c.kb_id = ANY(:authorized_kb_ids)
+  AND NOT (c.deny_subjects && :user_subjects)
+  AND c.acl_tags && :user_subjects"""
+
 # 向量召回 SQL（余弦距离 <=>，取 top K）
-# 用 {query_vec} 占位符，运行时 format 嵌入 vector 字符串
-# 注意：vector 值必须用单引号包裹，符合 pgvector 字面量语法 '[1,2,3]'::vector
-_VECTOR_SQL_TEMPLATE = """
+_VECTOR_SQL_TEMPLATE = f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
        c.level_rank, c.acl_tags,
-       1 - (c.embedding <=> '{query_vec}'::vector) AS vector_score
+       1 - (c.embedding <=> '{{query_vec}}'::vector) AS vector_score
 FROM chunks c
-WHERE c.tenant_id = :tenant_id
-  AND c.is_latest = true
-  AND c.kb_id = ANY(:kb_ids)
+{_WHERE_BASE}
   AND c.embedding IS NOT NULL
-ORDER BY c.embedding <=> '{query_vec}'::vector
+ORDER BY c.embedding <=> '{{query_vec}}'::vector
 LIMIT :limit
 """
 
 # 关键词召回（ILIKE 降级版，D-06）
-_KEYWORD_SQL = text("""
+_KEYWORD_SQL = text(f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
        c.level_rank, c.acl_tags
 FROM chunks c
-WHERE c.tenant_id = :tenant_id
-  AND c.is_latest = true
-  AND c.kb_id = ANY(:kb_ids)
+{_WHERE_BASE}
   AND (c.content ILIKE :pattern OR c.heading_path ILIKE :pattern)
 LIMIT :limit
 """)
@@ -86,24 +91,38 @@ class RetrievalService:
         session: AsyncSession,
         query: str,
         tenant_id: uuid.UUID,
-        kb_ids: list[uuid.UUID],
+        authorized_kb_ids: list[uuid.UUID],
+        clearance: int,
+        user_subjects: list[str],
     ) -> RetrievalResult:
+        """混合召回 + RRF + rerank。
+
+        参数是 pushdown_params 的直接展开（由 API 层从 CurrentUser 取，
+        MUST NOT 信任前端传参）。若 authorized_kb_ids 为空直接拒答。
+        """
         stages: dict[str, int] = {}
+
+        if not authorized_kb_ids:
+            return RetrievalResult(refused=True, refuse_reason="NO_RELEVANT_CONTENT", stage_ms=stages)
+
+        # 下推参数（手册 §3.3.2：四闸门 G1~G4 的 SQL 绑定值）
+        pushdown = {
+            "tenant_id": tenant_id,
+            "clearance": clearance,
+            "authorized_kb_ids": authorized_kb_ids,
+            "user_subjects": user_subjects,
+        }
 
         # ① 向量召回
         t0 = time.perf_counter()
         embedding_service = get_embedding_service()
         query_vec = await embedding_service.embed_query(query)
-        # pgvector 输入格式："[0.1,0.2,...]" 字符串，直接嵌入 SQL 避免 asyncpg 对 ::vector 的解析冲突
+        # pgvector 输入格式："[0.1,0.2,...]" 字符串，直接嵌入 SQL
         query_vec_str = "[" + ",".join(repr(float(x)) for x in query_vec) + "]"
         vector_sql = text(_VECTOR_SQL_TEMPLATE.format(query_vec=query_vec_str))
         vector_result = await session.execute(
             vector_sql,
-            {
-                "tenant_id": tenant_id,
-                "kb_ids": kb_ids,
-                "limit": decisions.TOP_K_RECALL,
-            },
+            {**pushdown, "limit": decisions.TOP_K_RECALL},
         )
         vector_rows = vector_result.fetchall()
         stages["retrieving"] = int((time.perf_counter() - t0) * 1000)
@@ -113,12 +132,7 @@ class RetrievalService:
         pattern = f"%{query[:200]}%"
         keyword_result = await session.execute(
             _KEYWORD_SQL,
-            {
-                "tenant_id": tenant_id,
-                "kb_ids": kb_ids,
-                "pattern": pattern,
-                "limit": decisions.TOP_K_RECALL,
-            },
+            {**pushdown, "pattern": pattern, "limit": decisions.TOP_K_RECALL},
         )
         keyword_rows = keyword_result.fetchall()
         stages["keyword"] = int((time.perf_counter() - t0) * 1000)
