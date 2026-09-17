@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +15,31 @@ from app.services.storage import get_storage
 
 router = APIRouter(tags=["documents"])
 
+# 可预览的原文格式 → 响应媒体类型（docx/xls 等二进制格式暂不支持预览）
+RAW_MEDIA_TYPES: dict[str, str] = {
+    "md": "text/plain; charset=utf-8",
+    "txt": "text/plain; charset=utf-8",
+    "pdf": "application/pdf",
+}
+
+
+async def _get_visible_document(
+    doc_id: uuid.UUID,
+    user: CurrentUser,
+    session: AsyncSession,
+) -> Document:
+    """按租户 + G2 库级授权 + G1 密级三重校验取文档，不通过则抛 403/404。"""
+    doc = await session.get(Document, doc_id)
+    if doc is None or doc.tenant_id != user.tenant_id or doc.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+    # G2：库级授权（kb_id ∈ authorized_kb_ids）
+    if doc.kb_id not in user.authorized_kb_ids:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
+    # G1：密级（文档 level_rank 不得超过用户 clearance）
+    if doc.level_rank > user.clearance:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
+    return doc
+
 
 @router.get("/documents/{doc_id}", response_model=DocumentDetail)
 async def get_document(
@@ -22,9 +47,7 @@ async def get_document(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> DocumentDetail:
-    doc = await session.get(Document, doc_id)
-    if doc is None or doc.tenant_id != user.tenant_id or doc.deleted_at is not None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+    doc = await _get_visible_document(doc_id, user, session)
 
     # chunk 预览（前 20 条）
     stmt = (
@@ -55,6 +78,29 @@ async def get_document(
             )
             for c in chunks
         ],
+    )
+
+
+@router.get("/documents/{doc_id}/raw")
+async def get_document_raw(
+    doc_id: uuid.UUID,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> Response:
+    """文档原文预览：md/txt 返回纯文本，pdf 返回二进制流，其余格式 415。"""
+    doc = await _get_visible_document(doc_id, user, session)
+    media_type = RAW_MEDIA_TYPES.get(doc.ext)
+    if media_type is None:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="该格式暂不支持在线预览",
+        )
+    storage = await get_storage()
+    data = await storage.get_object(doc.storage_key)
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename="{doc.filename}"'},
     )
 
 

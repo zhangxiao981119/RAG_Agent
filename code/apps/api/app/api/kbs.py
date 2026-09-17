@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config.settings import get_settings
-from app.models import Document, KnowledgeBase, ParseJob
+from app.models import Document, KnowledgeBase, KnowledgeBaseMember, ParseJob
 from app.schemas.documents import DocumentOut
 from app.schemas.kbs import (
     KnowledgeBaseCreate,
@@ -32,6 +32,7 @@ from app.schemas.kbs import (
 )
 from app.services import kb_member as kb_member_service
 from app.services.acl import compute_doc_acl_tags
+from app.services.acl.subjects import invalidate_tenant_acl
 from app.services.storage import get_storage
 
 router = APIRouter(tags=["knowledge-bases"])
@@ -76,31 +77,48 @@ async def create_kb(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> KnowledgeBaseOut:
-    # 公开库互斥（手册 §3.2.4 + entities 唯一索引）
-    kb = KnowledgeBase(
-        tenant_id=user.tenant_id,
-        name=payload.name,
-        description=payload.description,
-        visibility="public" if payload.is_public else "restricted",
-        is_public=payload.is_public,
-        owner_id=user.user_id,
-    )
-    session.add(kb)
+    settings = get_settings()
+    redis = Redis.from_url(settings.redis_url)
     try:
-        await session.commit()
-    except Exception as exc:
-        await session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"CONFLICT: {exc}",
-        ) from exc
-    return KnowledgeBaseOut(
-        id=kb.id,
-        name=kb.name,
-        description=kb.description,
-        is_public=kb.is_public,
-        doc_count=0,
-    )
+        # 公开库互斥（手册 §3.2.4 + entities 唯一索引）
+        kb = KnowledgeBase(
+            tenant_id=user.tenant_id,
+            name=payload.name,
+            description=payload.description,
+            visibility="public" if payload.is_public else "restricted",
+            is_public=payload.is_public,
+            owner_id=user.user_id,
+        )
+        session.add(kb)
+        await session.flush()
+        # 创建者自动成为库成员：消除"受限库建完创建者自己看不到"的场景
+        session.add(
+            KnowledgeBaseMember(
+                tenant_id=user.tenant_id,
+                kb_id=kb.id,
+                subject_type="user",
+                subject_id=str(user.user_id),
+            )
+        )
+        # 权限变更点：INCR tenant.acl_epoch（§3.2.6），与成员写入同事务提交
+        await invalidate_tenant_acl(session, redis, user.tenant_id)
+        try:
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"CONFLICT: {exc}",
+            ) from exc
+        return KnowledgeBaseOut(
+            id=kb.id,
+            name=kb.name,
+            description=kb.description,
+            is_public=kb.is_public,
+            doc_count=0,
+        )
+    finally:
+        await redis.aclose()
 
 
 @router.get("/kbs/{kb_id}", response_model=KnowledgeBaseDetail)
