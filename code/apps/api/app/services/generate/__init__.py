@@ -105,7 +105,7 @@ class GenerationResult:
 
 class GenerationService:
     async def generate(
-        self, query: str, chunks: list[RetrievedChunk]
+        self, query: str, chunks: list[RetrievedChunk], history: list[dict] | None = None
     ) -> GenerationResult:
         # 构造引用映射
         valid_ns: set[int] = set()
@@ -124,11 +124,11 @@ class GenerationService:
                 )
             )
 
-        # 构造 prompt
-        messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_prompt(query, chunks)},
-        ]
+        # 构造 messages：system → history → 当前 user prompt
+        messages: list[dict] = [{"role": "system", "content": _SYSTEM_PROMPT}]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": _build_user_prompt(query, chunks)})
 
         # 调 LLM（流式生成，服务端缓冲完整文本）
         # 异常处理（手册 §3.4 故障 3/4）：

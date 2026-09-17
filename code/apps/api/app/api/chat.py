@@ -23,6 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
+from app.config import decisions
 from app.database import SessionLocal
 from app.models import Conversation, KnowledgeBase, Message
 from app.schemas.chat import ChatAskRequest
@@ -154,8 +155,27 @@ async def chat_ask(
         yield _sse("citations", {"citations": citations_payload})
 
         # 生成（含 L3 校验，generation 统一处理 LLM 异常）
+        # 读最近 N 条历史消息作为上下文
+        history: list[dict] = []
+        async with SessionLocal() as hist_session:
+            hist_rows = (await hist_session.execute(
+                select(Message)
+                .where(
+                    Message.conversation_id == conversation_id,
+                    Message.role.in_(["user", "assistant"]),
+                )
+                .order_by(Message.created_at.desc())
+                .limit(decisions.MAX_HISTORY_TURNS + 1)  # +1 是刚写入的当前 user msg
+            )).scalars().all()
+            # 按时间正序，跳过最新那条（就是当前正在处理的 user message）
+            for m in reversed(hist_rows[:-1]):
+                # 跳过被拒答的 assistant 消息（content 为空）
+                if m.role == "assistant" and not m.content:
+                    continue
+                history.append({"role": m.role, "content": m.content})
+
         generation = get_generation_service()
-        gen_result = await generation.generate(payload.question, result.chunks)
+        gen_result = await generation.generate(payload.question, result.chunks, history=history)
 
         if gen_result.refused:
             reason = gen_result.refuse_reason
