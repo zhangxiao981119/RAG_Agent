@@ -1,11 +1,16 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { App, Button, Card, Col, Empty, Input, Modal, Row, Select, Space, Spin, Tag, Typography } from 'antd'
+import { App, Button, Card, Col, Empty, Modal, Row, Select, Space, Spin, Tag, Typography } from 'antd'
 import { PlusOutlined, TeamOutlined, MinusCircleOutlined } from '@ant-design/icons'
 
 import {
   fetchKbs,
   fetchKbMembers,
+  fetchUsers,
+  fetchGroups,
+  fetchRoles,
+  fetchDepartments,
+  DepartmentNode,
   KnowledgeBase,
   KbMemberItem,
   setKbMembers,
@@ -154,11 +159,13 @@ function MemberModal({
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
 
-  // 新增成员表单
+  // 新增成员表单：类型决定主体来源，下拉选择（user/group 存 UUID，dept 存路径，role 存角色名）
   const [addType, setAddType] = useState<KbMemberItem['subject_type']>('user')
-  const [addId, setAddId] = useState('')
-  const [addLabel, setAddLabel] = useState('')
+  const [addOptions, setAddOptions] = useState<{ value: string; label: string }[]>([])
+  const [addLoading, setAddLoading] = useState(false)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
 
+  // 打开 Modal 时拉取已有成员
   useEffect(() => {
     if (!open) return
     setLoading(true)
@@ -168,20 +175,47 @@ function MemberModal({
       .finally(() => setLoading(false))
   }, [open, kb.id, message])
 
+  useEffect(() => {
+    if (!open) return
+    setSelectedId(null)
+    setAddLoading(true)
+    const load = async (): Promise<{ value: string; label: string }[]> => {
+      if (addType === 'user') {
+        const page = await fetchUsers(1, 200)
+        return page.items.map((u) => ({ value: u.id, label: `${u.display_name} (${u.username})` }))
+      }
+      if (addType === 'group') {
+        const groups = await fetchGroups()
+        return groups.map((g) => ({ value: g.id, label: g.name }))
+      }
+      if (addType === 'dept') {
+        const flatten = (nodes: DepartmentNode[]): DepartmentNode[] =>
+          nodes.flatMap((n) => [n, ...flatten(n.children)])
+        const tree = await fetchDepartments()
+        return flatten(tree).map((d) => ({ value: d.path, label: d.path }))
+      }
+      const roles = await fetchRoles()
+      return roles.map((r) => ({ value: r.name, label: r.name }))
+    }
+    load()
+      .then(setAddOptions)
+      .catch((e) => message.error(e instanceof Error ? e.message : String(e)))
+      .finally(() => setAddLoading(false))
+  }, [open, addType, message])
+
   const addMember = () => {
-    const id = addId.trim()
-    if (!id) {
-      message.warning('subject_id 不能为空')
+    if (!selectedId) {
+      message.warning('请先选择一个主体')
       return
     }
     // 去重
-    if (members.some((m) => m.subject_type === addType && m.subject_id === id)) {
+    if (members.some((m) => m.subject_type === addType && m.subject_id === selectedId)) {
       message.warning('该成员已存在')
       return
     }
-    setMembers([...members, { subject_type: addType, subject_id: id, label: addLabel.trim() || id }])
-    setAddId('')
-    setAddLabel('')
+    const label = addOptions.find((o) => o.value === selectedId)?.label ?? selectedId
+    setMembers([...members, { subject_type: addType, subject_id: selectedId, label }])
+    setSelectedId(null)
   }
 
   const removeMember = (idx: number) => {
@@ -218,7 +252,7 @@ function MemberModal({
       cancelText="取消"
     >
       <Spin spinning={loading}>
-        {/* 新增表单 */}
+        {/* 新增表单：类型 + 主体下拉选择 */}
         <Card size="small" title="添加成员" style={{ marginBottom: 16 }}>
           <Space wrap>
             <Select
@@ -232,24 +266,23 @@ function MemberModal({
                 { value: 'role', label: '角色' },
               ]}
             />
-            <Input
-              placeholder="subject_id (UUID / 路径 / 角色名)"
-              value={addId}
-              onChange={(e) => setAddId(e.target.value)}
-              style={{ width: 240 }}
-            />
-            <Input
-              placeholder="label (展示名，可选)"
-              value={addLabel}
-              onChange={(e) => setAddLabel(e.target.value)}
-              style={{ width: 180 }}
+            <Select
+              showSearch
+              optionFilterProp="label"
+              placeholder={addType === 'user' ? '选择用户' : addType === 'group' ? '选择用户组' : addType === 'dept' ? '选择部门' : '选择角色'}
+              value={selectedId}
+              onChange={setSelectedId}
+              loading={addLoading}
+              notFoundContent={addLoading ? <Spin size="small" /> : '暂无可选项'}
+              style={{ width: 280 }}
+              options={addOptions}
             />
             <Button type="primary" onClick={addMember}>
               添加
             </Button>
           </Space>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            提示：user/group 填 UUID 字符串；dept 填规整路径如 /总部/财务部/；role 填角色名如 admin
+            提示：user/group 保存其 UUID，dept 保存规整路径，role 保存角色名，均由选择自动填入
           </Text>
         </Card>
 
