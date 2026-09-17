@@ -69,6 +69,7 @@ class User(Base):
     clearance: Mapped[int] = mapped_column(Integer, nullable=False, server_default="20")
     role_names: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default="{}")
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    memory: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (

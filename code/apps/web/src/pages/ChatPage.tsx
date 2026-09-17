@@ -232,7 +232,10 @@ function CitationPanel({ citation, onClose }: { citation: Citation | null; onClo
         {citation.heading_path && (
           <div className="mt-1 text-blue-700">{citation.heading_path}</div>
         )}
-        <div className="mt-1 text-xs text-blue-600">第 {citation.page_no} 页 · 相关度 {citation.score.toFixed(2)}</div>
+        <div className="mt-1 text-xs text-blue-600">
+          {citation.page_no != null && <>第 {citation.page_no} 页 · </>}
+          相关度 {citation.score.toFixed(2)}
+        </div>
       </div>
       <div className="rounded-lg bg-slate-50 p-3 leading-relaxed text-slate-700">
         {citation.snippet}

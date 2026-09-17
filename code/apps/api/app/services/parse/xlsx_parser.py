@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+import io
+
 from app.services.parse.base import ParsedBlock, ParseError
 
 try:
@@ -22,7 +24,7 @@ def _row_to_tsv(row: list[object]) -> str:
 
 def parse_xlsx(data: bytes) -> list[ParsedBlock]:
     try:
-        wb = load_workbook(data, read_only=True, data_only=True)
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception as exc:
         raise ParseError(f"XLSX 打开失败: {exc}") from exc
 

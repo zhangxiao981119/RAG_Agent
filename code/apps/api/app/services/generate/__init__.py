@@ -105,7 +105,11 @@ class GenerationResult:
 
 class GenerationService:
     async def generate(
-        self, query: str, chunks: list[RetrievedChunk], history: list[dict] | None = None
+        self,
+        query: str,
+        chunks: list[RetrievedChunk],
+        history: list[dict] | None = None,
+        memory_prompt: str = "",
     ) -> GenerationResult:
         # 构造引用映射
         valid_ns: set[int] = set()
@@ -124,8 +128,9 @@ class GenerationService:
                 )
             )
 
-        # 构造 messages：system → history → 当前 user prompt
-        messages: list[dict] = [{"role": "system", "content": _SYSTEM_PROMPT}]
+        # 构造 messages：system(+memory) → history → 当前 user prompt
+        system_content = _SYSTEM_PROMPT + (memory_prompt if memory_prompt else "")
+        messages: list[dict] = [{"role": "system", "content": system_content}]
         if history:
             messages.extend(history)
         messages.append({"role": "user", "content": _build_user_prompt(query, chunks)})

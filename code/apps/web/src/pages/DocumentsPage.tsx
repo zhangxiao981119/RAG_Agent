@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 
-import { fetchDocuments, fetchKbs, uploadDocument, KnowledgeBase, Document } from '../mocks/data'
+import { fetchDocuments, fetchKbs, uploadDocument, deleteDocument, KnowledgeBase, Document } from '../mocks/data'
 
 const STATUS_LABEL: Record<Document['status'], { text: string; cls: string }> = {
   pending: { text: '待处理', cls: 'bg-slate-100 text-slate-600' },
@@ -72,6 +72,16 @@ export function DocumentsPage() {
     }
   }
 
+  async function handleDelete(doc: Document) {
+    if (!confirm(`确定删除文档 "${doc.filename}" 吗？删除后不可恢复。`)) return
+    try {
+      await deleteDocument(doc.id)
+      setDocuments((prev) => prev.filter((d) => d.id !== doc.id))
+    } catch (e: any) {
+      setError(e.message || '删除失败')
+    }
+  }
+
   return (
     <section>
       <div className="mb-6 flex items-center justify-between">
@@ -135,6 +145,7 @@ export function DocumentsPage() {
               <th className="px-4 py-3 text-left font-medium">版本</th>
               <th className="px-4 py-3 text-left font-medium">状态</th>
               <th className="px-4 py-3 text-left font-medium">上传时间</th>
+              <th className="px-4 py-3 text-left font-medium">操作</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
@@ -150,6 +161,14 @@ export function DocumentsPage() {
                   </span>
                 </td>
                 <td className="px-4 py-3 text-slate-500">{new Date(d.uploaded_at).toLocaleString()}</td>
+                <td className="px-4 py-3">
+                  <button
+                    onClick={() => handleDelete(d)}
+                    className="text-red-500 hover:text-red-700 text-xs"
+                  >
+                    删除
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>

@@ -41,6 +41,7 @@ from app.services.parse.markdown_parser import parse_markdown  # noqa: E402
 from app.services.parse.pdf_parser import parse_pdf  # noqa: E402
 from app.services.parse.text_parser import parse_text  # noqa: E402
 from app.services.parse.xlsx_parser import parse_xlsx  # noqa: E402
+from app.services.parse.xls_parser import parse_xls  # noqa: E402
 from app.services.parse.docx_parser import parse_docx  # noqa: E402
 
 
@@ -49,7 +50,7 @@ _DISPATCH = {
     "md": parse_markdown,
     "txt": parse_text,
     "xlsx": parse_xlsx,
-    "xls": parse_xlsx,  # .xls 暂按 xlsx 处理（openpyxl 只支持新格式）
+    "xls": parse_xls,
     "docx": parse_docx,
 }
 
