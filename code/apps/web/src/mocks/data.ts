@@ -62,8 +62,42 @@ export type User = {
 
 // ---------- 工具函数 ----------
 
+const TOKEN_KEY = 'kagent_token'
+const USER_KEY = 'kagent_user'
+
+/** 读取 localStorage 中的 JWT token。 */
+export function getStoredToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY)
+}
+
+/** 读取 localStorage 中的已登录用户信息。 */
+export function getStoredUser(): User | null {
+  const raw = localStorage.getItem(USER_KEY)
+  if (!raw) return null
+  try {
+    return JSON.parse(raw) as User
+  } catch {
+    return null
+  }
+}
+
+/** 清除本地登录态。 */
+export function clearAuth(): void {
+  localStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem(USER_KEY)
+}
+
+/** 给请求头附加 Authorization: Bearer <token>。 */
+function withAuth(init?: RequestInit): RequestInit {
+  const token = getStoredToken()
+  if (!token) return init ?? {}
+  const headers = new Headers(init?.headers)
+  headers.set('Authorization', `Bearer ${token}`)
+  return { ...init, headers }
+}
+
 async function http<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init)
+  const response = await fetch(url, withAuth(init))
   if (!response.ok) {
     const text = await response.text().catch(() => '')
     throw new Error(`HTTP ${response.status}: ${text}`)
@@ -98,7 +132,11 @@ export async function fetchDocument(docId: string): Promise<Document | undefined
 }
 
 export async function deleteDocument(docId: string): Promise<void> {
-  await fetch(`/api/documents/${docId}`, { method: 'DELETE' })
+  const resp = await fetch(`/api/documents/${docId}`, withAuth({ method: 'DELETE' }))
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    throw new Error(`HTTP ${resp.status}: ${text}`)
+  }
 }
 
 export async function uploadDocument(kbId: string, file: File): Promise<Document> {
@@ -122,12 +160,12 @@ export async function askChat(
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const response = await fetch('/api/chat/ask', {
+  const response = await fetch('/api/chat/ask', withAuth({
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ question, kb_ids: kbIds, conversation_id: null }),
     signal,
-  })
+  }))
   if (!response.ok || !response.body) {
     const text = await response.text().catch(() => '')
     throw new Error(`HTTP ${response.status}: ${text}`)
@@ -163,17 +201,71 @@ export async function askChat(
   }
 }
 
-// ---------- 登录（M2 占位：无真实认证，返回固定 admin） ----------
-// M3 接 JWT 后替换为 POST /api/auth/login
+// ---------- 登录（M3 真实认证：RSA 加密密码 → POST /api/auth/login） ----------
 
-export async function mockLogin(username: string, _password: string): Promise<User> {
-  await new Promise((r) => setTimeout(r, 200))
-  // M2 固定返回 admin（后端也是固定 admin）
-  if (username === 'admin') {
-    return { id: 'u_admin', display_name: '系统管理员', dept_path: '/总部/', clearance: 40 }
-  }
-  // 其他用户名也允许（M2 无权限校验）
-  return { id: 'u_admin', display_name: username, dept_path: '/总部/技术中心/', clearance: 20 }
+type LoginResponse = {
+  token: string
+  token_type: string
+  user: User
+}
+
+type PublicKeyResponse = {
+  public_key: string
+}
+
+/** base64 字符串转 ArrayBuffer（Web Crypto importKey 需要）。 */
+function base64ToArrayBuffer(b64: string): ArrayBuffer {
+  const binary = atob(b64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes.buffer
+}
+
+/** ArrayBuffer 转 base64 字符串。 */
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf)
+  let binary = ''
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
+  return btoa(binary)
+}
+
+/** 用后端 RSA 公钥（SPKI DER）以 RSA-OAEP(SHA-256) 加密明文密码，返回 base64 密文。 */
+async function encryptPassword(publicKeyB64: string, password: string): Promise<string> {
+  const der = base64ToArrayBuffer(publicKeyB64)
+  const publicKey = await crypto.subtle.importKey(
+    'spki',
+    der,
+    { name: 'RSA-OAEP', hash: 'SHA-256' },
+    false,
+    ['encrypt'],
+  )
+  const encrypted = await crypto.subtle.encrypt(
+    { name: 'RSA-OAEP' },
+    publicKey,
+    new TextEncoder().encode(password),
+  )
+  return arrayBufferToBase64(encrypted)
+}
+
+export async function login(username: string, password: string): Promise<User> {
+  // 1. 获取 RSA 公钥
+  const { public_key } = await http<PublicKeyResponse>('/api/auth/public-key')
+  // 2. 用公钥加密密码（网络上只传输密文）
+  const encryptedPassword = await encryptPassword(public_key, password)
+  // 3. 提交密文登录
+  const data = await http<LoginResponse>('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password: encryptedPassword }),
+  })
+  localStorage.setItem(TOKEN_KEY, data.token)
+  localStorage.setItem(USER_KEY, JSON.stringify(data.user))
+  return data.user
+}
+
+/** 退出登录：清 localStorage。 */
+export function logout(): void {
+  clearAuth()
 }
 
 // ---------- 向后兼容（ChatPage 仍引用 mockAsk） ----------

@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.auth import router as auth_router
 from app.api.chat import router as chat_router
 from app.api.documents import router as documents_router
 from app.api.health import router as health_router
@@ -18,6 +19,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="知识库问答 Agent API", version="0.2.0", lifespan=lifespan)
 app.include_router(health_router, prefix="/api")
+app.include_router(auth_router, prefix="/api")
 app.include_router(kbs_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
 app.include_router(jobs_router, prefix="/api")

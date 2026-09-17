@@ -20,6 +20,14 @@ class Settings(BaseSettings):
     app_env: str = "dev"
     secret_key: str = "change-me"
     tenant_code: str = "default"
+    # ── M3 JWT 认证 ──────────────────────────────────────────
+    jwt_secret: str = "change-me-jwt"
+    jwt_expire_minutes: int = 1440  # 默认 24 小时
+    # ── M3 登录安全策略 ──────────────────────────────────────
+    bcrypt_rounds: int = 12  # bcrypt 哈希轮数，越大越慢越安全
+    login_max_failures: int = 5  # 连续失败多少次后锁定账户
+    login_lock_minutes: int = 15  # 账户锁定时长（分钟）
+    login_rate_per_minute: int = 10  # 单 IP 每分钟最多登录尝试次数
     database_url: str = "postgresql+asyncpg://user:pass@postgres:5432/kagent"
     redis_url: str = "redis://redis:6379/0"
     s3_endpoint: str = "http://minio:9000"
