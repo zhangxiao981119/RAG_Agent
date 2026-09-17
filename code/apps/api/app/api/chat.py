@@ -56,18 +56,21 @@ async def chat_ask(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
-    # 校验 kb_ids
-    if not payload.kb_ids:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="kb_ids 不能为空")
+    # 校验 kb_ids 与 user.authorized_kb_ids 求交集（手册 §3.2.7 G2：前端可能传无权限的库）
+    effective_kb_ids = [
+        kb for kb in payload.kb_ids if kb in user.authorized_kb_ids
+    ]
+    if not effective_kb_ids:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
     kb_rows = (
         await session.execute(
             select(KnowledgeBase).where(
-                KnowledgeBase.id.in_(payload.kb_ids),
+                KnowledgeBase.id.in_(effective_kb_ids),
                 KnowledgeBase.tenant_id == user.tenant_id,
             )
         )
     ).scalars().all()
-    if len(kb_rows) != len(payload.kb_ids):
+    if len(kb_rows) != len(effective_kb_ids):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="部分知识库不存在")
 
     # 复用或创建 conversation
@@ -114,7 +117,9 @@ async def chat_ask(
                     retrieve_session,
                     payload.question,
                     user.tenant_id,
-                    payload.kb_ids,
+                    user.authorized_kb_ids,
+                    user.clearance,
+                    user.subjects,
                 )
             except Exception as exc:
                 logger.exception("检索失败")
