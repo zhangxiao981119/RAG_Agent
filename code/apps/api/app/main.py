@@ -7,11 +7,13 @@ from app.api.auth import router as auth_router
 from app.api.chat import router as chat_router
 from app.api.departments import router as departments_router
 from app.api.documents import router as documents_router
+from app.api.finetune import router as finetune_router
 from app.api.groups import router as groups_router
 from app.api.health import router as health_router
 from app.api.jobs import router as jobs_router
 from app.api.kbs import router as kbs_router
 from app.api.me import router as me_router
+from app.api.messages import router as messages_router
 from app.api.roles import router as roles_router
 from app.api.users import router as users_router
 from app.config import decisions
@@ -48,3 +50,5 @@ app.include_router(kbs_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
 app.include_router(jobs_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
+app.include_router(messages_router, prefix="/api")
+app.include_router(finetune_router, prefix="/api")
