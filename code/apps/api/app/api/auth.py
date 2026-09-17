@@ -1,22 +1,42 @@
-"""M3 认证 API —— POST /api/auth/login 签发 JWT。
+"""M3 认证 API —— login / refresh / logout。
 
 安全策略：
   1. IP 速率限制：单 IP 每分钟最多 login_rate_per_minute 次尝试，超限 429
   2. 账户失败锁定：连续失败 login_max_failures 次后锁定 login_lock_minutes 分钟，超限 423
   3. 统一错误文案：账号不存在/密码错误/已锁定均不泄露账号有效性
+  4. refresh rotation：每次 refresh 后旧 refresh 立即入黑名单（防盗用）
+  5. logout：把 access + refresh 的 jti 加入 Redis 黑名单（TTL=剩余有效期）
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+import time
+from typing import Any
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db
+from app.api.deps import get_current_user, get_db, CurrentUser
 from app.config.settings import get_settings
 from app.models import Department, Tenant, User
-from app.schemas.auth import LoginRequest, LoginResponse, PublicKeyResponse, UserInfo
-from app.services.auth import create_access_token, verify_password
+from app.schemas.auth import (
+    LoginRequest,
+    LoginResponse,
+    LogoutRequest,
+    LogoutResponse,
+    PublicKeyResponse,
+    RefreshRequest,
+    RefreshResponse,
+    UserInfo,
+)
+from app.services.auth import (
+    JWTError,
+    create_access_token,
+    create_refresh_token,
+    verify_password,
+    verify_refresh_token,
+)
 from app.services.crypto import decrypt_password, get_public_key_spki_b64
 
 router = APIRouter(tags=["auth"])
@@ -25,6 +45,7 @@ router = APIRouter(tags=["auth"])
 _RATE_KEY = "auth:rate:{ip}"          # IP 限流计数，TTL 60s
 _FAIL_KEY = "auth:fail:{tid}:{user}"  # 账户失败计数
 _LOCK_KEY = "auth:lock:{tid}:{user}"  # 账户锁定标记
+_BLACKLIST_KEY = "auth:blacklist:{jti}"  # token 黑名单，TTL=token 剩余有效期
 
 
 def _client_ip(request: Request) -> str:
@@ -33,6 +54,21 @@ def _client_ip(request: Request) -> str:
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+async def _revoke_token(redis: Redis, payload: dict[str, Any]) -> None:
+    """把 token 的 jti 加入黑名单，TTL 设为其剩余有效期。"""
+    jti = payload.get("jti")
+    exp = payload.get("exp")
+    if not jti or not exp:
+        return
+    now = int(time.time())
+    ttl = max(1, int(exp) - now)  # 至少留 1 秒，避免 0/负 TTL 被拒
+    try:
+        await redis.setex(_BLACKLIST_KEY.format(jti=jti), ttl, "1")
+    except Exception:  # noqa: BLE001
+        # 黑名单写失败不影响主流程；最坏情况是 token 仍可用直到自然过期
+        pass
 
 
 @router.get("/auth/public-key", response_model=PublicKeyResponse)
@@ -47,7 +83,7 @@ async def login(
     request: Request,
     session: AsyncSession = Depends(get_db),
 ) -> LoginResponse:
-    """用户名+密码登录，签发 JWT。"""
+    """用户名+密码登录，签发 access + refresh token。"""
     settings = get_settings()
     tenant = await session.scalar(select(Tenant).where(Tenant.code == settings.tenant_code))
     if tenant is None:
@@ -101,7 +137,7 @@ async def login(
                 )
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户名或密码错误")
 
-        # ── 4. 登录成功，清除失败计数 ─────────────────────────
+        # ── 5. 登录成功，清除失败计数 + 签发双 token ─────────
         fail_key = _FAIL_KEY.format(tid=tenant.id, user=payload.username)
         await redis.delete(fail_key, lock_key)
 
@@ -112,9 +148,11 @@ async def login(
             if dept is not None:
                 dept_path = dept.path
 
-        token = create_access_token(user.id, tenant.id, user.username)
+        access_token = create_access_token(user.id, tenant.id, user.username)
+        refresh_token = create_refresh_token(user.id, tenant.id, user.username)
         return LoginResponse(
-            token=token,
+            token=access_token,
+            refresh_token=refresh_token,
             user=UserInfo(
                 id=user.id,
                 display_name=user.display_name,
@@ -122,5 +160,98 @@ async def login(
                 clearance=user.clearance,
             ),
         )
+    finally:
+        await redis.aclose()
+
+
+@router.post("/auth/refresh", response_model=RefreshResponse)
+async def refresh(
+    payload: RefreshRequest,
+    session: AsyncSession = Depends(get_db),
+) -> RefreshResponse:
+    """用 refresh token 换新 access + 新 refresh（rotation）。
+
+    流程：
+      1. 校验 refresh token 签名 + 过期 + typ
+      2. 检查 jti 是否在黑名单（已登出 / 已 rotation 过）
+      3. 查 User，校验仍存在 + active + tenant 一致
+      4. 旧 refresh 的 jti 入黑名单（TTL=剩余有效期）—— 一次性使用
+      5. 签发新 access + 新 refresh
+    """
+    try:
+        refresh_payload = verify_refresh_token(payload.refresh_token)
+    except JWTError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "refresh token 无效或已过期") from exc
+
+    jti = refresh_payload.get("jti")
+    user_id_raw = refresh_payload.get("sub")
+    tenant_id_raw = refresh_payload.get("tenant")
+    username = refresh_payload.get("username")
+    if not jti or not user_id_raw or not tenant_id_raw or not username:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "refresh token 字段缺失")
+
+    import uuid as _uuid
+    try:
+        user_id = _uuid.UUID(user_id_raw)
+        tenant_id = _uuid.UUID(tenant_id_raw)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "refresh token 字段格式错误") from exc
+
+    settings = get_settings()
+    redis = Redis.from_url(settings.redis_url)
+    try:
+        # 黑名单检查
+        if await redis.exists(_BLACKLIST_KEY.format(jti=jti)):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "refresh token 已失效，请重新登录")
+
+        user = await session.get(User, user_id)
+        if user is None or user.tenant_id != tenant_id or user.username != username:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户不存在或已被替换")
+        if user.status != "active":
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户已被禁用")
+
+        # rotation：旧 refresh 入黑名单
+        await _revoke_token(redis, refresh_payload)
+
+        new_access = create_access_token(user.id, tenant_id, user.username)
+        new_refresh = create_refresh_token(user.id, tenant_id, user.username)
+        return RefreshResponse(token=new_access, refresh_token=new_refresh)
+    finally:
+        await redis.aclose()
+
+
+@router.post("/auth/logout", response_model=LogoutResponse)
+async def logout(
+    payload: LogoutRequest,
+    user: CurrentUser = Depends(get_current_user),  # 用 access token 鉴权
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> LogoutResponse:
+    """登出：把 access + refresh 的 jti 加入 Redis 黑名单。
+
+    鉴权依赖 get_current_user（已检查黑名单 + 用户状态），所以到这里 access token
+    一定是有效的。可选 body.refresh_token 一并吊销。
+    """
+    settings = get_settings()
+    redis = Redis.from_url(settings.redis_url)
+    try:
+        # access token 入黑名单
+        if authorization and authorization.startswith("Bearer "):
+            access_token = authorization.removeprefix("Bearer ").strip()
+            try:
+                from app.services.auth import verify_access_token
+                access_payload = verify_access_token(access_token)
+                await _revoke_token(redis, access_payload)
+            except JWTError:
+                pass  # 已过期/无效，无需入黑名单
+
+        # 可选：refresh token 一并吊销
+        if payload.refresh_token:
+            try:
+                refresh_payload = verify_refresh_token(payload.refresh_token)
+                await _revoke_token(redis, refresh_payload)
+            except JWTError:
+                pass  # refresh 已过期/无效，跳过
+
+        return LogoutResponse(revoked=True)
     finally:
         await redis.aclose()

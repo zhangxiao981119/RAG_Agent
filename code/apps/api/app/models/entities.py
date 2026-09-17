@@ -32,6 +32,8 @@ class Tenant(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     code: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    # §3.2.6 权限缓存版本号；任何权限变更都 +1 使旧缓存 key 失效
+    acl_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (CheckConstraint("status IN ('active','suspended')", name="ck_tenants_status"),)
@@ -298,3 +300,61 @@ class EvalCase(Base):
     expected_doc_ids: Mapped[list[uuid.UUID]] = mapped_column(ARRAY(UUID(as_uuid=True)), server_default="{}")
     note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ─────────────────────────────────────────────────────────────
+# M4 任务 3：acl_tags 写库断言（模型层 event listener，不可绕过）
+#
+# 覆盖两条约束（手册 §3.2.4 + §4.2.8）：
+#   A1  public MUST 单独存在（acl_tags = ["public"]，不能混 dept/group/...）
+#   A2  acl_tags MUST NOT 含 level: 标签（放进来会让 G4 绕过 G1 密级闸门）
+#   空  acl_tags 为空数组 → 自动规范化为 ["public"]
+#
+# 实现方式：SQLAlchemy before_insert / before_update event，所有写库路径
+# （上传 API、解析 worker、未来手动标签覆盖）都会走这里。
+# 抛 AclTagError → 转 ValueError（API 层已有 ValueError → 400 的映射）。
+# ─────────────────────────────────────────────────────────────
+from sqlalchemy import event as _sa_event
+
+
+def _validate_and_normalize_acl_tags(target: object) -> None:
+    """对 Document / Chunk 的 acl_tags 做断言 + 空数组规范化。
+
+    lazy import validate_acl_tags 避免 models → services 的循环依赖。
+    """
+    tags = getattr(target, "acl_tags", None)
+    if tags is None:
+        return  # 列有 server_default，允许 None 在 DB 层处理
+
+    # 空数组规范化为 ["public"]（约束 1）
+    if not tags:
+        target.acl_tags = ["public"]
+        tags = ["public"]
+
+    # 断言（lazy import）
+    from app.services.acl import validate_acl_tags
+    from app.services.acl.errors import AclTagError
+    try:
+        validate_acl_tags(tags)
+    except AclTagError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+@_sa_event.listens_for(Document, "before_insert")
+def _doc_before_insert(mapper, connection, target):
+    _validate_and_normalize_acl_tags(target)
+
+
+@_sa_event.listens_for(Document, "before_update")
+def _doc_before_update(mapper, connection, target):
+    _validate_and_normalize_acl_tags(target)
+
+
+@_sa_event.listens_for(Chunk, "before_insert")
+def _chunk_before_insert(mapper, connection, target):
+    _validate_and_normalize_acl_tags(target)
+
+
+@_sa_event.listens_for(Chunk, "before_update")
+def _chunk_before_update(mapper, connection, target):
+    _validate_and_normalize_acl_tags(target)

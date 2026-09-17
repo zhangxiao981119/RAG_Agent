@@ -13,6 +13,7 @@ import uuid
 
 from arq.connections import RedisSettings, create_pool
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,7 +21,17 @@ from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config.settings import get_settings
 from app.models import Document, KnowledgeBase, ParseJob
 from app.schemas.documents import DocumentOut
-from app.schemas.kbs import KnowledgeBaseCreate, KnowledgeBaseDetail, KnowledgeBaseOut
+from app.schemas.kbs import (
+    KnowledgeBaseCreate,
+    KnowledgeBaseDetail,
+    KnowledgeBaseOut,
+    KbMemberItem,
+    KbMemberListResponse,
+    KbMemberSetRequest,
+    KbMemberSetResponse,
+)
+from app.services import kb_member as kb_member_service
+from app.services.acl import compute_doc_acl_tags
 from app.services.storage import get_storage
 
 router = APIRouter(tags=["knowledge-bases"])
@@ -111,6 +122,63 @@ async def get_kb(
     )
 
 
+@router.get("/kbs/{kb_id}/members", response_model=KbMemberListResponse)
+async def list_kb_members(
+    kb_id: uuid.UUID,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> KbMemberListResponse:
+    """列出知识库成员（四种主体，含展示用 label）。"""
+    kb = await session.get(KnowledgeBase, kb_id)
+    if kb is None or kb.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+    rows = await kb_member_service.list_members(session, user.tenant_id, kb_id)
+    return KbMemberListResponse(
+        kb_id=kb_id,
+        members=[
+            KbMemberItem(subject_type=r.subject_type, subject_id=r.subject_id, label=r.label)
+            for r in rows
+        ],
+    )
+
+
+@router.put("/kbs/{kb_id}/members", response_model=KbMemberSetResponse)
+async def set_kb_members(
+    kb_id: uuid.UUID,
+    payload: KbMemberSetRequest,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> KbMemberSetResponse:
+    """全量设置知识库成员（四种主体，手册 §5.1）。
+
+    成员实际变化时由 services/kb_member 触发 tenant_acl_epoch+1。
+    """
+    settings = get_settings()
+    redis = Redis.from_url(settings.redis_url)
+    try:
+        kb = await session.get(KnowledgeBase, kb_id)
+        if kb is None or kb.tenant_id != user.tenant_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+        try:
+            rows, changed = await kb_member_service.set_members(
+                session, redis, user.tenant_id, kb_id,
+                [(m.subject_type, m.subject_id) for m in payload.members],
+            )
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+        await session.commit()
+        return KbMemberSetResponse(
+            kb_id=kb_id,
+            changed=changed,
+            members=[
+                KbMemberItem(subject_type=r.subject_type, subject_id=r.subject_id, label=r.label)
+                for r in rows
+            ],
+        )
+    finally:
+        await redis.aclose()
+
+
 @router.get("/kbs/{kb_id}/documents", response_model=list[DocumentOut])
 async def list_documents(
     kb_id: uuid.UUID,
@@ -186,6 +254,13 @@ async def upload_document(
     storage = await get_storage()
     await storage.put_object(storage_key, data, file.content_type or "application/octet-stream")
 
+    # M4 任务 2：owner_dept_path = 上传者部门路径（仅自身路径，不展开祖先）。
+    # CurrentUser.dept_path 来自主体解析（departments 表原值），admin 无部门时为空串
+    owner_dept_path: str | None = user.dept_path or None
+
+    # acl_tags 由 compute_doc_acl_tags 唯一生成（§4.2.8 H1：dept 仅自身路径）
+    acl_tags = sorted(compute_doc_acl_tags(dept_path=owner_dept_path))
+
     # 建 document
     document = Document(
         tenant_id=user.tenant_id,
@@ -200,8 +275,8 @@ async def upload_document(
         status="pending",
         level=1,
         level_rank=20,
-        owner_dept_path=None,
-        acl_tags=["public"],
+        owner_dept_path=owner_dept_path,
+        acl_tags=acl_tags,
         deny_subjects=[],
         uploaded_by=user.user_id,
     )

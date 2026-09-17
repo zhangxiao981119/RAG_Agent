@@ -1,6 +1,29 @@
 import { useEffect, useRef, useState } from 'react'
+import {
+  Alert,
+  Button,
+  Card,
+  Checkbox,
+  Drawer,
+  Empty,
+  Input,
+  Space,
+  Spin,
+  Tag,
+  Typography,
+} from 'antd'
+import { SendOutlined, StopOutlined } from '@ant-design/icons'
 
-import { mockAsk, ChatEvent, Citation, KnowledgeBase, fetchKbs, User } from '../mocks/data'
+import {
+  ChatEvent,
+  Citation,
+  fetchKbs,
+  KnowledgeBase,
+  mockAsk,
+  User,
+} from '../mocks/data'
+
+const { Text } = Typography
 
 type Message = {
   id: string
@@ -17,23 +40,31 @@ type Props = { currentUser: User }
 export function ChatPage({ currentUser }: Props) {
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState<Message[]>([
-    { id: 'welcome', role: 'assistant', text: `你好 ${currentUser.display_name}，我是知识库问答助手。请选择知识库后提问。` },
+    {
+      id: 'welcome',
+      role: 'assistant',
+      text: `你好 ${currentUser.display_name}，我是知识库问答助手。请选择知识库后提问。`,
+    },
   ])
   const [kbs, setKbs] = useState<KnowledgeBase[]>([])
   const [selectedKbs, setSelectedKbs] = useState<string[]>([])
   const [sidebarCitation, setSidebarCitation] = useState<Citation | null>(null)
-  const [error, setError] = useState<string | null>(null)
   const [streaming, setStreaming] = useState(false)
 
   const abortRef = useRef<AbortController | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
+  // 知识库列表加载失败用 Alert 展示（页面级错误，不适合一闪而过的 message）
+  const [loadError, setLoadError] = useState<string | null>(null)
+
   useEffect(() => {
-    fetchKbs().then((list) => {
-      setKbs(list)
-      // 默认选中所有知识库（M2 无权限，全选）
-      setSelectedKbs(list.map((kb) => kb.id))
-    }).catch((e) => setError(e.message))
+    fetchKbs()
+      .then((list) => {
+        setKbs(list)
+        // 默认选中所有知识库
+        setSelectedKbs(list.map((kb) => kb.id))
+      })
+      .catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
   }, [])
 
   useEffect(() => {
@@ -48,7 +79,6 @@ export function ChatPage({ currentUser }: Props) {
     const assistantMsg: Message = { id: `a_${Date.now()}`, role: 'assistant', text: '', loading: true }
     setMessages((prev) => [...prev, userMsg, assistantMsg])
     setInput('')
-    setError(null)
     setStreaming(true)
 
     const controller = new AbortController()
@@ -72,17 +102,33 @@ export function ChatPage({ currentUser }: Props) {
       await mockAsk(question, selectedKbs, handler, controller.signal)
 
       setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantMsg.id
-            ? refused
-              ? { ...m, loading: false, refused: true, refusedMessage: refusedMessage ?? '知识库中未找到相关内容', text: '' }
-              : { ...m, loading: false, text: buffer || '(空)', citations }
-            : m,
-        ),
+        prev.map((m) => {
+          if (m.id !== assistantMsg.id) return m
+          return refused
+            ? {
+                ...m,
+                loading: false,
+                refused: true,
+                refusedMessage: refusedMessage ?? '知识库中未找到相关内容',
+                text: '',
+              }
+            : { ...m, loading: false, text: buffer || '(空)', citations }
+        }),
       )
-    } catch (e: any) {
-      setMessages((prev) => prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: '' } : m)))
-      setError(e.message || '请求失败')
+    } catch (e) {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: '' } : m)),
+      )
+      // 输出错误气泡（同时保留在对话流中，比顶部红框更贴近出错位置）
+      setMessages((prev) =>
+        prev.concat({
+          id: `err_${Date.now()}`,
+          role: 'assistant',
+          text: '',
+          refused: true,
+          refusedMessage: e instanceof Error ? e.message : '请求失败，请稍后重试',
+        }),
+      )
     } finally {
       setStreaming(false)
       abortRef.current = null
@@ -93,37 +139,42 @@ export function ChatPage({ currentUser }: Props) {
     abortRef.current?.abort()
   }
 
-  function toggleKb(kbId: string) {
-    setSelectedKbs((prev) =>
-      prev.includes(kbId) ? prev.filter((id) => id !== kbId) : [...prev, kbId],
-    )
-  }
-
   return (
-    <>
-    <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_360px]">
-      {/* 左侧：知识库选择 + 对话 */}
-      <div className="min-w-0">
-        <section className="mb-4 rounded-xl border border-slate-200 bg-white p-4">
-          <h3 className="mb-2 text-sm font-semibold text-slate-700">选择知识库</h3>
-          <div className="flex flex-wrap gap-2">
-            {kbs.map((kb) => (
-              <label key={kb.id} className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-sm hover:bg-slate-100">
-                <input
-                  type="checkbox"
-                  className="h-4 w-4 rounded border-slate-300 text-blue-600"
-                  checked={selectedKbs.includes(kb.id)}
-                  onChange={() => toggleKb(kb.id)}
-                />
-                <span className="text-slate-700">{kb.name}</span>
-                {kb.is_public && <span className="rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-700">公开</span>}
-              </label>
-            ))}
-          </div>
-        </section>
+    <div className="chat-grid">
+      {/* 窄屏隐藏右侧常驻栏，引用通过 Drawer 查看 */}
+      <style>{`
+        .chat-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; }
+        @media (max-width: 992px) {
+          .chat-grid { grid-template-columns: 1fr; }
+          .chat-citation-aside { display: none; }
+        }
+      `}</style>
 
-        <section className="rounded-xl border border-slate-200 bg-white">
-          <div className="h-[calc(100vh-420px)] min-h-[300px] space-y-4 overflow-y-auto p-4">
+      <div style={{ minWidth: 0 }}>
+        {/* 知识库选择 */}
+        <Card size="small" style={{ marginBottom: 16 }} styles={{ body: { padding: 12 } }}>
+          <Text strong style={{ display: 'block', marginBottom: 8, fontSize: 13 }}>
+            选择知识库
+          </Text>
+          <Checkbox.Group
+            value={selectedKbs}
+            onChange={(values) => setSelectedKbs(values as string[])}
+            options={kbs.map((kb) => ({
+              value: kb.id,
+              label: (
+                <Space size={6}>
+                  <span>{kb.name}</span>
+                  {kb.is_public && <Tag color="blue" style={{ marginInlineEnd: 0 }}>公开</Tag>}
+                </Space>
+              ),
+            }))}
+          />
+        </Card>
+
+        {/* 对话区 */}
+        <Card variant="borderless" styles={{ body: { padding: 0 } }}>
+          <div style={{ height: 'calc(100vh - 360px)', minHeight: 320, overflowY: 'auto', padding: 16 }}>
+            {loadError && <Alert type="error" showIcon message={loadError} style={{ marginBottom: 12 }} />}
             {messages.map((m) => (
               <MessageBubble
                 key={m.id}
@@ -134,156 +185,181 @@ export function ChatPage({ currentUser }: Props) {
             <div ref={messagesEndRef} />
           </div>
 
-          {error && (
-            <div className="border-t border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">{error}</div>
-          )}
-
-          <div className="border-t border-slate-200 p-4">
-            <div className="flex gap-2">
-              <textarea
+          <div style={{ borderTop: '1px solid #f0f0f0', padding: 16 }}>
+            <Space.Compact style={{ width: '100%' }}>
+              <Input.TextArea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault()
-                    handleAsk()
+                    void handleAsk()
                   }
                 }}
                 placeholder="输入你的问题，Enter 发送，Shift+Enter 换行"
-                className="flex-1 resize-none rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
-                rows={2}
+                autoSize={{ minRows: 1, maxRows: 4 }}
                 disabled={streaming}
               />
               {streaming ? (
-                <button
-                  onClick={handleStop}
-                  className="rounded-lg bg-slate-700 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
-                >
+                <Button danger icon={<StopOutlined />} onClick={handleStop} style={{ height: 'auto' }}>
                   停止
-                </button>
+                </Button>
               ) : (
-                <button
-                  onClick={handleAsk}
+                <Button
+                  type="primary"
+                  icon={<SendOutlined />}
+                  onClick={() => void handleAsk()}
                   disabled={!input.trim()}
-                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-60"
+                  style={{ height: 'auto' }}
                 >
                   提问
-                </button>
+                </Button>
               )}
-            </div>
+            </Space.Compact>
           </div>
-        </section>
+        </Card>
       </div>
 
-      {/* 右侧：引用抽屉（宽屏侧栏） */}
-      <aside className="hidden rounded-xl border border-slate-200 bg-white lg:block">
-        {sidebarCitation ? (
-          <div className="p-4">
-            <CitationPanel citation={sidebarCitation} onClose={() => setSidebarCitation(null)} />
-          </div>
-        ) : (
-          <CitationPanel citation={null} onClose={() => {}} />
-        )}
+      {/* 宽屏：右侧常驻引用面板 */}
+      <aside className="chat-citation-aside" style={{ minWidth: 0 }}>
+        <Card variant="borderless" style={{ height: '100%' }} styles={{ body: { padding: 16 } }}>
+          <CitationPanel citation={sidebarCitation} onClose={() => setSidebarCitation(null)} />
+        </Card>
       </aside>
-    </div>
 
-    {/* 窄屏：点击引用编号弹出 bottom-sheet overlay */}
-    {sidebarCitation && (
-      <div
-        className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 block lg:hidden"
-        onClick={() => setSidebarCitation(null)}
+      {/* 窄屏：引用抽屉 */}
+      <Drawer
+        open={sidebarCitation !== null}
+        onClose={() => setSidebarCitation(null)}
+        title="原文片段"
+        width={420}
+        placement="right"
       >
-        <div className="w-full max-h-[80vh] overflow-y-auto rounded-t-2xl border border-slate-200 bg-white" onClick={(e) => e.stopPropagation()}>
-          <div className="border-b border-slate-200 px-5 py-3">
-            <div className="h-1.5 w-10 mx-auto rounded-full bg-slate-300" />
-          </div>
-          <div className="p-5">
-            <h3 className="mb-3 text-sm font-semibold text-slate-700">原文片段</h3>
-            <CitationPanel citation={sidebarCitation} onClose={() => setSidebarCitation(null)} />
-          </div>
-        </div>
-      </div>
-    )}
-    </>
+        <CitationPanel citation={sidebarCitation} onClose={() => setSidebarCitation(null)} />
+      </Drawer>
+    </div>
   )
 }
 
+// 引用内容面板（宽屏侧栏与窄屏抽屉共用）
 function CitationPanel({ citation, onClose }: { citation: Citation | null; onClose: () => void }) {
   if (!citation) {
     return (
-      <div className="rounded-xl border border-slate-200 bg-white p-10 text-center text-sm text-slate-400">
-        点击答案中的引用编号可查看原文片段
-      </div>
+      <Empty
+        image={Empty.PRESENTED_IMAGE_SIMPLE}
+        description="点击答案中的引用编号可查看原文片段"
+        style={{ marginTop: 80 }}
+      />
     )
   }
   return (
-    <div className="space-y-3 text-sm">
-      <div className="mb-3 flex items-center justify-between">
-        <div />
-        <button
-          onClick={onClose}
-          className="text-slate-400 hover:text-slate-600"
-        >
-          x
-        </button>
-      </div>
-      <div className="rounded-lg bg-blue-50 p-3">
-        <div className="font-medium text-blue-900">{citation.filename}</div>
+    <div>
+      <div style={{ background: '#e6f4ff', borderRadius: 8, padding: 12 }}>
+        <div style={{ fontWeight: 600, color: '#0958d9' }}>{citation.filename}</div>
         {citation.heading_path && (
-          <div className="mt-1 text-blue-700">{citation.heading_path}</div>
+          <div style={{ marginTop: 4, color: '#1677ff', fontSize: 13 }}>{citation.heading_path}</div>
         )}
-        <div className="mt-1 text-xs text-blue-600">
+        <div style={{ marginTop: 4, color: '#4096ff', fontSize: 12 }}>
           {citation.page_no != null && <>第 {citation.page_no} 页 · </>}
           相关度 {citation.score.toFixed(2)}
         </div>
       </div>
-      <div className="rounded-lg bg-slate-50 p-3 leading-relaxed text-slate-700">
+      <div
+        style={{
+          marginTop: 12,
+          background: '#fafafa',
+          borderRadius: 8,
+          padding: 12,
+          lineHeight: 1.7,
+          fontSize: 13,
+          color: 'rgba(0,0,0,0.75)',
+          whiteSpace: 'pre-wrap',
+        }}
+      >
         {citation.snippet}
       </div>
+      <Button type="link" size="small" style={{ paddingLeft: 0, marginTop: 8 }} onClick={onClose}>
+        关闭
+      </Button>
     </div>
   )
 }
 
-function MessageBubble({ msg, onOpenCitation }: { msg: Message; onOpenCitation: (c: Citation) => void }) {
+// 消息气泡
+function MessageBubble({
+  msg,
+  onOpenCitation,
+}: {
+  msg: Message
+  onOpenCitation: (c: Citation) => void
+}) {
   if (msg.role === 'user') {
     return (
-      <div className="flex justify-end">
-        <div className="max-w-[80%] rounded-xl bg-blue-600 px-4 py-2 text-sm text-white">{msg.text}</div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+        <div
+          style={{
+            maxWidth: '80%',
+            background: '#1677ff',
+            color: '#fff',
+            borderRadius: 12,
+            borderTopRightRadius: 2,
+            padding: '8px 14px',
+            fontSize: 14,
+            whiteSpace: 'pre-wrap',
+          }}
+        >
+          {msg.text}
+        </div>
       </div>
     )
   }
 
-  // 拒答专用样式（手册 M1 验收 B2）
+  // 拒答 / 出错提示（手册 M1 验收 B2）
   if (msg.refused) {
     return (
-      <div className="flex">
-        <div className="flex max-w-[80%] items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-          <span className="mt-0.5 text-base">!</span>
-          <div>
-            <div className="font-medium">知识库中未找到相关内容</div>
-            <div className="mt-1 text-xs text-amber-600">换个问题试试？或者检查知识库选择是否正确。</div>
-          </div>
-        </div>
+      <div style={{ display: 'flex', marginBottom: 12 }}>
+        <Alert
+          type="warning"
+          showIcon
+          style={{ maxWidth: '80%' }}
+          message="知识库中未找到相关内容"
+          description={msg.refusedMessage || '换个问题试试？或者检查知识库选择是否正确。'}
+        />
       </div>
     )
   }
 
   if (msg.loading) {
     return (
-      <div className="flex">
-        <div className="rounded-xl bg-slate-100 px-4 py-2 text-sm text-slate-500">思考中...</div>
+      <div style={{ display: 'flex', marginBottom: 12 }}>
+        <div
+          style={{
+            background: '#f5f5f5',
+            borderRadius: 12,
+            borderTopLeftRadius: 2,
+            padding: '10px 14px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            color: 'rgba(0,0,0,0.45)',
+            fontSize: 14,
+          }}
+        >
+          <Spin size="small" />
+          思考中...
+        </div>
       </div>
     )
   }
 
   // 渲染答案：按换行分段，每段内把 [n] 替换成可点击的引用编号
   const segments = msg.text.split('\n').filter((s) => s.length > 0)
-  let keyIdx = 0
 
   function renderInline(text: string) {
     const parts: React.ReactNode[] = []
     const regex = /\[(\d+)\]/g
     let lastIndex = 0
+    let keyIdx = 0
     let m: RegExpExecArray | null
     while ((m = regex.exec(text)) !== null) {
       if (m.index > lastIndex) parts.push(text.slice(lastIndex, m.index))
@@ -291,13 +367,14 @@ function MessageBubble({ msg, onOpenCitation }: { msg: Message; onOpenCitation: 
       const citation = msg.citations?.find((c) => c.n === n)
       if (citation) {
         parts.push(
-          <button
+          <Tag
             key={`ref-${keyIdx++}`}
+            color="blue"
+            style={{ cursor: 'pointer', marginInline: 2, borderRadius: 10 }}
             onClick={() => onOpenCitation(citation)}
-            className="mx-0.5 inline-flex h-5 min-w-[1.25rem] items-center justify-center rounded-full bg-blue-100 px-1.5 text-xs font-medium text-blue-700 hover:bg-blue-200 align-baseline"
           >
             {n}
-          </button>,
+          </Tag>,
         )
       } else {
         parts.push(`[${n}]`)
@@ -309,10 +386,21 @@ function MessageBubble({ msg, onOpenCitation }: { msg: Message; onOpenCitation: 
   }
 
   return (
-    <div className="flex">
-      <div className="max-w-[80%] whitespace-pre-wrap rounded-xl bg-slate-100 px-4 py-3 text-sm leading-relaxed text-slate-800">
+    <div style={{ display: 'flex', marginBottom: 12 }}>
+      <div
+        style={{
+          maxWidth: '80%',
+          background: '#f5f5f5',
+          borderRadius: 12,
+          borderTopLeftRadius: 2,
+          padding: '10px 14px',
+          fontSize: 14,
+          lineHeight: 1.7,
+          color: 'rgba(0,0,0,0.85)',
+        }}
+      >
         {segments.map((seg, i) => (
-          <div key={i} className={i > 0 ? 'mt-1' : ''}>
+          <div key={i} style={{ marginTop: i > 0 ? 6 : 0 }}>
             {renderInline(seg)}
           </div>
         ))}

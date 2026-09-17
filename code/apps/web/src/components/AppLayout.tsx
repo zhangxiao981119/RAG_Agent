@@ -1,12 +1,23 @@
-import { NavLink, Outlet } from 'react-router-dom'
+import { Button, Layout, Menu } from 'antd'
+import {
+  AppstoreOutlined,
+  BookOutlined,
+  FileTextOutlined,
+  LogoutOutlined,
+  MessageOutlined,
+} from '@ant-design/icons'
+import type { MenuProps } from 'antd'
+import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 
 import { User } from '../mocks/data'
 
-const navigation = [
-  { to: '/chat', label: '知识问答' },
-  { to: '/knowledge-bases', label: '知识库' },
-  { to: '/documents', label: '文档' },
-  { to: '/admin', label: '系统管理' },
+const { Sider, Content } = Layout
+
+const menuItems: MenuProps['items'] = [
+  { key: '/chat', icon: <MessageOutlined />, label: '知识问答' },
+  { key: '/knowledge-bases', icon: <BookOutlined />, label: '知识库' },
+  { key: '/documents', icon: <FileTextOutlined />, label: '文档' },
+  { key: '/admin', icon: <AppstoreOutlined />, label: '系统管理' },
 ]
 
 type Props = {
@@ -15,46 +26,105 @@ type Props = {
 }
 
 export function AppLayout({ currentUser, onLogout }: Props) {
+  const navigate = useNavigate()
+  const location = useLocation()
+
+  // 文档子路由 /knowledge-bases/:id/documents 时高亮「知识库」
+  const selectedKey = location.pathname.startsWith('/knowledge-bases/')
+    ? '/knowledge-bases'
+    : location.pathname
+
   return (
-    <div className="min-h-screen lg:grid lg:grid-cols-[240px_1fr]">
-      <aside className="border-b border-slate-800 bg-slate-950 px-5 py-4 text-white lg:min-h-screen lg:border-b-0 lg:border-r">
-        <div className="mb-6 flex items-center gap-2 text-lg font-semibold lg:mb-10">
-          <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-blue-600 text-sm">Q</span>
+    <Layout style={{ minHeight: '100vh' }}>
+      <Sider
+        width={224}
+        theme="dark"
+        breakpoint="lg"
+        collapsedWidth={0}
+        style={{ position: 'sticky', top: 0, height: '100vh' }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            height: 56,
+            margin: '8px 16px',
+            color: '#fff',
+            fontSize: 16,
+            fontWeight: 600,
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+          }}
+        >
+          <span
+            style={{
+              display: 'inline-flex',
+              width: 28,
+              height: 28,
+              alignItems: 'center',
+              justifyContent: 'center',
+              borderRadius: 8,
+              background: '#1677ff',
+              fontSize: 14,
+              flexShrink: 0,
+            }}
+          >
+            Q
+          </span>
           <span>知识库问答</span>
         </div>
-        <nav className="flex gap-2 overflow-x-auto lg:flex-col">
-          {navigation.map((item) => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              className={({ isActive }) =>
-                `whitespace-nowrap rounded-lg px-4 py-2 text-sm transition ${
-                  isActive ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-800'
-                }`
-              }
-            >
-              {item.label}
-            </NavLink>
-          ))}
-        </nav>
+        <Menu
+          theme="dark"
+          mode="inline"
+          selectedKeys={[selectedKey]}
+          items={menuItems}
+          onClick={({ key }) => navigate(key)}
+        />
         {currentUser && (
-          <div className="mt-auto pt-8">
-            <div className="border-t border-slate-800 pt-4">
-              <div className="text-sm font-medium text-white">{currentUser.display_name}</div>
-              <div className="text-xs text-slate-400">{currentUser.dept_path}</div>
-              <button
-                onClick={onLogout}
-                className="mt-2 text-xs text-slate-400 hover:text-white"
-              >
-                退出登录
-              </button>
+          <div
+            style={{
+              position: 'absolute',
+              bottom: 0,
+              left: 0,
+              right: 0,
+              padding: 16,
+              borderTop: '1px solid rgba(255,255,255,0.12)',
+            }}
+          >
+            <div style={{ color: '#fff', fontSize: 14, fontWeight: 500 }}>
+              {currentUser.display_name}
             </div>
+            <div
+              style={{
+                color: 'rgba(255,255,255,0.45)',
+                fontSize: 12,
+                marginTop: 2,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {currentUser.dept_path || '未分配部门'}
+            </div>
+            <Button
+              type="text"
+              size="small"
+              danger
+              icon={<LogoutOutlined />}
+              onClick={onLogout}
+              style={{ marginTop: 8, paddingLeft: 0 }}
+            >
+              退出登录
+            </Button>
           </div>
         )}
-      </aside>
-      <main className="min-w-0 p-5 sm:p-8 lg:p-10">
-        <Outlet />
-      </main>
-    </div>
+      </Sider>
+      <Layout>
+        <Content style={{ padding: 24 }}>
+          <Outlet />
+        </Content>
+      </Layout>
+    </Layout>
   )
 }

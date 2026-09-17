@@ -51,7 +51,7 @@ async def seed() -> None:
                     parent_id=department_by_path[parent_path].id if parent_path else None,
                     name=name,
                     path=path,
-                    depth=path.count("/") - 1,
+                    depth=path.strip("/").count("/"),  # /总部/ -> 0, /总部/技术中心/ -> 1
                     sort_order=index,
                     visible_to_parent=visible,
                 )

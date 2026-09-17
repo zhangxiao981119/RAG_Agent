@@ -1,6 +1,7 @@
 """权限服务：主体解析 / 标签生成 / 可见性判定。"""
 from app.services.acl.errors import AclError, AclPathError, AclTagError
 from app.services.acl.subjects import (
+    ACL_CACHE_KEY_FMT,
     DeptNode,
     ExpansionWarning,
     KnowledgeBaseRecord,
@@ -10,6 +11,8 @@ from app.services.acl.subjects import (
     check_expansion_scale,
     compute_doc_acl_tags,
     dept_ancestors,
+    invalidate_tenant_acl,
+    load_principal_from_db,
     normalize_dept_path,
     resolve_authorized_kb_ids,
     resolve_user_subjects,
@@ -24,6 +27,7 @@ from app.services.acl.visibility import (
 )
 
 __all__ = [
+    "ACL_CACHE_KEY_FMT",
     "PUSHDOWN_WHERE_SQL",
     "AclError",
     "AclPathError",
@@ -39,7 +43,9 @@ __all__ = [
     "compute_doc_acl_tags",
     "dept_ancestors",
     "filter_visible",
+    "invalidate_tenant_acl",
     "is_visible",
+    "load_principal_from_db",
     "normalize_dept_path",
     "pushdown_params",
     "resolve_authorized_kb_ids",

@@ -80,9 +80,9 @@ async def run_parse_job(
             tenant_id = document.tenant_id
             kb_id = document.kb_id
             document_id = document.id
-            # M2 无权限版本：acl_tags = {public}，deny_subjects = []
-            acl_tags = ["public"]
-            deny_subjects: list[str] = []
+            # M4 任务 2：chunk 标签冗余自 documents 行（§4.2.8），不在解析侧重复生成
+            acl_tags = list(document.acl_tags or [])
+            deny_subjects = list(document.deny_subjects or [])
             level_rank = document.level_rank
 
             # 删除旧版本 chunks（重新索引时清理）
