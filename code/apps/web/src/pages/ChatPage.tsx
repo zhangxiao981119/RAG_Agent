@@ -18,11 +18,11 @@ import {
 import {
   CheckOutlined,
   CopyOutlined,
+  LikeOutlined,
   MessageOutlined,
   RedoOutlined,
   SendOutlined,
   StopOutlined,
-  ThumbsUpOutlined,
 } from '@ant-design/icons'
 
 import {
@@ -534,7 +534,7 @@ function MessageBubble({
               cancelText="取消"
               onConfirm={() => onAdopt(msg)}
             >
-              <Button type="text" size="small" icon={<ThumbsUpOutlined />}>
+              <Button type="text" size="small" icon={<LikeOutlined />}>
                 采纳
               </Button>
             </Popconfirm>
