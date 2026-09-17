@@ -8,6 +8,7 @@ import {
   Drawer,
   Empty,
   Input,
+  Popconfirm,
   Space,
   Spin,
   Tag,
@@ -518,15 +519,25 @@ function MessageBubble({
             </Button>
           </Tooltip>
           {msg.adopted ? (
-            <Button type="text" size="small" icon={<CheckOutlined />} disabled>
-              已采纳
-            </Button>
+            <Tooltip title="该问答对已收集为微调样本，微调时由管理员导出">
+              <span>
+                <Button type="text" size="small" icon={<CheckOutlined />} disabled>
+                  已采纳
+                </Button>
+              </span>
+            </Tooltip>
           ) : (
-            <Tooltip title="采纳为微调样本（问答对入库）">
-              <Button type="text" size="small" icon={<ThumbsUpOutlined />} onClick={() => onAdopt(msg)}>
+            <Popconfirm
+              title="采纳这条回答？"
+              description="问答对将收集为微调样本，供后续模型微调使用。"
+              okText="采纳"
+              cancelText="取消"
+              onConfirm={() => onAdopt(msg)}
+            >
+              <Button type="text" size="small" icon={<ThumbsUpOutlined />}>
                 采纳
               </Button>
-            </Tooltip>
+            </Popconfirm>
           )}
         </Space>
       )}
