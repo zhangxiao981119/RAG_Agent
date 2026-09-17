@@ -116,7 +116,8 @@ async def list_logs(
             "object_type": log.object_type,
             "object_id": log.object_id,
             "detail": log.detail,
-            "ip": log.ip,
+            # INET 列 asyncpg 返回 IPv4Address/IPv6Address 对象，序列化为字符串
+            "ip": str(log.ip) if log.ip else None,
             "created_at": log.created_at.isoformat(),
         }
         for log, display, username in rows
