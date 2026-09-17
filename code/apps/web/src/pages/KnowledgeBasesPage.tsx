@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { App, Button, Card, Col, Empty, Modal, Row, Select, Space, Spin, Tag, Typography } from 'antd'
+import { App, Button, Card, Checkbox, Col, Empty, Input, Modal, Row, Select, Space, Spin, Tag, Typography } from 'antd'
 import { PlusOutlined, TeamOutlined, MinusCircleOutlined } from '@ant-design/icons'
 
 import {
+  createKb,
   fetchKbs,
   fetchKbMembers,
   fetchUsers,
@@ -47,6 +48,31 @@ export function KnowledgeBasesPage() {
   const [memberModalOpen, setMemberModalOpen] = useState(false)
   const [memberModalKb, setMemberModalKb] = useState<KnowledgeBase | null>(null)
 
+  // 新建知识库 Modal
+  const [createOpen, setCreateOpen] = useState(false)
+  const [createForm, setCreateForm] = useState({ name: '', description: '', isPublic: false })
+  const [creating, setCreating] = useState(false)
+
+  const handleCreate = async () => {
+    const name = createForm.name.trim()
+    if (!name) {
+      message.warning('请填写知识库名称')
+      return
+    }
+    setCreating(true)
+    try {
+      const kb = await createKb(name, createForm.description.trim(), createForm.isPublic)
+      message.success(`知识库「${kb.name}」已创建`)
+      setCreateOpen(false)
+      setCreateForm({ name: '', description: '', isPublic: false })
+      fetchKbs().then(setKbs).catch(() => {})
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e))
+    } finally {
+      setCreating(false)
+    }
+  }
+
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
@@ -56,7 +82,14 @@ export function KnowledgeBasesPage() {
           </Title>
           <Text type="secondary">管理可访问的知识库</Text>
         </div>
-        <Button type="primary" icon={<PlusOutlined />}>
+        <Button
+          type="primary"
+          icon={<PlusOutlined />}
+          onClick={() => {
+            setCreateForm({ name: '', description: '', isPublic: false })
+            setCreateOpen(true)
+          }}
+        >
           新建知识库
         </Button>
       </div>
@@ -131,6 +164,47 @@ export function KnowledgeBasesPage() {
           }}
         />
       )}
+
+      {/* 新建知识库 Modal：创建后后端自动把创建者登记为库成员 */}
+      <Modal
+        title="新建知识库"
+        open={createOpen}
+        onCancel={() => setCreateOpen(false)}
+        onOk={handleCreate}
+        confirmLoading={creating}
+        okText="创建"
+        cancelText="取消"
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size={12}>
+          <div>
+            <Text strong>名称</Text>
+            <Input
+              placeholder="知识库名称"
+              value={createForm.name}
+              maxLength={100}
+              onChange={(e) => setCreateForm((f) => ({ ...f, name: e.target.value }))}
+              style={{ marginTop: 4 }}
+            />
+          </div>
+          <div>
+            <Text strong>描述</Text>
+            <Input.TextArea
+              placeholder="知识库用途描述（可选）"
+              value={createForm.description}
+              maxLength={500}
+              autoSize={{ minRows: 3, maxRows: 6 }}
+              onChange={(e) => setCreateForm((f) => ({ ...f, description: e.target.value }))}
+              style={{ marginTop: 4 }}
+            />
+          </div>
+          <Checkbox
+            checked={createForm.isPublic}
+            onChange={(e) => setCreateForm((f) => ({ ...f, isPublic: e.target.checked }))}
+          >
+            公开库（所有登录用户可见；不勾选则仅成员可见）
+          </Checkbox>
+        </Space>
+      </Modal>
     </div>
   )
 }
