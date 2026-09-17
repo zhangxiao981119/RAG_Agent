@@ -151,7 +151,7 @@ export function DocumentsPage() {
     {
       title: '操作',
       key: 'actions',
-      width: 130,
+      width: 160,
       render: (_, record) => (
         <Space size={4}>
           <Button

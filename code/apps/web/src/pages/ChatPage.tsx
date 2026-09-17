@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import visit from 'unist-util-visit'
 import {
   Alert,
   App,
@@ -399,6 +402,36 @@ function CitationPanel({ citation, onClose }: { citation: Citation | null; onClo
   )
 }
 
+// ─────────────────────────────────────────────────────────────
+// rehype 插件：把 markdown 文本节点里的 [n] 引用标号替换为 sup.cite-ref 元素，
+// 由下方 ReactMarkdown components.sup 接管渲染（点击打开引用）。
+// ─────────────────────────────────────────────────────────────
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function rehypeCitation() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (tree: any) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    visit(tree, 'text', (node: any, index: number, parent: any) => {
+      if (!parent || !/\[\d+\]/.test(node.value)) return
+      const children = []
+      let last = 0
+      for (const m of node.value.matchAll(/\[(\d+)\]/g)) {
+        const i = m.index ?? 0
+        if (i > last) children.push({ type: 'text', value: node.value.slice(last, i) })
+        children.push({
+          type: 'element',
+          tagName: 'sup',
+          properties: { className: ['cite-ref'], dataCite: m[1] },
+          children: [{ type: 'text', value: m[1] }],
+        })
+        last = i + m[0].length
+      }
+      if (last < node.value.length) children.push({ type: 'text', value: node.value.slice(last) })
+      parent.children.splice(index, 1, ...children)
+    })
+  }
+}
+
 // 消息气泡
 function MessageBubble({
   msg,
@@ -474,39 +507,8 @@ function MessageBubble({
     )
   }
 
-  // 正常回答：气泡 + 底部操作栏（复制/重试/追问/采纳）
+  // 正常回答：气泡（Markdown 渲染）+ 底部操作栏（复制/重试/追问/采纳）
   const canOperate = !msg.loading && msg.done && !msg.refused && !!msg.messageId && !!msg.text
-  const segments = msg.text.split('\n').filter((s) => s.length > 0)
-
-  function renderInline(text: string) {
-    const parts: React.ReactNode[] = []
-    const regex = /\[(\d+)\]/g
-    let lastIndex = 0
-    let keyIdx = 0
-    let m: RegExpExecArray | null
-    while ((m = regex.exec(text)) !== null) {
-      if (m.index > lastIndex) parts.push(text.slice(lastIndex, m.index))
-      const n = Number(m[1])
-      const citation = msg.citations?.find((c) => c.n === n)
-      if (citation) {
-        parts.push(
-          <Tag
-            key={`ref-${keyIdx++}`}
-            color="blue"
-            style={{ cursor: 'pointer', marginInline: 2, borderRadius: 10 }}
-            onClick={() => onOpenCitation(citation)}
-          >
-            {n}
-          </Tag>,
-        )
-      } else {
-        parts.push(`[${n}]`)
-      }
-      lastIndex = m.index + m[0].length
-    }
-    if (lastIndex < text.length) parts.push(text.slice(lastIndex))
-    return parts
-  }
 
   return (
     <div style={{ marginBottom: 12 }}>
@@ -519,15 +521,33 @@ function MessageBubble({
             borderTopLeftRadius: 2,
             padding: '10px 14px',
             fontSize: 14,
-            lineHeight: 1.7,
             color: 'rgba(0,0,0,0.85)',
           }}
         >
-          {segments.map((seg, i) => (
-            <div key={i} style={{ marginTop: i > 0 ? 6 : 0 }}>
-              {renderInline(seg)}
-            </div>
-          ))}
+          <ReactMarkdown
+            className="md-body"
+            remarkPlugins={[remarkGfm]}
+            rehypePlugins={[rehypeCitation]}
+            components={{
+              sup: ({ node, children }) => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const n = Number((node as any)?.properties?.dataCite ?? 0)
+                const citation = msg.citations?.find((c) => c.n === n)
+                if (!citation) return <sup>{children}</sup>
+                return (
+                  <sup
+                    className="cite-ref"
+                    title={citation.filename}
+                    onClick={() => onOpenCitation(citation)}
+                  >
+                    {n}
+                  </sup>
+                )
+              },
+            }}
+          >
+            {msg.text}
+          </ReactMarkdown>
         </div>
       </div>
       {canOperate && (
