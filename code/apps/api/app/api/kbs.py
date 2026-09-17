@@ -42,10 +42,15 @@ async def list_kbs(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> list[KnowledgeBaseOut]:
-    # M2 无权限：返回该租户所有知识库
-    stmt = select(KnowledgeBase).where(KnowledgeBase.tenant_id == user.tenant_id)
+    # M4 任务 4：G2 库级授权过滤，只返回 user.authorized_kb_ids
+    auth_ids = user.authorized_kb_ids
+    if not auth_ids:
+        return []
+    stmt = select(KnowledgeBase).where(
+        KnowledgeBase.tenant_id == user.tenant_id,
+        KnowledgeBase.id.in_(auth_ids),
+    )
     rows = (await session.execute(stmt)).scalars().all()
-    # 附带 doc_count
     result: list[KnowledgeBaseOut] = []
     for kb in rows:
         count_stmt = (
@@ -104,6 +109,9 @@ async def get_kb(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> KnowledgeBaseDetail:
+    # M4 任务 4：G2 库级授权校验
+    if kb_id not in user.authorized_kb_ids:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
     kb = await session.get(KnowledgeBase, kb_id)
     if kb is None or kb.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
@@ -185,6 +193,9 @@ async def list_documents(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> list[DocumentOut]:
+    # M4 任务 4：G2 库级授权校验
+    if kb_id not in user.authorized_kb_ids:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
     stmt = (
         select(Document)
         .where(
