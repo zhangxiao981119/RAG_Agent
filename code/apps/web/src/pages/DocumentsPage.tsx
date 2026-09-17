@@ -224,7 +224,6 @@ export function DocumentsPage() {
           dataSource={documents}
           size="middle"
           pagination={false}
-          scroll={{ x: 800 }}
           locale={{ emptyText: <Empty description={selectedKb ? '该知识库暂无文档' : '请先选择知识库'} /> }}
         />
       </Card>
@@ -237,48 +236,25 @@ export function DocumentsPage() {
 // ─────────────────────────────────────────────────────────────
 // 文档原文预览 Modal
 //
-// md/txt → 纯文本展示；pdf → blob URL 嵌入 iframe（浏览器自带查看器）；
-// 其他格式（docx/xls/xlsx）后端不支持在线预览，给出提示。
+// 后端 raw 接口已把所有上传格式统一提取为纯文本（md/txt 原文；
+// docx/xlsx/xls/pdf 由后端提取），前端统一按文本展示。
 // Modal body 高度由全局 CSS 限制在可视区内并内部滚动。
 // ─────────────────────────────────────────────────────────────
-const TEXT_EXTS = ['md', 'txt']
-
 function PreviewModal({ doc, onClose }: { doc: Document | null; onClose: () => void }) {
   const { message } = App.useApp()
   const [loading, setLoading] = useState(false)
   const [textContent, setTextContent] = useState('')
-  const [pdfUrl, setPdfUrl] = useState('')
 
   useEffect(() => {
     if (!doc) return
-    let objectUrl = ''
     setLoading(true)
     setTextContent('')
-    setPdfUrl('')
-    if (doc.ext === 'pdf') {
-      fetchDocumentRaw(doc.id)
-        .then((r) => r.blob())
-        .then((blob) => {
-          objectUrl = URL.createObjectURL(blob)
-          setPdfUrl(objectUrl)
-        })
-        .catch((e) => message.error(e instanceof Error ? e.message : String(e)))
-        .finally(() => setLoading(false))
-    } else if (TEXT_EXTS.includes(doc.ext)) {
-      fetchDocumentRaw(doc.id)
-        .then((r) => r.text())
-        .then(setTextContent)
-        .catch((e) => message.error(e instanceof Error ? e.message : String(e)))
-        .finally(() => setLoading(false))
-    } else {
-      setLoading(false)
-    }
-    return () => {
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
-    }
+    fetchDocumentRaw(doc.id)
+      .then((r) => r.text())
+      .then(setTextContent)
+      .catch((e) => message.error(e instanceof Error ? e.message : String(e)))
+      .finally(() => setLoading(false))
   }, [doc, message])
-
-  const unsupported = doc != null && !TEXT_EXTS.includes(doc.ext) && doc.ext !== 'pdf'
 
   return (
     <Modal
@@ -289,15 +265,7 @@ function PreviewModal({ doc, onClose }: { doc: Document | null; onClose: () => v
       width={860}
     >
       <Spin spinning={loading}>
-        {unsupported ? (
-          <Empty description="该格式暂不支持在线预览" />
-        ) : pdfUrl ? (
-          <iframe
-            src={pdfUrl}
-            title="文档预览"
-            style={{ width: '100%', height: 'calc(100vh - 260px)', border: 'none', borderRadius: 4 }}
-          />
-        ) : textContent ? (
+        {textContent ? (
           <pre
             style={{
               margin: 0,

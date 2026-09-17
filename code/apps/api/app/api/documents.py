@@ -15,12 +15,8 @@ from app.services.storage import get_storage
 
 router = APIRouter(tags=["documents"])
 
-# 可预览的原文格式 → 响应媒体类型（docx/xls 等二进制格式暂不支持预览）
-RAW_MEDIA_TYPES: dict[str, str] = {
-    "md": "text/plain; charset=utf-8",
-    "txt": "text/plain; charset=utf-8",
-    "pdf": "application/pdf",
-}
+# 预览提取服务（所有上传格式统一转纯文本）
+from app.services.preview import PreviewError, extract_preview_text
 
 
 async def _get_visible_document(
@@ -87,19 +83,20 @@ async def get_document_raw(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> Response:
-    """文档原文预览：md/txt 返回纯文本，pdf 返回二进制流，其余格式 415。"""
+    """文档原文预览：所有上传格式统一提取为纯文本（md/txt 原文，docx/xlsx/xls/pdf 提取），提取失败 415。"""
     doc = await _get_visible_document(doc_id, user, session)
-    media_type = RAW_MEDIA_TYPES.get(doc.ext)
-    if media_type is None:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail="该格式暂不支持在线预览",
-        )
     storage = await get_storage()
     data = await storage.get_object(doc.storage_key)
+    try:
+        text = extract_preview_text(doc.ext, data)
+    except PreviewError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=str(exc),
+        )
     return Response(
-        content=data,
-        media_type=media_type,
+        content=text,
+        media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'inline; filename="{doc.filename}"'},
     )
 
