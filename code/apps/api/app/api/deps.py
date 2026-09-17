@@ -1,24 +1,25 @@
-"""依赖注入 —— M2 用固定 admin 用户（无权限版本，手册 §6 M2 任务 6）。
+"""依赖注入 —— M3 JWT 认证。
 
-M3 接 JWT 后替换这里。其他 API 层只依赖 CurrentUser 抽象，不感知具体来源。
+从 Authorization: Bearer <token> 解析 JWT，校验后返回 CurrentUser。
+其他 API 层只依赖 CurrentUser 抽象，不感知具体来源。
 """
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
 
-from fastapi import Depends
+from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config.settings import get_settings
 from app.database import SessionLocal
-from app.models import Tenant, User
+from app.models import Department, Tenant, User
+from app.services.auth import JWTError, verify_access_token
 
 
 @dataclass(frozen=True)
 class CurrentUser:
-    """M2 固定 admin 用户。M3 替换为 JWT 解析结果。"""
+    """当前登录用户上下文（API 层只依赖此抽象）。"""
 
     user_id: uuid.UUID
     tenant_id: uuid.UUID
@@ -37,27 +38,48 @@ async def get_db() -> AsyncSession:
 
 async def get_current_user(
     session: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> CurrentUser:
-    """M2 占位：固定返回 admin 用户。M3 改为从 JWT 解析。"""
-    settings = get_settings()
-    tenant = await session.scalar(
-        select(Tenant).where(Tenant.code == settings.tenant_code)
-    )
-    if tenant is None:
-        raise RuntimeError("租户未初始化，请先运行 scripts/seed.py")
-    user = await session.scalar(
-        select(User).where(User.tenant_id == tenant.id, User.username == "admin")
-    )
-    if user is None:
-        raise RuntimeError("admin 用户未初始化，请先运行 scripts/seed.py")
+    """从 Authorization: Bearer <token> 解析 JWT 并返回当前用户。"""
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "缺少认证信息")
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        payload = verify_access_token(token)
+    except JWTError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "认证信息无效或已过期") from exc
+
+    user_id_raw = payload.get("sub")
+    tenant_id_raw = payload.get("tenant")
+    username = payload.get("username")
+    if not user_id_raw or not tenant_id_raw or not username:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "认证信息字段缺失")
+
+    try:
+        user_id = uuid.UUID(user_id_raw)
+        tenant_id = uuid.UUID(tenant_id_raw)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "认证信息字段格式错误") from exc
+
+    user = await session.get(User, user_id)
+    if user is None or user.tenant_id != tenant_id or user.username != username:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户不存在或已被替换")
+    if user.status != "active":
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户已被禁用")
+
+    dept_path = ""
+    if user.dept_id is not None:
+        dept = await session.get(Department, user.dept_id)
+        if dept is not None:
+            dept_path = dept.path
 
     return CurrentUser(
         user_id=user.id,
-        tenant_id=tenant.id,
+        tenant_id=tenant_id,
         username=user.username,
         display_name=user.display_name,
         clearance=user.clearance,
-        dept_path="",  # M2 不查 dept，M3 补
-        subjects=["public"],  # M2 无权限版本
-        authorized_kb_ids=[],  # M2 不限，chat 直接信任前端 kb_ids
+        dept_path=dept_path,
+        subjects=["public"],  # M3 暂无权限版本
+        authorized_kb_ids=[],  # M3 不限，chat 直接信任前端 kb_ids
     )

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
-import { mockLogin, User } from '../mocks/data'
+import { login, User } from '../mocks/data'
 
 type Props = {
   onLogin: (user: User) => void
@@ -11,15 +11,19 @@ export function LoginPage({ onLogin }: Props) {
   const [username, setUsername] = useState('admin')
   const [password, setPassword] = useState('ChangeMe123!')
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const navigate = useNavigate()
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setLoading(true)
+    setError(null)
     try {
-      const user = await mockLogin(username, password)
+      const user = await login(username, password)
       onLogin(user)
       navigate('/chat')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '登录失败')
     } finally {
       setLoading(false)
     }
@@ -30,7 +34,11 @@ export function LoginPage({ onLogin }: Props) {
       <section className="w-full max-w-md rounded-2xl bg-white p-8 shadow-lg">
         <p className="text-sm font-medium text-blue-600">知识库问答 Agent</p>
         <h1 className="mt-2 text-2xl font-bold">登录</h1>
-        <p className="mt-3 text-sm text-slate-600">M1 假登录，输入任意用户名密码即可进入演示。</p>
+        <p className="mt-3 text-sm text-slate-600">使用账号密码登录（与 scripts/seed.py 一致）。</p>
+
+        {error && (
+          <div className="mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-600">{error}</div>
+        )}
 
         <form className="mt-6 space-y-4" onSubmit={handleSubmit}>
           <div>
