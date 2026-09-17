@@ -22,6 +22,7 @@ GROUNDING_CHECK_ENABLED: Final[bool] = True     # L3；MUST NOT 置 False
 TOP_K_RECALL: Final[int] = 50                   # 每路召回条数
 TOP_K_RERANK: Final[int] = 8                    # 重排后取用条数
 RRF_K: Final[int] = 60
+MAX_HISTORY_TURNS: Final[int] = 6               # 上下文窗口：最近 6 条历史消息（3 轮问答）
 
 
 # ── 分块 ──────────────────────────────────────────────────
