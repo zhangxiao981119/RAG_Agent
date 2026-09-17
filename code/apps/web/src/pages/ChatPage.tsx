@@ -45,6 +45,8 @@ type Message = {
   refused?: boolean
   refusedMessage?: string
   loading?: boolean
+  /** 流式打字完成（终态落定后为 true，操作栏仅在完成后可用） */
+  done?: boolean
   /** 后端 assistant message id（meta 事件带回），采纳/复制等操作依赖它 */
   messageId?: string
   /** 已采纳为微调样本 */
@@ -129,8 +131,10 @@ export function ChatPage({ currentUser }: Props) {
     }
   }
 
-  /** 追问：输入区滚动进视野并聚焦（长对话时输入框可能在视口外，仅 focus 无可见效果）。 */
-  function handleFollowUp() {
+  /** 追问：把该回答对应的原问题填入输入框（可直接修改/补充后发送），并滚动聚焦输入区。 */
+  function handleFollowUp(msg: Message) {
+    const q = findQuestionOf(msg.id)
+    setInput(q ?? '')
     inputAreaRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     inputRef.current?.focus()
   }
@@ -168,11 +172,12 @@ export function ChatPage({ currentUser }: Props) {
               ? {
                   ...m,
                   loading: false,
+                  done: true,
                   refused: true,
                   refusedMessage: refusedMessage ?? '知识库中未找到相关内容',
                   text: '',
                 }
-              : { ...m, loading: false, text: buffer || '(空)', citations }
+              : { ...m, loading: false, done: true, text: buffer || '(空)', citations }
           }),
         )
         setStreaming(false)
@@ -184,7 +189,8 @@ export function ChatPage({ currentUser }: Props) {
       shown = Math.min(buffer.length, shown + step)
       const visible = buffer.slice(0, shown)
       setMessages((prev) =>
-        prev.map((m) => (m.id === assistantMsg.id ? { ...m, text: visible } : m)),
+        // 打字开始即清 loading：气泡组件在 loading 态只渲染"思考中"，会遮住打字文本
+        prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: visible } : m)),
       )
     }, 33)
 
@@ -406,7 +412,7 @@ function MessageBubble({
   onOpenCitation: (c: Citation) => void
   onCopy: (m: Message) => void
   onRetry: (m: Message) => void
-  onFollowUp: () => void
+  onFollowUp: (m: Message) => void
   onAdopt: (m: Message) => void
 }) {
   if (msg.role === 'user') {
@@ -469,7 +475,7 @@ function MessageBubble({
   }
 
   // 正常回答：气泡 + 底部操作栏（复制/重试/追问/采纳）
-  const canOperate = !msg.loading && !msg.refused && !!msg.messageId && !!msg.text
+  const canOperate = !msg.loading && msg.done && !msg.refused && !!msg.messageId && !!msg.text
   const segments = msg.text.split('\n').filter((s) => s.length > 0)
 
   function renderInline(text: string) {
@@ -533,7 +539,7 @@ function MessageBubble({
             重试
           </Button>
           <Tooltip title="继续就此话题提问">
-            <Button type="text" size="small" icon={<MessageOutlined />} onClick={onFollowUp}>
+            <Button type="text" size="small" icon={<MessageOutlined />} onClick={() => onFollowUp(msg)}>
               追问
             </Button>
           </Tooltip>
