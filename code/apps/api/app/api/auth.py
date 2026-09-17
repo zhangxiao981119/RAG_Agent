@@ -30,6 +30,7 @@ from app.schemas.auth import (
     RefreshResponse,
     UserInfo,
 )
+from app.services import audit
 from app.services.auth import (
     JWTError,
     create_access_token,
@@ -124,6 +125,11 @@ async def login(
         )
         # 账号不存在或非激活态，也走失败计数（防枚举：不区分"不存在"和"密码错"）
         if user is None or user.status != "active" or not verify_password(plain_password, user.password_hash):
+            await audit.record(
+                tenant.id, user.id if user else None,
+                "auth.login.fail", object_type="user", object_id=payload.username,
+                detail={"reason": "用户名或密码错误"}, ip=client_ip,
+            )
             fail_key = _FAIL_KEY.format(tid=tenant.id, user=payload.username)
             failures = await redis.incr(fail_key)
             if failures == 1:
@@ -131,6 +137,12 @@ async def login(
             if failures >= settings.login_max_failures:
                 await redis.setex(lock_key, settings.login_lock_minutes * 60, "1")
                 await redis.delete(fail_key)
+                await audit.record(
+                    tenant.id, user.id if user else None,
+                    "auth.login.locked", object_type="user", object_id=payload.username,
+                    detail={"reason": f"连续失败 {failures} 次，锁定 {settings.login_lock_minutes} 分钟"},
+                    ip=client_ip,
+                )
                 raise HTTPException(
                     status.HTTP_423_LOCKED,
                     f"账户已临时锁定，请 {settings.login_lock_minutes} 分钟后重试",
@@ -140,6 +152,10 @@ async def login(
         # ── 5. 登录成功，清除失败计数 + 签发双 token ─────────
         fail_key = _FAIL_KEY.format(tid=tenant.id, user=payload.username)
         await redis.delete(fail_key, lock_key)
+        await audit.record(
+            tenant.id, user.id, "auth.login.success",
+            object_type="user", object_id=user.username, ip=client_ip,
+        )
 
         # 部门路径
         dept_path = ""

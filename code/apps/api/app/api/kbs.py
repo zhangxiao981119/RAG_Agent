@@ -30,6 +30,7 @@ from app.schemas.kbs import (
     KbMemberSetRequest,
     KbMemberSetResponse,
 )
+from app.services import audit
 from app.services import kb_member as kb_member_service
 from app.services.acl import compute_doc_acl_tags
 from app.services.acl.subjects import invalidate_tenant_acl
@@ -110,6 +111,12 @@ async def create_kb(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"CONFLICT: {exc}",
             ) from exc
+        # 审计：建库动作（含库可见性）
+        await audit.record(
+            user.tenant_id, user.user_id, "kb.create",
+            object_type="kb", object_id=str(kb.id),
+            detail={"name": kb.name, "is_public": kb.is_public},
+        )
         return KnowledgeBaseOut(
             id=kb.id,
             name=kb.name,
@@ -189,6 +196,7 @@ async def set_kb_members(
             rows, changed = await kb_member_service.set_members(
                 session, redis, user.tenant_id, kb_id,
                 [(m.subject_type, m.subject_id) for m in payload.members],
+                operator_user_id=user.user_id,
             )
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
@@ -323,6 +331,13 @@ async def upload_document(
     await session.commit()
     await session.refresh(document)
     await session.refresh(parse_job)
+
+    # 审计：上传文档（含目标库/文件名/大小/密级）
+    await audit.record(
+        user.tenant_id, user.user_id, "doc.upload",
+        object_type="document", object_id=str(document.id),
+        detail={"kb_id": str(kb_id), "filename": filename, "size_bytes": size_bytes, "level_rank": 20},
+    )
 
     # 入队 arq 任务（必须指定与 WorkerSettings.queue_name 一致）
     redis = await create_pool(
