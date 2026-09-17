@@ -218,6 +218,17 @@ export async function fetchDocument(docId: string): Promise<Document | undefined
   }
 }
 
+/** 拉取文档原文（预览用）。调用方按 ext 决定读文本还是 blob。 */
+export async function fetchDocumentRaw(docId: string): Promise<Response> {
+  const resp = await fetch(`/api/documents/${docId}/raw`, withAuth())
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    if (resp.status === 401) handleUnauthorized()
+    throw new ApiError(resp.status, extractErrorMessage(resp.status, text))
+  }
+  return resp
+}
+
 export async function deleteDocument(docId: string): Promise<void> {
   const resp = await fetch(`/api/documents/${docId}`, withAuth({ method: 'DELETE' }))
   if (!resp.ok) {

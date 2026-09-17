@@ -5,14 +5,17 @@ import {
   Button,
   Card,
   Empty,
+  Modal,
   Popconfirm,
   Select,
+  Space,
+  Spin,
   Table,
   Tag,
   Typography,
   Upload,
 } from 'antd'
-import { DeleteOutlined, InboxOutlined } from '@ant-design/icons'
+import { DeleteOutlined, EyeOutlined, InboxOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import dayjs from 'dayjs'
 
@@ -20,6 +23,7 @@ import {
   deleteDocument,
   Document,
   fetchDocuments,
+  fetchDocumentRaw,
   fetchKbs,
   KnowledgeBase,
   uploadDocument,
@@ -51,6 +55,7 @@ export function DocumentsPage() {
   const [selectedKb, setSelectedKb] = useState<string>(kbId || '')
   const [documents, setDocuments] = useState<Document[]>([])
   const [uploading, setUploading] = useState(false)
+  const [previewDoc, setPreviewDoc] = useState<Document | null>(null)
 
   useEffect(() => {
     fetchKbs()
@@ -146,20 +151,30 @@ export function DocumentsPage() {
     {
       title: '操作',
       key: 'actions',
-      width: 90,
+      width: 130,
       render: (_, record) => (
-        <Popconfirm
-          title={`确定删除文档「${record.filename}」吗？`}
-          description="删除后不可恢复。"
-          okText="删除"
-          okButtonProps={{ danger: true }}
-          cancelText="取消"
-          onConfirm={() => handleDelete(record)}
-        >
-          <Button type="link" size="small" danger icon={<DeleteOutlined />}>
-            删除
+        <Space size={4}>
+          <Button
+            type="link"
+            size="small"
+            icon={<EyeOutlined />}
+            onClick={() => setPreviewDoc(record)}
+          >
+            预览
           </Button>
-        </Popconfirm>
+          <Popconfirm
+            title={`确定删除文档「${record.filename}」吗？`}
+            description="删除后不可恢复。"
+            okText="删除"
+            okButtonProps={{ danger: true }}
+            cancelText="取消"
+            onConfirm={() => handleDelete(record)}
+          >
+            <Button type="link" size="small" danger icon={<DeleteOutlined />}>
+              删除
+            </Button>
+          </Popconfirm>
+        </Space>
       ),
     },
   ]
@@ -213,6 +228,92 @@ export function DocumentsPage() {
           locale={{ emptyText: <Empty description={selectedKb ? '该知识库暂无文档' : '请先选择知识库'} /> }}
         />
       </Card>
+
+      <PreviewModal doc={previewDoc} onClose={() => setPreviewDoc(null)} />
     </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────
+// 文档原文预览 Modal
+//
+// md/txt → 纯文本展示；pdf → blob URL 嵌入 iframe（浏览器自带查看器）；
+// 其他格式（docx/xls/xlsx）后端不支持在线预览，给出提示。
+// Modal body 高度由全局 CSS 限制在可视区内并内部滚动。
+// ─────────────────────────────────────────────────────────────
+const TEXT_EXTS = ['md', 'txt']
+
+function PreviewModal({ doc, onClose }: { doc: Document | null; onClose: () => void }) {
+  const { message } = App.useApp()
+  const [loading, setLoading] = useState(false)
+  const [textContent, setTextContent] = useState('')
+  const [pdfUrl, setPdfUrl] = useState('')
+
+  useEffect(() => {
+    if (!doc) return
+    let objectUrl = ''
+    setLoading(true)
+    setTextContent('')
+    setPdfUrl('')
+    if (doc.ext === 'pdf') {
+      fetchDocumentRaw(doc.id)
+        .then((r) => r.blob())
+        .then((blob) => {
+          objectUrl = URL.createObjectURL(blob)
+          setPdfUrl(objectUrl)
+        })
+        .catch((e) => message.error(e instanceof Error ? e.message : String(e)))
+        .finally(() => setLoading(false))
+    } else if (TEXT_EXTS.includes(doc.ext)) {
+      fetchDocumentRaw(doc.id)
+        .then((r) => r.text())
+        .then(setTextContent)
+        .catch((e) => message.error(e instanceof Error ? e.message : String(e)))
+        .finally(() => setLoading(false))
+    } else {
+      setLoading(false)
+    }
+    return () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [doc, message])
+
+  const unsupported = doc != null && !TEXT_EXTS.includes(doc.ext) && doc.ext !== 'pdf'
+
+  return (
+    <Modal
+      title={`预览 · ${doc?.filename ?? ''}`}
+      open={doc != null}
+      onCancel={onClose}
+      footer={null}
+      width={860}
+    >
+      <Spin spinning={loading}>
+        {unsupported ? (
+          <Empty description="该格式暂不支持在线预览" />
+        ) : pdfUrl ? (
+          <iframe
+            src={pdfUrl}
+            title="文档预览"
+            style={{ width: '100%', height: 'calc(100vh - 260px)', border: 'none', borderRadius: 4 }}
+          />
+        ) : textContent ? (
+          <pre
+            style={{
+              margin: 0,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              fontFamily: 'inherit',
+              fontSize: 13,
+              lineHeight: 1.7,
+            }}
+          >
+            {textContent}
+          </pre>
+        ) : (
+          !loading && <Empty description="暂无内容" />
+        )}
+      </Spin>
+    </Modal>
   )
 }
