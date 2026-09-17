@@ -302,6 +302,29 @@ class EvalCase(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class FinetuneSample(Base):
+    """采纳的问答对 —— 微调数据收集（用户采纳后入库，微调时按 exported_at 取出未导出样本）。"""
+
+    __tablename__ = "finetune_samples"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    # 不设 FK 级联：会话/消息清理不应连带丢失已收集的微调数据
+    conversation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # 唯一约束：同一条回答只能被采纳一次（幂等）
+    assistant_message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
+    citations: Mapped[list[dict]] = mapped_column(JSONB, nullable=False, server_default="[]")
+    adopted_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    adopted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # 导出打标：微调取出后写时间戳，下次只取未导出的增量
+    exported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("idx_ft_tenant_exported", "tenant_id", "exported_at"),)
+
+
 # ─────────────────────────────────────────────────────────────
 # M4 任务 3：acl_tags 写库断言（模型层 event listener，不可绕过）
 #
