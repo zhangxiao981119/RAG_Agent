@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 
@@ -19,18 +20,18 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # 表结构对齐 models/entities.py 中已有的 AuditLog 模型（项目骨架定义）
     op.create_table(
         "audit_logs",
         sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
-        sa.Column("tenant_id", UUID(as_uuid=True), nullable=False),
-        # 不设 FK：user 删除后日志仍保留（审计不可随对象删除）
+        sa.Column("tenant_id", UUID(as_uuid=True), sa.ForeignKey("tenants.id"), nullable=False),
         sa.Column("user_id", UUID(as_uuid=True), nullable=True),
         # action 命名约定：chat.ask / doc.upload / doc.delete / kb.create / acl.member.set / auth.login.*
         sa.Column("action", sa.Text(), nullable=False),
         sa.Column("object_type", sa.Text(), nullable=True),
         sa.Column("object_id", sa.Text(), nullable=True),
         sa.Column("detail", JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
-        sa.Column("ip", sa.Text(), nullable=True),
+        sa.Column("ip", postgresql.INET(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         comment="审计日志（谁在何时做了什么）",
     )
