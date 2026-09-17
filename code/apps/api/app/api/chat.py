@@ -25,9 +25,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config import decisions
 from app.database import SessionLocal
-from app.models import Conversation, KnowledgeBase, Message
+from app.models import Conversation, KnowledgeBase, Message, User
 from app.schemas.chat import ChatAskRequest
 from app.services.generate import get_generation_service
+from app.services.memory import build_memory_prompt, compress_history, extract_facts
 from app.services.retrieve import get_retrieval_service
 
 logger = logging.getLogger(__name__)
@@ -155,7 +156,7 @@ async def chat_ask(
         yield _sse("citations", {"citations": citations_payload})
 
         # 生成（含 L3 校验，generation 统一处理 LLM 异常）
-        # 读最近 N 条历史消息作为上下文
+        # 1. 读最近 N 条历史消息作为上下文
         history: list[dict] = []
         async with SessionLocal() as hist_session:
             hist_rows = (await hist_session.execute(
@@ -165,7 +166,7 @@ async def chat_ask(
                     Message.role.in_(["user", "assistant"]),
                 )
                 .order_by(Message.created_at.desc())
-                .limit(decisions.MAX_HISTORY_TURNS + 1)  # +1 是刚写入的当前 user msg
+                .limit(max(decisions.MAX_HISTORY_TURNS + 1, decisions.MEMORY_COMPRESS_THRESHOLD + 1))
             )).scalars().all()
             # 按时间正序，跳过最新那条（就是当前正在处理的 user message）
             for m in reversed(hist_rows[:-1]):
@@ -174,8 +175,24 @@ async def chat_ask(
                     continue
                 history.append({"role": m.role, "content": m.content})
 
+        # 2. 历史过长时压缩（把较早的合并成摘要）
+        if len(history) > decisions.MEMORY_COMPRESS_THRESHOLD:
+            history = await compress_history(history, decisions.MAX_HISTORY_TURNS)
+
+        # 3. 读用户画像
+        user_memory: dict = {}
+        async with SessionLocal() as mem_session:
+            u = await mem_session.get(User, user.user_id)
+            if u and u.memory:
+                user_memory = u.memory or {}
+
+        # 4. 生成（注入画像 + 压缩后的历史）
         generation = get_generation_service()
-        gen_result = await generation.generate(payload.question, result.chunks, history=history)
+        gen_result = await generation.generate(
+            payload.question, result.chunks,
+            history=history,
+            memory_prompt=build_memory_prompt(user_memory),
+        )
 
         if gen_result.refused:
             reason = gen_result.refuse_reason
@@ -220,6 +237,9 @@ async def chat_ask(
             },
         )
 
+        # 后台更新用户画像（不阻塞流式响应）
+        asyncio.create_task(_update_user_memory(user.user_id, payload.question, gen_result.text))
+
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
@@ -249,3 +269,21 @@ async def _persist_assistant(
         )
         session.add(msg)
         await session.commit()
+
+
+async def _update_user_memory(
+    user_id: uuid.UUID,
+    user_msg: str,
+    assistant_msg: str,
+) -> None:
+    """后台更新用户画像。静默失败不阻塞主流程。"""
+    try:
+        async with SessionLocal() as session:
+            u = await session.get(User, user_id)
+            if u is None:
+                return
+            new_memory = await extract_facts(user_msg, assistant_msg, u.memory or {})
+            u.memory = new_memory
+            await session.commit()
+    except Exception:
+        logger.exception("用户画像更新失败")

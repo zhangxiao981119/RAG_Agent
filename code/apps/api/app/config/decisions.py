@@ -23,6 +23,9 @@ TOP_K_RECALL: Final[int] = 50                   # 每路召回条数
 TOP_K_RERANK: Final[int] = 8                    # 重排后取用条数
 RRF_K: Final[int] = 60
 MAX_HISTORY_TURNS: Final[int] = 6               # 上下文窗口：最近 6 条历史消息（3 轮问答）
+MEMORY_COMPRESS_THRESHOLD: Final[int] = 12      # 历史超过 12 条时触发压缩
+MEMORY_MAX_FACTS: Final[int] = 20                # 用户画像最多缓存 20 条关键事实
+MEMORY_MAX_PROFILE_CHARS: Final[int] = 800      # 用户画像文本上限
 
 
 # ── 分块 ──────────────────────────────────────────────────

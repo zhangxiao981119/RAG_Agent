@@ -26,8 +26,8 @@ class RetrievedChunk:
 
     @property
     def display_score(self) -> float:
-        """前端展示用的归一化分数（取 rerank 或 rrf）。"""
-        return self.rerank_score if self.rerank_score is not None else self.rrf_score
+        """前端展示用的分数（rerank 优先，否则 vector 余弦相似度）。"""
+        return self.rerank_score if self.rerank_score is not None else self.vector_score
 
 
 @dataclass

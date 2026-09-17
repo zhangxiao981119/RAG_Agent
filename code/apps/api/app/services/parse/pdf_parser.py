@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import io
 import re
 
 from app.services.parse.base import ParsedBlock, ParseError
@@ -34,7 +35,7 @@ def _is_heading(line: str) -> bool:
 
 def parse_pdf(data: bytes) -> list[ParsedBlock]:
     try:
-        reader = PdfReader(data)  # type: ignore[call-arg]
+        reader = PdfReader(io.BytesIO(data))  # type: ignore[call-arg]
     except Exception as exc:
         raise ParseError(f"PDF 打开失败: {exc}") from exc
 
