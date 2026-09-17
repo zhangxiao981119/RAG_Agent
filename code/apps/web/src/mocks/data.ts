@@ -179,6 +179,33 @@ export async function createKb(name: string, description: string, isPublic: bool
   })
 }
 
+// ---------- 知识库成员管理 (M4 任务 8) ----------
+
+export type KbMemberItem = {
+  subject_type: 'user' | 'group' | 'dept' | 'role'
+  subject_id: string
+  label: string
+}
+
+export async function fetchKbMembers(kbId: string): Promise<KbMemberItem[]> {
+  const r = await http<{ kb_id: string; members: KbMemberItem[] }>(`/api/kbs/${kbId}/members`)
+  return r.members
+}
+
+export async function setKbMembers(
+  kbId: string,
+  members: KbMemberItem[],
+): Promise<{ changed: boolean; members: KbMemberItem[] }> {
+  const payload = {
+    members: members.map((m) => ({ subject_type: m.subject_type, subject_id: m.subject_id })),
+  }
+  return http<{ changed: boolean; members: KbMemberItem[] }>(`/api/kbs/${kbId}/members`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
 export async function fetchDocuments(kbId: string): Promise<Document[]> {
   return http<Document[]>(`/api/kbs/${kbId}/documents`)
 }
