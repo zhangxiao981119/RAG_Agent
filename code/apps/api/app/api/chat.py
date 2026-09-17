@@ -27,6 +27,7 @@ from app.config import decisions
 from app.database import SessionLocal
 from app.models import Conversation, KnowledgeBase, Message, User
 from app.schemas.chat import ChatAskRequest
+from app.services import audit
 from app.services.generate import get_generation_service
 from app.services.memory import build_memory_prompt, compress_history, extract_facts
 from app.services.retrieve import get_retrieval_service
@@ -142,6 +143,17 @@ async def chat_ask(
                 text="", refused=True, citations=[],
                 meta={"stage_ms": result.stage_ms, "refused": True},
             )
+            # 审计：拒答也记录（refused=True 无引用）
+            await audit.record(
+                user.tenant_id, user.user_id, "chat.ask",
+                object_type="conversation", object_id=str(conversation_id),
+                detail={
+                    "question": payload.question,
+                    "kb_ids": [str(kb) for kb in effective_kb_ids],
+                    "doc_ids": [],
+                    "refused": True,
+                },
+            )
             return
 
         # citations（MUST 在 delta 之前）
@@ -159,6 +171,18 @@ async def chat_ask(
             for i, c in enumerate(result.chunks)
         ]
         yield _sse("citations", {"citations": citations_payload})
+
+        # 审计：谁在何时问了什么、引用到哪些文档（手册 F4 / M5 任务 3）
+        await audit.record(
+            user.tenant_id, user.user_id, "chat.ask",
+            object_type="conversation", object_id=str(conversation_id),
+            detail={
+                "question": payload.question,
+                "kb_ids": [str(kb) for kb in effective_kb_ids],
+                "doc_ids": sorted({c["doc_id"] for c in citations_payload}),
+                "refused": False,
+            },
+        )
 
         # 生成（含 L3 校验，generation 统一处理 LLM 异常）
         # 1. 读最近 N 条历史消息作为上下文

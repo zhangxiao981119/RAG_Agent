@@ -25,6 +25,7 @@ from app.models import (
     User,
 )
 from app.services.acl import invalidate_tenant_acl, normalize_dept_path
+from app.services.audit import record_with_session
 
 # 合法主体类型（与 models.KnowledgeBaseMember 的 CHECK 约束一致）
 VALID_SUBJECT_TYPES = ("user", "group", "dept", "role")
@@ -170,13 +171,14 @@ async def set_members(
     tenant_id: uuid.UUID,
     kb_id: uuid.UUID,
     members: list[tuple[str, str]],
+    operator_user_id: uuid.UUID | None = None,
 ) -> tuple[list[KbMemberRow], bool]:
     """全量设置成员（PUT 语义）。返回 (设置后的成员列表, 是否发生实际变更)。
 
     · dept 的 subject_id 先经 normalize_dept_path 规整为 /a/b/ 形式
     · 请求内去重（唯一约束 uq_kb_members_subject）
     · 与现有集合一致 → 不动库、不动 acl_epoch（避免无意义的缓存失效）
-    · 有变化 → 全删 + 全插 + tenant_acl_epoch+1（§3.2.6 失效表）
+    · 有变化 → 全删 + 全插 + tenant_acl_epoch+1（§3.2.6 失效表）+ 审计（同事务）
     """
     # 规整 + 去重（保持传入顺序）
     normalized: list[tuple[str, str]] = []
@@ -222,6 +224,16 @@ async def set_members(
         ))
     await session.flush()
     await invalidate_tenant_acl(session, redis, tenant_id)
+    # 审计：权限变更与成员写入同事务（变更回滚则日志一并回滚）
+    await record_with_session(
+        session, tenant_id, operator_user_id, "acl.member.set",
+        object_type="kb", object_id=str(kb_id),
+        detail={
+            "added": [f"{t}:{i}" for t, i in sorted(seen - existing)],
+            "removed": [f"{t}:{i}" for t, i in sorted(existing - seen)],
+            "final": [f"{t}:{i}" for t, i in normalized],
+        },
+    )
     return await list_members(session, tenant_id, kb_id), True
 
 

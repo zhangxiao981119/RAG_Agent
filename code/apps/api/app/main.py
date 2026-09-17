@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api.auth import router as auth_router
+from app.api.audit import router as audit_router
 from app.api.chat import router as chat_router
 from app.api.departments import router as departments_router
 from app.api.documents import router as documents_router
@@ -52,3 +53,4 @@ app.include_router(jobs_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 app.include_router(messages_router, prefix="/api")
 app.include_router(finetune_router, prefix="/api")
+app.include_router(audit_router, prefix="/api")

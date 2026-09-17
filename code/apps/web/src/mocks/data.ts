@@ -485,6 +485,38 @@ export type UserPage = {
   page_size: number
 }
 
+// ---------- 审计日志（M5 任务 3 提前实现） ----------
+
+export type AuditLogItem = {
+  id: number
+  user_id: string | null
+  user_label: string
+  action: string
+  object_type: string | null
+  object_id: string | null
+  detail: Record<string, unknown>
+  ip: string | null
+  created_at: string
+}
+
+export type AuditLogPage = {
+  items: AuditLogItem[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** 分页拉取审计日志。action 传前缀（如 doc）可按动作类过滤。 */
+export async function fetchAuditLogs(
+  page = 1,
+  pageSize = 20,
+  action?: string,
+): Promise<AuditLogPage> {
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
+  if (action) params.set('action', action)
+  return http<AuditLogPage>(`/api/admin/audit-logs?${params.toString()}`)
+}
+
 /** 分页拉取用户（含 dept_path）。page 从 1 开始。 */
 export async function fetchUsers(page = 1, pageSize = 20): Promise<UserPage> {
   return http<UserPage>(`/api/users?page=${page}&page_size=${pageSize}`)

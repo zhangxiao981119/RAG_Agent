@@ -16,6 +16,7 @@ from app.services.storage import get_storage
 router = APIRouter(tags=["documents"])
 
 # 预览提取服务（所有上传格式统一转纯文本）
+from app.services import audit
 from app.services.preview import PreviewError, extract_preview_text
 
 
@@ -119,6 +120,13 @@ async def delete_document(
         update(Chunk).where(Chunk.document_id == doc_id).values(is_latest=False)
     )
     await session.commit()
+
+    # 审计：删除文档（记录文件名便于追溯）
+    await audit.record(
+        user.tenant_id, user.user_id, "doc.delete",
+        object_type="document", object_id=str(doc_id),
+        detail={"filename": doc.filename, "kb_id": str(doc.kb_id)},
+    )
 
     # 清理对象存储（best-effort）
     try:

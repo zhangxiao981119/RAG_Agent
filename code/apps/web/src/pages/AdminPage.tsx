@@ -2,13 +2,14 @@ import { useState } from 'react'
 import { Card, Tabs, Typography } from 'antd'
 
 import { DeptPanel } from './admin/DeptPanel'
+import { AuditPanel } from './admin/AuditPanel'
 import { GroupPanel } from './admin/GroupPanel'
 import { RolePanel } from './admin/RolePanel'
 import { UserPanel } from './admin/UserPanel'
 
-type AdminTabKey = 'dept' | 'users' | 'groups' | 'roles'
+type AdminTabKey = 'dept' | 'users' | 'groups' | 'roles' | 'audit'
 
-// 系统管理：组织架构 / 用户 / 用户组 / 角色 四个标签页
+// 系统管理：组织架构 / 用户 / 用户组 / 角色 / 审计日志 五个标签页
 // 面板按激活标签懒挂载，切到对应标签时才请求数据
 export function AdminPage() {
   const [activeKey, setActiveKey] = useState<AdminTabKey>('dept')
@@ -19,7 +20,7 @@ export function AdminPage() {
         系统管理
       </Typography.Title>
       <Typography.Text type="secondary">
-        管理组织架构、用户、用户组与角色；权限相关变更会实时失效旧缓存。
+        管理组织架构、用户、用户组、角色，并查看全租户审计日志；权限相关变更会实时失效旧缓存。
       </Typography.Text>
 
       <Tabs
@@ -38,6 +39,11 @@ export function AdminPage() {
             key: 'roles',
             label: '角色管理',
             children: activeKey === 'roles' ? <RolePanel /> : null,
+          },
+          {
+            key: 'audit',
+            label: '审计日志',
+            children: activeKey === 'audit' ? <AuditPanel /> : null,
           },
         ]}
       />
