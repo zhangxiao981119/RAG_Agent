@@ -252,16 +252,22 @@ export async function fetchJob(jobId: string): Promise<Job> {
 
 // ---------- SSE 提问 ----------
 
+/** 采纳回答为微调样本。重复采纳返回 already_adopted=true。 */
+export async function adoptAnswer(messageId: string): Promise<{ adopted: boolean; already_adopted: boolean; sample_id: string }> {
+  return http('/api/messages/' + messageId + '/adopt', { method: 'POST' })
+}
+
 export async function askChat(
   question: string,
   kbIds: string[],
+  conversationId: string | null,
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   const response = await fetch('/api/chat/ask', withAuth({
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, kb_ids: kbIds, conversation_id: null }),
+    body: JSON.stringify({ question, kb_ids: kbIds, conversation_id: conversationId }),
     signal,
   }))
   if (!response.ok || !response.body) {

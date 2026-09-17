@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   Alert,
+  App,
   Button,
   Card,
   Checkbox,
@@ -10,11 +11,21 @@ import {
   Space,
   Spin,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
-import { SendOutlined, StopOutlined } from '@ant-design/icons'
+import {
+  CheckOutlined,
+  CopyOutlined,
+  MessageOutlined,
+  RedoOutlined,
+  SendOutlined,
+  StopOutlined,
+  ThumbsUpOutlined,
+} from '@ant-design/icons'
 
 import {
+  adoptAnswer,
   ChatEvent,
   Citation,
   fetchKbs,
@@ -33,11 +44,16 @@ type Message = {
   refused?: boolean
   refusedMessage?: string
   loading?: boolean
+  /** 后端 assistant message id（meta 事件带回），采纳/复制等操作依赖它 */
+  messageId?: string
+  /** 已采纳为微调样本 */
+  adopted?: boolean
 }
 
 type Props = { currentUser: User }
 
 export function ChatPage({ currentUser }: Props) {
+  const { message } = App.useApp()
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -50,9 +66,12 @@ export function ChatPage({ currentUser }: Props) {
   const [selectedKbs, setSelectedKbs] = useState<string[]>([])
   const [sidebarCitation, setSidebarCitation] = useState<Citation | null>(null)
   const [streaming, setStreaming] = useState(false)
+  /** 会话 id：首轮提问后由 meta 事件带回，后续追问续传（上下文连续） */
+  const [conversationId, setConversationId] = useState<string | null>(null)
 
   const abortRef = useRef<AbortController | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
 
   // 知识库列表加载失败用 Alert 展示（页面级错误，不适合一闪而过的 message）
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -71,8 +90,42 @@ export function ChatPage({ currentUser }: Props) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  async function handleAsk() {
-    const question = input.trim()
+  /** 找某条 assistant 消息对应的提问（向前最近一条 user 消息）。 */
+  function findQuestionOf(assistantMsgId: string): string | null {
+    const idx = messages.findIndex((m) => m.id === assistantMsgId)
+    for (let i = idx - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') return messages[i].text
+    }
+    return null
+  }
+
+  /** 采纳回答为微调样本（幂等，后端唯一约束兜底）。 */
+  async function handleAdopt(msg: Message) {
+    if (!msg.messageId) return
+    try {
+      const r = await adoptAnswer(msg.messageId)
+      if (r.already_adopted) {
+        message.info('该回答已采纳过')
+      } else {
+        message.success('已采纳，问答对已收集为微调样本')
+      }
+      setMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, adopted: true } : m)))
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /** 复制回答全文。 */
+  async function handleCopy(msg: Message) {
+    try {
+      await navigator.clipboard.writeText(msg.text)
+      message.success('已复制')
+    } catch {
+      message.error('复制失败，请手动选择文本复制')
+    }
+  }
+
+  async function askQuestion(question: string) {
     if (!question || streaming) return
 
     const userMsg: Message = { id: `u_${Date.now()}`, role: 'user', text: question }
@@ -85,12 +138,32 @@ export function ChatPage({ currentUser }: Props) {
     abortRef.current = controller
 
     let buffer = ''
+    let shown = 0
     let citations: Citation[] | undefined
     let refused = false
     let refusedMessage: string | undefined
 
+    // 打字机：约 30 字/秒渲染 delta 缓冲；落后过多时按比例加速追赶
+    const typer = window.setInterval(() => {
+      if (buffer.length <= shown) return
+      const step = Math.max(1, Math.ceil((buffer.length - shown) / 30))
+      shown = Math.min(buffer.length, shown + step)
+      const visible = buffer.slice(0, shown)
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantMsg.id ? { ...m, text: visible } : m)),
+      )
+    }, 33)
+
     const handler = (event: ChatEvent) => {
-      if (event.event === 'citations') citations = event.data.citations
+      if (event.event === 'meta') {
+        // 首轮事件带回后端会话/消息 id：会话续传用，采纳用
+        setConversationId(event.data.conversation_id)
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsg.id ? { ...m, messageId: event.data.message_id } : m,
+          ),
+        )
+      } else if (event.event === 'citations') citations = event.data.citations
       else if (event.event === 'delta') buffer += event.data.text
       else if (event.event === 'refused') {
         refused = true
@@ -99,22 +172,7 @@ export function ChatPage({ currentUser }: Props) {
     }
 
     try {
-      await mockAsk(question, selectedKbs, handler, controller.signal)
-
-      setMessages((prev) =>
-        prev.map((m) => {
-          if (m.id !== assistantMsg.id) return m
-          return refused
-            ? {
-                ...m,
-                loading: false,
-                refused: true,
-                refusedMessage: refusedMessage ?? '知识库中未找到相关内容',
-                text: '',
-              }
-            : { ...m, loading: false, text: buffer || '(空)', citations }
-        }),
-      )
+      await mockAsk(question, selectedKbs, conversationId, handler, controller.signal)
     } catch (e) {
       setMessages((prev) =>
         prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: '' } : m)),
@@ -130,9 +188,30 @@ export function ChatPage({ currentUser }: Props) {
         }),
       )
     } finally {
-      setStreaming(false)
-      abortRef.current = null
+      clearInterval(typer)
     }
+
+    // 流结束：flush 全文（打字机残余 + citations / refused 终态）
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id !== assistantMsg.id) return m
+        return refused
+          ? {
+              ...m,
+              loading: false,
+              refused: true,
+              refusedMessage: refusedMessage ?? '知识库中未找到相关内容',
+              text: '',
+            }
+          : { ...m, loading: false, text: buffer || '(空)', citations }
+      }),
+    )
+    setStreaming(false)
+    abortRef.current = null
+  }
+
+  async function handleAsk() {
+    await askQuestion(input.trim())
   }
 
   function handleStop() {
@@ -180,6 +259,14 @@ export function ChatPage({ currentUser }: Props) {
                 key={m.id}
                 msg={m}
                 onOpenCitation={(c) => setSidebarCitation(c)}
+                onCopy={handleCopy}
+                onRetry={(msg) => {
+                  const q = findQuestionOf(msg.id)
+                  if (q) void askQuestion(q)
+                  else message.warning('未找到原始问题')
+                }}
+                onFollowUp={() => inputRef.current?.focus()}
+                onAdopt={handleAdopt}
               />
             ))}
             <div ref={messagesEndRef} />
@@ -188,6 +275,7 @@ export function ChatPage({ currentUser }: Props) {
           <div style={{ borderTop: '1px solid #f0f0f0', padding: 16 }}>
             <Space.Compact style={{ width: '100%' }}>
               <Input.TextArea
+                ref={inputRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => {
@@ -289,9 +377,17 @@ function CitationPanel({ citation, onClose }: { citation: Citation | null; onClo
 function MessageBubble({
   msg,
   onOpenCitation,
+  onCopy,
+  onRetry,
+  onFollowUp,
+  onAdopt,
 }: {
   msg: Message
   onOpenCitation: (c: Citation) => void
+  onCopy: (m: Message) => void
+  onRetry: (m: Message) => void
+  onFollowUp: () => void
+  onAdopt: (m: Message) => void
 }) {
   if (msg.role === 'user') {
     return (
@@ -352,7 +448,8 @@ function MessageBubble({
     )
   }
 
-  // 渲染答案：按换行分段，每段内把 [n] 替换成可点击的引用编号
+  // 正常回答：气泡 + 底部操作栏（复制/重试/追问/采纳）
+  const canOperate = !msg.loading && !msg.refused && !!msg.messageId && !!msg.text
   const segments = msg.text.split('\n').filter((s) => s.length > 0)
 
   function renderInline(text: string) {
@@ -386,25 +483,53 @@ function MessageBubble({
   }
 
   return (
-    <div style={{ display: 'flex', marginBottom: 12 }}>
-      <div
-        style={{
-          maxWidth: '80%',
-          background: '#f5f5f5',
-          borderRadius: 12,
-          borderTopLeftRadius: 2,
-          padding: '10px 14px',
-          fontSize: 14,
-          lineHeight: 1.7,
-          color: 'rgba(0,0,0,0.85)',
-        }}
-      >
-        {segments.map((seg, i) => (
-          <div key={i} style={{ marginTop: i > 0 ? 6 : 0 }}>
-            {renderInline(seg)}
-          </div>
-        ))}
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ display: 'flex' }}>
+        <div
+          style={{
+            maxWidth: '80%',
+            background: '#f5f5f5',
+            borderRadius: 12,
+            borderTopLeftRadius: 2,
+            padding: '10px 14px',
+            fontSize: 14,
+            lineHeight: 1.7,
+            color: 'rgba(0,0,0,0.85)',
+          }}
+        >
+          {segments.map((seg, i) => (
+            <div key={i} style={{ marginTop: i > 0 ? 6 : 0 }}>
+              {renderInline(seg)}
+            </div>
+          ))}
+        </div>
       </div>
+      {canOperate && (
+        <Space size={0} style={{ marginLeft: 4, marginTop: 2 }}>
+          <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => onCopy(msg)}>
+            复制
+          </Button>
+          <Button type="text" size="small" icon={<RedoOutlined />} onClick={() => onRetry(msg)}>
+            重试
+          </Button>
+          <Tooltip title="继续就此话题提问">
+            <Button type="text" size="small" icon={<MessageOutlined />} onClick={onFollowUp}>
+              追问
+            </Button>
+          </Tooltip>
+          {msg.adopted ? (
+            <Button type="text" size="small" icon={<CheckOutlined />} disabled>
+              已采纳
+            </Button>
+          ) : (
+            <Tooltip title="采纳为微调样本（问答对入库）">
+              <Button type="text" size="small" icon={<ThumbsUpOutlined />} onClick={() => onAdopt(msg)}>
+                采纳
+              </Button>
+            </Tooltip>
+          )}
+        </Space>
+      )}
     </div>
   )
 }
