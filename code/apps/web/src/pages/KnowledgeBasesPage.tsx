@@ -1,61 +1,76 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { App, Button, Card, Col, Empty, Row, Spin, Tag, Typography } from 'antd'
+import { PlusOutlined } from '@ant-design/icons'
 
 import { fetchKbs, KnowledgeBase } from '../mocks/data'
 
+const { Title, Text, Paragraph } = Typography
+
 export function KnowledgeBasesPage() {
+  const { message } = App.useApp()
   const [kbs, setKbs] = useState<KnowledgeBase[]>([])
-  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     fetchKbs()
       .then(setKbs)
-      .catch((e) => setError(e.message))
-  }, [])
+      .catch((e) => message.error(e instanceof Error ? e.message : String(e)))
+      .finally(() => setLoading(false))
+  }, [message])
 
   return (
-    <section>
-      <div className="mb-6 flex items-center justify-between">
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">知识库</h1>
-          <p className="mt-1 text-sm text-slate-600">管理可访问的知识库</p>
+          <Title level={4} style={{ margin: 0 }}>
+            知识库
+          </Title>
+          <Text type="secondary">管理可访问的知识库</Text>
         </div>
-        <button className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">
+        <Button type="primary" icon={<PlusOutlined />}>
           新建知识库
-        </button>
+        </Button>
       </div>
 
-      {error && (
-        <div className="mb-4 rounded-lg bg-red-50 px-4 py-2 text-sm text-red-700">{error}</div>
-      )}
-
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        {kbs.map((kb) => (
-          <Link
-            key={kb.id}
-            to={`/knowledge-bases/${kb.id}/documents`}
-            className="group rounded-xl border border-slate-200 bg-white p-5 transition hover:border-blue-400 hover:shadow-md"
-          >
-            <div className="flex items-start justify-between">
-              <h3 className="font-semibold text-slate-900 group-hover:text-blue-700">{kb.name}</h3>
-              {kb.is_public && (
-                <span className="rounded bg-blue-100 px-2 py-0.5 text-xs text-blue-700">公开</span>
-              )}
-            </div>
-            <p className="mt-2 text-sm text-slate-500">{kb.description}</p>
-            <div className="mt-4 flex items-center gap-4 text-xs text-slate-500">
-              <span>{kb.doc_count} 份文档</span>
-              <span className="text-blue-600 group-hover:underline">查看文档 →</span>
-            </div>
-          </Link>
-        ))}
-      </div>
-
-      {kbs.length === 0 && !error && (
-        <div className="rounded-xl border border-dashed border-slate-300 bg-white p-12 text-center text-slate-500">
-          暂无知识库
-        </div>
-      )}
-    </section>
+      <Spin spinning={loading}>
+        {!loading && kbs.length === 0 ? (
+          <Card variant="borderless">
+            <Empty description="暂无知识库" />
+          </Card>
+        ) : (
+          <Row gutter={[16, 16]}>
+            {kbs.map((kb) => (
+              <Col xs={24} sm={12} lg={8} key={kb.id}>
+                <Link to={`/knowledge-bases/${kb.id}/documents`}>
+                  <Card
+                    hoverable
+                    variant="borderless"
+                    styles={{ body: { padding: 20 } }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                      <Text strong style={{ fontSize: 15 }}>
+                        {kb.name}
+                      </Text>
+                      {kb.is_public && <Tag color="blue">公开</Tag>}
+                    </div>
+                    <Paragraph
+                      type="secondary"
+                      ellipsis={{ rows: 2 }}
+                      style={{ marginTop: 8, marginBottom: 16, minHeight: 44 }}
+                    >
+                      {kb.description || '暂无描述'}
+                    </Paragraph>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {kb.doc_count} 份文档
+                    </Text>
+                  </Card>
+                </Link>
+              </Col>
+            ))}
+          </Row>
+        )}
+      </Spin>
+    </div>
   )
 }

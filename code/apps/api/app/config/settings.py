@@ -22,7 +22,8 @@ class Settings(BaseSettings):
     tenant_code: str = "default"
     # ── M3 JWT 认证 ──────────────────────────────────────────
     jwt_secret: str = "change-me-jwt"
-    jwt_expire_minutes: int = 1440  # 默认 24 小时
+    jwt_expire_minutes: int = 1440  # access token 默认 24 小时
+    jwt_refresh_expire_days: int = 7  # refresh token 默认 7 天
     # ── M3 登录安全策略 ──────────────────────────────────────
     bcrypt_rounds: int = 12  # bcrypt 哈希轮数，越大越慢越安全
     login_max_failures: int = 5  # 连续失败多少次后锁定账户
