@@ -325,31 +325,6 @@ class FinetuneSample(Base):
     __table_args__ = (Index("idx_ft_tenant_exported", "tenant_id", "exported_at"),)
 
 
-class AuditLog(Base):
-    """审计日志 —— 谁在何时做了什么（手册 §4.2.10）。
-
-    user 不设 FK：用户删除后日志仍保留；保留期 1 年（§8 D-15），归档任务后续实现。
-    """
-
-    __tablename__ = "audit_logs"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-    # action 命名：chat.ask / doc.upload / doc.delete / kb.create / acl.member.set / auth.login.*
-    action: Mapped[str] = mapped_column(Text, nullable=False)
-    object_type: Mapped[str | None] = mapped_column(Text)
-    object_id: Mapped[str | None] = mapped_column(Text)
-    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
-    ip: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-    __table_args__ = (
-        Index("idx_audit_time", "tenant_id", created_at.desc()),
-        Index("idx_audit_user", "tenant_id", "user_id", created_at.desc()),
-    )
-
-
 # ─────────────────────────────────────────────────────────────
 # M4 任务 3：acl_tags 写库断言（模型层 event listener，不可绕过）
 #
