@@ -73,6 +73,8 @@ export function ChatPage({ currentUser }: Props) {
   const abortRef = useRef<AbortController | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  // 输入区容器：追问时滚动进视野（长对话时输入框可能在视口外）
+  const inputAreaRef = useRef<HTMLDivElement>(null)
 
   // 知识库列表加载失败用 Alert 展示（页面级错误，不适合一闪而过的 message）
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -88,7 +90,8 @@ export function ChatPage({ currentUser }: Props) {
   }, [])
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    // 打字机期间每 33ms 更新一次消息，auto 瞬时贴底开销小；smooth 高频调用会抖动
+    messagesEndRef.current?.scrollIntoView({ behavior: 'auto' })
   }, [messages])
 
   /** 找某条 assistant 消息对应的提问（向前最近一条 user 消息）。 */
@@ -126,6 +129,12 @@ export function ChatPage({ currentUser }: Props) {
     }
   }
 
+  /** 追问：输入区滚动进视野并聚焦（长对话时输入框可能在视口外，仅 focus 无可见效果）。 */
+  function handleFollowUp() {
+    inputAreaRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    inputRef.current?.focus()
+  }
+
   async function askQuestion(question: string) {
     if (!question || streaming) return
 
@@ -143,11 +152,35 @@ export function ChatPage({ currentUser }: Props) {
     let citations: Citation[] | undefined
     let refused = false
     let refusedMessage: string | undefined
+    let sseDone = false
 
-    // 打字机：约 30 字/秒渲染 delta 缓冲；落后过多时按比例加速追赶
+    // 确定性打字机：前端严格按约 30 字/秒渲染缓冲，积压过大时加速；
+    // SSE 结束后必须等缓冲打完才落终态，避免 flush 跳字破坏打字机观感
     const typer = window.setInterval(() => {
-      if (buffer.length <= shown) return
-      const step = Math.max(1, Math.ceil((buffer.length - shown) / 30))
+      if (shown >= buffer.length) {
+        if (!sseDone) return
+        // 缓冲已全部打出且流已结束：落终态（citations / refused）
+        clearInterval(typer)
+        setMessages((prev) =>
+          prev.map((m) => {
+            if (m.id !== assistantMsg.id) return m
+            return refused
+              ? {
+                  ...m,
+                  loading: false,
+                  refused: true,
+                  refusedMessage: refusedMessage ?? '知识库中未找到相关内容',
+                  text: '',
+                }
+              : { ...m, loading: false, text: buffer || '(空)', citations }
+          }),
+        )
+        setStreaming(false)
+        abortRef.current = null
+        return
+      }
+      const diff = buffer.length - shown
+      const step = diff > 150 ? 5 : 1
       shown = Math.min(buffer.length, shown + step)
       const visible = buffer.slice(0, shown)
       setMessages((prev) =>
@@ -175,6 +208,7 @@ export function ChatPage({ currentUser }: Props) {
     try {
       await mockAsk(question, selectedKbs, conversationId, handler, controller.signal)
     } catch (e) {
+      clearInterval(typer)
       setMessages((prev) =>
         prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: '' } : m)),
       )
@@ -188,27 +222,12 @@ export function ChatPage({ currentUser }: Props) {
           refusedMessage: e instanceof Error ? e.message : '请求失败，请稍后重试',
         }),
       )
-    } finally {
-      clearInterval(typer)
+      setStreaming(false)
+      abortRef.current = null
+      return
     }
-
-    // 流结束：flush 全文（打字机残余 + citations / refused 终态）
-    setMessages((prev) =>
-      prev.map((m) => {
-        if (m.id !== assistantMsg.id) return m
-        return refused
-          ? {
-              ...m,
-              loading: false,
-              refused: true,
-              refusedMessage: refusedMessage ?? '知识库中未找到相关内容',
-              text: '',
-            }
-          : { ...m, loading: false, text: buffer || '(空)', citations }
-      }),
-    )
-    setStreaming(false)
-    abortRef.current = null
+    // SSE 正常结束：置位后由 typer 在缓冲打完时落终态（见 interval 内）
+    sseDone = true
   }
 
   async function handleAsk() {
@@ -266,14 +285,14 @@ export function ChatPage({ currentUser }: Props) {
                   if (q) void askQuestion(q)
                   else message.warning('未找到原始问题')
                 }}
-                onFollowUp={() => inputRef.current?.focus()}
+                onFollowUp={handleFollowUp}
                 onAdopt={handleAdopt}
               />
             ))}
             <div ref={messagesEndRef} />
           </div>
 
-          <div style={{ borderTop: '1px solid #f0f0f0', padding: 16 }}>
+          <div ref={inputAreaRef} style={{ borderTop: '1px solid #f0f0f0', padding: 16 }}>
             <Space.Compact style={{ width: '100%' }}>
               <Input.TextArea
                 ref={inputRef}
