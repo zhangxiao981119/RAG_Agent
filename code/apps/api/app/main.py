@@ -1,6 +1,5 @@
 import json
 import logging
-import logging.config
 import traceback
 from contextlib import asynccontextmanager
 
@@ -29,31 +28,6 @@ logger = logging.getLogger(__name__)
 
 # ── M6 可观测：结构化 JSON 日志 ──────────────────────────
 # 每条日志输出为单行 JSON，方便 ELK/Loki 等日志聚合系统采集
-_LOGGING_CONFIG = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "json": {
-            "()": "app.main.JsonFormatter",
-        },
-    },
-    "handlers": {
-        "default": {
-            "class": "logging.StreamHandler",
-            "formatter": "json",
-            "stream": "ext://sys.stdout",
-        },
-    },
-    "root": {
-        "handlers": ["default"],
-        "level": "INFO",
-    },
-    "loggers": {
-        "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
-        "uvicorn.error": {"handlers": ["default"], "level": "INFO", "propagate": False},
-        "uvicorn.access": {"handlers": ["default"], "level": "INFO", "propagate": False},
-    },
-}
 
 
 class JsonFormatter(logging.Formatter):
@@ -82,7 +56,15 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(entry, ensure_ascii=False, default=str)
 
 
-logging.config.dictConfig(_LOGGING_CONFIG)
+# 手动配置（不用 dictConfig，避免模块加载时序问题）
+_json_handler = logging.StreamHandler()
+_json_handler.setFormatter(JsonFormatter())
+logging.root.handlers = [_json_handler]
+logging.root.setLevel(logging.INFO)
+for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    _logger = logging.getLogger(_name)
+    _logger.handlers = [_json_handler]
+    _logger.propagate = False
 
 
 @asynccontextmanager
