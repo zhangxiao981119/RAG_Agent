@@ -40,10 +40,33 @@ _SYSTEM_PROMPT = """你是一个严格依据知识库回答问题的助手。
 - 不要用 ``` 代码围栏包裹全文
 - 引用编号紧跟结论，中间不加空格
 
-如果 <context> 无法回答问题，直接回复"知识库中未找到相关内容"，不要附引用编号。"""
+追问建议：
+- 在回答最末尾，另起一行输出 <followups> 标签，内含 2-3 条针对上述回答的追问建议
+- 每条建议一行，简短（不超过 15 字），是用户可能想继续追问的问题
+- 格式示例：
+  <followups>
+  详细介绍第一点的原理
+  举个例子说明
+  还有哪些适用场景
+  </followups>
+
+如果 <context> 无法回答问题，直接回复"知识库中未找到相关内容"，不要附引用编号，也不要输出 <followups>。"""
 
 # 在数字编号前自动补换行的正则：匹配行内 "1. "（编号后必须跟空格，避免误切 "2.0" 这类版本号）
 _LIST_ITEM_RE = re.compile(r"(?<!\n)\s+(\d+\.\s)")
+
+# 解析 <followups> 块：从 LLM 输出末尾提取追问建议并从正文剥离
+_FOLLOWUPS_RE = re.compile(r"\s*<followups>\s*(.*?)\s*</followups>\s*", re.DOTALL)
+
+
+def _extract_followups(text: str) -> tuple[str, list[str]]:
+    """从 LLM 输出中提取 <followups> 追问建议，返回 (干净正文, 建议列表)。"""
+    m = _FOLLOWUPS_RE.search(text)
+    if not m:
+        return text, []
+    lines = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()]
+    clean = _FOLLOWUPS_RE.sub("", text).rstrip()
+    return clean, lines
 
 
 def _ensure_line_breaks(text: str) -> str:
@@ -102,6 +125,7 @@ class GenerationResult:
     refuse_reason: str
     citations: list[Citation] = field(default_factory=list)
     usage: dict = field(default_factory=dict)
+    suggestions: list[str] = field(default_factory=list)
 
 
 class GenerationService:
@@ -179,14 +203,18 @@ class GenerationService:
                 citations=citations,
             )
 
+        # 从正文剥离 <followups> 追问建议
+        clean_text, suggestions = _extract_followups(grounding_result.text)
+
         return GenerationResult(
-            text=_ensure_line_breaks(grounding_result.text),
+            text=_ensure_line_breaks(clean_text),
             raw_text=raw_text,
             stripped_sentences=grounding_result.stripped_sentences,
             refused=False,
             refuse_reason="",
             citations=citations,
             usage={"prompt_tokens": 0, "completion_tokens": len(raw_text)},
+            suggestions=suggestions,
         )
 
 
