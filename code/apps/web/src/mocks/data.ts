@@ -19,7 +19,7 @@ export type ChatEvent =
   | { event: 'stage'; data: { stage: string; ms: number } }
   | { event: 'citations'; data: { citations: Citation[] } }
   | { event: 'delta'; data: { text: string } }
-  | { event: 'done'; data: { finish_reason: string; grounding: { stripped_sentences: number }; usage: { prompt_tokens: number; completion_tokens: number } } }
+  | { event: 'done'; data: { finish_reason: string; grounding: { stripped_sentences: number }; usage: { prompt_tokens: number; completion_tokens: number }; suggestions?: string[] } }
   | { event: 'refused'; data: { reason: string; message: string } }
 
 export type KnowledgeBase = {
