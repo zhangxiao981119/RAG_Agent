@@ -5,6 +5,7 @@ import {
   Button,
   Card,
   Empty,
+  Input,
   Modal,
   Popconfirm,
   Select,
@@ -56,6 +57,8 @@ export function DocumentsPage() {
   const [documents, setDocuments] = useState<Document[]>([])
   const [uploading, setUploading] = useState(false)
   const [previewDoc, setPreviewDoc] = useState<Document | null>(null)
+  // 前端搜索关键字（按文件名过滤）
+  const [search, setSearch] = useState('')
 
   useEffect(() => {
     fetchKbs()
@@ -110,6 +113,13 @@ export function DocumentsPage() {
       message.error(e instanceof Error ? e.message : '删除失败')
     }
   }
+
+  // 前端搜索过滤：按文件名匹配（大小写不敏感），空关键字返回全部
+  const filteredDocuments = documents.filter((d) => {
+    const q = search.trim().toLowerCase()
+    if (!q) return true
+    return d.filename.toLowerCase().includes(q)
+  })
 
   const columns: ColumnsType<Document> = [
     { title: '文件名', dataIndex: 'filename', key: 'filename', ellipsis: true },
@@ -218,13 +228,22 @@ export function DocumentsPage() {
       </Dragger>
 
       <Card variant="borderless" styles={{ body: { padding: 0 } }}>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+          <Input.Search
+            placeholder="按文件名搜索"
+            allowClear
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={{ width: 240 }}
+          />
+        </div>
         <Table<Document>
           rowKey="id"
           columns={columns}
-          dataSource={documents}
+          dataSource={filteredDocuments}
           size="middle"
           pagination={false}
-          locale={{ emptyText: <Empty description={selectedKb ? '该知识库暂无文档' : '请先选择知识库'} /> }}
+          locale={{ emptyText: <Empty description={selectedKb ? (search.trim() ? '未匹配到文档' : '该知识库暂无文档') : '请先选择知识库'} /> }}
         />
       </Card>
 

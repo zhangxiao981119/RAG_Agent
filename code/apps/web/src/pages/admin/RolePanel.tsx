@@ -19,6 +19,8 @@ export function RolePanel() {
   const [editing, setEditing] = useState<{ mode: 'create' } | { mode: 'edit'; role: AdminRole } | null>(
     null,
   )
+  // 前端搜索关键字（按角色名过滤）
+  const [search, setSearch] = useState('')
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -88,21 +90,37 @@ export function RolePanel() {
     },
   ]
 
+  // 前端搜索过滤：按角色名匹配（大小写不敏感），空关键字返回全部
+  const filteredRoles = roles.filter((r) => {
+    const q = search.trim().toLowerCase()
+    if (!q) return true
+    return r.name.toLowerCase().includes(q)
+  })
+
   return (
     <div>
-      <Space style={{ marginBottom: 16 }}>
-        <Button type="primary" icon={<PlusOutlined />} onClick={() => setEditing({ mode: 'create' })}>
-          新建角色
-        </Button>
-        <Button icon={<ReloadOutlined />} onClick={() => void refresh()}>
-          刷新
-        </Button>
-      </Space>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
+        <Space>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => setEditing({ mode: 'create' })}>
+            新建角色
+          </Button>
+          <Button icon={<ReloadOutlined />} onClick={() => void refresh()}>
+            刷新
+          </Button>
+        </Space>
+        <Input.Search
+          placeholder="按角色名搜索"
+          allowClear
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          style={{ width: 240 }}
+        />
+      </div>
 
       <Table<AdminRole>
         rowKey="id"
         columns={columns}
-        dataSource={roles}
+        dataSource={filteredRoles}
         loading={loading}
         size="middle"
         pagination={false}

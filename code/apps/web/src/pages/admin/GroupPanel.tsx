@@ -44,6 +44,8 @@ export function GroupPanel() {
   const [loading, setLoading] = useState(true)
   const [edit, setEdit] = useState<EditState | null>(null)
   const [membersGroup, setMembersGroup] = useState<AdminGroup | null>(null)
+  // 前端搜索关键字（按组名过滤）
+  const [search, setSearch] = useState('')
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -120,21 +122,37 @@ export function GroupPanel() {
     },
   ]
 
+  // 前端搜索过滤：按组名匹配（大小写不敏感），空关键字返回全部
+  const filteredGroups = groups.filter((g) => {
+    const q = search.trim().toLowerCase()
+    if (!q) return true
+    return g.name.toLowerCase().includes(q)
+  })
+
   return (
     <div>
-      <Space style={{ marginBottom: 16 }}>
-        <Button type="primary" icon={<PlusOutlined />} onClick={() => setEdit({ mode: 'create' })}>
-          新建用户组
-        </Button>
-        <Button icon={<ReloadOutlined />} onClick={() => void refresh()}>
-          刷新
-        </Button>
-      </Space>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
+        <Space>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => setEdit({ mode: 'create' })}>
+            新建用户组
+          </Button>
+          <Button icon={<ReloadOutlined />} onClick={() => void refresh()}>
+            刷新
+          </Button>
+        </Space>
+        <Input.Search
+          placeholder="按组名搜索"
+          allowClear
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          style={{ width: 240 }}
+        />
+      </div>
 
       <Table<AdminGroup>
         rowKey="id"
         columns={columns}
-        dataSource={groups}
+        dataSource={filteredGroups}
         loading={loading}
         size="middle"
         pagination={false}
