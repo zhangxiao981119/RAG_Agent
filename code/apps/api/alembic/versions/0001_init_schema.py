@@ -180,19 +180,7 @@ _STATEMENTS = [
         finished_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
-    """CREATE TABLE audit_logs (
-        id BIGSERIAL PRIMARY KEY,
-        tenant_id UUID NOT NULL REFERENCES tenants(id),
-        user_id UUID,
-        action TEXT NOT NULL,
-        object_type TEXT,
-        object_id TEXT,
-        detail JSONB NOT NULL DEFAULT '{}'::JSONB,
-        ip INET,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )""",
-    "CREATE INDEX idx_audit_time ON audit_logs(tenant_id, created_at DESC)",
-    "CREATE INDEX idx_audit_user ON audit_logs(tenant_id, user_id, created_at DESC)",
+    # audit_logs 表与索引由 0005 迁移统一创建，0001 MUST NOT 重复建表（全新库会 DuplicateTable）
     """CREATE TABLE eval_cases (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         tenant_id UUID NOT NULL REFERENCES tenants(id),
@@ -207,7 +195,6 @@ _STATEMENTS = [
 
 _DROP_STATEMENTS = [
     "DROP TABLE IF EXISTS eval_cases",
-    "DROP TABLE IF EXISTS audit_logs",
     "DROP TABLE IF EXISTS parse_jobs",
     "DROP TABLE IF EXISTS messages",
     "DROP TABLE IF EXISTS conversations",
