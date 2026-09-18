@@ -111,9 +111,15 @@ export function ChatPage({ currentUser }: Props) {
   // 加载会话列表
   const refreshConversations = useCallback(() => {
     fetchConversations()
-      .then(setConversations)
+      .then((list) => {
+        setConversations(list)
+        // 首次进入页面时自动选中最近一次对话（列表按 update_time 降序，第一个即最新）
+        if (!conversationId && list.length > 0) {
+          handleSelectConversation(list[0])
+        }
+      })
       .catch(() => {})
-  }, [])
+  }, [conversationId])
 
   useEffect(() => {
     refreshConversations()
