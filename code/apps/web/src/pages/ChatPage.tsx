@@ -413,7 +413,7 @@ function rehypeCitation() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const replacements: Array<{ parent: any; index: number; children: any[] }> = []
     visit(tree, 'text', (node, index, parent) => {
-      if (!parent || index === null || !/\[\d+\]/.test(node.value)) return
+      if (!parent || index === null || typeof index !== 'number' || !/\[\d+\]/.test(node.value)) return
       const newChildren: any[] = []
       let last = 0
       for (const m of node.value.matchAll(/\[(\d+)\]/g)) {
