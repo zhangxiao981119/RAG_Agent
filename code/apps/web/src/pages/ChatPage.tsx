@@ -436,7 +436,10 @@ export function ChatPage({ currentUser }: Props) {
                   title="删除此对话？"
                   okText="删除"
                   cancelText="取消"
-                  onConfirm={(e) => e?.stopPropagation()}
+                  onConfirm={(e) => {
+                    e?.stopPropagation()
+                    void handleDeleteConversation(conv, e as unknown as React.MouseEvent)
+                  }}
                   onCancel={(e) => e?.stopPropagation()}
                 >
                   <Button
