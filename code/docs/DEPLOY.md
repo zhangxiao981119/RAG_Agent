@@ -205,6 +205,91 @@ $COMPOSE up -d --build api worker web
 
 ---
 
+## 9. 回滚
+
+按影响范围由小到大分三类：**功能回滚**（线上零停服，秒级生效）→ **迁移回滚**（需停服或维护窗口）→ **镜像回滚**（退回旧版本交付包）。
+
+### 9.1 功能回滚（特性开关，推荐首选）
+
+配额管理、敏感词过滤、重排等特性均接入 `feature_flags` 表，admin 在「系统管理 → 灰度开关」关闭对应规则即等价于回滚该功能，缓存 TTL 60s 内全租户生效。
+
+| 特性 key | 关闭后的效果 |
+|----------|--------------|
+| `quota` | 不再执行配额检查与四级降级，所有提问按无配额策略放行 |
+| `sensitive_filter` | 不再做输入/输出敏感词命中检测 |
+| `rerank` | 检索结果不再重排，直接用向量分 + RRF 融合 |
+
+操作步骤：
+
+1. 管理员登录 → 系统管理 → 灰度开关
+2. 找到对应 `feature_key` 的规则 → 关闭 Switch（或删除整条规则）
+3. 等待最多 60 秒，Redis 缓存过期后该特性在全租户范围内关闭
+
+如需更细粒度（按部门）回滚，可编辑规则的 `dept_path_pattern` 把命中范围缩小到空集，或把 `rollout_percent` 改为 0。
+
+### 9.2 迁移回滚（数据库 schema 回退）
+
+Alembic 迁移按版本号顺序执行，回退用 `downgrade` 命令。**迁移回滚前必须按第 5 节备份数据库**，且回退期间需停止 `api` 与 `worker` 避免写入冲突。
+
+```bash
+cd code
+COMPOSE="docker compose -p kagent -f docker-compose.prod.yml"
+
+# 1. 停止应用层（保留 postgres / redis）
+$COMPOSE stop api worker
+
+# 2. 查看当前迁移版本
+$COMPOSE exec -T postgres psql -U kagent -d kagent -c "SELECT version_num FROM alembic_version;"
+
+# 3. 回退一个版本（例如 0007 → 0006）
+$COMPOSE exec -T api alembic downgrade -1
+
+# 4. 或回退到指定版本
+$COMPOSE exec -T api alembic downgrade 0006
+
+# 5. 回退完成后重启应用层
+$COMPOSE up -d api worker
+```
+
+> 注意：`downgrade` 会执行迁移文件中的 `downgrade()` 函数，对应 0007 会 `DROP TABLE` 三张表（tenant_quotas / sensitive_words / feature_flags）。如该表已有线上数据且可能复用，请先 `pg_dump` 备份对应表。
+
+### 9.3 镜像回滚（退回上一交付版本）
+
+适用于：代码级故障（如 chat 流式输出异常、迁移逻辑错误）导致整版本不可用，需快速退回上一个稳定版本。
+
+```bash
+cd code
+COMPOSE="docker compose -p kagent -f docker-compose.prod.yml"
+
+# 1. 切换交付包到上一稳定版本（保留 .env 不变）
+git checkout <上一稳定 tag 或 commit>   # 或解压旧交付包覆盖 code/
+
+# 2. 用旧代码重建并启动（迁移会自动 alembic upgrade head）
+$COMPOSE up -d --build api worker web
+
+# 3. 观察日志确认正常
+$COMPOSE logs -f api
+```
+
+如已执行过新版迁移且新版表结构有破坏性变更（如 0007 建表后又在 0008 改了列类型），需先按 9.2 执行 `alembic downgrade <旧版本>` 再启动旧镜像，否则旧代码会因 schema 不匹配报错。
+
+### 9.4 回滚决策树
+
+```
+故障现象
+  │
+  ├─ 单一特性异常（如配额误拒答 / 敏感词误拦截）
+  │     → 9.1 关闭对应 feature_flag（秒级，零停服）
+  │
+  ├─ 多特性同时异常，怀疑是新迁移引入
+  │     → 9.2 alembic downgrade -1（需停 api+worker）
+  │
+  └─ 整体不可用（启动失败 / 全量提问报错）
+        → 9.3 退回上一交付镜像 + 9.2 回退迁移
+```
+
+---
+
 ## 附：交付物清单
 
 ```

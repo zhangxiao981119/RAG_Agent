@@ -82,9 +82,8 @@ export function ChatPage({ currentUser }: Props) {
   /** 会话 id：首轮提问后由 meta 事件带回，后续追问续传（上下文连续） */
   const [conversationId, setConversationId] = useState<string | null>(null)
 
-  /** 追问上下文：点击追问按钮时展示原问题，让用户感知"是在追问哪条" */
+  /** 追问上下文：点击追问按钮时展示该条 AI 回答摘要，让用户感知"是在追问哪条" */
   const [followUpContext, setFollowUpContext] = useState<{
-    question: string
     assistantText: string
   } | null>(null)
 
@@ -108,13 +107,18 @@ export function ChatPage({ currentUser }: Props) {
       .catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
   }, [])
 
-  // 加载会话列表
+  // 标记是否已完成首次自动选中（只在首次加载会话列表时自动选中最近一条，
+  // 后续手动新建对话 / 切换会话都不应再触发自动选中，否则会覆盖"新建对话"状态）
+  const hasInitialSelected = useRef(false)
+
+  // 加载会话列表（删会话 / 提问完成后刷新侧边栏）
   const refreshConversations = useCallback(() => {
     fetchConversations()
       .then((list) => {
         setConversations(list)
-        // 首次进入页面时自动选中最近一次对话（列表按 update_time 降序，第一个即最新）
-        if (!conversationId && list.length > 0) {
+        // 仅首次加载：自动选中最近一次对话（列表按 update_time 降序，第一个即最新）
+        if (!hasInitialSelected.current && !conversationId && list.length > 0) {
+          hasInitialSelected.current = true
           handleSelectConversation(list[0])
         }
       })
@@ -123,7 +127,9 @@ export function ChatPage({ currentUser }: Props) {
 
   useEffect(() => {
     refreshConversations()
-  }, [refreshConversations])
+    // 仅首次进入页面时触发，后续 conversationId 变化不应触发刷新
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'auto' })
@@ -356,14 +362,10 @@ export function ChatPage({ currentUser }: Props) {
     setTimeout(() => inputRef.current?.focus(), 300)
   }
 
-  /** 通用追问：把该回答对应的原问题填入输入框 + 灰色行展示 AI 回答摘要。 */
+  /** 通用追问：不自动填入原问题，仅灰色行展示 AI 回答摘要并聚焦输入框，由用户自行输入新问题。 */
   function handleFollowUp(msg: Message) {
-    const q = findQuestionOf(msg.id)
-    if (!q) return
-    setInput(q)
-    // 灰色行展示 AI 回答摘要（让用户感知"是在追问这条回答"）
     const summary = msg.text.replace(/\s+/g, ' ').trim().slice(0, 80)
-    setFollowUpContext({ question: q, assistantText: summary })
+    setFollowUpContext({ assistantText: summary })
     inputAreaRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     setTimeout(() => inputRef.current?.focus(), 300)
   }
@@ -549,10 +551,6 @@ export function ChatPage({ currentUser }: Props) {
               value={input}
               onChange={(e) => {
                 setInput(e.target.value)
-                // 用户主动输入新问题 → 清除追问上下文
-                if (followUpContext && e.target.value !== followUpContext.question) {
-                  // 不立即清，等用户首次实际修改后再清
-                }
               }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {

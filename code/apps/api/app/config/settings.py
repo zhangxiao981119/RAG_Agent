@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     parse_job_timeout_seconds: int = 600
     # ── M6 安全加固 ──────────────────────────────────────────
     chat_rate_limit_per_minute: int = 20  # 单用户每分钟最多提问次数，超过返回 429
+    # ── M6 续篇：配额管理（手册第 14 步 — 双层速率+总量）─────
+    default_daily_token_limit: int = 200_000       # 单用户每日默认 token 上限
+    default_daily_message_limit: int = 200         # 单用户每日默认问答次数
+    default_tenant_daily_token_limit: int = 2_000_000      # 租户每日 token 上限
+    default_tenant_monthly_token_limit: int = 50_000_000  # 租户月度 token 上限
 
     @field_validator("allowed_ext", mode="before")
     @classmethod
