@@ -130,6 +130,14 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile
     command: arq app.workers.parse_job.WorkerSettings
+    restart: unless-stopped
+    healthcheck:
+      # arq 无 HTTP 端口，用 pgrep 检查进程是否存活
+      test: ["CMD", "pgrep", "-f", "arq app.workers.parse_job"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     environment:
       APP_ENV: ${APP_ENV:-dev}
       TENANT_CODE: ${TENANT_CODE:-default}
