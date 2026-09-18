@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select, update
@@ -95,10 +96,15 @@ async def get_document_raw(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail=str(exc),
         )
+    # RFC 6266：非 ASCII 文件名必须用 filename*=UTF-8''urlencoded 形式，
+    # 直接把中文塞 filename= 会导致 httpx/uvicorn latin-1 编码炸掉
+    ascii_fallback = doc.filename.encode("ascii", "replace").decode("ascii")
+    utf8_encoded = quote(doc.filename)
+    cd = f"inline; filename=\"{ascii_fallback}\"; filename*=UTF-8''{utf8_encoded}"
     return Response(
         content=text,
         media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": f'inline; filename="{doc.filename}"'},
+        headers={"Content-Disposition": cd},
     )
 
 
