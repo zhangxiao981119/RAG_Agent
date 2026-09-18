@@ -21,7 +21,7 @@ import {
   CopyOutlined,
   DeleteOutlined,
   LikeOutlined,
-  PlusOutlined,
+  MessageOutlined,
   RedoOutlined,
   SendOutlined,
   StopOutlined,
@@ -80,6 +80,12 @@ export function ChatPage({ currentUser }: Props) {
   const [streaming, setStreaming] = useState(false)
   /** 会话 id：首轮提问后由 meta 事件带回，后续追问续传（上下文连续） */
   const [conversationId, setConversationId] = useState<string | null>(null)
+
+  /** 追问上下文：点击追问按钮时展示原问题，让用户感知"是在追问哪条" */
+  const [followUpContext, setFollowUpContext] = useState<{
+    question: string
+    assistantText: string
+  } | null>(null)
 
   // 会话列表（左侧侧边栏）
   const [conversations, setConversations] = useState<Conversation[]>([])
@@ -325,7 +331,11 @@ export function ChatPage({ currentUser }: Props) {
   }
 
   async function handleAsk() {
-    await askQuestion(input.trim())
+    const q = input.trim()
+    if (!q) return
+    // 发送成功后清除追问上下文
+    clearFollowUpContext()
+    await askQuestion(q)
   }
 
   function handleStop() {
@@ -337,6 +347,21 @@ export function ChatPage({ currentUser }: Props) {
     setInput(text)
     inputAreaRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     setTimeout(() => inputRef.current?.focus(), 300)
+  }
+
+  /** 通用追问：把该回答对应的原问题填入输入框 + 设置灰色展示行。 */
+  function handleFollowUp(msg: Message) {
+    const q = findQuestionOf(msg.id)
+    if (!q) return
+    setInput(q)
+    setFollowUpContext({ question: q, assistantText: msg.text.slice(0, 60) })
+    inputAreaRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    setTimeout(() => inputRef.current?.focus(), 300)
+  }
+
+  /** 关闭追问上下文展示行（用户直接输入新问题时）。 */
+  function clearFollowUpContext() {
+    setFollowUpContext(null)
   }
 
   return (
@@ -459,6 +484,7 @@ export function ChatPage({ currentUser }: Props) {
               onCopy={handleCopy}
               onRetry={handleRetry}
               onSuggestionClick={handleSuggestionClick}
+              onFollowUp={handleFollowUp}
               onAdopt={handleAdopt}
             />
           ))}
@@ -467,11 +493,55 @@ export function ChatPage({ currentUser }: Props) {
 
         {/* 输入区 */}
         <div ref={inputAreaRef} style={{ borderTop: '1px solid #f0f0f0', padding: 12, flexShrink: 0 }}>
+          {/* 追问上下文灰色展示行 */}
+          {followUpContext && (
+            <div
+              style={{
+                background: '#fafafa',
+                border: '1px solid #f0f0f0',
+                borderRadius: 6,
+                padding: '6px 10px',
+                marginBottom: 8,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                fontSize: 13,
+              }}
+            >
+              <span style={{ color: '#bfbfbf', flexShrink: 0 }}>追问中</span>
+              <span
+                style={{
+                  color: '#8c8c8c',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  flex: 1,
+                }}
+                title={followUpContext.question}
+              >
+                {followUpContext.question}
+              </span>
+              <Button
+                type="text"
+                size="small"
+                style={{ flexShrink: 0, color: '#bfbfbf' }}
+                onClick={clearFollowUpContext}
+              >
+                x
+              </Button>
+            </div>
+          )}
           <Space.Compact style={{ width: '100%' }}>
             <Input.TextArea
               ref={inputRef}
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value)
+                // 用户主动输入新问题 → 清除追问上下文
+                if (followUpContext && e.target.value !== followUpContext.question) {
+                  // 不立即清，等用户首次实际修改后再清
+                }
+              }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()
@@ -608,6 +678,7 @@ function MessageBubble({
   onCopy,
   onRetry,
   onSuggestionClick,
+  onFollowUp,
   onAdopt,
 }: {
   msg: Message
@@ -615,6 +686,7 @@ function MessageBubble({
   onCopy: (m: Message) => void
   onRetry: (m: Message) => void
   onSuggestionClick: (text: string) => void
+  onFollowUp: (m: Message) => void
   onAdopt: (m: Message) => void
 }) {
   if (msg.role === 'user') {
@@ -752,6 +824,11 @@ function MessageBubble({
           <Button type="text" size="small" icon={<RedoOutlined />} onClick={() => onRetry(msg)}>
             重试
           </Button>
+          <Tooltip title="基于这条回答继续追问">
+            <Button type="text" size="small" icon={<MessageOutlined />} onClick={() => onFollowUp(msg)}>
+              追问
+            </Button>
+          </Tooltip>
           {msg.adopted ? (
             <Tooltip title="该问答对已收集为微调样本，微调时由管理员导出">
               <span>

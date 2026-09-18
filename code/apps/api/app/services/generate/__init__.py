@@ -55,6 +55,17 @@ _SYSTEM_PROMPT = """你是一个严格依据知识库回答问题的助手。
 # 在数字编号前自动补换行的正则：匹配行内 "1. "（编号后必须跟空格，避免误切 "2.0" 这类版本号）
 _LIST_ITEM_RE = re.compile(r"(?<!\n)\s+(\d+\.\s)")
 
+# 匹配 Markdown 小标题（#### / ### / ## / #），捕获小标题及其后的内容
+_HEADING_RE = re.compile(r"(?<!\n)(#{1,6}\s+[^\n#]+?)(?=\s+\d+\.\s|\s*$)")
+
+# 匹配段落之间挤在一起的情况：引用编号后跟中文/英文，且紧跟下一个引用编号或标题
+# 例："...已超过 70%¹公司倡导开放、协作..." → "...已超过 70%¹\n\n公司倡导开放、协作..."
+_REF_PARA_RE = re.compile(r"(\[\d+\])\s+(?=[^\s#\-*>\[\d])")
+
+# 匹配 "小标题后直接跟编号" 的情况
+# 例："#### 核心业务1. 自然语言处理" → "#### 核心业务\n\n1. 自然语言处理"
+_HEADING_LIST_RE = re.compile(r"(#{1,6}\s+[^\n\d#]+)(\d+\.\s)")
+
 # 解析 <followups> 块：从 LLM 输出末尾提取追问建议并从正文剥离
 _FOLLOWUPS_RE = re.compile(r"\s*<followups>\s*(.*?)\s*</followups>\s*", re.DOTALL)
 
@@ -70,17 +81,34 @@ def _extract_followups(text: str) -> tuple[str, list[str]]:
 
 
 def _ensure_line_breaks(text: str) -> str:
-    """把挤在一行的 1. xxx 2. yyy 3. zzz 变成每行一个编号项。"""
+    """把 LLM 输出的挤在一起的内容按 Markdown 规则正确换行。
+
+    处理：
+    1. 小标题后补空行
+    2. 小标题后直接跟数字编号 → 拆成两行
+    3. 行内数字编号前补换行
+    4. 引用编号后如果紧跟另一个内容 → 补段落分隔
+    """
     if not text:
         return text
-    # 先统一已有换行符
     text = text.replace("\r\n", "\n")
-    # 在非首行的数字编号前加 \n
-    result = _LIST_ITEM_RE.sub(r"\n\1", text)
-    # 清理多余空行（3+ 空行 → 2 空行）
-    result = re.sub(r"\n{3,}", "\n\n", result)
-    # 首尾 trim
-    return result.strip()
+
+    # 1. 小标题后直接跟编号 → 拆开
+    text = _HEADING_LIST_RE.sub(r"\1\n\n\2", text)
+
+    # 2. 小标题后补空行（确保每个小标题独占一行且前后有间距）
+    #    先把 "#### 标题后续内容" 改成 "#### 标题\n\n后续内容"
+    text = re.sub(r"(#{1,6}\s+[^\n#]+)\s+(?=[^\s#\-\*>\d\[`])", r"\1\n\n", text)
+
+    # 3. 行内数字编号前补换行（编号后必须跟空格，避免误切版本号）
+    text = _LIST_ITEM_RE.sub(r"\n\1", text)
+
+    # 4. 清理多余空行（3+ → 2）
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # 5. 清理编号项之间的多余空行（列表项之间不应有空行）
+    text = re.sub(r"(\d+\.\s[^\n]+)\n\n(\d+\.\s)", r"\1\n\2", text)
+
+    return text.strip()
 
 
 def _build_context(chunks: list[RetrievedChunk]) -> str:
