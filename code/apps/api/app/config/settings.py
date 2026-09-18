@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     )
     audit_retention_days: int = 365
     multi_tenant: bool = False
+    # ── M5 生产初始化 ────────────────────────────────────────
+    admin_password: str = "ChangeMe123!"  # seed_prod 创建管理员时使用，生产 MUST 通过环境变量覆盖
     # ── M2 模型调用 ──────────────────────────────────────────
     embedding_batch_size: int = 32
     rerank_timeout_seconds: float = 3.0

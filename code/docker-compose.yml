@@ -71,7 +71,8 @@ services:
     volumes:
       # 镜像内 HF_HOME=/app/.cache/huggingface，挂载路径必须与之匹配
       - hf_cache:/app/.cache/huggingface
-    mem_limit: 2g
+    # 稳态约 2.4GB（CLI warmup 与 server engine 双份驻留），启动峰值超 3GB；给 3g 会在加载期 OOM(137)
+    mem_limit: 4g
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 10s

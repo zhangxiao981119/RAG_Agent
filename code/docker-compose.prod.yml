@@ -1,0 +1,215 @@
+# 生产环境部署编排（M5 任务 6 · 手册附录 B 环境变量清单）
+#
+# 与开发用 docker-compose.yml 的差异：
+#   1. APP_ENV=prod；api 启动只跑 alembic + seed_prod（不建测试用户/评估用例）
+#   2. 关键密钥无弱默认值，MUST 在 .env 中提供（${VAR:?提示} 缺失即报错，拒绝启动）
+#   3. 只暴露 web 的 HTTP 端口；postgres/redis/minio/模型服务/api 均不绑定宿主端口
+#   4. 全部服务 restart: unless-stopped + 日志轮转
+#
+# 使用：cp .env.prod.example .env 并改密后
+#   docker compose -p kagent -f docker-compose.prod.yml up -d --build
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?必须在 .env 设置}
+      POSTGRES_USER: ${POSTGRES_USER:?必须在 .env 设置}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?必须在 .env 设置}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?必须在 .env 设置}
+    environment:
+      # 供容器内 healthcheck 脚本读取（redis 镜像本身不使用该变量，密码以 command 的 requirepass 为准）
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?必须在 .env 设置}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?必须在 .env 设置}
+    volumes:
+      - minio_data:/data
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # 本地嵌入服务（OpenAI 兼容 /v1/embeddings）。如使用外部端点，删除本服务并改 EMBEDDING_BASE_URL
+  embedding:
+    image: ${EMBEDDING_IMAGE:-michaelf34/infinity:latest}
+    restart: unless-stopped
+    command: v2 --model-id ${EMBEDDING_MODEL_ID:-BAAI/bge-m3} --engine torch --url-prefix /v1 --port 8000 --served-model-name ${EMBEDDING_MODEL:-bge-m3}
+    environment:
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+    volumes:
+      - hf_cache:/app/.cache/huggingface
+    mem_limit: 3g
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 180s
+
+  # 本地重排服务（OpenAI 兼容 /v1/rerank）
+  reranker:
+    image: ${RERANKER_IMAGE:-michaelf34/infinity:latest}
+    restart: unless-stopped
+    command: v2 --model-id ${RERANKER_MODEL_ID:-BAAI/bge-reranker-v2-m3} --engine torch --url-prefix /v1 --port 8000 --served-model-name ${RERANK_MODEL:-bge-reranker-v2-m3}
+    environment:
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+    volumes:
+      - hf_cache:/app/.cache/huggingface
+    # 稳态约 2.4GB（CLI warmup 与 server engine 双份驻留），启动峰值超 3GB；给 3g 会在加载期 OOM(137)
+    mem_limit: 4g
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 180s
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    # 生产启动：迁移 + 生产种子（仅租户/管理员/公开库）+ API；不跑开发种子与评估用例
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m scripts.seed_prod &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2"
+    environment:
+      APP_ENV: prod
+      SECRET_KEY: ${SECRET_KEY:?必须在 .env 设置（建议 openssl rand -hex 32）}
+      JWT_SECRET: ${JWT_SECRET:?必须在 .env 设置（建议 openssl rand -hex 32）}
+      TENANT_CODE: ${TENANT_CODE:-default}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?必须在 .env 设置（首次登录后请修改）}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-kagent-docs}
+      LLM_BASE_URL: ${LLM_BASE_URL:?必须在 .env 设置}
+      LLM_API_KEY: ${LLM_API_KEY:?必须在 .env 设置}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://embedding:8000/v1}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      RERANK_BASE_URL: ${RERANK_BASE_URL:-http://reranker:8000/v1}
+      RERANK_MODEL: ${RERANKER_MODEL:-bge-reranker-v2-m3}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-100}
+      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
+      MULTI_TENANT: ${MULTI_TENANT:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      embedding:
+        condition: service_started
+      reranker:
+        condition: service_started
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  # arq 异步解析 worker
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    command: arq app.workers.parse_job.WorkerSettings
+    environment:
+      APP_ENV: prod
+      SECRET_KEY: ${SECRET_KEY:?必须在 .env 设置}
+      JWT_SECRET: ${JWT_SECRET:?必须在 .env 设置}
+      TENANT_CODE: ${TENANT_CODE:-default}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-kagent-docs}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://embedding:8000/v1}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      embedding:
+        condition: service_started
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "arq app.workers.parse_job"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  web:
+    build: ./apps/web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-80}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  hf_cache:
