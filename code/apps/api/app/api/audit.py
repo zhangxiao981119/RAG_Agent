@@ -47,12 +47,15 @@ async def list_audit_logs(
     page_size: int = Query(20, ge=1, le=100),
     action: str | None = Query(None, max_length=50, description="动作前缀过滤，如 doc.* 传 doc"),
     user_id: uuid.UUID | None = Query(None, description="按操作人过滤"),
+    start_date: str | None = Query(None, description="起始日期 YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="结束日期 YYYY-MM-DD"),
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> AuditLogPage:
     _require_admin(user)
     items, total = await audit.list_logs(
-        session, user.tenant_id, page, page_size, action=action, user_id=user_id
+        session, user.tenant_id, page, page_size,
+        action=action, user_id=user_id, start_date=start_date, end_date=end_date,
     )
     return AuditLogPage(
         items=[AuditLogItem(**item) for item in items],

@@ -253,6 +253,7 @@ async def chat_ask(
             "finish_reason": "stopped",
             "grounding": {"stripped_sentences": gen_result.stripped_sentences},
             "usage": gen_result.usage,
+            "suggestions": gen_result.suggestions,
         })
 
         # 持久化
@@ -263,6 +264,7 @@ async def chat_ask(
                 "stage_ms": result.stage_ms,
                 "grounding_stripped": gen_result.stripped_sentences,
                 "usage": gen_result.usage,
+                "suggestions": gen_result.suggestions,
             },
         )
 
@@ -316,3 +318,92 @@ async def _update_user_memory(
             await session.commit()
     except Exception:
         logger.exception("用户画像更新失败")
+
+
+# ── 会话管理接口（多轮对话历史） ────────────────────────────────
+
+
+@router.get("/conversations")
+async def list_conversations(
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    """当前用户的会话列表（最近 50 条，按最后消息时间倒序）。"""
+    # 子查询：每个会话最后一条消息的时间
+    from sqlalchemy import func, desc
+
+    last_msg_sq = (
+        select(
+            Message.conversation_id,
+            func.max(Message.created_at).label("last_at"),
+        )
+        .group_by(Message.conversation_id)
+        .subquery()
+    )
+    rows = (
+        await session.execute(
+            select(
+                Conversation.id,
+                Conversation.title,
+                Conversation.created_at,
+                func.coalesce(last_msg_sq.c.last_at, Conversation.created_at).label("last_at"),
+            )
+            .outerjoin(last_msg_sq, last_msg_sq.c.conversation_id == Conversation.id)
+            .where(Conversation.tenant_id == user.tenant_id, Conversation.user_id == user.user_id)
+            .order_by(desc("last_at"))
+            .limit(50)
+        )
+    ).all()
+    return [
+        {
+            "id": str(r.id),
+            "title": r.title or "新对话",
+            "created_at": r.created_at.isoformat(),
+            "last_at": r.last_at.isoformat() if r.last_at else None,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/conversations/{conversation_id}/messages")
+async def get_conversation_messages(
+    conversation_id: uuid.UUID,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    """加载某会话的全部消息（按时间正序）。"""
+    conv = await session.get(Conversation, conversation_id)
+    if conv is None or conv.tenant_id != user.tenant_id or conv.user_id != user.user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
+    rows = (
+        await session.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at)
+        )
+    ).scalars().all()
+    return [
+        {
+            "id": str(m.id),
+            "role": m.role,
+            "content": m.content,
+            "citations": m.citations,
+            "meta": m.meta,
+            "created_at": m.created_at.isoformat(),
+        }
+        for m in rows
+    ]
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: uuid.UUID,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> None:
+    """删除会话（级联删除消息）。"""
+    conv = await session.get(Conversation, conversation_id)
+    if conv is None or conv.tenant_id != user.tenant_id or conv.user_id != user.user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
+    await session.delete(conv)
+    await session.commit()

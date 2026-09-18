@@ -81,6 +81,8 @@ async def list_logs(
     page_size: int,
     action: str | None = None,
     user_id: uuid.UUID | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """服务端分页查询审计日志，返回 (items, total)。item 附 user 展示名。"""
     conditions = [AuditLog.tenant_id == tenant_id]
@@ -89,6 +91,11 @@ async def list_logs(
         conditions.append(AuditLog.action.like(f"{action}%"))
     if user_id:
         conditions.append(AuditLog.user_id == user_id)
+    if start_date:
+        conditions.append(AuditLog.created_at >= start_date)
+    if end_date:
+        # end_date 是日期（YYYY-MM-DD），加一天作为上界实现"含当天"
+        conditions.append(AuditLog.created_at < f"{end_date} 23:59:59")
 
     total = (
         await session.execute(select(func.count()).select_from(AuditLog).where(*conditions))

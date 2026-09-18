@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
@@ -7,7 +7,6 @@ import {
   Button,
   Card,
   Checkbox,
-  Drawer,
   Empty,
   Input,
   Popconfirm,
@@ -20,8 +19,9 @@ import {
 import {
   CheckOutlined,
   CopyOutlined,
+  DeleteOutlined,
   LikeOutlined,
-  MessageOutlined,
+  PlusOutlined,
   RedoOutlined,
   SendOutlined,
   StopOutlined,
@@ -31,6 +31,11 @@ import {
   adoptAnswer,
   ChatEvent,
   Citation,
+  Conversation,
+  ConversationMessage,
+  deleteConversation,
+  fetchConversationMessages,
+  fetchConversations,
   fetchKbs,
   KnowledgeBase,
   mockAsk,
@@ -53,6 +58,8 @@ type Message = {
   messageId?: string
   /** 已采纳为微调样本 */
   adopted?: boolean
+  /** 快捷追问建议（后端 done 事件带回） */
+  suggestions?: string[]
 }
 
 type Props = { currentUser: User }
@@ -74,27 +81,38 @@ export function ChatPage({ currentUser }: Props) {
   /** 会话 id：首轮提问后由 meta 事件带回，后续追问续传（上下文连续） */
   const [conversationId, setConversationId] = useState<string | null>(null)
 
+  // 会话列表（左侧侧边栏）
+  const [conversations, setConversations] = useState<Conversation[]>([])
+
   const abortRef = useRef<AbortController | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
-  // 输入区容器：追问时滚动进视野（长对话时输入框可能在视口外）
   const inputAreaRef = useRef<HTMLDivElement>(null)
 
-  // 知识库列表加载失败用 Alert 展示（页面级错误，不适合一闪而过的 message）
   const [loadError, setLoadError] = useState<string | null>(null)
 
+  // 加载知识库列表
   useEffect(() => {
     fetchKbs()
       .then((list) => {
         setKbs(list)
-        // 默认选中所有知识库
         setSelectedKbs(list.map((kb) => kb.id))
       })
       .catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
   }, [])
 
+  // 加载会话列表
+  const refreshConversations = useCallback(() => {
+    fetchConversations()
+      .then(setConversations)
+      .catch(() => {})
+  }, [])
+
   useEffect(() => {
-    // 打字机期间每 33ms 更新一次消息，auto 瞬时贴底开销小；smooth 高频调用会抖动
+    refreshConversations()
+  }, [refreshConversations])
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'auto' })
   }, [messages])
 
@@ -107,7 +125,7 @@ export function ChatPage({ currentUser }: Props) {
     return null
   }
 
-  /** 采纳回答为微调样本（幂等，后端唯一约束兜底）。 */
+  /** 采纳回答为微调样本。 */
   async function handleAdopt(msg: Message) {
     if (!msg.messageId) return
     try {
@@ -133,12 +151,82 @@ export function ChatPage({ currentUser }: Props) {
     }
   }
 
-  /** 追问：把该回答对应的原问题填入输入框（可直接修改/补充后发送），并滚动聚焦输入区。 */
-  function handleFollowUp(msg: Message) {
+  /** 重试：用原问题重新提问。 */
+  function handleRetry(msg: Message) {
     const q = findQuestionOf(msg.id)
-    setInput(q ?? '')
-    inputAreaRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
-    inputRef.current?.focus()
+    if (q) void askQuestion(q)
+    else message.warning('未找到原始问题')
+  }
+
+  /** 新建对话：清空消息 + 重置会话 id。 */
+  function handleNewConversation() {
+    if (streaming) {
+      message.warning('请等待当前回答结束')
+      return
+    }
+    setConversationId(null)
+    setMessages([
+      {
+        id: 'welcome',
+        role: 'assistant',
+        text: `你好 ${currentUser.display_name}，我是知识库问答助手。请选择知识库后提问。`,
+      },
+    ])
+    setInput('')
+    setSidebarCitation(null)
+  }
+
+  /** 切换到历史会话：加载消息列表。 */
+  async function handleSelectConversation(conv: Conversation) {
+    if (streaming) {
+      message.warning('请等待当前回答结束')
+      return
+    }
+    try {
+      const msgs = await fetchConversationMessages(conv.id)
+      setConversationId(conv.id)
+      setSidebarCitation(null)
+      // 后端消息 → 前端 Message 结构
+      const mapped: Message[] = msgs.map((m) => {
+        const meta = m.meta || {}
+        const refused = !!meta.refused
+        const suggestions = Array.isArray(meta.suggestions) ? meta.suggestions : []
+        return {
+          id: m.id,
+          role: m.role,
+          text: m.content,
+          citations: Array.isArray(m.citations) ? m.citations : [],
+          refused,
+          refusedMessage: refused ? '知识库中未找到相关内容' : undefined,
+          done: true,
+          messageId: m.id,
+          suggestions: refused ? [] : suggestions,
+        }
+      })
+      setMessages(
+        mapped.length > 0
+          ? mapped
+          : [{ id: 'empty', role: 'assistant', text: '此会话暂无消息' }],
+      )
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : '加载失败')
+    }
+  }
+
+  /** 删除会话。 */
+  async function handleDeleteConversation(conv: Conversation, e: React.MouseEvent) {
+    e.stopPropagation()
+    try {
+      await deleteConversation(conv.id)
+      message.success('已删除')
+      refreshConversations()
+      // 如果删的是当前会话，清空
+      if (conv.id === conversationId) {
+        handleNewConversation()
+      }
+    } catch (e2) {
+      message.error(e2 instanceof Error ? e2.message : '删除失败')
+    }
   }
 
   async function askQuestion(question: string) {
@@ -159,13 +247,11 @@ export function ChatPage({ currentUser }: Props) {
     let refused = false
     let refusedMessage: string | undefined
     let sseDone = false
+    let suggestions: string[] = []
 
-    // 确定性打字机：前端严格按约 30 字/秒渲染缓冲，积压过大时加速；
-    // SSE 结束后必须等缓冲打完才落终态，避免 flush 跳字破坏打字机观感
     const typer = window.setInterval(() => {
       if (shown >= buffer.length) {
         if (!sseDone) return
-        // 缓冲已全部打出且流已结束：落终态（citations / refused）
         clearInterval(typer)
         setMessages((prev) =>
           prev.map((m) => {
@@ -179,11 +265,13 @@ export function ChatPage({ currentUser }: Props) {
                   refusedMessage: refusedMessage ?? '知识库中未找到相关内容',
                   text: '',
                 }
-              : { ...m, loading: false, done: true, text: buffer || '(空)', citations }
+              : { ...m, loading: false, done: true, text: buffer || '(空)', citations, suggestions }
           }),
         )
         setStreaming(false)
         abortRef.current = null
+        // 刷新会话列表（标题可能更新）
+        refreshConversations()
         return
       }
       const diff = buffer.length - shown
@@ -191,14 +279,12 @@ export function ChatPage({ currentUser }: Props) {
       shown = Math.min(buffer.length, shown + step)
       const visible = buffer.slice(0, shown)
       setMessages((prev) =>
-        // 打字开始即清 loading：气泡组件在 loading 态只渲染"思考中"，会遮住打字文本
         prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: visible } : m)),
       )
     }, 33)
 
     const handler = (event: ChatEvent) => {
       if (event.event === 'meta') {
-        // 首轮事件带回后端会话/消息 id：会话续传用，采纳用
         setConversationId(event.data.conversation_id)
         setMessages((prev) =>
           prev.map((m) =>
@@ -210,6 +296,8 @@ export function ChatPage({ currentUser }: Props) {
       else if (event.event === 'refused') {
         refused = true
         refusedMessage = event.data.message
+      } else if (event.event === 'done') {
+        suggestions = event.data.suggestions ?? []
       }
     }
 
@@ -220,7 +308,6 @@ export function ChatPage({ currentUser }: Props) {
       setMessages((prev) =>
         prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: '' } : m)),
       )
-      // 输出错误气泡（同时保留在对话流中，比顶部红框更贴近出错位置）
       setMessages((prev) =>
         prev.concat({
           id: `err_${Date.now()}`,
@@ -234,7 +321,6 @@ export function ChatPage({ currentUser }: Props) {
       abortRef.current = null
       return
     }
-    // SSE 正常结束：置位后由 typer 在缓冲打完时落终态（见 interval 内）
     sseDone = true
   }
 
@@ -246,20 +332,104 @@ export function ChatPage({ currentUser }: Props) {
     abortRef.current?.abort()
   }
 
-  return (
-    <div className="chat-grid">
-      {/* 窄屏隐藏右侧常驻栏，引用通过 Drawer 查看 */}
-      <style>{`
-        .chat-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; }
-        @media (max-width: 992px) {
-          .chat-grid { grid-template-columns: 1fr; }
-          .chat-citation-aside { display: none; }
-        }
-      `}</style>
+  /** 点击追问建议气泡：填入输入框，聚焦后用户可编辑后发送。 */
+  function handleSuggestionClick(text: string) {
+    setInput(text)
+    inputAreaRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    setTimeout(() => inputRef.current?.focus(), 300)
+  }
 
-      <div style={{ minWidth: 0 }}>
+  return (
+    <div style={{ display: 'flex', height: 'calc(100vh - 64px)', gap: 0 }}>
+      {/* 左侧会话侧边栏 */}
+      <div
+        style={{
+          width: 220,
+          minWidth: 220,
+          borderRight: '1px solid #f0f0f0',
+          display: 'flex',
+          flexDirection: 'column',
+          background: '#fafafa',
+        }}
+      >
+        <div style={{ padding: '12px 12px 8px' }}>
+          <Button
+            type="dashed"
+            block
+            icon={<PlusOutlined />}
+            onClick={handleNewConversation}
+          >
+            新建对话
+          </Button>
+        </div>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '0 8px 8px' }}>
+          {conversations.length === 0 ? (
+            <div style={{ textAlign: 'center', color: 'rgba(0,0,0,0.35)', fontSize: 12, marginTop: 20 }}>
+              暂无历史对话
+            </div>
+          ) : (
+            conversations.map((conv) => (
+              <div
+                key={conv.id}
+                onClick={() => handleSelectConversation(conv)}
+                style={{
+                  padding: '8px 10px',
+                  borderRadius: 8,
+                  cursor: 'pointer',
+                  marginBottom: 2,
+                  background: conv.id === conversationId ? '#e6f4ff' : 'transparent',
+                  transition: 'background 0.15s',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 4,
+                }}
+                onMouseEnter={(e) => {
+                  if (conv.id !== conversationId) e.currentTarget.style.background = '#f0f0f0'
+                }}
+                onMouseLeave={(e) => {
+                  if (conv.id !== conversationId) e.currentTarget.style.background = 'transparent'
+                }}
+              >
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div
+                    style={{
+                      fontSize: 13,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      fontWeight: conv.id === conversationId ? 500 : 400,
+                    }}
+                  >
+                    {conv.title || '新对话'}
+                  </div>
+                </div>
+                <Popconfirm
+                  title="删除此对话？"
+                  okText="删除"
+                  cancelText="取消"
+                  onConfirm={(e) => e?.stopPropagation()}
+                  onCancel={(e) => e?.stopPropagation()}
+                >
+                  <Button
+                    type="text"
+                    size="small"
+                    danger
+                    icon={<DeleteOutlined />}
+                    onClick={(e) => e.stopPropagation()}
+                    style={{ flexShrink: 0 }}
+                  />
+                </Popconfirm>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      {/* 中间对话区 */}
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
         {/* 知识库选择 */}
-        <Card size="small" style={{ marginBottom: 16 }} styles={{ body: { padding: 12 } }}>
+        <Card size="small" style={{ margin: 12, flexShrink: 0 }} styles={{ body: { padding: 12 } }}>
           <Text strong style={{ display: 'block', marginBottom: 8, fontSize: 13 }}>
             选择知识库
           </Text>
@@ -278,92 +448,82 @@ export function ChatPage({ currentUser }: Props) {
           />
         </Card>
 
-        {/* 对话区 */}
-        <Card variant="borderless" styles={{ body: { padding: 0 } }}>
-          <div style={{ height: 'calc(100vh - 360px)', minHeight: 320, overflowY: 'auto', padding: 16 }}>
-            {loadError && <Alert type="error" showIcon message={loadError} style={{ marginBottom: 12 }} />}
-            {messages.map((m) => (
-              <MessageBubble
-                key={m.id}
-                msg={m}
-                onOpenCitation={(c) => setSidebarCitation(c)}
-                onCopy={handleCopy}
-                onRetry={(msg) => {
-                  const q = findQuestionOf(msg.id)
-                  if (q) void askQuestion(q)
-                  else message.warning('未找到原始问题')
-                }}
-                onFollowUp={handleFollowUp}
-                onAdopt={handleAdopt}
-              />
-            ))}
-            <div ref={messagesEndRef} />
-          </div>
+        {/* 对话消息区 */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '0 16px' }}>
+          {loadError && <Alert type="error" showIcon message={loadError} style={{ marginBottom: 12 }} />}
+          {messages.map((m) => (
+            <MessageBubble
+              key={m.id}
+              msg={m}
+              onOpenCitation={(c) => setSidebarCitation(c)}
+              onCopy={handleCopy}
+              onRetry={handleRetry}
+              onSuggestionClick={handleSuggestionClick}
+              onAdopt={handleAdopt}
+            />
+          ))}
+          <div ref={messagesEndRef} />
+        </div>
 
-          <div ref={inputAreaRef} style={{ borderTop: '1px solid #f0f0f0', padding: 16 }}>
-            <Space.Compact style={{ width: '100%' }}>
-              <Input.TextArea
-                ref={inputRef}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault()
-                    void handleAsk()
-                  }
-                }}
-                placeholder="输入你的问题，Enter 发送，Shift+Enter 换行"
-                autoSize={{ minRows: 1, maxRows: 4 }}
-                disabled={streaming}
-              />
-              {streaming ? (
-                <Button danger icon={<StopOutlined />} onClick={handleStop} style={{ height: 'auto' }}>
-                  停止
-                </Button>
-              ) : (
-                <Button
-                  type="primary"
-                  icon={<SendOutlined />}
-                  onClick={() => void handleAsk()}
-                  disabled={!input.trim()}
-                  style={{ height: 'auto' }}
-                >
-                  提问
-                </Button>
-              )}
-            </Space.Compact>
-          </div>
-        </Card>
+        {/* 输入区 */}
+        <div ref={inputAreaRef} style={{ borderTop: '1px solid #f0f0f0', padding: 12, flexShrink: 0 }}>
+          <Space.Compact style={{ width: '100%' }}>
+            <Input.TextArea
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  void handleAsk()
+                }
+              }}
+              placeholder="输入你的问题，Enter 发送，Shift+Enter 换行"
+              autoSize={{ minRows: 1, maxRows: 4 }}
+              disabled={streaming}
+            />
+            {streaming ? (
+              <Button danger icon={<StopOutlined />} onClick={handleStop} style={{ height: 'auto' }}>
+                停止
+              </Button>
+            ) : (
+              <Button
+                type="primary"
+                icon={<SendOutlined />}
+                onClick={() => void handleAsk()}
+                disabled={!input.trim()}
+                style={{ height: 'auto' }}
+              >
+                提问
+              </Button>
+            )}
+          </Space.Compact>
+        </div>
       </div>
 
-      {/* 宽屏：右侧常驻引用面板 */}
-      <aside className="chat-citation-aside" style={{ minWidth: 0 }}>
-        <Card variant="borderless" style={{ height: '100%' }} styles={{ body: { padding: 16 } }}>
-          <CitationPanel citation={sidebarCitation} onClose={() => setSidebarCitation(null)} />
-        </Card>
-      </aside>
-
-      {/* 窄屏：引用抽屉 */}
-      <Drawer
-        open={sidebarCitation !== null}
-        onClose={() => setSidebarCitation(null)}
-        title="原文片段"
-        width={420}
-        placement="right"
+      {/* 右侧常驻引用面板（不再用 Drawer） */}
+      <div
+        style={{
+          width: 320,
+          minWidth: 320,
+          borderLeft: '1px solid #f0f0f0',
+          overflowY: 'auto',
+          padding: 12,
+        }}
       >
-        <CitationPanel citation={sidebarCitation} onClose={() => setSidebarCitation(null)} />
-      </Drawer>
+        <CitationPanel citation={sidebarCitation} />
+      </div>
     </div>
   )
 }
 
-// 引用内容面板（宽屏侧栏与窄屏抽屉共用）
-function CitationPanel({ citation, onClose }: { citation: Citation | null; onClose: () => void }) {
+// 引用内容面板（右侧常驻栏）
+function CitationPanel({ citation }: { citation: Citation | null }) {
   if (!citation) {
     return (
       <Empty
         image={Empty.PRESENTED_IMAGE_SIMPLE}
-        description="点击答案中的引用编号可查看原文片段"
+        description="点击答案中的引用编号查看原文片段"
         style={{ marginTop: 80 }}
       />
     )
@@ -394,9 +554,6 @@ function CitationPanel({ citation, onClose }: { citation: Citation | null; onClo
       >
         {citation.snippet}
       </div>
-      <Button type="link" size="small" style={{ paddingLeft: 0, marginTop: 8 }} onClick={onClose}>
-        关闭
-      </Button>
     </div>
   )
 }
@@ -428,7 +585,6 @@ function rehypeCitation() {
         if (last < node.value.length) newChildren.push({ type: 'text', value: node.value.slice(last) })
         if (parent && index !== null && Array.isArray(parent.children)) {
           parent.children.splice(index, 1, ...newChildren)
-          // 替换后从新增节点继续往下走，跳过刚插入的纯文本/元素
           for (let k = index; k < index + newChildren.length; k++) {
             walk(newChildren[k], parent, k)
           }
@@ -451,14 +607,14 @@ function MessageBubble({
   onOpenCitation,
   onCopy,
   onRetry,
-  onFollowUp,
+  onSuggestionClick,
   onAdopt,
 }: {
   msg: Message
   onOpenCitation: (c: Citation) => void
   onCopy: (m: Message) => void
   onRetry: (m: Message) => void
-  onFollowUp: (m: Message) => void
+  onSuggestionClick: (text: string) => void
   onAdopt: (m: Message) => void
 }) {
   if (msg.role === 'user') {
@@ -482,7 +638,6 @@ function MessageBubble({
     )
   }
 
-  // 拒答 / 出错提示（手册 M1 验收 B2）
   if (msg.refused) {
     return (
       <div style={{ display: 'flex', marginBottom: 12 }}>
@@ -520,7 +675,6 @@ function MessageBubble({
     )
   }
 
-  // 正常回答：气泡（Markdown 渲染）+ 底部操作栏（复制/重试/追问/采纳）
   const canOperate = !msg.loading && msg.done && !msg.refused && !!msg.messageId && !!msg.text
 
   return (
@@ -564,19 +718,40 @@ function MessageBubble({
           </div>
         </div>
       </div>
+
+      {/* 追问建议气泡 */}
+      {canOperate && msg.suggestions && msg.suggestions.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8, marginLeft: 4 }}>
+          {msg.suggestions.map((s, i) => (
+            <Tag
+              key={i}
+              color="blue"
+              style={{
+                cursor: 'pointer',
+                borderRadius: 16,
+                padding: '2px 12px',
+                fontSize: 13,
+                background: '#f0f5ff',
+                border: '1px solid #adc6ff',
+                color: '#0958d9',
+              }}
+              onClick={() => onSuggestionClick(s)}
+            >
+              {s}
+            </Tag>
+          ))}
+        </div>
+      )}
+
+      {/* 操作栏 */}
       {canOperate && (
-        <Space size={0} style={{ marginLeft: 4, marginTop: 2 }}>
+        <Space size={0} style={{ marginLeft: 4, marginTop: 4 }}>
           <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => onCopy(msg)}>
             复制
           </Button>
           <Button type="text" size="small" icon={<RedoOutlined />} onClick={() => onRetry(msg)}>
             重试
           </Button>
-          <Tooltip title="继续就此话题提问">
-            <Button type="text" size="small" icon={<MessageOutlined />} onClick={() => onFollowUp(msg)}>
-              追问
-            </Button>
-          </Tooltip>
           {msg.adopted ? (
             <Tooltip title="该问答对已收集为微调样本，微调时由管理员导出">
               <span>

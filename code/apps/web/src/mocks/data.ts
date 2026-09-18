@@ -250,6 +250,36 @@ export async function fetchJob(jobId: string): Promise<Job> {
   return http<Job>(`/api/jobs/${jobId}`)
 }
 
+// ---------- 会话管理（多轮对话历史） ----------
+
+export type Conversation = {
+  id: string
+  title: string
+  created_at: string
+  last_at: string | null
+}
+
+export type ConversationMessage = {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  citations: Citation[]
+  meta: { suggestions?: string[]; refused?: boolean }
+  created_at: string
+}
+
+export async function fetchConversations(): Promise<Conversation[]> {
+  return http<Conversation[]>('/api/conversations')
+}
+
+export async function fetchConversationMessages(convId: string): Promise<ConversationMessage[]> {
+  return http<ConversationMessage[]>(`/api/conversations/${convId}/messages`)
+}
+
+export async function deleteConversation(convId: string): Promise<void> {
+  return http<void>(`/api/conversations/${convId}`, { method: 'DELETE' })
+}
+
 // ---------- SSE 提问 ----------
 
 /** 采纳回答为微调样本。重复采纳返回 already_adopted=true。 */
