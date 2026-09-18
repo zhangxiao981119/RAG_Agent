@@ -44,14 +44,19 @@ async def list_kbs(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> list[KnowledgeBaseOut]:
-    # M4 任务 4：G2 库级授权过滤，只返回 user.authorized_kb_ids
-    auth_ids = user.authorized_kb_ids
-    if not auth_ids:
-        return []
-    stmt = select(KnowledgeBase).where(
-        KnowledgeBase.tenant_id == user.tenant_id,
-        KnowledgeBase.id.in_(auth_ids),
-    )
+    # admin（clearance >= 40）可看租户下全部知识库；普通用户走 G2 库级授权过滤
+    if user.clearance >= 40:
+        stmt = select(KnowledgeBase).where(
+            KnowledgeBase.tenant_id == user.tenant_id,
+        )
+    else:
+        auth_ids = user.authorized_kb_ids
+        if not auth_ids:
+            return []
+        stmt = select(KnowledgeBase).where(
+            KnowledgeBase.tenant_id == user.tenant_id,
+            KnowledgeBase.id.in_(auth_ids),
+        )
     rows = (await session.execute(stmt)).scalars().all()
     result: list[KnowledgeBaseOut] = []
     for kb in rows:
@@ -128,14 +133,46 @@ async def create_kb(
         await redis.aclose()
 
 
+@router.delete("/kbs/{kb_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_kb(
+    kb_id: uuid.UUID,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> None:
+    """删除知识库（级联删文档/chunks/members/sync_sources）。
+
+    权限：仅 admin（clearance >= 40）或库 owner 可删。
+    """
+    kb = await session.get(KnowledgeBase, kb_id)
+    if kb is None or kb.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+    if user.clearance < 40 and kb.owner_id != user.user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
+
+    settings = get_settings()
+    redis = Redis.from_url(settings.redis_url)
+    try:
+        await invalidate_tenant_acl(session, redis, user.tenant_id)
+        await session.delete(kb)
+        await session.commit()
+    finally:
+        await redis.aclose()
+
+    await audit.record(
+        user.tenant_id, user.user_id, "kb.delete",
+        object_type="kb", object_id=str(kb_id),
+        detail={"name": kb.name},
+    )
+
+
 @router.get("/kbs/{kb_id}", response_model=KnowledgeBaseDetail)
 async def get_kb(
     kb_id: uuid.UUID,
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> KnowledgeBaseDetail:
-    # M4 任务 4：G2 库级授权校验
-    if kb_id not in user.authorized_kb_ids:
+    # admin 豁免 G2 库级授权校验
+    if user.clearance < 40 and kb_id not in user.authorized_kb_ids:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
     kb = await session.get(KnowledgeBase, kb_id)
     if kb is None or kb.tenant_id != user.tenant_id:
@@ -219,8 +256,8 @@ async def list_documents(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> list[DocumentOut]:
-    # M4 任务 4：G2 库级授权校验
-    if kb_id not in user.authorized_kb_ids:
+    # admin 豁免 G2 库级授权校验
+    if user.clearance < 40 and kb_id not in user.authorized_kb_ids:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
     stmt = (
         select(Document)

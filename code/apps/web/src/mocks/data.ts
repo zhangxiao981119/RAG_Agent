@@ -179,6 +179,10 @@ export async function createKb(name: string, description: string, isPublic: bool
   })
 }
 
+export async function deleteKb(kbId: string): Promise<void> {
+  await http<void>(`/api/kbs/${kbId}`, { method: 'DELETE' })
+}
+
 // ---------- 知识库成员管理 (M4 任务 8) ----------
 
 export type KbMemberItem = {

@@ -30,8 +30,8 @@ async def _get_visible_document(
     doc = await session.get(Document, doc_id)
     if doc is None or doc.tenant_id != user.tenant_id or doc.deleted_at is not None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
-    # G2：库级授权（kb_id ∈ authorized_kb_ids）
-    if doc.kb_id not in user.authorized_kb_ids:
+    # G2：库级授权（kb_id ∈ authorized_kb_ids），admin 豁免
+    if user.clearance < 40 and doc.kb_id not in user.authorized_kb_ids:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
     # G1：密级（文档 level_rank 不得超过用户 clearance）
     if doc.level_rank > user.clearance:

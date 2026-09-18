@@ -59,10 +59,13 @@ async def chat_ask(
     session: AsyncSession = Depends(get_db),
     _: None = Depends(check_chat_rate_limit),
 ) -> StreamingResponse:
-    # 校验 kb_ids 与 user.authorized_kb_ids 求交集（手册 §3.2.7 G2：前端可能传无权限的库）
-    effective_kb_ids = [
-        kb for kb in payload.kb_ids if kb in user.authorized_kb_ids
-    ]
+    # admin 豁免 G2 库级授权校验；普通用户求交集（手册 §3.2.7 G2）
+    if user.clearance >= 40:
+        effective_kb_ids = list(payload.kb_ids)
+    else:
+        effective_kb_ids = [
+            kb for kb in payload.kb_ids if kb in user.authorized_kb_ids
+        ]
     if not effective_kb_ids:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
     kb_rows = (
