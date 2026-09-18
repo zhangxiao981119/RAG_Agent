@@ -110,6 +110,12 @@ OCR_ENABLED: Final[bool] = False
 AUDIT_RETENTION_DAYS: Final[int] = 365
 
 
+# ── 脱敏（M5 任务 2）─────────────────────────────────
+MASK_PII_ENABLED: Final[bool] = True
+"""输出层 PII 脱敏。命中手机号/身份证/银行卡的片段打码。
+MUST NOT 对 citations.snippet 打码（原文是原文）。"""
+
+
 def self_check() -> None:
     """应用启动时调用。任何一条不成立 → 抛异常，拒绝启动（fail-closed）。"""
     if not GROUNDING_CHECK_ENABLED:

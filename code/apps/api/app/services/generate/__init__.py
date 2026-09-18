@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from app.config import decisions
 from app.services.grounding import check_grounding
 from app.services.llm import LLMError, LLMTimeout, get_llm_service
+from app.services.mask import mask_pii
 from app.services.retrieve.base import RetrievedChunk
 
 logger = logging.getLogger(__name__)
@@ -234,8 +235,13 @@ class GenerationService:
         # 从正文剥离 <followups> 追问建议
         clean_text, suggestions = _extract_followups(grounding_result.text)
 
+        # 格式修复 + PII 脱敏（M5 任务 2）
+        formatted = _ensure_line_breaks(clean_text)
+        if decisions.MASK_PII_ENABLED:
+            formatted = mask_pii(formatted)
+
         return GenerationResult(
-            text=_ensure_line_breaks(clean_text),
+            text=formatted,
             raw_text=raw_text,
             stripped_sentences=grounding_result.stripped_sentences,
             refused=False,
