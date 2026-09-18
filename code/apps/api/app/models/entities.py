@@ -289,6 +289,42 @@ class AuditLog(Base):
     )
 
 
+class SyncSource(Base):
+    """M6 任务 1：知识源同步 — 配置表（§8 D-07）。
+
+    支持两种源类型：
+    - local：扫描宿主机挂载目录
+    - git：定时 git pull 后扫描工作目录
+
+    增量指纹存在 synced_files（JSONB），格式：
+    { "relative/path.md": {"mtime": float, "size": int, "doc_id": "uuid"} }
+    """
+
+    __tablename__ = "sync_sources"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    kb_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    source_type: Mapped[str] = mapped_column(Text, nullable=False)  # local | git
+    path: Mapped[str] = mapped_column(Text, nullable=False)  # 本地目录 或 Git URL
+    branch: Mapped[str | None] = mapped_column(Text)  # Git 分支，仅 git 类型
+    file_patterns: Mapped[str] = mapped_column(Text, nullable=False, server_default="*.md,*.pdf,*.txt,*.docx")
+    level_rank: Mapped[int] = mapped_column(Integer, nullable=False, server_default="20")
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")  # active | paused
+    synced_files: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_sync_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("source_type IN ('local','git')", name="ck_sync_sources_type"),
+        CheckConstraint("status IN ('active','paused')", name="ck_sync_sources_status"),
+    )
+
+
 class EvalCase(Base):
     __tablename__ = "eval_cases"
 

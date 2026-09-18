@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
-# healthcheck 需要 pgrep (procps)
-RUN apt-get update && apt-get install -y --no-install-recommends procps \
+# healthcheck 需要 pgrep (procps)；M6 知识源同步需要 git
+RUN apt-get update && apt-get install -y --no-install-recommends procps git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

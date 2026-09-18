@@ -4,6 +4,8 @@
   parse_job 入队 → 拉文件 → 解析 → 分块 → 嵌入 → 写 chunks → 更新 status
 失败重试 max_attempts 次后进死信（status=dead）。
 
+M6 任务 1：cron job 定时扫描所有 active 同步源（每 30 分钟）。
+
 启动：arq app.workers.parse_job.WorkerSettings
 """
 from __future__ import annotations
@@ -15,6 +17,7 @@ from typing import Any
 
 from arq import Retry
 from arq.connections import RedisSettings
+from arq.cron import cron
 from sqlalchemy import delete
 
 from app.config.settings import get_settings
@@ -139,9 +142,22 @@ async def run_parse_job(
                     raise Retry(defer=2 ** retry_job.attempts) from exc
 
 
+async def run_sync_all(ctx: dict[str, Any]) -> int:
+    """M6 任务 1：cron job 入口 — 扫描所有 active 同步源并增量同步。"""
+    from app.services.sync_service import sync_all_active_sources
+
+    new_count = await sync_all_active_sources()
+    logger.info("sync.cron.complete", extra={"new_count": new_count})
+    return new_count
+
+
 class WorkerSettings:
     """arq Worker 配置。"""
-    functions = [run_parse_job]
+    functions = [run_parse_job, run_sync_all]
     queue_name = get_settings().arq_queue_name
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     max_tries = get_settings().arq_max_attempts
+    # M6 任务 1：每 30 分钟扫描所有 active 同步源
+    cron_jobs = [
+        cron(run_sync_all, minute={0, 30}),
+    ]

@@ -21,6 +21,7 @@ from app.api.me import router as me_router
 from app.api.messages import router as messages_router
 from app.api.rate_limit import check_chat_rate_limit  # noqa: F401 — 限流依赖
 from app.api.roles import router as roles_router
+from app.api.sync import router as sync_router
 from app.api.users import router as users_router
 from app.config import decisions
 
@@ -119,3 +120,4 @@ app.include_router(chat_router, prefix="/api")
 app.include_router(messages_router, prefix="/api")
 app.include_router(finetune_router, prefix="/api")
 app.include_router(audit_router, prefix="/api")
+app.include_router(sync_router, prefix="/api")
