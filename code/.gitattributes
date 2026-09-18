@@ -1,0 +1,2 @@
+# Shell 脚本 MUST 使用 LF：交付到 Linux 服务器执行时，CRLF 会导致 shebang 与命令解析失败
+*.sh text eol=lf
