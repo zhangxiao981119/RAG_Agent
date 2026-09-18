@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import {
   App,
   Button,
@@ -285,18 +287,24 @@ function PreviewModal({ doc, onClose }: { doc: Document | null; onClose: () => v
     >
       <Spin spinning={loading}>
         {textContent ? (
-          <pre
-            style={{
-              margin: 0,
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-word',
-              fontFamily: 'inherit',
-              fontSize: 13,
-              lineHeight: 1.7,
-            }}
-          >
-            {textContent}
-          </pre>
+          doc?.ext === 'md' ? (
+            <div className="md-body" style={{ fontSize: 13 }}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{textContent}</ReactMarkdown>
+            </div>
+          ) : (
+            <pre
+              style={{
+                margin: 0,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                fontFamily: 'inherit',
+                fontSize: 13,
+                lineHeight: 1.7,
+              }}
+            >
+              {textContent}
+            </pre>
+          )
         ) : (
           !loading && <Empty description="暂无内容" />
         )}

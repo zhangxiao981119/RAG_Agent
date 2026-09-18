@@ -22,6 +22,7 @@ import {
   DeleteOutlined,
   LikeOutlined,
   MessageOutlined,
+  PlusOutlined,
   RedoOutlined,
   SendOutlined,
   StopOutlined,
@@ -349,12 +350,14 @@ export function ChatPage({ currentUser }: Props) {
     setTimeout(() => inputRef.current?.focus(), 300)
   }
 
-  /** 通用追问：把该回答对应的原问题填入输入框 + 设置灰色展示行。 */
+  /** 通用追问：把该回答对应的原问题填入输入框 + 灰色行展示 AI 回答摘要。 */
   function handleFollowUp(msg: Message) {
     const q = findQuestionOf(msg.id)
     if (!q) return
     setInput(q)
-    setFollowUpContext({ question: q, assistantText: msg.text.slice(0, 60) })
+    // 灰色行展示 AI 回答摘要（让用户感知"是在追问这条回答"）
+    const summary = msg.text.replace(/\s+/g, ' ').trim().slice(0, 80)
+    setFollowUpContext({ question: q, assistantText: summary })
     inputAreaRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     setTimeout(() => inputRef.current?.focus(), 300)
   }
@@ -508,7 +511,7 @@ export function ChatPage({ currentUser }: Props) {
                 fontSize: 13,
               }}
             >
-              <span style={{ color: '#bfbfbf', flexShrink: 0 }}>追问中</span>
+              <span style={{ color: '#bfbfbf', flexShrink: 0 }}>追问这条回答</span>
               <span
                 style={{
                   color: '#8c8c8c',
@@ -517,9 +520,9 @@ export function ChatPage({ currentUser }: Props) {
                   whiteSpace: 'nowrap',
                   flex: 1,
                 }}
-                title={followUpContext.question}
+                title={followUpContext.assistantText}
               >
-                {followUpContext.question}
+                {followUpContext.assistantText}
               </span>
               <Button
                 type="text"
