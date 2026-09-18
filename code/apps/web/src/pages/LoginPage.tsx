@@ -134,7 +134,7 @@ export function LoginPage({ onLogin }: Props) {
 
         <Form<LoginFormValues>
           layout="vertical"
-          initialValues={{ username: 'admin', password: 'ChangeMe123!' }}
+          initialValues={{ username: '', password: '' }}
           onFinish={handleSubmit}
           requiredMark={false}
         >

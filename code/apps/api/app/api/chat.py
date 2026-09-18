@@ -23,6 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
+from app.api.rate_limit import check_chat_rate_limit
 from app.config import decisions
 from app.database import SessionLocal
 from app.models import Conversation, KnowledgeBase, Message, User
@@ -56,6 +57,7 @@ async def chat_ask(
     payload: ChatAskRequest,
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
+    _: None = Depends(check_chat_rate_limit),
 ) -> StreamingResponse:
     # 校验 kb_ids 与 user.authorized_kb_ids 求交集（手册 §3.2.7 G2：前端可能传无权限的库）
     effective_kb_ids = [
@@ -103,6 +105,9 @@ async def chat_ask(
     message_id = uuid.uuid4()
 
     async def event_stream() -> AsyncIterator[str]:
+        import time as _time
+        _t0 = _time.monotonic()
+
         # meta 事件
         yield _sse("meta", {
             "conversation_id": str(conversation_id),
@@ -111,6 +116,7 @@ async def chat_ask(
         })
 
         # 检索
+        _t_retrieve = _time.monotonic()
         async with SessionLocal() as retrieve_session:
             retrieval = get_retrieval_service()
             try:
@@ -131,6 +137,14 @@ async def chat_ask(
                 return
 
         yield _sse("stage", {"stage": "retrieving", "ms": result.stage_ms.get("retrieving", 0)})
+
+        _retrieve_ms = int((_time.monotonic() - _t_retrieve) * 1000)
+        logger.info("chat.retrieve", extra={
+            "user_id": str(user.user_id),
+            "retrieve_ms": _retrieve_ms,
+            "chunks_found": len(result.chunks),
+            "refused": result.refused,
+        })
 
         if result.refused:
             yield _sse("refused", {
@@ -154,6 +168,16 @@ async def chat_ask(
                     "refused": True,
                 },
             )
+            _total_ms = int((_time.monotonic() - _t0) * 1000)
+            logger.info("chat.ask.complete", extra={
+                "user_id": str(user.user_id),
+                "total_ms": _total_ms,
+                "retrieve_ms": _retrieve_ms,
+                "refused": True,
+                "refuse_reason": result.refuse_reason,
+                "chunks_count": 0,
+                "conversation_id": str(conversation_id),
+            })
             return
 
         # citations（MUST 在 delta 之前）
@@ -242,6 +266,17 @@ async def chat_ask(
                     "grounding_stripped": gen_result.stripped_sentences,
                 },
             )
+            _total_ms = int((_time.monotonic() - _t0) * 1000)
+            logger.info("chat.ask.complete", extra={
+                "user_id": str(user.user_id),
+                "total_ms": _total_ms,
+                "retrieve_ms": _retrieve_ms,
+                "refused": True,
+                "refuse_reason": reason,
+                "chunks_count": len(result.chunks),
+                "grounding_stripped": gen_result.stripped_sentences,
+                "conversation_id": str(conversation_id),
+            })
             return
 
         # 模拟流式推送最终文本
@@ -254,6 +289,21 @@ async def chat_ask(
             "grounding": {"stripped_sentences": gen_result.stripped_sentences},
             "usage": gen_result.usage,
             "suggestions": gen_result.suggestions,
+        })
+
+        # M6 可观测：记录端到端指标
+        _total_ms = int((_time.monotonic() - _t0) * 1000)
+        logger.info("chat.ask.complete", extra={
+            "user_id": str(user.user_id),
+            "total_ms": _total_ms,
+            "retrieve_ms": _retrieve_ms,
+            "refused": False,
+            "refuse_reason": None,
+            "chunks_count": len(result.chunks),
+            "grounding_stripped": gen_result.stripped_sentences,
+            "prompt_tokens": gen_result.usage.get("prompt_tokens", 0),
+            "completion_tokens": gen_result.usage.get("completion_tokens", 0),
+            "conversation_id": str(conversation_id),
         })
 
         # 持久化
