@@ -411,14 +411,15 @@ function rehypeCitation() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (tree: any) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    visit(tree, 'text', (node: any, index: number | null, parent: any) => {
+    const replacements: Array<{ parent: any; index: number; children: any[] }> = []
+    visit(tree, 'text', (node, index, parent) => {
       if (!parent || index === null || !/\[\d+\]/.test(node.value)) return
-      const children = []
+      const newChildren: any[] = []
       let last = 0
       for (const m of node.value.matchAll(/\[(\d+)\]/g)) {
         const i = m.index ?? 0
-        if (i > last) children.push({ type: 'text', value: node.value.slice(last, i) })
-        children.push({
+        if (i > last) newChildren.push({ type: 'text', value: node.value.slice(last, i) })
+        newChildren.push({
           type: 'element',
           tagName: 'sup',
           properties: { className: ['cite-ref'], dataCite: m[1] },
@@ -426,11 +427,14 @@ function rehypeCitation() {
         })
         last = i + m[0].length
       }
-      if (last < node.value.length) children.push({ type: 'text', value: node.value.slice(last) })
-      parent.children.splice(index, 1, ...children)
-      // 返回新位置，跳过刚插入的节点（纯文本/元素，无需再次处理）
-      return index + children.length
+      if (last < node.value.length) newChildren.push({ type: 'text', value: node.value.slice(last) })
+      replacements.push({ parent, index, children: newChildren })
     })
+    // 逆序替换，避免索引偏移
+    for (let i = replacements.length - 1; i >= 0; i--) {
+      const { parent, index, children } = replacements[i]
+      parent.children.splice(index, 1, ...children)
+    }
   }
 }
 
