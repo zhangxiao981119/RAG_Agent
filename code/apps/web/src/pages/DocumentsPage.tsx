@@ -229,7 +229,7 @@ export function DocumentsPage() {
         <p className="ant-upload-hint">支持 PDF / Markdown / TXT / XLS / XLSX / DOCX，单文件不超过 100 MB</p>
       </Dragger>
 
-      <Card variant="borderless" styles={{ body: { padding: 0 } }}>
+      <Card variant="borderless" styles={{ body: { padding: 16 } }}>
         <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
           <Input.Search
             placeholder="按文件名搜索"

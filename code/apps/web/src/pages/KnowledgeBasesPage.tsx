@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { App, Button, Card, Checkbox, Col, Empty, Input, Modal, Row, Select, Space, Spin, Tag, Typography } from 'antd'
-import { PlusOutlined, TeamOutlined, MinusCircleOutlined } from '@ant-design/icons'
+import { App, Button, Card, Checkbox, Col, Empty, Input, Modal, Popconfirm, Row, Select, Space, Spin, Tag, Typography } from 'antd'
+import { PlusOutlined, TeamOutlined, MinusCircleOutlined, DeleteOutlined } from '@ant-design/icons'
 
 import {
   createKb,
+  deleteKb,
   fetchKbs,
   fetchKbMembers,
   fetchUsers,
@@ -82,6 +83,16 @@ export function KnowledgeBasesPage() {
     return kb.name.toLowerCase().includes(q)
   })
 
+  const handleDelete = async (kb: KnowledgeBase) => {
+    try {
+      await deleteKb(kb.id)
+      message.success(`知识库「${kb.name}」已删除`)
+      fetchKbs().then(setKbs).catch(() => {})
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e))
+    }
+  }
+
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20, gap: 12, flexWrap: 'wrap' }}>
@@ -149,6 +160,26 @@ export function KnowledgeBasesPage() {
                           成员
                         </Button>
                       )}
+                      <Popconfirm
+                        title="删除知识库"
+                        description={`确定删除「${kb.name}」及其全部文档？此操作不可恢复。`}
+                        onConfirm={(e) => {
+                          e?.preventDefault()
+                          handleDelete(kb)
+                        }}
+                        onCancel={(e) => e?.preventDefault()}
+                        okText="删除"
+                        cancelText="取消"
+                        okButtonProps={{ danger: true }}
+                      >
+                        <Button
+                          size="small"
+                          type="text"
+                          danger
+                          icon={<DeleteOutlined />}
+                          onClick={(e) => e.preventDefault()}
+                        />
+                      </Popconfirm>
                     </Space>
                   }
                 >
@@ -373,9 +404,11 @@ function MemberModal({
               添加
             </Button>
           </Space>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            提示：user/group 保存其 UUID，dept 保存规整路径，role 保存角色名，均由选择自动填入
-          </Text>
+          <div style={{ marginTop: 8 }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              提示：user/group 保存其 UUID，dept 保存规整路径，role 保存角色名，均由选择自动填入
+            </Text>
+          </div>
         </Card>
 
         {/* 当前成员列表 */}
