@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { visit } from 'unist-util-visit'
 import {
   Alert,
   App,
@@ -405,36 +404,44 @@ function CitationPanel({ citation, onClose }: { citation: Citation | null; onClo
 // ─────────────────────────────────────────────────────────────
 // rehype 插件：把 markdown 文本节点里的 [n] 引用标号替换为 sup.cite-ref 元素，
 // 由下方 ReactMarkdown components.sup 接管渲染（点击打开引用）。
+// 手写递归遍历，避开 unist-util-visit 类型签名反复卡壳。
 // ─────────────────────────────────────────────────────────────
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function rehypeCitation() {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (tree: any) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const replacements: Array<{ parent: any; index: number; children: any[] }> = []
-    visit(tree, 'text', (node, index, parent) => {
-      if (!parent || index === null || typeof index !== 'number' || !/\[\d+\]/.test(node.value)) return
-      const newChildren: any[] = []
-      let last = 0
-      for (const m of node.value.matchAll(/\[(\d+)\]/g)) {
-        const i = m.index ?? 0
-        if (i > last) newChildren.push({ type: 'text', value: node.value.slice(last, i) })
-        newChildren.push({
-          type: 'element',
-          tagName: 'sup',
-          properties: { className: ['cite-ref'], dataCite: m[1] },
-          children: [{ type: 'text', value: m[1] }],
-        })
-        last = i + m[0].length
+    const walk = (node: any, parent: any, index: number | null) => {
+      if (!node || typeof node !== 'object') return
+      if (node.type === 'text' && typeof node.value === 'string' && /\[\d+\]/.test(node.value)) {
+        const newChildren: any[] = []
+        let last = 0
+        for (const m of node.value.matchAll(/\[(\d+)\]/g)) {
+          const i = m.index ?? 0
+          if (i > last) newChildren.push({ type: 'text', value: node.value.slice(last, i) })
+          newChildren.push({
+            type: 'element',
+            tagName: 'sup',
+            properties: { className: ['cite-ref'], dataCite: m[1] },
+            children: [{ type: 'text', value: m[1] }],
+          })
+          last = i + m[0].length
+        }
+        if (last < node.value.length) newChildren.push({ type: 'text', value: node.value.slice(last) })
+        if (parent && index !== null && Array.isArray(parent.children)) {
+          parent.children.splice(index, 1, ...newChildren)
+          // 替换后从新增节点继续往下走，跳过刚插入的纯文本/元素
+          for (let k = index; k < index + newChildren.length; k++) {
+            walk(newChildren[k], parent, k)
+          }
+          return
+        }
       }
-      if (last < node.value.length) newChildren.push({ type: 'text', value: node.value.slice(last) })
-      replacements.push({ parent, index, children: newChildren })
-    })
-    // 逆序替换，避免索引偏移
-    for (let i = replacements.length - 1; i >= 0; i--) {
-      const { parent, index, children } = replacements[i]
-      parent.children.splice(index, 1, ...children)
+      if (Array.isArray(node.children)) {
+        for (let i = 0; i < node.children.length; i++) {
+          walk(node.children[i], node, i)
+        }
+      }
     }
+    walk(tree, null, null)
   }
 }
 
