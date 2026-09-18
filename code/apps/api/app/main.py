@@ -11,6 +11,8 @@ from app.api.audit import router as audit_router
 from app.api.chat import router as chat_router
 from app.api.departments import router as departments_router
 from app.api.documents import router as documents_router
+from app.api.eval import router as eval_router
+from app.api.feature_flags import router as feature_flags_router
 from app.api.finetune import router as finetune_router
 from app.api.groups import router as groups_router
 from app.api.health import router as health_router
@@ -18,8 +20,10 @@ from app.api.jobs import router as jobs_router
 from app.api.kbs import router as kbs_router
 from app.api.me import router as me_router
 from app.api.messages import router as messages_router
+from app.api.quota import router as quota_router
 from app.api.rate_limit import check_chat_rate_limit  # noqa: F401 — 限流依赖
 from app.api.roles import router as roles_router
+from app.api.sensitive_words import router as sensitive_words_router
 from app.api.sync import router as sync_router
 from app.api.users import router as users_router
 from app.config import decisions
@@ -103,3 +107,8 @@ app.include_router(messages_router, prefix="/api")
 app.include_router(finetune_router, prefix="/api")
 app.include_router(audit_router, prefix="/api")
 app.include_router(sync_router, prefix="/api")
+app.include_router(eval_router, prefix="/api")
+# ── M6 续篇：配额 / 敏感词 / 灰度开关 ─────────────────────
+app.include_router(quota_router, prefix="/api")
+app.include_router(sensitive_words_router, prefix="/api")
+app.include_router(feature_flags_router, prefix="/api")

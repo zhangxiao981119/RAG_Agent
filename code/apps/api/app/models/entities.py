@@ -361,6 +361,75 @@ class FinetuneSample(Base):
     __table_args__ = (Index("idx_ft_tenant_exported", "tenant_id", "exported_at"),)
 
 
+# ── M6 续篇：配额 / 敏感词 / 灰度开关 ───────────────────────────
+
+
+class TenantQuota(Base):
+    """租户级配额（一租户一行）。M6 续篇 — 单/租户双层 token 限额。
+
+    表无记录时 chat.py / services/quota.py 走 settings 默认值。
+    """
+
+    __tablename__ = "tenant_quotas"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False, unique=True)
+    # 每日 token 上限（输入+输出合计）
+    daily_token_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 每日问答次数上限
+    daily_message_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 月度全局 token 上限（防止单租户刷爆整月预算）
+    monthly_token_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SensitiveWord(Base):
+    """敏感词表（admin 管理，命中即拒答）。
+
+    word 小写存储；匹配时先对输入做 NFKC 归一化 + 去零宽 + 小写。
+    """
+
+    __tablename__ = "sensitive_words"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    word: Mapped[str] = mapped_column(Text, nullable=False)
+    # 分类：政治/广告/违法/辱骂，仅展示用
+    category: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "word", name="uq_sensitive_tenant_word"),
+        Index("idx_sensitive_tenant_word", "tenant_id", "word"),
+    )
+
+
+class FeatureFlag(Base):
+    """特性开关（按部门灰度，关闭即回滚功能）。
+
+    dept_path_pattern 支持 SQL LIKE：'公司/研发中心/%'、'%' 表示全量。
+    rollout_percent 命中部门内再按 user_id hash 取模放量（0-100）。
+    """
+
+    __tablename__ = "feature_flags"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    feature_key: Mapped[str] = mapped_column(Text, nullable=False)
+    dept_path_pattern: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    rollout_percent: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("100"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "feature_key", "dept_path_pattern", name="uq_feature_flags_tenant_key_pattern"),
+        Index("idx_feature_flags_tenant_key", "tenant_id", "feature_key", "enabled"),
+    )
+
+
 # ─────────────────────────────────────────────────────────────
 # M4 任务 3：acl_tags 写库断言（模型层 event listener，不可绕过）
 #

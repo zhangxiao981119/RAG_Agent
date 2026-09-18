@@ -110,10 +110,31 @@ OCR_ENABLED: Final[bool] = False
 AUDIT_RETENTION_DAYS: Final[int] = 365
 
 
-# ── 脱敏（M5 任务 2）─────────────────────────────────
+# ── 脱敏（M5 任务 2）──────────────────────────────────
 MASK_PII_ENABLED: Final[bool] = True
 """输出层 PII 脱敏。命中手机号/身份证/银行卡的片段打码。
 MUST NOT 对 citations.snippet 打码（原文是原文）。"""
+
+
+# ── 配额管理（M6 续篇 — 手册第 14 步）──────────────────
+QUOTA_SOFT_THRESHOLD: Final[float] = 0.9
+"""达到配额 90% 时触发四级降级：按用户画像→历史→压缩→检索片段 顺序裁剪，
+绝不丢当前轮的检索片段（手册第 14 步硬性要求）。"""
+
+QUOTA_TOKEN_ESTIMATE_CHARS_PER_TOKEN: Final[int] = 2
+"""token 估算系数：len(text) // 2 ≈ token 数（中文保守估计）。"""
+
+QUOTA_FEATURE_KEY: Final[str] = "quota"
+"""配额管理的 feature flag key，关闭即跳过配额检查。"""
+
+
+# ── 敏感词过滤（M6 续篇）──────────────────────────────
+SENSITIVE_FILTER_ENABLED: Final[bool] = True
+"""输入侧 + 输出侧双向命中检测。命中即拒答（走 refused 事件）。
+★ 与 PII 脱敏职责不同：PII 是隐私数据打码（保留语义），敏感词是政策性禁用词（直接拒答）。"""
+
+SENSITIVE_FEATURE_KEY: Final[str] = "sensitive_filter"
+"""敏感词过滤的 feature flag key，关闭即放行。"""
 
 
 def self_check() -> None:

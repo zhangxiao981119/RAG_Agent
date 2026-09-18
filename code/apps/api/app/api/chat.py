@@ -29,6 +29,9 @@ from app.database import SessionLocal
 from app.models import Conversation, KnowledgeBase, Message, User
 from app.schemas.chat import ChatAskRequest
 from app.services import audit
+from app.services import feature_flag as flag_service
+from app.services import quota as quota_service
+from app.services import sensitive as sensitive_service
 from app.services.generate import get_generation_service
 from app.services.memory import build_memory_prompt, compress_history, extract_facts
 from app.services.retrieve import get_retrieval_service
@@ -78,6 +81,37 @@ async def chat_ask(
     ).scalars().all()
     if len(kb_rows) != len(effective_kb_ids):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="部分知识库不存在")
+
+    # ── M6 续篇：敏感词输入侧检查（feature flag 守护）─────────
+    # 命中即拒答（走 refused 事件，不留替换痕迹）
+    # 检查放在会话/消息创建之前，避免污染历史
+    sensitive_enabled = await flag_service.is_enabled(
+        user.tenant_id, decisions.SENSITIVE_FEATURE_KEY, user.dept_path, user.user_id,
+    ) if decisions.SENSITIVE_FILTER_ENABLED else False
+    if sensitive_enabled:
+        hit, word = await sensitive_service.check_input(payload.question, user.tenant_id)
+        if hit:
+            # 不创建会话/消息，直接返回 refused 流
+            async def _sensitive_refused_stream() -> AsyncIterator[str]:
+                yield _sse("meta", {
+                    "conversation_id": None,
+                    "message_id": None,
+                    "stage": "blocked",
+                })
+                yield _sse("refused", {
+                    "reason": "SENSITIVE_INPUT",
+                    "message": "问题包含敏感词，已被拦截",
+                })
+                await audit.record(
+                    user.tenant_id, user.user_id, "chat.sensitive.block",
+                    object_type="conversation", object_id=None,
+                    detail={"word": word, "side": "input"},
+                )
+            return StreamingResponse(
+                _sensitive_refused_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
 
     # 复用或创建 conversation
     conversation_id = payload.conversation_id
@@ -181,6 +215,18 @@ async def chat_ask(
                 "chunks_count": 0,
                 "conversation_id": str(conversation_id),
             })
+            # M6 可观测：指标持久化（供 P95 聚合查询）
+            await audit.record(
+                user.tenant_id, user.user_id, "chat.ask.metric",
+                object_type="conversation", object_id=str(conversation_id),
+                detail={
+                    "total_ms": _total_ms,
+                    "retrieve_ms": _retrieve_ms,
+                    "refused": True,
+                    "refuse_reason": result.refuse_reason,
+                    "chunks_count": 0,
+                },
+            )
             return
 
         # citations（MUST 在 delta 之前）
@@ -242,12 +288,62 @@ async def chat_ask(
             if u and u.memory:
                 user_memory = u.memory or {}
 
-        # 4. 生成（注入画像 + 压缩后的历史）
+        # ── M6 续篇：配额检查 + 四级降级（feature flag 守护）─────
+        # feature flag 关闭 → 跳过配额检查，用原 history/memory
+        # feature flag 开启 → 调 check_and_degrade 返回裁剪方案
+        # 软阈值 90% 触发降级，硬超限直接 refused
+        memory_prompt = build_memory_prompt(user_memory)
+        degraded_from = "none"
+        effective_chunks = result.chunks
+        quota_enabled = await flag_service.is_enabled(
+            user.tenant_id, decisions.QUOTA_FEATURE_KEY, user.dept_path, user.user_id,
+        )
+        if quota_enabled:
+            plan = await quota_service.check_and_degrade(
+                user.tenant_id, user.user_id,
+                payload.question, history, memory_prompt, result.chunks,
+            )
+            if plan.refused:
+                yield _sse("refused", {
+                    "reason": plan.refuse_reason,
+                    "message": "今日配额已用尽，请明日再试",
+                })
+                await _persist_assistant(
+                    conversation_id, user, message_id,
+                    text="", refused=True, citations=citations_payload,
+                    meta={
+                        "stage_ms": result.stage_ms,
+                        "refused": True,
+                        "reason": plan.refuse_reason,
+                    },
+                )
+                await audit.record(
+                    user.tenant_id, user.user_id, "chat.quota.exceeded",
+                    object_type="conversation", object_id=str(conversation_id),
+                    detail={"reason": plan.refuse_reason},
+                )
+                return
+            # 用降级方案替换原参数
+            history = plan.history
+            memory_prompt = plan.memory_prompt
+            effective_chunks = plan.chunks
+            degraded_from = plan.degraded_from
+            if degraded_from != "none":
+                logger.info("chat.quota.degraded", extra={
+                    "user_id": str(user.user_id),
+                    "level": degraded_from,
+                    "history_kept": len(history),
+                    "chunks_kept": len(effective_chunks),
+                })
+
+        # 4. 生成（注入画像 + 压缩后的历史 + 可能裁剪后的 chunks）
+        #    传 tenant_id 用于输出侧敏感词检查（generate 内部检查）
         generation = get_generation_service()
         gen_result = await generation.generate(
-            payload.question, result.chunks,
+            payload.question, effective_chunks,
             history=history,
-            memory_prompt=build_memory_prompt(user_memory),
+            memory_prompt=memory_prompt,
+            tenant_id=user.tenant_id,
         )
 
         if gen_result.refused:
@@ -257,6 +353,7 @@ async def chat_ask(
                 "UNGROUNDED": "知识库中未找到相关内容",
                 "LLM_TIMEOUT": "响应较慢，请重试",
                 "LLM_ERROR": "生成服务异常，请稍后重试",
+                "SENSITIVE_OUTPUT": "回答内容包含敏感词，已被拦截",
             }.get(reason, "知识库中未找到相关内容")
             yield _sse("refused", {"reason": reason, "message": user_message})
             await _persist_assistant(
@@ -280,6 +377,19 @@ async def chat_ask(
                 "grounding_stripped": gen_result.stripped_sentences,
                 "conversation_id": str(conversation_id),
             })
+            # M6 可观测：指标持久化
+            await audit.record(
+                user.tenant_id, user.user_id, "chat.ask.metric",
+                object_type="conversation", object_id=str(conversation_id),
+                detail={
+                    "total_ms": _total_ms,
+                    "retrieve_ms": _retrieve_ms,
+                    "refused": True,
+                    "refuse_reason": reason,
+                    "chunks_count": len(result.chunks),
+                    "grounding_stripped": gen_result.stripped_sentences,
+                },
+            )
             return
 
         # 模拟流式推送最终文本
@@ -308,6 +418,28 @@ async def chat_ask(
             "completion_tokens": gen_result.usage.get("completion_tokens", 0),
             "conversation_id": str(conversation_id),
         })
+        # M6 可观测：指标持久化（供 P95 聚合查询）
+        await audit.record(
+            user.tenant_id, user.user_id, "chat.ask.metric",
+            object_type="conversation", object_id=str(conversation_id),
+            detail={
+                "total_ms": _total_ms,
+                "retrieve_ms": _retrieve_ms,
+                "refused": False,
+                "refuse_reason": None,
+                "chunks_count": len(result.chunks),
+                "grounding_stripped": gen_result.stripped_sentences,
+                "prompt_tokens": gen_result.usage.get("prompt_tokens", 0),
+                "completion_tokens": gen_result.usage.get("completion_tokens", 0),
+            },
+        )
+
+        # ── M6 续篇：配额用量上报（Redis 计数器累加）─────────
+        # Redis 不可用不影响主流程（audit_logs 已写入 metric，SQL 兜底可查）
+        await quota_service._incr_usage(
+            user.tenant_id, user.user_id,
+            tokens=gen_result.usage.get("prompt_tokens", 0) + gen_result.usage.get("completion_tokens", 0),
+        )
 
         # 持久化
         await _persist_assistant(
@@ -318,6 +450,7 @@ async def chat_ask(
                 "grounding_stripped": gen_result.stripped_sentences,
                 "usage": gen_result.usage,
                 "suggestions": gen_result.suggestions,
+                "quota_degraded_from": degraded_from,
             },
         )
 

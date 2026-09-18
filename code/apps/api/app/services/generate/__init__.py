@@ -168,6 +168,7 @@ class GenerationService:
         chunks: list[RetrievedChunk],
         history: list[dict] | None = None,
         memory_prompt: str = "",
+        tenant_id: uuid.UUID | None = None,
     ) -> GenerationResult:
         # 构造引用映射
         valid_ns: set[int] = set()
@@ -241,6 +242,26 @@ class GenerationService:
 
         # 格式修复 + PII 脱敏（M5 任务 2）
         formatted = _ensure_line_breaks(clean_text)
+
+        # ── M6 续篇：输出侧敏感词检查（feature flag 守护）─────
+        # 命中即拒答（refused=True, refuse_reason="SENSITIVE_OUTPUT"）
+        # 与 PII 脱敏职责不同：PII 是隐私数据打码（保留语义），
+        # 敏感词是政策性禁用词，直接拒答，不留替换痕迹
+        if decisions.SENSITIVE_FILTER_ENABLED and tenant_id is not None:
+            # lazy import 避免 services/generate → services/sensitive 的潜在循环
+            from app.services.sensitive import check_output
+            hit, word = await check_output(formatted, tenant_id)
+            if hit:
+                logger.warning("SENSITIVE_OUTPUT hit: word=%s", word)
+                return GenerationResult(
+                    text="",
+                    raw_text=raw_text,
+                    stripped_sentences=grounding_result.stripped_sentences,
+                    refused=True,
+                    refuse_reason="SENSITIVE_OUTPUT",
+                    citations=citations,
+                )
+
         if decisions.MASK_PII_ENABLED:
             formatted = mask_pii(formatted)
 

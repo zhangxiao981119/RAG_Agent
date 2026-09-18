@@ -555,6 +555,53 @@ export async function fetchAuditLogs(
   return http<AuditLogPage>(`/api/admin/audit-logs?${params.toString()}`)
 }
 
+// ---------- 系统监控 (M6 可观测) ----------
+
+export type MetricSummary = {
+  window: string
+  total_requests: number
+  refused_count: number
+  refused_rate: number
+  total_p50: number
+  total_p95: number
+  total_p99: number
+  total_avg: number
+  retrieve_p50: number
+  retrieve_p95: number
+  retrieve_p99: number
+  retrieve_avg: number
+}
+
+export async function fetchMetrics(hours = 24): Promise<MetricSummary> {
+  return http<MetricSummary>(`/api/admin/metrics?hours=${hours}`)
+}
+
+// ---------- 评估门禁 (M6 G5) ----------
+
+export type EvalCaseResult = {
+  question: string
+  expected_answerable: boolean
+  actual_refused: boolean
+  passed: boolean
+  chunks_count: number
+  refuse_reason: string | null
+  elapsed_ms: number
+}
+
+export type EvalReport = {
+  total: number
+  passed: number
+  failed: number
+  answer_accuracy: number
+  refuse_accuracy: number
+  total_seconds: number
+  cases: EvalCaseResult[]
+}
+
+export async function runEval(): Promise<EvalReport> {
+  return http<EvalReport>('/api/admin/eval/run', { method: 'POST' })
+}
+
 /** 分页拉取用户（含 dept_path）。page 从 1 开始。 */
 export async function fetchUsers(page = 1, pageSize = 20): Promise<UserPage> {
   return http<UserPage>(`/api/users?page=${page}&page_size=${pageSize}`)
@@ -717,4 +764,160 @@ export async function updateRole(
 /** 删除角色（从所有 user.role_names 移除）。返回受影响用户数。 */
 export async function deleteRole(id: string): Promise<{ deleted: boolean; affected_users: number }> {
   return http(`/api/roles/${id}`, { method: 'DELETE' })
+}
+
+// ---------- M6 续篇：配额管理 API ----------
+
+export type TenantQuota = {
+  tenant_id: string
+  daily_token_limit: number
+  daily_message_limit: number
+  monthly_token_limit: number
+  updated_at: string
+}
+
+export type QuotaUsage = {
+  user_id: string
+  user_tokens_today: number
+  user_messages_today: number
+  tenant_tokens_today: number
+  tenant_tokens_this_month: number
+  user_daily_token_limit: number
+  user_daily_message_limit: number
+  tenant_daily_token_limit: number
+  tenant_monthly_token_limit: number
+}
+
+/** 查当前租户配额。 */
+export async function fetchQuota(): Promise<TenantQuota> {
+  return http<TenantQuota>('/api/admin/quota')
+}
+
+/** 修改租户配额。 */
+export async function updateQuota(payload: {
+  daily_token_limit: number
+  daily_message_limit: number
+  monthly_token_limit: number
+}): Promise<TenantQuota> {
+  return http<TenantQuota>('/api/admin/quota', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+/** 查当前用户今日用量（普通用户可查自己的）。 */
+export async function fetchQuotaUsage(): Promise<QuotaUsage> {
+  return http<QuotaUsage>('/api/admin/quota/usage')
+}
+
+// ---------- M6 续篇：敏感词管理 API ----------
+
+export type SensitiveWord = {
+  id: string
+  word: string
+  category: string | null
+  created_by: string | null
+  created_at: string
+}
+
+export type SensitiveBatchResult = {
+  added: number
+  duplicates_skipped: number
+}
+
+/** 列出敏感词（分页 + 模糊搜）。 */
+export async function fetchSensitiveWords(
+  page = 1,
+  pageSize = 50,
+  keyword?: string,
+  category?: string,
+): Promise<SensitiveWord[]> {
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
+  if (keyword) params.set('keyword', keyword)
+  if (category) params.set('category', category)
+  return http<SensitiveWord[]>(`/api/admin/sensitive-words?${params.toString()}`)
+}
+
+/** 新增单个敏感词。 */
+export async function createSensitiveWord(
+  word: string,
+  category?: string | null,
+): Promise<SensitiveWord> {
+  return http<SensitiveWord>('/api/admin/sensitive-words', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ word, category: category ?? null }),
+  })
+}
+
+/** 批量新增敏感词（支持传入多行或逗号分隔的整段文本）。 */
+export async function batchCreateSensitiveWords(
+  words: string[],
+  category?: string | null,
+): Promise<SensitiveBatchResult> {
+  return http<SensitiveBatchResult>('/api/admin/sensitive-words/batch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ words, category: category ?? null }),
+  })
+}
+
+/** 删除单条敏感词。 */
+export async function deleteSensitiveWord(id: string): Promise<void> {
+  await http(`/api/admin/sensitive-words/${id}`, { method: 'DELETE' })
+}
+
+// ---------- M6 续篇：灰度开关管理 API ----------
+
+export type FeatureFlag = {
+  id: string
+  tenant_id: string
+  feature_key: string
+  dept_path_pattern: string
+  enabled: boolean
+  rollout_percent: number
+  created_at: string
+  updated_at: string
+}
+
+/** 列出特性开关（可按 feature_key 过滤）。 */
+export async function fetchFeatureFlags(featureKey?: string): Promise<FeatureFlag[]> {
+  const params = featureKey ? `?feature_key=${encodeURIComponent(featureKey)}` : ''
+  return http<FeatureFlag[]>(`/api/admin/feature-flags${params}`)
+}
+
+/** 新增特性开关规则。 */
+export async function createFeatureFlag(payload: {
+  feature_key: string
+  dept_path_pattern: string
+  enabled?: boolean
+  rollout_percent?: number
+}): Promise<FeatureFlag> {
+  return http<FeatureFlag>('/api/admin/feature-flags', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+/** 修改特性开关（仅传变更字段）。 */
+export async function updateFeatureFlag(
+  id: string,
+  payload: {
+    enabled?: boolean
+    rollout_percent?: number
+    dept_path_pattern?: string
+  },
+): Promise<FeatureFlag> {
+  return http<FeatureFlag>(`/api/admin/feature-flags/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+/** 删除特性开关。 */
+export async function deleteFeatureFlag(id: string): Promise<void> {
+  await http(`/api/admin/feature-flags/${id}`, { method: 'DELETE' })
 }
