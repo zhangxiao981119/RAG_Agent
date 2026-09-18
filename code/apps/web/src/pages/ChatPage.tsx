@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import visit from 'unist-util-visit'
+import { visit } from 'unist-util-visit'
 import {
   Alert,
   App,
@@ -411,8 +411,8 @@ function rehypeCitation() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (tree: any) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    visit(tree, 'text', (node: any, index: number, parent: any) => {
-      if (!parent || !/\[\d+\]/.test(node.value)) return
+    visit(tree, 'text', (node: any, index: number | null, parent: any) => {
+      if (!parent || index === null || !/\[\d+\]/.test(node.value)) return
       const children = []
       let last = 0
       for (const m of node.value.matchAll(/\[(\d+)\]/g)) {
@@ -428,6 +428,8 @@ function rehypeCitation() {
       }
       if (last < node.value.length) children.push({ type: 'text', value: node.value.slice(last) })
       parent.children.splice(index, 1, ...children)
+      // 返回新位置，跳过刚插入的节点（纯文本/元素，无需再次处理）
+      return index + children.length
     })
   }
 }
@@ -524,30 +526,31 @@ function MessageBubble({
             color: 'rgba(0,0,0,0.85)',
           }}
         >
-          <ReactMarkdown
-            className="md-body"
-            remarkPlugins={[remarkGfm]}
-            rehypePlugins={[rehypeCitation]}
-            components={{
-              sup: ({ node, children }) => {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const n = Number((node as any)?.properties?.dataCite ?? 0)
-                const citation = msg.citations?.find((c) => c.n === n)
-                if (!citation) return <sup>{children}</sup>
-                return (
-                  <sup
-                    className="cite-ref"
-                    title={citation.filename}
-                    onClick={() => onOpenCitation(citation)}
-                  >
-                    {n}
-                  </sup>
-                )
-              },
-            }}
-          >
-            {msg.text}
-          </ReactMarkdown>
+          <div className="md-body">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              rehypePlugins={[rehypeCitation]}
+              components={{
+                sup: ({ node, children }) => {
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const n = Number((node as any)?.properties?.dataCite ?? 0)
+                  const citation = msg.citations?.find((c) => c.n === n)
+                  if (!citation) return <sup>{children}</sup>
+                  return (
+                    <sup
+                      className="cite-ref"
+                      title={citation.filename}
+                      onClick={() => onOpenCitation(citation)}
+                    >
+                      {n}
+                    </sup>
+                  )
+                },
+              }}
+            >
+              {msg.text}
+            </ReactMarkdown>
+          </div>
         </div>
       </div>
       {canOperate && (
