@@ -1,3 +1,5 @@
+import logging
+import traceback
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -19,6 +21,8 @@ from app.api.roles import router as roles_router
 from app.api.users import router as users_router
 from app.config import decisions
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -37,6 +41,7 @@ async def _value_error_handler(request: Request, exc: ValueError):
     acl_tags 后抛 ValueError（原 AclTagError 转义），此处统一映射为 400，
     让 API 调用方拿到可读的拒绝原因而不是 500。
     """
+    logger.error("ValueError on %s %s: %s\n%s", request.method, request.url.path, exc, traceback.format_exc())
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
