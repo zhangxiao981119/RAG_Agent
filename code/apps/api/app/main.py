@@ -1,4 +1,6 @@
+import json
 import logging
+import logging.config
 import traceback
 from contextlib import asynccontextmanager
 
@@ -17,11 +19,69 @@ from app.api.jobs import router as jobs_router
 from app.api.kbs import router as kbs_router
 from app.api.me import router as me_router
 from app.api.messages import router as messages_router
+from app.api.rate_limit import check_chat_rate_limit  # noqa: F401 — 限流依赖
 from app.api.roles import router as roles_router
 from app.api.users import router as users_router
 from app.config import decisions
 
 logger = logging.getLogger(__name__)
+
+# ── M6 可观测：结构化 JSON 日志 ──────────────────────────
+# 每条日志输出为单行 JSON，方便 ELK/Loki 等日志聚合系统采集
+_LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "json": {
+            "()": "app.main.JsonFormatter",
+        },
+    },
+    "handlers": {
+        "default": {
+            "class": "logging.StreamHandler",
+            "formatter": "json",
+            "stream": "ext://sys.stdout",
+        },
+    },
+    "root": {
+        "handlers": ["default"],
+        "level": "INFO",
+    },
+    "loggers": {
+        "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+        "uvicorn.error": {"handlers": ["default"], "level": "INFO", "propagate": False},
+        "uvicorn.access": {"handlers": ["default"], "level": "INFO", "propagate": False},
+    },
+}
+
+
+class JsonFormatter(logging.Formatter):
+    """单行 JSON 日志格式化器，支持 extra 中的结构化字段。"""
+
+    _RESERVED = {
+        "name", "msg", "args", "levelname", "levelno", "pathname",
+        "filename", "module", "exc_info", "exc_text", "stack_info",
+        "lineno", "funcName", "created", "msecs", "relativeCreated",
+        "thread", "threadName", "processName", "process",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S.%03d"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        # extra 中的非保留字段全部带上
+        for key, value in record.__dict__.items():
+            if key not in self._RESERVED and not key.startswith("_"):
+                entry[key] = value
+        if record.exc_info:
+            entry["traceback"] = self.formatException(record.exc_info)
+        return json.dumps(entry, ensure_ascii=False, default=str)
+
+
+logging.config.dictConfig(_LOGGING_CONFIG)
 
 
 @asynccontextmanager

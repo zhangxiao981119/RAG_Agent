@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     arq_queue_name: str = "arq:parse"
     arq_max_attempts: int = 3
     parse_job_timeout_seconds: int = 600
+    # ── M6 安全加固 ──────────────────────────────────────────
+    chat_rate_limit_per_minute: int = 20  # 单用户每分钟最多提问次数，超过返回 429
 
     @field_validator("allowed_ext", mode="before")
     @classmethod
