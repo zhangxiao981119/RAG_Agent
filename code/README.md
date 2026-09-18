@@ -14,7 +14,6 @@ cd code
 
 # 2. 可选：编辑 .env（改 LLM API Key、改管理员密码、换端口）
 #    不编辑也行，默认值能跑起来
-cp .env .env.local   # Windows 跳过，.env 已存在
 
 # 3. 一键启动（首次约 10-30 分钟，取决于模型下载速度）
 docker compose up -d --build
@@ -223,8 +222,7 @@ code/
 ├── docker-compose.prod.yml      # 生产环境（4 服务 + 2 个 API worker）
 ├── .env.prod.example            # 生产配置模板
 └── docs/
-    ├── DEPLOY.md                # 生产部署详细指南（F1-F5 验收）
-    └── 回滚指南（§9）
+    └── DEPLOY.md                # 生产部署指南（F1-F5 验收 + §9 回滚指南）
 ```
 
 ---
