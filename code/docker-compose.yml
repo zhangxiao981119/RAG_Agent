@@ -108,10 +108,10 @@ services:
       MULTI_TENANT: ${MULTI_TENANT:-false}
     ports:
       - "8000:8000"
+    volumes:
+      - ./sync_data:/data/sync
     depends_on:
       postgres:
-        condition: service_healthy
-      redis:
         condition: service_healthy
       minio:
         condition: service_healthy
@@ -125,7 +125,7 @@ services:
       timeout: 5s
       retries: 20
 
-  # arq 异步解析 worker（M2 §6 任务 2）
+  # arq 异步解析 worker（M2 §6 任务 2 / M6 任务 1 同步 cron）
   worker:
     build:
       context: .
@@ -152,12 +152,12 @@ services:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
       ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx}
+    volumes:
+      - ./sync_data:/data/sync
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      minio:
         condition: service_healthy
       embedding:
         condition: service_started
