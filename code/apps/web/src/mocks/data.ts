@@ -536,14 +536,18 @@ export type AuditLogPage = {
   page_size: number
 }
 
-/** 分页拉取审计日志。action 传前缀（如 doc）可按动作类过滤。 */
+/** 分页拉取审计日志。action 传前缀（如 doc）可按动作类过滤；startDate/endDate 为 YYYY-MM-DD 日期范围（含当天）。 */
 export async function fetchAuditLogs(
   page = 1,
   pageSize = 20,
   action?: string,
+  startDate?: string,
+  endDate?: string,
 ): Promise<AuditLogPage> {
   const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
   if (action) params.set('action', action)
+  if (startDate) params.set('start_date', startDate)
+  if (endDate) params.set('end_date', endDate)
   return http<AuditLogPage>(`/api/admin/audit-logs?${params.toString()}`)
 }
 

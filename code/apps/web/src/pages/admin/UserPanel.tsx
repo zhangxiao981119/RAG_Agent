@@ -14,7 +14,7 @@ import {
   Tag,
 } from 'antd'
 import { PlusOutlined, ReloadOutlined } from '@ant-design/icons'
-import type { ColumnsType, TablePaginationConfig } from 'antd/es/table'
+import type { ColumnsType } from 'antd/es/table'
 
 import {
   AdminRole,
@@ -50,33 +50,29 @@ type UserFormValues = {
 export function UserPanel() {
   const { message } = App.useApp()
   const [users, setUsers] = useState<AdminUser[]>([])
-  const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(10)
   const [loading, setLoading] = useState(false)
   const [deptTree, setDeptTree] = useState<DepartmentNode[]>([])
   const [roles, setRoles] = useState<AdminRole[]>([])
   const [edit, setEdit] = useState<EditState | null>(null)
+  // 前端搜索关键字（按用户名/姓名过滤，数据量不大故全量加载后本地过滤）
+  const [search, setSearch] = useState('')
 
-  const load = useCallback(
-    async (p: number, ps: number) => {
-      setLoading(true)
-      try {
-        const data = await fetchUsers(p, ps)
-        setUsers(data.items)
-        setTotal(data.total)
-      } catch (e) {
-        message.error(errMsg(e))
-      } finally {
-        setLoading(false)
-      }
-    },
-    [message],
-  )
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      // 用户规模有限，一次拉取全部供前端搜索过滤（page_size 上限 200）
+      const data = await fetchUsers(1, 200)
+      setUsers(data.items)
+    } catch (e) {
+      message.error(errMsg(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [message])
 
   useEffect(() => {
-    void load(page, pageSize)
-  }, [page, pageSize, load])
+    void load()
+  }, [load])
 
   // 部门树 + 角色列表只在弹窗打开时需要，这里随面板加载一次供下拉使用
   useEffect(() => {
@@ -88,20 +84,11 @@ export function UserPanel() {
       .catch((e) => message.error(errMsg(e)))
   }, [message])
 
-  function handleTableChange(pagination: TablePaginationConfig) {
-    const nextPage = pagination.current ?? 1
-    const nextSize = pagination.pageSize ?? 10
-    setPageSize(nextSize)
-    setPage(nextPage)
-  }
-
   async function handleDelete(user: AdminUser) {
     try {
       await deleteUser(user.id)
       message.success(`用户「${user.username}」已删除`)
-      // 删完后若当前页空了，回退一页
-      if (users.length === 1 && page > 1) setPage(page - 1)
-      else await load(page, pageSize)
+      await load()
     } catch (e) {
       message.error(errMsg(e))
     }
@@ -110,6 +97,13 @@ export function UserPanel() {
   const currentUserId = getStoredUser()?.id
   const flatDepts = flattenDeptTree(deptTree)
   const roleOptions = roles.map((r) => ({ label: r.name, value: r.name }))
+
+  // 前端搜索过滤：按用户名/姓名匹配（大小写不敏感），空关键字返回全部
+  const filteredUsers = users.filter((u) => {
+    const q = search.trim().toLowerCase()
+    if (!q) return true
+    return u.username.toLowerCase().includes(q) || u.display_name.toLowerCase().includes(q)
+  })
 
   const columns: ColumnsType<AdminUser> = [
     { title: '用户名', dataIndex: 'username', key: 'username', width: 130 },
@@ -210,27 +204,32 @@ export function UserPanel() {
 
   return (
     <div>
-      <Space style={{ marginBottom: 16 }}>
-        <Button type="primary" icon={<PlusOutlined />} onClick={() => setEdit({ mode: 'create' })}>
-          新建用户
-        </Button>
-        <Button icon={<ReloadOutlined />} onClick={() => void load(page, pageSize)}>
-          刷新
-        </Button>
-      </Space>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
+        <Space>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => setEdit({ mode: 'create' })}>
+            新建用户
+          </Button>
+          <Button icon={<ReloadOutlined />} onClick={() => void load()}>
+            刷新
+          </Button>
+        </Space>
+        <Input.Search
+          placeholder="按用户名/姓名搜索"
+          allowClear
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          style={{ width: 240 }}
+        />
+      </div>
 
       <Table<AdminUser>
         rowKey="id"
         columns={columns}
-        dataSource={users}
+        dataSource={filteredUsers}
         loading={loading}
         size="middle"
         scroll={{ x: 1100 }}
-        onChange={handleTableChange}
         pagination={{
-          current: page,
-          pageSize,
-          total,
           showSizeChanger: true,
           pageSizeOptions: [10, 20, 50],
           showTotal: (t) => `共 ${t} 个用户`,
@@ -245,7 +244,7 @@ export function UserPanel() {
           onClose={() => setEdit(null)}
           onSaved={async () => {
             setEdit(null)
-            await load(page, pageSize)
+            await load()
           }}
         />
       )}

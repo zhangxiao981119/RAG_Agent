@@ -1,10 +1,11 @@
 // 审计日志面板 —— 谁在何时做了什么（M5 任务 3 提前实现）
 // 服务端分页 + 动作前缀过滤；详情列展示动作关键信息（问题/文件名/成员变更等）
 import { useCallback, useEffect, useState } from 'react'
-import { App, Select, Space, Table, Tag, Tooltip } from 'antd'
+import { App, DatePicker, Select, Space, Table, Tag, Tooltip } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import type { ColumnsType, TablePaginationConfig } from 'antd/es/table'
 import dayjs from 'dayjs'
+import type { Dayjs } from 'dayjs'
 
 import { AuditLogItem, fetchAuditLogs } from '../../mocks/data'
 import { errMsg } from './common'
@@ -63,26 +64,27 @@ export function AuditPanel() {
   const [pageSize, setPageSize] = useState(20)
   const [loading, setLoading] = useState(false)
   const [action, setAction] = useState('')
+  // 日期范围筛选：[开始, 结束]，清空时为 null
+  const [dateRange, setDateRange] = useState<[Dayjs | null, Dayjs | null] | null>(null)
 
-  const load = useCallback(
-    async (p: number, ps: number, act: string) => {
-      setLoading(true)
-      try {
-        const data = await fetchAuditLogs(p, ps, act || undefined)
-        setItems(data.items)
-        setTotal(data.total)
-      } catch (e) {
-        message.error(errMsg(e))
-      } finally {
-        setLoading(false)
-      }
-    },
-    [message],
-  )
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const startDate = dateRange?.[0]?.format('YYYY-MM-DD')
+      const endDate = dateRange?.[1]?.format('YYYY-MM-DD')
+      const data = await fetchAuditLogs(page, pageSize, action || undefined, startDate, endDate)
+      setItems(data.items)
+      setTotal(data.total)
+    } catch (e) {
+      message.error(errMsg(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [message, page, pageSize, action, dateRange])
 
   useEffect(() => {
-    void load(page, pageSize, action)
-  }, [page, pageSize, action, load])
+    void load()
+  }, [load])
 
   const handleTableChange = (pagination: TablePaginationConfig) => {
     setPage(pagination.current ?? 1)
@@ -138,7 +140,7 @@ export function AuditPanel() {
 
   return (
     <div>
-      <Space style={{ marginBottom: 12 }}>
+      <Space style={{ marginBottom: 12 }} wrap>
         <Select
           value={action}
           onChange={(v) => {
@@ -148,7 +150,16 @@ export function AuditPanel() {
           options={ACTION_FILTERS}
           style={{ width: 160 }}
         />
-        <a onClick={() => void load(page, pageSize, action)}>
+        <DatePicker.RangePicker
+          value={dateRange}
+          onChange={(dates) => {
+            setDateRange(dates ?? null)
+            setPage(1)
+          }}
+          allowClear
+          placeholder={['开始日期', '结束日期']}
+        />
+        <a onClick={() => void load()}>
           <ReloadOutlined /> 刷新
         </a>
       </Space>

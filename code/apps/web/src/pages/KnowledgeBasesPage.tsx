@@ -37,6 +37,8 @@ export function KnowledgeBasesPage() {
   const { message } = App.useApp()
   const [kbs, setKbs] = useState<KnowledgeBase[]>([])
   const [loading, setLoading] = useState(true)
+  // 前端搜索关键字（按知识库名过滤）
+  const [search, setSearch] = useState('')
 
   useEffect(() => {
     fetchKbs()
@@ -73,35 +75,51 @@ export function KnowledgeBasesPage() {
     }
   }
 
+  // 前端搜索过滤：按知识库名匹配（大小写不敏感），空关键字返回全部
+  const filteredKbs = kbs.filter((kb) => {
+    const q = search.trim().toLowerCase()
+    if (!q) return true
+    return kb.name.toLowerCase().includes(q)
+  })
+
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20, gap: 12, flexWrap: 'wrap' }}>
         <div>
           <Title level={4} style={{ margin: 0 }}>
             知识库
           </Title>
           <Text type="secondary">管理可访问的知识库</Text>
         </div>
-        <Button
-          type="primary"
-          icon={<PlusOutlined />}
-          onClick={() => {
-            setCreateForm({ name: '', description: '', isPublic: false })
-            setCreateOpen(true)
-          }}
-        >
-          新建知识库
-        </Button>
+        <Space>
+          <Input.Search
+            placeholder="按知识库名搜索"
+            allowClear
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={{ width: 240 }}
+          />
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={() => {
+              setCreateForm({ name: '', description: '', isPublic: false })
+              setCreateOpen(true)
+            }}
+          >
+            新建知识库
+          </Button>
+        </Space>
       </div>
 
       <Spin spinning={loading}>
-        {!loading && kbs.length === 0 ? (
+        {!loading && filteredKbs.length === 0 ? (
           <Card variant="borderless">
-            <Empty description="暂无知识库" />
+            <Empty description={search.trim() ? '未匹配到知识库' : '暂无知识库'} />
           </Card>
         ) : (
           <Row gutter={[16, 16]}>
-            {kbs.map((kb) => (
+            {filteredKbs.map((kb) => (
               <Col xs={24} sm={12} lg={8} key={kb.id}>
                 <Card
                   hoverable
