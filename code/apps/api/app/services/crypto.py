@@ -6,7 +6,7 @@
   然后再 GET 一次确保所有 worker 使用同一份密钥。
 
 后端持有 RSA 私钥，公钥通过 /api/auth/public-key 下发给前端。
-前端用 RSA-OAEP(SHA-256) 加密密码，后端私钥解密后再走 bcrypt 校验。
+前端用 Web Crypto 以 RSA-OAEP(SHA-256) 加密密码，后端私钥解密后再走 bcrypt 校验。
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def _ensure_key() -> rsa.RSAPrivateKey:
 
 
 def get_public_key_spki_b64() -> str:
-    """导出公钥为 SPKI DER 格式并 base64 编码，供前端 Web Crypto importKey 直接使用。"""
+    """导出公钥为 SPKI DER 格式并 base64 编码，供前端 Web Crypto importKey 使用。"""
     key = _ensure_key()
     public_key = key.public_key()
     der = public_key.public_bytes(

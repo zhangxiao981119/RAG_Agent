@@ -74,7 +74,7 @@ async def _revoke_token(redis: Redis, payload: dict[str, Any]) -> None:
 
 @router.get("/auth/public-key", response_model=PublicKeyResponse)
 async def get_public_key() -> PublicKeyResponse:
-    """返回 RSA 公钥（SPKI DER base64），供前端加密密码。"""
+    """返回 RSA 公钥（SPKI DER base64），供前端 Web Crypto 加密密码。"""
     return PublicKeyResponse(public_key=get_public_key_spki_b64())
 
 
