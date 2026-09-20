@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 class LoginRequest(BaseModel):
     """POST /api/auth/login 请求体。
 
-    password 为前端用 RSA-OAEP(SHA-256) 加密后的 base64 密文，非明文。
+    password 为前端用 Web Crypto RSA-OAEP(SHA-256) 加密后的 base64 密文，非明文。
     """
 
     username: str = Field(min_length=1, max_length=64)
@@ -17,7 +17,7 @@ class LoginRequest(BaseModel):
 
 
 class PublicKeyResponse(BaseModel):
-    """GET /api/auth/public-key 响应：SPKI DER 格式公钥的 base64 编码。"""
+    """GET /api/auth/public-key 响应：SPKI DER 格式公钥（base64 编码）。"""
 
     public_key: str
 
