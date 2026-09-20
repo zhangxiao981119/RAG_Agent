@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from app.config import decisions
-from app.services.grounding import check_grounding
+from app.services.grounding import check_grounding, check_line
 from app.services.llm import LLMError, LLMTimeout, get_llm_service
 from app.services.mask import mask_pii
 from app.services.retrieve.base import RetrievedChunk
@@ -279,3 +279,208 @@ class GenerationService:
 
 def get_generation_service() -> GenerationService:
     return GenerationService()
+
+
+# ── 真流式生成（供 /chat/ask 透传，降低首字延迟）──────────────────
+
+
+@dataclass
+class StreamDelta:
+    """流式事件。type=delta 时 text 为增量文本；type=refused/done 时 text 为空。"""
+
+    type: str  # "delta" | "done" | "refused"
+    text: str = ""
+    refused: bool = False
+    refuse_reason: str = ""
+    stripped_sentences: int = 0
+    full_text: str = ""
+    suggestions: list[str] = field(default_factory=list)
+    usage: dict = field(default_factory=dict)
+
+
+# 匹配 <followups> 开始标签（流式中遇到即切换为收集追问模式）
+_FOLLOWUPS_OPEN_RE = re.compile(r"<followups>")
+
+
+class StreamGenerationService(GenerationService):
+    """真流式生成：LLM delta 经行级 grounding / PII / 敏感词校验后立即透传。
+
+    与非流式 generate 的差异：
+      · 不缓冲完整回答，收到完整行就校验并推送，首字延迟 = LLM 首字延迟
+      · grounding 按行做（check_line），无效引用行在推送前丢弃，前端不会看到后撤回
+      · 敏感词按行检查，命中即中止并发 refused
+      · <followups> 块不推给前端，只在 done 事件里返回 suggestions
+    """
+
+    async def stream_generate(
+        self,
+        query: str,
+        chunks: list[RetrievedChunk],
+        history: list[dict] | None = None,
+        memory_prompt: str = "",
+        tenant_id: uuid.UUID | None = None,
+    ):
+        # 引用映射（同 generate）
+        valid_ns: set[int] = set()
+        citations: list[Citation] = []
+        for index, chunk in enumerate(chunks, start=1):
+            valid_ns.add(index)
+            citations.append(
+                Citation(
+                    n=index,
+                    chunk_id=chunk.chunk_id,
+                    doc_id=chunk.document_id,
+                    filename=chunk.filename,
+                    heading_path=chunk.heading_path,
+                    page_no=chunk.page_no,
+                    score=chunk.display_score,
+                )
+            )
+
+        system_content = _SYSTEM_PROMPT + (memory_prompt if memory_prompt else "")
+        messages: list[dict] = [{"role": "system", "content": system_content}]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": _build_user_prompt(query, chunks)})
+
+        llm = get_llm_service()
+        # 流式状态
+        line_buf = ""          # 尚未换行的累积片段
+        full_text = ""         # 已通过校验并推送给前端的累计正文
+        stripped = 0
+        in_followups = False
+        followups_buf = ""
+        llm_failed = False
+        llm_fail_reason = ""
+        aborted = False        # 敏感词命中后置 True，中止流
+
+        async def _flush_lines(buf: str, is_final: bool = False):
+            """把 buf 按行切分，完整行逐行校验并 yield delta。直接修改外层 line_buf。"""
+            nonlocal line_buf, full_text, stripped, in_followups, followups_buf, aborted
+            pieces = buf.split("\n")
+            if is_final:
+                complete = pieces
+                line_buf = ""
+            else:
+                complete = pieces[:-1]
+                line_buf = pieces[-1]
+            for line in complete:
+                if aborted:
+                    return
+                # 进入 followups 区：收集不推送
+                if in_followups:
+                    if "</followups>" in line:
+                        idx = line.index("</followups>")
+                        followups_buf += line[:idx]
+                        in_followups = False
+                    else:
+                        followups_buf += line + "\n"
+                    continue
+                # 检测 <followups> 开标签
+                m = _FOLLOWUPS_OPEN_RE.search(line)
+                if m:
+                    before = line[: m.start()]
+                    after = line[m.end():]
+                    if before.strip():
+                        keep, is_stripped = check_line(before, valid_ns)
+                        if is_stripped:
+                            stripped += 1
+                        elif keep:
+                            out = await self._post_check(before, tenant_id)
+                            if out is None:
+                                yield StreamDelta(type="refused", refused=True, refuse_reason="SENSITIVE_OUTPUT", stripped_sentences=stripped, full_text=full_text)
+                                aborted = True
+                                return
+                            full_text += out
+                            yield StreamDelta(type="delta", text=out)
+                    in_followups = True
+                    if "</followups>" in after:
+                        idx = after.index("</followups>")
+                        followups_buf += after[:idx]
+                        in_followups = False
+                    else:
+                        followups_buf += after + "\n"
+                    continue
+                # 普通正文行：grounding + 敏感词 + PII
+                keep, is_stripped = check_line(line, valid_ns)
+                if is_stripped:
+                    stripped += 1
+                    continue
+                if not keep:
+                    continue
+                out = await self._post_check(line, tenant_id)
+                if out is None:
+                    yield StreamDelta(type="refused", refused=True, refuse_reason="SENSITIVE_OUTPUT", stripped_sentences=stripped, full_text=full_text)
+                    aborted = True
+                    return
+                to_emit = out + "\n"
+                full_text += to_emit
+                yield StreamDelta(type="delta", text=to_emit)
+
+        try:
+            async for delta in llm.stream_chat(messages, decisions.GENERATION_TEMPERATURE):
+                line_buf += delta
+                async for evt in _flush_lines(line_buf):
+                    if evt.type == "refused":
+                        yield evt
+                        return
+                    yield evt
+                if aborted:
+                    return
+        except LLMTimeout as exc:
+            logger.warning("LLM 首 token 超时: %s", exc)
+            llm_failed = True
+            llm_fail_reason = "LLM_TIMEOUT"
+        except LLMError as exc:
+            logger.error("LLM 生成失败: %s", exc)
+            llm_failed = True
+            llm_fail_reason = "LLM_ERROR"
+
+        # 处理最后一段未换行内容
+        if line_buf and not llm_failed and not aborted:
+            async for evt in _flush_lines(line_buf, is_final=True):
+                if evt.type == "refused":
+                    yield evt
+                    return
+                yield evt
+
+        if llm_failed and not full_text.strip():
+            yield StreamDelta(
+                type="refused", refused=True, refuse_reason=llm_fail_reason,
+                stripped_sentences=stripped, full_text="",
+            )
+            return
+
+        # 解析 followups
+        suggestions = [ln.strip() for ln in followups_buf.splitlines() if ln.strip()]
+
+        # 全部被剥离 → 拒答
+        if not full_text.strip():
+            yield StreamDelta(
+                type="refused", refused=True, refuse_reason="UNGROUNDED",
+                stripped_sentences=stripped, full_text="",
+            )
+            return
+
+        yield StreamDelta(
+            type="done",
+            full_text=full_text,
+            stripped_sentences=stripped,
+            suggestions=suggestions,
+            usage={"prompt_tokens": 0, "completion_tokens": len(full_text)},
+        )
+
+    async def _post_check(self, text: str, tenant_id: uuid.UUID | None) -> str | None:
+        """PII 脱敏 + 敏感词检查。命中敏感词返回 None（上层发 refused）。"""
+        if decisions.MASK_PII_ENABLED:
+            text = mask_pii(text)
+        if decisions.SENSITIVE_FILTER_ENABLED and tenant_id is not None:
+            from app.services.sensitive import check_output
+            hit, _word = await check_output(text, tenant_id)
+            if hit:
+                return None
+        return text
+
+
+def get_stream_generation_service() -> StreamGenerationService:
+    return StreamGenerationService()

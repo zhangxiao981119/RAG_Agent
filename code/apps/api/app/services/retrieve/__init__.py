@@ -75,16 +75,6 @@ def _build_rrf_scores(
     return scores
 
 
-def _normalize_rerank_scores(scores: list[float]) -> list[float]:
-    """重排分归一化到 0~1（min-max）。"""
-    if not scores:
-        return []
-    lo, hi = min(scores), max(scores)
-    if hi - lo < 1e-9:
-        return [1.0 for _ in scores]
-    return [(s - lo) / (hi - lo) for s in scores]
-
-
 class RetrievalService:
     async def retrieve(
         self,
@@ -165,53 +155,56 @@ class RetrievalService:
 
         # ④ rerank
         t0 = time.perf_counter()
+        # rerank 在线时只保留被重排返回的候选（未返回即视为不相关，已淘汰）
+        reranked_ids: list[uuid.UUID] = []
         rerank_scores: dict[uuid.UUID, float] = {}
         use_rerank = True
         try:
             rerank_service = get_rerank_service()
             documents = [all_chunks[cid]["content"] for cid in candidate_ids]
             results = await rerank_service.rerank(query, documents, decisions.TOP_K_RERANK)
-            # results 是 [(原 index, 分数)]，按 index 升序对齐到 candidate_ids
-            results_sorted = sorted(results, key=lambda x: x[0])
-            raw_scores = [s for _, s in results_sorted]
-            norm_scores = _normalize_rerank_scores(raw_scores)
-            for (idx, _), norm in zip(results_sorted, norm_scores, strict=False):
-                rerank_scores[candidate_ids[idx]] = norm
+            # results 按相关性绝对分降序，直接采用（relevance_score 已是 0~1 的 sigmoid 分）
+            for idx, score in results:
+                cid = candidate_ids[idx]
+                reranked_ids.append(cid)
+                rerank_scores[cid] = float(score)
         except RerankTimeout:
             use_rerank = False
         stages["rerank"] = int((time.perf_counter() - t0) * 1000)
 
-        # ⑤ 构造 RetrievedChunk 并按 final_score 排序
-        #    final_score 优先级：rerank 分 > vector_score（rerank 超时降级）
+        # ⑤ 构造 RetrievedChunk
+        #    rerank 在线：候选集 = rerank 返回项，顺序即重排顺序，final=绝对 rerank 分
+        #    rerank 降级：候选集 = 全部召回，final=向量余弦分，按分排序取 TOP_K
         retrieved: list[RetrievedChunk] = []
-        for cid in candidate_ids:
+
+        def _build_chunk(cid: uuid.UUID) -> RetrievedChunk:
             row = all_chunks[cid]
             vec_score = float(row.get("vector_score") or 0.0)
-            rrf_score = rrf_scores[cid]
-            r_score = rerank_scores.get(cid) if use_rerank else None
-            # rerank 超时降级：用向量余弦分（0~1），RRF 分只是排名融合不是相似度
-            final = r_score if r_score is not None else vec_score
-            retrieved.append(
-                RetrievedChunk(
-                    chunk_id=cid,
-                    document_id=row["document_id"],
-                    kb_id=row["kb_id"],
-                    filename=filenames.get(row["document_id"], ""),
-                    content=row["content"],
-                    heading_path=row["heading_path"] or "",
-                    page_no=row["page_no"],
-                    level_rank=row["level_rank"],
-                    vector_score=vec_score,
-                    keyword_score=1.0 if cid in keyword_ranks else None,
-                    rrf_score=rrf_score,
-                    rerank_score=r_score,
-                    final_score=final,
-                )
+            r_score = rerank_scores.get(cid)
+            return RetrievedChunk(
+                chunk_id=cid,
+                document_id=row["document_id"],
+                kb_id=row["kb_id"],
+                filename=filenames.get(row["document_id"], ""),
+                content=row["content"],
+                heading_path=row["heading_path"] or "",
+                page_no=row["page_no"],
+                level_rank=row["level_rank"],
+                vector_score=vec_score,
+                keyword_score=1.0 if cid in keyword_ranks else None,
+                rrf_score=rrf_scores[cid],
+                rerank_score=r_score,
+                final_score=r_score if r_score is not None else vec_score,
             )
-        retrieved.sort(key=lambda c: c.final_score, reverse=True)
-        retrieved = retrieved[: decisions.TOP_K_RERANK]
 
-        # L1 阈值闸门
+        if use_rerank:
+            retrieved = [_build_chunk(cid) for cid in reranked_ids]
+        else:
+            retrieved = [_build_chunk(cid) for cid in candidate_ids]
+            retrieved.sort(key=lambda c: c.final_score, reverse=True)
+            retrieved = retrieved[: decisions.TOP_K_RERANK]
+
+        # L1 阈值闸门（rerank 在线时比绝对相关性分；降级时比向量余弦分）
         if not retrieved or retrieved[0].final_score < decisions.RELEVANCE_THRESHOLD:
             return RetrievalResult(refused=True, refuse_reason="NO_RELEVANT_CONTENT", stage_ms=stages)
 

@@ -32,7 +32,7 @@ from app.services import audit
 from app.services import feature_flag as flag_service
 from app.services import quota as quota_service
 from app.services import sensitive as sensitive_service
-from app.services.generate import get_generation_service
+from app.services.generate import get_stream_generation_service
 from app.services.memory import build_memory_prompt, compress_history, extract_facts
 from app.services.retrieve import get_retrieval_service
 
@@ -43,16 +43,6 @@ router = APIRouter(tags=["chat"])
 def _sse(event: str, data: dict) -> str:
     """构造 SSE 事件块。data 用 JSON 序列化。"""
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
-
-
-async def _simulate_stream(text: str) -> AsyncIterator[str]:
-    """模拟流式推送：3 字符/片，间隔 100ms（约 30 字符/秒，用户偏好可读速度）。"""
-    chars = list(text)
-    step = 3
-    for start in range(0, len(chars), step):
-        chunk_text = "".join(chars[start : start + step])
-        yield _sse("delta", {"text": chunk_text})
-        await asyncio.sleep(0.1)
 
 
 @router.post("/chat/ask")
@@ -161,7 +151,10 @@ async def chat_ask(
                     retrieve_session,
                     payload.question,
                     user.tenant_id,
-                    user.authorized_kb_ids,
+                    # 必须传 effective_kb_ids（含 admin G2 豁免 + 前端所选库交集），
+                    # 传 user.authorized_kb_ids 会导致 admin 豁免失效、且检索范围
+                    # 扩大到用户全部已授权库而非本次选择的库
+                    effective_kb_ids,
                     user.clearance,
                     user.subjects,
                 )
@@ -229,34 +222,6 @@ async def chat_ask(
             )
             return
 
-        # citations（MUST 在 delta 之前）
-        citations_payload = [
-            {
-                "n": i + 1,
-                "chunk_id": str(c.chunk_id),
-                "doc_id": str(c.document_id),
-                "filename": c.filename,
-                "heading_path": c.heading_path,
-                "page_no": c.page_no,
-                "score": c.display_score,
-                "snippet": c.content[:200],
-            }
-            for i, c in enumerate(result.chunks)
-        ]
-        yield _sse("citations", {"citations": citations_payload})
-
-        # 审计：谁在何时问了什么、引用到哪些文档（手册 F4 / M5 任务 3）
-        await audit.record(
-            user.tenant_id, user.user_id, "chat.ask",
-            object_type="conversation", object_id=str(conversation_id),
-            detail={
-                "question": payload.question,
-                "kb_ids": [str(kb) for kb in effective_kb_ids],
-                "doc_ids": sorted({c["doc_id"] for c in citations_payload}),
-                "refused": False,
-            },
-        )
-
         # 生成（含 L3 校验，generation 统一处理 LLM 异常）
         # 1. 读最近 N 条历史消息作为上下文
         history: list[dict] = []
@@ -310,7 +275,7 @@ async def chat_ask(
                 })
                 await _persist_assistant(
                     conversation_id, user, message_id,
-                    text="", refused=True, citations=citations_payload,
+                    text="", refused=True, citations=[],
                     meta={
                         "stage_ms": result.stage_ms,
                         "refused": True,
@@ -336,17 +301,62 @@ async def chat_ask(
                     "chunks_kept": len(effective_chunks),
                 })
 
+        # citations 基于 effective_chunks 构造：编号必须与生成 prompt 中的 [n] 一致，
+        # 否则配额裁剪后 prompt 重编号会与前端引用载荷错位。MUST 在 delta 之前下发。
+        citations_payload = [
+            {
+                "n": i + 1,
+                "chunk_id": str(c.chunk_id),
+                "doc_id": str(c.document_id),
+                "filename": c.filename,
+                "heading_path": c.heading_path,
+                "page_no": c.page_no,
+                "score": c.display_score,
+                "snippet": c.content[:200],
+            }
+            for i, c in enumerate(effective_chunks)
+        ]
+        yield _sse("citations", {"citations": citations_payload})
+
+        # 审计：谁在何时问了什么、引用到哪些文档（手册 F4 / M5 任务 3）
+        await audit.record(
+            user.tenant_id, user.user_id, "chat.ask",
+            object_type="conversation", object_id=str(conversation_id),
+            detail={
+                "question": payload.question,
+                "kb_ids": [str(kb) for kb in effective_kb_ids],
+                "doc_ids": sorted({c["doc_id"] for c in citations_payload}),
+                "refused": False,
+            },
+        )
+
         # 4. 生成（注入画像 + 压缩后的历史 + 可能裁剪后的 chunks）
-        #    传 tenant_id 用于输出侧敏感词检查（generate 内部检查）
-        generation = get_generation_service()
-        gen_result = await generation.generate(
+        #    真流式透传：LLM delta 经行级 grounding / 敏感词 / PII 后立即推给前端
+        generation = get_stream_generation_service()
+        gen_result = None  # 最终结果（done/refused 时由 stream 填充）
+        final_text = ""
+        final_stripped = 0
+        final_suggestions: list[str] = []
+        final_usage: dict = {}
+        async for stream_evt in generation.stream_generate(
             payload.question, effective_chunks,
             history=history,
             memory_prompt=memory_prompt,
             tenant_id=user.tenant_id,
-        )
+        ):
+            if stream_evt.type == "delta":
+                yield _sse("delta", {"text": stream_evt.text})
+            elif stream_evt.type == "refused":
+                gen_result = stream_evt
+                break
+            elif stream_evt.type == "done":
+                gen_result = stream_evt
+                final_text = stream_evt.full_text
+                final_stripped = stream_evt.stripped_sentences
+                final_suggestions = stream_evt.suggestions
+                final_usage = stream_evt.usage
 
-        if gen_result.refused:
+        if gen_result is not None and gen_result.refused:
             reason = gen_result.refuse_reason
             user_message = {
                 "NO_RELEVANT_CONTENT": "知识库中未找到相关内容",
@@ -377,7 +387,6 @@ async def chat_ask(
                 "grounding_stripped": gen_result.stripped_sentences,
                 "conversation_id": str(conversation_id),
             })
-            # M6 可观测：指标持久化
             await audit.record(
                 user.tenant_id, user.user_id, "chat.ask.metric",
                 object_type="conversation", object_id=str(conversation_id),
@@ -392,16 +401,12 @@ async def chat_ask(
             )
             return
 
-        # 模拟流式推送最终文本
-        async for delta_event in _simulate_stream(gen_result.text):
-            yield delta_event
-
         # done
         yield _sse("done", {
             "finish_reason": "stopped",
-            "grounding": {"stripped_sentences": gen_result.stripped_sentences},
-            "usage": gen_result.usage,
-            "suggestions": gen_result.suggestions,
+            "grounding": {"stripped_sentences": final_stripped},
+            "usage": final_usage,
+            "suggestions": final_suggestions,
         })
 
         # M6 可观测：记录端到端指标
@@ -413,12 +418,11 @@ async def chat_ask(
             "refused": False,
             "refuse_reason": None,
             "chunks_count": len(result.chunks),
-            "grounding_stripped": gen_result.stripped_sentences,
-            "prompt_tokens": gen_result.usage.get("prompt_tokens", 0),
-            "completion_tokens": gen_result.usage.get("completion_tokens", 0),
+            "grounding_stripped": final_stripped,
+            "prompt_tokens": final_usage.get("prompt_tokens", 0),
+            "completion_tokens": final_usage.get("completion_tokens", 0),
             "conversation_id": str(conversation_id),
         })
-        # M6 可观测：指标持久化（供 P95 聚合查询）
         await audit.record(
             user.tenant_id, user.user_id, "chat.ask.metric",
             object_type="conversation", object_id=str(conversation_id),
@@ -428,34 +432,33 @@ async def chat_ask(
                 "refused": False,
                 "refuse_reason": None,
                 "chunks_count": len(result.chunks),
-                "grounding_stripped": gen_result.stripped_sentences,
-                "prompt_tokens": gen_result.usage.get("prompt_tokens", 0),
-                "completion_tokens": gen_result.usage.get("completion_tokens", 0),
+                "grounding_stripped": final_stripped,
+                "prompt_tokens": final_usage.get("prompt_tokens", 0),
+                "completion_tokens": final_usage.get("completion_tokens", 0),
             },
         )
 
         # ── M6 续篇：配额用量上报（Redis 计数器累加）─────────
-        # Redis 不可用不影响主流程（audit_logs 已写入 metric，SQL 兜底可查）
         await quota_service._incr_usage(
             user.tenant_id, user.user_id,
-            tokens=gen_result.usage.get("prompt_tokens", 0) + gen_result.usage.get("completion_tokens", 0),
+            tokens=final_usage.get("prompt_tokens", 0) + final_usage.get("completion_tokens", 0),
         )
 
         # 持久化
         await _persist_assistant(
             conversation_id, user, message_id,
-            text=gen_result.text, refused=False, citations=citations_payload,
+            text=final_text, refused=False, citations=citations_payload,
             meta={
                 "stage_ms": result.stage_ms,
-                "grounding_stripped": gen_result.stripped_sentences,
-                "usage": gen_result.usage,
-                "suggestions": gen_result.suggestions,
+                "grounding_stripped": final_stripped,
+                "usage": final_usage,
+                "suggestions": final_suggestions,
                 "quota_degraded_from": degraded_from,
             },
         )
 
         # 后台更新用户画像（不阻塞流式响应）
-        asyncio.create_task(_update_user_memory(user.user_id, payload.question, gen_result.text))
+        asyncio.create_task(_update_user_memory(user.user_id, payload.question, final_text))
 
     return StreamingResponse(
         event_stream(),

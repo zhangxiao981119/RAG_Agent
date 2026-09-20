@@ -20,6 +20,23 @@ from dataclasses import dataclass
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 
 
+def check_line(line: str, valid_citation_ns: set[int]) -> tuple[bool, bool]:
+    """单行归因校验。
+
+    返回 (keep, is_stripped)：
+      keep=True 保留该行；keep=False 丢弃（含无效引用）。
+      is_stripped 表示该行因无效引用被丢弃（用于统计 stripped_sentences）。
+      无引用的行（标题、空行、连接句）直接保留，is_stripped=False。
+    """
+    ns = [int(m) for m in _CITATION_RE.findall(line)]
+    if not ns:
+        return True, False
+    invalid_ns = [n for n in ns if n not in valid_citation_ns]
+    if invalid_ns:
+        return False, True
+    return True, False
+
+
 @dataclass
 class GroundingResult:
     text: str
@@ -37,18 +54,11 @@ def check_grounding(
     stripped = 0
 
     for line in lines:
-        ns = [int(m) for m in _CITATION_RE.findall(line)]
-        if not ns:
-            # 无引用的行（markdown 标题、空行、连接句等），直接保留
-            kept_lines.append(line)
-            continue
-        # 有引用：检查是否全部在有效集合里
-        invalid_ns = [n for n in ns if n not in valid_citation_ns]
-        if invalid_ns:
+        keep, is_stripped = check_line(line, valid_citation_ns)
+        if is_stripped:
             stripped += 1
-            continue  # 整行丢弃
-        # 引用全部有效，保留
-        kept_lines.append(line)
+        if keep:
+            kept_lines.append(line)
 
     final_text = "\n".join(kept_lines)
     if not final_text.strip():
