@@ -69,24 +69,46 @@ def _block_to_units(block: ParsedBlock) -> list[tuple[str, str, int | None]]:
         lines = block.text.split("\n")
         if not lines:
             return []
-        header_line = lines[0]
+
+        def _line_pieces(text_line: str) -> list[str]:
+            """单行（含表头）超 MAX 时硬切成多片。
+
+            保证下游 _accumulate 收到的每个 unit 都 <= CHUNK_MAX_TOKENS，
+            否则超大 unit 会让累积器一个单元都装不下，index 永不推进形成死循环。
+            """
+            if _count_tokens(text_line) <= decisions.CHUNK_MAX_TOKENS:
+                return [text_line]
+            return _hard_split(text_line, decisions.CHUNK_MAX_TOKENS)
+
+        # 展平所有行：超长单元格被硬切（极端场景，与文本路径硬切同级降级）
+        flat_pieces: list[str] = []
+        for ln in lines:
+            flat_pieces.extend(_line_pieces(ln))
+        if not flat_pieces:
+            return []
+        header_line = flat_pieces[0]  # 首片作为表头（首片即原表头或其第一片）
+        header_tokens = _count_tokens(header_line)
+
         units: list[tuple[str, str, int | None]] = []
         buffer_lines = [header_line]  # 第一组带表头
-        buffer_tokens = _count_tokens(header_line)
-        for line in lines[1:]:
+        buffer_tokens = header_tokens
+        for line in flat_pieces[1:]:
             line_tokens = _count_tokens(line)
-            if buffer_tokens + line_tokens > decisions.CHUNK_MAX_TOKENS and len(buffer_lines) > 1:
+            if buffer_tokens + line_tokens > decisions.CHUNK_MAX_TOKENS:
                 units.append(
                     ("\n".join(buffer_lines), block.heading_path, block.page_no)
                 )
-                # 下一组重置，保留表头
-                buffer_lines = [header_line, line]
-                buffer_tokens = _count_tokens(header_line) + line_tokens
+                # 下一组优先带表头；表头 + 本行仍超 MAX 时放弃表头，本行单独成组
+                if header_tokens + line_tokens <= decisions.CHUNK_MAX_TOKENS:
+                    buffer_lines = [header_line, line]
+                    buffer_tokens = header_tokens + line_tokens
+                else:
+                    buffer_lines = [line]
+                    buffer_tokens = line_tokens
             else:
                 buffer_lines.append(line)
                 buffer_tokens += line_tokens
-        if len(buffer_lines) > 1:
-            units.append(("\n".join(buffer_lines), block.heading_path, block.page_no))
+        units.append(("\n".join(buffer_lines), block.heading_path, block.page_no))
         return units
 
     # 文本块：段落 → 句子 → 硬切
@@ -122,6 +144,7 @@ def _accumulate(units: list[tuple[str, str, int | None]]) -> list[ChunkData]:
     while index < len(units):
         current = list(overlap_units)
         current_tokens = sum(_count_tokens(u[0]) for u in current)
+        consumed = 0
         # 累积
         while index < len(units):
             unit = units[index]
@@ -131,8 +154,17 @@ def _accumulate(units: list[tuple[str, str, int | None]]) -> list[ChunkData]:
             current.append(unit)
             current_tokens += unit_tokens
             index += 1
+            consumed += 1
             if current_tokens >= decisions.CHUNK_TARGET_TOKENS:
                 break
+
+        if consumed == 0:
+            # 重叠单元挤占了空间（overlap 构造是先取后判，可能含大单元），
+            # 导致本轮一个新单元都装不下：丢弃重叠重新累积。
+            # 空累积必然能装下至少一个单元（每个单元 <= CHUNK_MAX_TOKENS），
+            # 保证 index 必然推进，避免死循环。
+            overlap_units = []
+            continue
 
         if not current:
             # 单个单元就超 MAX，硬切兜底（理论上前面已硬切过，这里不应该到）

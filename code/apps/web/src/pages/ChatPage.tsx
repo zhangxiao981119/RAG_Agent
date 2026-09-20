@@ -94,8 +94,20 @@ export function ChatPage({ currentUser }: Props) {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const inputAreaRef = useRef<HTMLDivElement>(null)
+  /** conversationId 的 ref 镜像：供 SSE 事件回调读取最新值，避免陈旧闭包 */
+  const conversationIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    conversationIdRef.current = conversationId
+  }, [conversationId])
 
   const [loadError, setLoadError] = useState<string | null>(null)
+
+  // 组件卸载：中止进行中的 SSE，避免请求/状态更新泄漏
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort()
+    }
+  }, [])
 
   // 加载知识库列表
   useEffect(() => {
@@ -111,19 +123,21 @@ export function ChatPage({ currentUser }: Props) {
   // 后续手动新建对话 / 切换会话都不应再触发自动选中，否则会覆盖"新建对话"状态）
   const hasInitialSelected = useRef(false)
 
-  // 加载会话列表（删会话 / 提问完成后刷新侧边栏）
+  // 加载会话列表（删会话 / 首轮提问拿到会话 id 后刷新侧边栏）
+  // 不依赖 conversationId state，避免 SSE 回调持有陈旧闭包导致误自动选中
   const refreshConversations = useCallback(() => {
     fetchConversations()
       .then((list) => {
         setConversations(list)
         // 仅首次加载：自动选中最近一次对话（列表按 update_time 降序，第一个即最新）
-        if (!hasInitialSelected.current && !conversationId && list.length > 0) {
+        if (!hasInitialSelected.current && !conversationIdRef.current && list.length > 0) {
           hasInitialSelected.current = true
           handleSelectConversation(list[0])
         }
       })
       .catch(() => {})
-  }, [conversationId])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     refreshConversations()
@@ -260,59 +274,47 @@ export function ChatPage({ currentUser }: Props) {
     const controller = new AbortController()
     abortRef.current = controller
 
-    let buffer = ''
-    let shown = 0
+    // 提问前是否已有会话：用于"会话 id 从空变非空"的边沿刷新
+    const startedWithConvId = conversationIdRef.current
+    let fullText = ''
     let citations: Citation[] | undefined
     let refused = false
     let refusedMessage: string | undefined
-    let sseDone = false
     let suggestions: string[] = []
 
-    const typer = window.setInterval(() => {
-      if (shown >= buffer.length) {
-        if (!sseDone) return
-        clearInterval(typer)
-        setMessages((prev) =>
-          prev.map((m) => {
-            if (m.id !== assistantMsg.id) return m
-            return refused
-              ? {
-                  ...m,
-                  loading: false,
-                  done: true,
-                  refused: true,
-                  refusedMessage: refusedMessage ?? '知识库中未找到相关内容',
-                  text: '',
-                }
-              : { ...m, loading: false, done: true, text: buffer || '(空)', citations, suggestions }
-          }),
-        )
-        setStreaming(false)
-        abortRef.current = null
-        // 刷新会话列表（标题可能更新）
-        refreshConversations()
-        return
-      }
-      const diff = buffer.length - shown
-      const step = diff > 150 ? 5 : 1
-      shown = Math.min(buffer.length, shown + step)
-      const visible = buffer.slice(0, shown)
+    // delta 直接渲染（真流式透传，不再用打字机缓冲）
+    const appendDelta = (chunk: string) => {
+      fullText += chunk
       setMessages((prev) =>
-        prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: visible } : m)),
+        prev.map((m) =>
+          m.id === assistantMsg.id ? { ...m, loading: false, text: fullText } : m,
+        ),
       )
-    }, 33)
+    }
 
     const handler = (event: ChatEvent) => {
       if (event.event === 'meta') {
-        setConversationId(event.data.conversation_id)
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantMsg.id ? { ...m, messageId: event.data.message_id } : m,
-          ),
-        )
-      } else if (event.event === 'citations') citations = event.data.citations
-      else if (event.event === 'delta') buffer += event.data.text
-      else if (event.event === 'refused') {
+        const cid = event.data.conversation_id
+        const mid = event.data.message_id
+        // 敏感词拦截等分支会回 null id，不能用 null 覆盖已有会话
+        if (cid) {
+          // 仅首轮（id 从空变非空）时更新并刷新侧边栏，避免每轮重复刷新
+          if (!startedWithConvId && !conversationIdRef.current) {
+            conversationIdRef.current = cid
+            setConversationId(cid)
+            refreshConversations()
+          }
+        }
+        if (mid) {
+          setMessages((prev) =>
+            prev.map((m) => (m.id === assistantMsg.id ? { ...m, messageId: mid } : m)),
+          )
+        }
+      } else if (event.event === 'citations') {
+        citations = event.data.citations
+      } else if (event.event === 'delta') {
+        appendDelta(event.data.text)
+      } else if (event.event === 'refused') {
         refused = true
         refusedMessage = event.data.message
       } else if (event.event === 'done') {
@@ -321,9 +323,35 @@ export function ChatPage({ currentUser }: Props) {
     }
 
     try {
-      await mockAsk(question, selectedKbs, conversationId, handler, controller.signal)
+      await mockAsk(question, selectedKbs, conversationIdRef.current, handler, controller.signal)
+      // 正常结束（含 refused）：统一收尾
+      setMessages((prev) =>
+        prev.map((m) => {
+          if (m.id !== assistantMsg.id) return m
+          return refused
+            ? {
+                ...m,
+                loading: false,
+                done: true,
+                refused: true,
+                refusedMessage: refusedMessage ?? '知识库中未找到相关内容',
+                text: '',
+              }
+            : { ...m, loading: false, done: true, text: fullText || '(空)', citations, suggestions }
+        }),
+      )
     } catch (e) {
-      clearInterval(typer)
+      if (controller.signal.aborted) {
+        // 用户点击"停止"主动中止：保留已流出的内容并正常收尾
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsg.id
+              ? { ...m, loading: false, done: true, text: fullText || '(已停止)', citations }
+              : m,
+          ),
+        )
+        return
+      }
       setMessages((prev) =>
         prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: '' } : m)),
       )
@@ -336,11 +364,11 @@ export function ChatPage({ currentUser }: Props) {
           refusedMessage: e instanceof Error ? e.message : '请求失败，请稍后重试',
         }),
       )
+    } finally {
+      // 主动停止在 catch 内 return，finally 仍会执行，统一回收流式态
       setStreaming(false)
       abortRef.current = null
-      return
     }
-    sseDone = true
   }
 
   async function handleAsk() {

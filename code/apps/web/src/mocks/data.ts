@@ -15,7 +15,7 @@ export type Citation = {
 }
 
 export type ChatEvent =
-  | { event: 'meta'; data: { conversation_id: string; message_id: string; stage: string } }
+  | { event: 'meta'; data: { conversation_id: string | null; message_id: string | null; stage: string } }
   | { event: 'stage'; data: { stage: string; ms: number } }
   | { event: 'citations'; data: { citations: Citation[] } }
   | { event: 'delta'; data: { text: string } }
@@ -362,14 +362,18 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
 }
 
 /** ArrayBuffer 转 base64 字符串。 */
-function arrayBufferToBase64(buf: ArrayBuffer): string {
-  const bytes = new Uint8Array(buf)
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer)
   let binary = ''
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
   return btoa(binary)
 }
 
-/** 用后端 RSA 公钥（SPKI DER）以 RSA-OAEP(SHA-256) 加密明文密码，返回 base64 密文。 */
+/**
+ * 用后端 RSA 公钥（SPKI DER base64）以 RSA-OAEP(SHA-256) 加密明文密码，返回 base64 密文。
+ * 注意：crypto.subtle 仅在安全上下文（https / localhost）可用，局域网 IP（http://192.168.x.x）
+ * 访问时 crypto 为 undefined，登录会报 "Cannot read properties of undefined (reading 'importKey')"。
+ */
 async function encryptPassword(publicKeyB64: string, password: string): Promise<string> {
   const der = base64ToArrayBuffer(publicKeyB64)
   const publicKey = await crypto.subtle.importKey(
