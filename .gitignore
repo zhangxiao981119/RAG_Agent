@@ -39,3 +39,9 @@ Thumbs.db
 
 # Git backup
 .git_bak/
+
+# Personal documents (never push)
+张枭-*
+*.pdf
+.workbuddy/
+.trae/
