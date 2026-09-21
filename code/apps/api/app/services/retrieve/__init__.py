@@ -11,6 +11,7 @@ M4 任务 5：权限下推过滤（H7）。向量 / 关键词 SQL 都接进四�
 """
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 
@@ -22,6 +23,8 @@ from app.services.acl.visibility import pushdown_params  # noqa: F401  (外部�
 from app.services.embedding import get_embedding_service
 from app.services.retrieve.base import RetrievalResult, RetrievedChunk
 from app.services.rerank import RerankTimeout, get_rerank_service
+
+logger = logging.getLogger(__name__)
 
 # 下推 SQL 骨架（来自 acl/visibility.py：四闸门 G1~G4）
 # 注意：chunks 表无 deleted_at 列，PUSHDOWN_WHERE_SQL 里的 deleted_at 条件要去掉
@@ -47,12 +50,13 @@ LIMIT :limit
 """
 
 # 关键词召回（ILIKE 降级版，D-06）
+# ESCAPE '\' 让 pattern 中的 \% \_ 当字面量，避免用户输入的 %/_ 被当 SQL 通配符
 _KEYWORD_SQL = text(f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
        c.level_rank, c.acl_tags
 FROM chunks c
 {_WHERE_BASE}
-  AND (c.content ILIKE :pattern OR c.heading_path ILIKE :pattern)
+  AND (c.content ILIKE :pattern ESCAPE '\\' OR c.heading_path ILIKE :pattern ESCAPE '\\')
 LIMIT :limit
 """)
 
@@ -119,7 +123,15 @@ class RetrievalService:
 
         # ② 关键词召回
         t0 = time.perf_counter()
-        pattern = f"%{query[:200]}%"
+        # 转义 ILIKE 通配符 % 和 _，避免用户输入改变匹配语义
+        # （如查询 "100% 完成" 不应把 % 当任意字符通配）
+        escaped = (
+            query[:200]
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
         keyword_result = await session.execute(
             _KEYWORD_SQL,
             {**pushdown, "pattern": pattern, "limit": decisions.TOP_K_RECALL},
@@ -169,6 +181,11 @@ class RetrievalService:
                 reranked_ids.append(cid)
                 rerank_scores[cid] = float(score)
         except RerankTimeout:
+            use_rerank = False
+        except Exception:
+            # rerank 服务异常（JSON 解析错、HTTP 5xx 等）按降级处理，
+            # 避免单点故障让整个检索失败（rerank 设计意图就是"失败即降级"）
+            logger.warning("rerank 异常，降级到 vector_score", exc_info=True)
             use_rerank = False
         stages["rerank"] = int((time.perf_counter() - t0) * 1000)
 
