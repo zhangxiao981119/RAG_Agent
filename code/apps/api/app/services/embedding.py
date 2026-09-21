@@ -22,6 +22,10 @@ class EmbeddingDimensionError(EmbeddingError):
     """返回维度与 chunks.embedding 维度不一致——会破坏 HNSW 索引。"""
 
 
+class EmbeddingCountError(EmbeddingError):
+    """返回向量条数与输入文本条数不一致（模型静默截断/跳过输入）。"""
+
+
 class EmbeddingService:
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """批量嵌入。返回向量列表，顺序与输入一致。"""
@@ -46,6 +50,13 @@ class EmbeddingService:
                 payload = response.json()
                 # 按 index 排序，保证顺序
                 data = sorted(payload["data"], key=lambda item: item["index"])
+                # 条数校验：模型可能静默截断/跳过输入，少返回会让上层 zip(strict=True)
+                # 抛含糊的 ValueError；在此提前给出可定位的明确错误
+                if len(data) != len(batch):
+                    raise EmbeddingCountError(
+                        f"embedding 批次返回 {len(data)} 条向量，期望 {len(batch)} 条"
+                        f"（批次起始 start={start}，模型可能截断或跳过输入）"
+                    )
                 for item in data:
                     vec = item["embedding"]
                     if len(vec) != settings.embedding_dim:

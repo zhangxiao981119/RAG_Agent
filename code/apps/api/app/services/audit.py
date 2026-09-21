@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import date, timedelta
 from typing import Any
 
 from sqlalchemy import func, select
@@ -17,6 +18,11 @@ from app.database import SessionLocal
 from app.models import AuditLog, User
 
 logger = logging.getLogger(__name__)
+
+
+def _escape_like(value: str) -> str:
+    """转义 LIKE 模式中的特殊字符（反斜杠/百分号/下划线），避免用户输入被当通配符。"""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 async def record(
@@ -81,21 +87,23 @@ async def list_logs(
     page_size: int,
     action: str | None = None,
     user_id: uuid.UUID | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """服务端分页查询审计日志，返回 (items, total)。item 附 user 展示名。"""
     conditions = [AuditLog.tenant_id == tenant_id]
     if action:
-        # 前缀匹配：传 doc.* 可筛全部文档类动作
-        conditions.append(AuditLog.action.like(f"{action}%"))
+        # 前缀匹配：传 doc 可筛 doc.* 全部文档类动作；转义用户输入里的 %/_ 通配符
+        conditions.append(
+            AuditLog.action.like(f"{_escape_like(action)}%", escape="\\")
+        )
     if user_id:
         conditions.append(AuditLog.user_id == user_id)
     if start_date:
         conditions.append(AuditLog.created_at >= start_date)
     if end_date:
-        # end_date 是日期（YYYY-MM-DD），加一天作为上界实现"含当天"
-        conditions.append(AuditLog.created_at < f"{end_date} 23:59:59")
+        # end_date 含当天：上界取次日 00:00:00，避免 "< 23:59:59" 漏掉最后 1 秒的微秒部分
+        conditions.append(AuditLog.created_at < end_date + timedelta(days=1))
 
     total = (
         await session.execute(select(func.count()).select_from(AuditLog).where(*conditions))
