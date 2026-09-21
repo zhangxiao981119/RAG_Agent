@@ -62,18 +62,20 @@ export type User = {
 
 // ---------- 工具函数 ----------
 
+// 全部用 sessionStorage：access/refresh token + user 信息
+// 关 tab 即失效，比 localStorage 长期持有更防 XSS 重放
 const TOKEN_KEY = 'kagent_token'
 const REFRESH_TOKEN_KEY = 'kagent_refresh_token'
 const USER_KEY = 'kagent_user'
 
-/** 读取 localStorage 中的 JWT token。 */
+/** 读取 sessionStorage 中的 JWT token。 */
 export function getStoredToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY)
+  return sessionStorage.getItem(TOKEN_KEY)
 }
 
-/** 读取 localStorage 中的已登录用户信息。 */
+/** 读取 sessionStorage 中的已登录用户信息。 */
 export function getStoredUser(): User | null {
-  const raw = localStorage.getItem(USER_KEY)
+  const raw = sessionStorage.getItem(USER_KEY)
   if (!raw) return null
   try {
     return JSON.parse(raw) as User
@@ -84,14 +86,14 @@ export function getStoredUser(): User | null {
 
 /** 清除本地登录态。 */
 export function clearAuth(): void {
-  localStorage.removeItem(TOKEN_KEY)
-  localStorage.removeItem(REFRESH_TOKEN_KEY)
-  localStorage.removeItem(USER_KEY)
+  sessionStorage.removeItem(TOKEN_KEY)
+  sessionStorage.removeItem(REFRESH_TOKEN_KEY)
+  sessionStorage.removeItem(USER_KEY)
 }
 
-/** 读取 localStorage 中的 refresh token。 */
+/** 读取 sessionStorage 中的 refresh token。 */
 export function getStoredRefreshToken(): string | null {
-  return localStorage.getItem(REFRESH_TOKEN_KEY)
+  return sessionStorage.getItem(REFRESH_TOKEN_KEY)
 }
 
 /** 给请求头附加 Authorization: Bearer <token>。 */
@@ -143,7 +145,7 @@ function extractErrorMessage(status: number, text: string): string {
 }
 
 /**
- * 登录态失效统一处理：本地持有 token 却收到 401（过期/被拉黑），
+ * 登录态失效统一处理：本地持有 token 却收到 401（refresh 也失败/被拉黑），
  * 清除本地凭据并回到登录页；登录接口自身的 401 不跳转。
  */
 function handleUnauthorized(): void {
@@ -154,8 +156,52 @@ function handleUnauthorized(): void {
   }
 }
 
+// ── 401 自动 refresh + inflight 复用 ─────────────────────
+// 多个并发请求同时 401 时，只发起一次 refresh，其余复用同一 Promise
+let refreshPromise: Promise<string | null> | null = null
+
+/**
+ * 用 refresh_token 换新 access + 新 refresh（rotation）。
+ * 成功返回新 access token 并更新存储；失败返回 null（调用方应走 handleUnauthorized）。
+ * refresh 自身 401 不重试（避免循环）。
+ */
+async function refreshAccessToken(): Promise<string | null> {
+  if (refreshPromise) return refreshPromise
+  const refreshToken = getStoredRefreshToken()
+  if (!refreshToken) return null
+  refreshPromise = (async () => {
+    try {
+      const r = await fetch('/api/auth/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      })
+      if (!r.ok) return null
+      const data = (await r.json()) as { token: string; refresh_token: string }
+      sessionStorage.setItem(TOKEN_KEY, data.token)
+      // refresh token rotation：后端发了新 refresh，旧 refresh 已入黑名单
+      sessionStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token)
+      return data.token
+    } catch {
+      return null
+    } finally {
+      refreshPromise = null
+    }
+  })()
+  return refreshPromise
+}
+
 async function http<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, withAuth(init))
+  let response = await fetch(url, withAuth(init))
+  // 401 先尝试 refresh + 重试一次；refresh 失败或重试仍 401 才登出
+  if (response.status === 401) {
+    const newToken = await refreshAccessToken()
+    if (newToken) {
+      const headers = new Headers(init?.headers)
+      headers.set('Authorization', `Bearer ${newToken}`)
+      response = await fetch(url, { ...init, headers })
+    }
+  }
   if (!response.ok) {
     const text = await response.text().catch(() => '')
     if (response.status === 401) handleUnauthorized()
@@ -224,7 +270,16 @@ export async function fetchDocument(docId: string): Promise<Document | undefined
 
 /** 拉取文档原文（预览用）。调用方按 ext 决定读文本还是 blob。 */
 export async function fetchDocumentRaw(docId: string): Promise<Response> {
-  const resp = await fetch(`/api/documents/${docId}/raw`, withAuth())
+  let resp = await fetch(`/api/documents/${docId}/raw`, withAuth())
+  // 401 先 refresh + 重试一次
+  if (resp.status === 401) {
+    const newToken = await refreshAccessToken()
+    if (newToken) {
+      resp = await fetch(`/api/documents/${docId}/raw`, {
+        headers: { Authorization: `Bearer ${newToken}` },
+      })
+    }
+  }
   if (!resp.ok) {
     const text = await resp.text().catch(() => '')
     if (resp.status === 401) handleUnauthorized()
@@ -234,11 +289,7 @@ export async function fetchDocumentRaw(docId: string): Promise<Response> {
 }
 
 export async function deleteDocument(docId: string): Promise<void> {
-  const resp = await fetch(`/api/documents/${docId}`, withAuth({ method: 'DELETE' }))
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '')
-    throw new Error(`HTTP ${resp.status}: ${text}`)
-  }
+  await http<void>(`/api/documents/${docId}`, { method: 'DELETE' })
 }
 
 export async function uploadDocument(kbId: string, file: File): Promise<Document> {
@@ -298,12 +349,28 @@ export async function askChat(
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const response = await fetch('/api/chat/ask', withAuth({
+  const body = JSON.stringify({ question, kb_ids: kbIds, conversation_id: conversationId })
+  let response = await fetch('/api/chat/ask', withAuth({
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, kb_ids: kbIds, conversation_id: conversationId }),
+    body,
     signal,
   }))
+  // 401 先 refresh + 重试一次（refresh 失败则走 handleUnauthorized）
+  if (response.status === 401) {
+    const newToken = await refreshAccessToken()
+    if (newToken) {
+      response = await fetch('/api/chat/ask', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${newToken}`,
+        },
+        body,
+        signal,
+      })
+    }
+  }
   if (!response.ok || !response.body) {
     const text = await response.text().catch(() => '')
     if (response.status === 401) handleUnauthorized()
@@ -402,13 +469,13 @@ export async function login(username: string, password: string): Promise<User> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password: encryptedPassword }),
   })
-  localStorage.setItem(TOKEN_KEY, data.token)
-  localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token)
-  localStorage.setItem(USER_KEY, JSON.stringify(data.user))
+  sessionStorage.setItem(TOKEN_KEY, data.token)
+  sessionStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token)
+  sessionStorage.setItem(USER_KEY, JSON.stringify(data.user))
   return data.user
 }
 
-/** 退出登录：调后端 logout 吊销 access + refresh，再清 localStorage。 */
+/** 退出登录：调后端 logout 吊销 access + refresh，再清本地凭据。 */
 export async function logout(): Promise<void> {
   const refreshToken = getStoredRefreshToken()
   try {
@@ -417,8 +484,10 @@ export async function logout(): Promise<void> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: refreshToken }),
     })
-  } catch {
-    // 后端登出失败也要清本地（最坏情况：token 自然过期前仍可用一段时间）
+  } catch (e) {
+    // 后端 logout 调用失败时仍清本地（用户主观意图是退出）
+    // 但远程 token 可能未吊销直至过期，控制台告警便于运维侧排查
+    console.warn('后端 logout 调用失败，本地凭据已清除，远程 token 可能未吊销', e)
   }
   clearAuth()
 }

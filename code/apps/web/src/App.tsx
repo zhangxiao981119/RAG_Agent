@@ -10,13 +10,13 @@ import { AdminPage } from './pages/AdminPage'
 import { getStoredUser, logout, User } from './mocks/data'
 
 export default function App() {
-  // 启动时尝试从 localStorage 恢复登录态
+  // 启动时尝试从 sessionStorage 恢复登录态
   const [user, setUser] = useState<User | null>(() => getStoredUser())
   const navigate = useNavigate()
 
   useEffect(() => {
     // 没有 token 的残留 user 清掉
-    if (user && !localStorage.getItem('kagent_token')) {
+    if (user && !sessionStorage.getItem('kagent_token')) {
       logout()
       setUser(null)
     }
@@ -26,8 +26,9 @@ export default function App() {
     setUser(u)
   }
 
-  function handleLogout() {
-    logout()
+  // await logout：避免浏览器在 logout 请求完成前卸载页面，导致 token 未被吊销
+  async function handleLogout() {
+    await logout()
     setUser(null)
     navigate('/login')
   }
@@ -43,7 +44,13 @@ export default function App() {
         <Route path="/knowledge-bases" element={<KnowledgeBasesPage />} />
         <Route path="/knowledge-bases/:kbId/documents" element={<DocumentsPage />} />
         <Route path="/documents" element={<DocumentsPage />} />
-        <Route path="/admin" element={<AdminPage />} />
+        {/* /admin 路由前端守卫：clearance < 40 重定向到 /chat，避免直接访问 URL 渲染 AdminPage */}
+        <Route
+          path="/admin"
+          element={
+            user.clearance >= 40 ? <AdminPage /> : <Navigate to="/chat" replace />
+          }
+        />
       </Route>
       <Route path="*" element={<Navigate to="/chat" replace />} />
     </Routes>
