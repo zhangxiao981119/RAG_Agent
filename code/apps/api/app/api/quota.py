@@ -10,11 +10,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user, get_db
+from app.api.deps import CurrentUser, get_current_user, get_db, require_admin
 from app.config.settings import get_settings
 from app.models import TenantQuota
 from app.schemas.quota import QuotaUsage, TenantQuotaOut, TenantQuotaUpdate
@@ -23,18 +23,12 @@ from app.services import quota as quota_service
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-def _require_admin(user: CurrentUser) -> None:
-    if user.clearance < 40:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
-
-
 @router.get("/quota", response_model=TenantQuotaOut)
 async def get_quota(
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> TenantQuotaOut:
     """查当前租户的配额。无记录返回 settings 默认值（让 admin 看清当前生效数值）。"""
-    _require_admin(user)
     row = (
         await session.execute(
             select(TenantQuota).where(TenantQuota.tenant_id == user.tenant_id)
@@ -62,11 +56,10 @@ async def get_quota(
 @router.put("/quota", response_model=TenantQuotaOut)
 async def update_quota(
     payload: TenantQuotaUpdate,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> TenantQuotaOut:
     """修改租户配额（admin only）。无记录则新建，有记录则更新。"""
-    _require_admin(user)
     row = (
         await session.execute(
             select(TenantQuota).where(TenantQuota.tenant_id == user.tenant_id)

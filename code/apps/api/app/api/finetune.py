@@ -10,12 +10,12 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user, get_db
+from app.api.deps import CurrentUser, get_db, require_admin
 from app.models import FinetuneSample
 
 router = APIRouter(prefix="/finetune", tags=["finetune"])
@@ -43,20 +43,14 @@ class FinetuneExportResponse(BaseModel):
     exported_at: str
 
 
-def _require_admin(user: CurrentUser) -> None:
-    if "role:admin" not in user.subjects:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
-
-
 @router.get("/finetune/samples", response_model=FinetuneSamplePage)
 async def list_finetune_samples(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     exported: bool | None = Query(None, description="null=全部 true=已导出 false=未导出"),
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> FinetuneSamplePage:
-    _require_admin(user)
     conditions = [FinetuneSample.tenant_id == user.tenant_id]
     if exported is True:
         conditions.append(FinetuneSample.exported_at.is_not(None))
@@ -96,7 +90,7 @@ async def list_finetune_samples(
 
 @router.post("/finetune/samples/export", response_model=FinetuneExportResponse)
 async def export_finetune_samples(
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> FinetuneExportResponse:
     """微调取出打标：把本租户所有未导出样本标记 exported_at。
@@ -104,7 +98,6 @@ async def export_finetune_samples(
     取数流程：先 GET /finetune/samples?exported=false 拿到全部未导出样本，
     再调本接口打标，之后同批样本不会再出现在未导出列表中（增量语义）。
     """
-    _require_admin(user)
     now = datetime.now(timezone.utc)
     rows = (
         await session.execute(

@@ -114,9 +114,8 @@ async def delete_document(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> None:
-    doc = await session.get(Document, doc_id)
-    if doc is None or doc.tenant_id != user.tenant_id or doc.deleted_at is not None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+    # G1/G2/属主三重校验，与 GET /documents/{id} 一致（避免 IDOR 越权删他人文档）
+    doc = await _get_visible_document(doc_id, user, session)
 
     # 软删 document
     doc.deleted_at = datetime.now(timezone.utc)

@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user, get_db
+from app.api.deps import CurrentUser, get_db, require_admin
 from app.config.settings import get_settings
 from app.models import User
 from app.schemas.user import (
@@ -66,7 +66,7 @@ def _user_to_response(u: User, dept_path: str | None) -> UserResponse:
 async def list_users(
     page: int = Query(1, ge=1, description="页码，从 1 开始"),
     page_size: int = Query(20, ge=1, le=200, description="每页条数，1-200"),
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> UserPageResponse:
     """分页列出用户（含 dept_path）。"""
@@ -84,7 +84,7 @@ async def list_users(
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(
     payload: UserCreateRequest,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     settings = get_settings()
@@ -120,7 +120,7 @@ async def create_user(
 async def update_user(
     user_id: uuid.UUID,
     payload: UserUpdateRequest,
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     """修改用户属性。用 model_dump(exclude_unset=True) 只取客户端实际传的字段。"""
@@ -151,7 +151,7 @@ async def update_user(
 async def reset_password(
     user_id: uuid.UUID,
     payload: UserResetPasswordRequest,
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     settings = get_settings()
@@ -179,7 +179,7 @@ async def reset_password(
 @router.delete("/{user_id}", response_model=UserDeleteResponse)
 async def delete_user(
     user_id: uuid.UUID,
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> UserDeleteResponse:
     """删除用户。禁止删除自己（防止管理员误操作把自己删了）。"""

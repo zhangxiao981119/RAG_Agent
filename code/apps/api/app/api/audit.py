@@ -8,12 +8,12 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user, get_db
+from app.api.deps import CurrentUser, get_db, require_admin
 from app.services import audit
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -38,11 +38,6 @@ class AuditLogPage(BaseModel):
     page_size: int
 
 
-def _require_admin(user: CurrentUser) -> None:
-    if "role:admin" not in user.subjects:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
-
-
 @router.get("/audit-logs", response_model=AuditLogPage)
 async def list_audit_logs(
     page: int = Query(1, ge=1),
@@ -51,10 +46,9 @@ async def list_audit_logs(
     user_id: uuid.UUID | None = Query(None, description="按操作人过滤"),
     start_date: str | None = Query(None, description="起始日期 YYYY-MM-DD"),
     end_date: str | None = Query(None, description="结束日期 YYYY-MM-DD"),
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> AuditLogPage:
-    _require_admin(user)
     items, total = await audit.list_logs(
         session, user.tenant_id, page, page_size,
         action=action, user_id=user_id, start_date=start_date, end_date=end_date,
@@ -95,11 +89,10 @@ class MetricSummary(BaseModel):
 @router.get("/metrics", response_model=MetricSummary)
 async def get_metrics(
     hours: int = Query(24, ge=1, le=720, description="查询最近 N 小时的数据"),
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> MetricSummary:
     """聚合 chat.ask.metric 指标，返回 P50/P95/P99 延迟和拒答率。"""
-    _require_admin(user)
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     # 用 PostgreSQL percentile_cont 原生聚合（detail 是 JSONB）
     sql = text("""

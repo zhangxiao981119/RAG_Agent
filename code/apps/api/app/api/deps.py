@@ -138,3 +138,16 @@ async def get_current_user(
         ),
         acl_epoch=acl_epoch,
     )
+
+
+async def require_admin(
+    user: CurrentUser = Depends(get_current_user),
+) -> CurrentUser:
+    """管理员依赖：clearance < 40 拒绝（403）。
+
+    统一 admin 鉴权口径，消除旧代码中 "role:admin" in subjects 与
+    clearance < 40 两套判定并存的歧义（M1）。
+    """
+    if user.clearance < 40:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
+    return user

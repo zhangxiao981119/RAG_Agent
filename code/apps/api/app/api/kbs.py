@@ -222,6 +222,7 @@ async def set_kb_members(
     """全量设置知识库成员（四种主体，手册 §5.1）。
 
     成员实际变化时由 services/kb_member 触发 tenant_acl_epoch+1。
+    权限：admin（clearance >= 40）或库 owner 可改，避免普通用户给自己加成员。
     """
     settings = get_settings()
     redis = Redis.from_url(settings.redis_url)
@@ -229,6 +230,9 @@ async def set_kb_members(
         kb = await session.get(KnowledgeBase, kb_id)
         if kb is None or kb.tenant_id != user.tenant_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+        # 仅 admin 或库 owner 可改成员
+        if user.clearance < 40 and kb.owner_id != user.user_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
         try:
             rows, changed = await kb_member_service.set_members(
                 session, redis, user.tenant_id, kb_id,
@@ -303,6 +307,10 @@ async def upload_document(
     kb = await session.get(KnowledgeBase, kb_id)
     if kb is None or kb.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+    # G2：库级授权（kb_id ∈ authorized_kb_ids），admin 豁免
+    # 与 list_documents 一致，避免普通用户向任意库上传文档
+    if user.clearance < 40 and kb_id not in user.authorized_kb_ids:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
 
     # 读文件内容（限制大小，避免 OOM）
     data = await file.read()
