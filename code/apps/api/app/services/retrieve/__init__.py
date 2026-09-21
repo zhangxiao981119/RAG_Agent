@@ -178,6 +178,9 @@ class RetrievalService:
             results = await rerank_service.rerank(query, documents, decisions.TOP_K_RERANK)
             # results 按相关性绝对分降序，直接采用（relevance_score 已是 0~1 的 sigmoid 分）
             for idx, score in results:
+                # 防御越界：异常 rerank 服务返回的 idx 可能超出 candidate_ids 范围
+                if not (0 <= idx < len(candidate_ids)):
+                    continue
                 cid = candidate_ids[idx]
                 reranked_ids.append(cid)
                 rerank_scores[cid] = float(score)

@@ -54,7 +54,7 @@ class LLMService:
             async with httpx.AsyncClient(timeout=settings.llm_total_timeout_seconds) as client:
                 async with client.stream(
                     "POST",
-                    f"{settings.llm_base_url.rstrip('/').rstrip('/v1')}/v1/chat/completions",
+                    f"{settings.llm_base_url.rstrip('/').removesuffix('/v1')}/v1/chat/completions",
                     headers=headers,
                     json=body,
                 ) as response:

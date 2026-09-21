@@ -353,7 +353,7 @@ export function ChatPage({ currentUser }: Props) {
         return
       }
       setMessages((prev) =>
-        prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: '' } : m)),
+        prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: fullText } : m)),
       )
       setMessages((prev) =>
         prev.concat({

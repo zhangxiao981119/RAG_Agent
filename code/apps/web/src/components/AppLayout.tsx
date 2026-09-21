@@ -38,7 +38,7 @@ export function AppLayout({ currentUser, onLogout }: Props) {
   useEffect(() => {
     if (!currentUser) return
     if (localStorage.getItem('kagent_onboarded')) return
-    if ((currentUser.clearance ?? 0) < 40) return
+    if (currentUser.clearance < 40) return
 
     let cancelled = false
     fetchKbs()
@@ -55,8 +55,9 @@ export function AppLayout({ currentUser, onLogout }: Props) {
 
   // 系统管理入口仅 admin（clearance >= 40）可见，避免普通用户误触
   const menuItems = useMemo<MenuProps['items']>(() => {
+    if (!currentUser) return [...BASE_MENU_ITEMS]
     const items = [...BASE_MENU_ITEMS]
-    if ((currentUser?.clearance ?? 0) >= 40) {
+    if (currentUser.clearance >= 40) {
       items.push({ key: '/admin', icon: <AppstoreOutlined />, label: '系统管理' })
     }
     return items

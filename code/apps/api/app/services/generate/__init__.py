@@ -437,7 +437,8 @@ class StreamGenerationService(GenerationService):
             llm_fail_reason = "LLM_ERROR"
 
         # 处理最后一段未换行内容
-        if line_buf and not llm_failed and not aborted:
+        # LLM 失败时也保留已生成的 partial 内容，避免已接收的文本被丢弃
+        if line_buf and not aborted:
             async for evt in _flush_lines(line_buf, is_final=True):
                 if evt.type == "refused":
                     yield evt

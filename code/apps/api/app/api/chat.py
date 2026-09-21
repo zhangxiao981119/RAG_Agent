@@ -243,7 +243,8 @@ async def chat_ask(
                 history.append({"role": m.role, "content": m.content})
 
         # 2. 历史过长时压缩（把较早的合并成摘要）
-        if len(history) > decisions.MEMORY_COMPRESS_THRESHOLD:
+        # >= 而非 > ：达到阈值即触发，否则 limit(N+1)+[:-1] 最多 N 条永不压缩
+        if len(history) >= decisions.MEMORY_COMPRESS_THRESHOLD:
             history = await compress_history(history, decisions.MAX_HISTORY_TURNS)
 
         # 3. 读用户画像
