@@ -61,6 +61,8 @@ type Message = {
   adopted?: boolean
   /** 快捷追问建议（后端 done 事件带回） */
   suggestions?: string[]
+  /** 网络断开导致 SSE 中断：保留已流出的 fullText，提示用户重试 */
+  networkError?: boolean
 }
 
 type Props = { currentUser: User }
@@ -352,17 +354,15 @@ export function ChatPage({ currentUser }: Props) {
         )
         return
       }
+      // 非主动中止：网络断开 / 后端连接中断 / HTTP 错误
+      // 保留已流出的 fullText（用户已看到的部分不丢失），标记为 networkError
+      // MessageBubble 会渲染断网提示 + 重试按钮（重试走 handleRetry → askQuestion）
       setMessages((prev) =>
-        prev.map((m) => (m.id === assistantMsg.id ? { ...m, loading: false, text: fullText } : m)),
-      )
-      setMessages((prev) =>
-        prev.concat({
-          id: `err_${Date.now()}`,
-          role: 'assistant',
-          text: '',
-          refused: true,
-          refusedMessage: e instanceof Error ? e.message : '请求失败，请稍后重试',
-        }),
+        prev.map((m) =>
+          m.id === assistantMsg.id
+            ? { ...m, loading: false, done: true, text: fullText || '', networkError: true }
+            : m,
+        ),
       )
     } finally {
       // 主动停止在 catch 内 return，finally 仍会执行，统一回收流式态
@@ -828,6 +828,35 @@ function MessageBubble({
           </div>
         </div>
       </div>
+
+      {/* 网络断开提示：SSE 中途断连时已保留 fullText，提示用户重试 */}
+      {msg.networkError && (
+        <div
+          style={{
+            marginTop: 8,
+            marginLeft: 4,
+            padding: '6px 12px',
+            background: '#fff7e6',
+            border: '1px solid #ffd591',
+            borderRadius: 6,
+            fontSize: 13,
+            color: '#d46b08',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+          }}
+        >
+          <span>连接中断，已保留已流出的内容，请点击重试</span>
+          <Button
+            size="small"
+            icon={<RedoOutlined />}
+            onClick={() => onRetry(msg)}
+            style={{ flexShrink: 0 }}
+          >
+            重试
+          </Button>
+        </div>
+      )}
 
       {/* 追问建议气泡 */}
       {canOperate && msg.suggestions && msg.suggestions.length > 0 && (

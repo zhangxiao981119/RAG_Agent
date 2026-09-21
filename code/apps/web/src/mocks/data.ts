@@ -292,12 +292,59 @@ export async function deleteDocument(docId: string): Promise<void> {
   await http<void>(`/api/documents/${docId}`, { method: 'DELETE' })
 }
 
-export async function uploadDocument(kbId: string, file: File): Promise<Document> {
-  const form = new FormData()
-  form.append('file', file)
-  return http<Document>(`/api/kbs/${kbId}/documents`, {
-    method: 'POST',
-    body: form,
+/** 带上传进度的文件上传。fetch 标准不支持 upload progress，必须用 XMLHttpRequest。
+ *  401 自动 refresh + 重试（复用 http() 的 refreshAccessToken 逻辑）。
+ */
+export function uploadDocument(
+  kbId: string,
+  file: File,
+  onProgress?: (percent: number) => void,
+): Promise<Document> {
+  return new Promise((resolve, reject) => {
+    const url = `/api/kbs/${kbId}/documents`
+    const form = new FormData()
+    form.append('file', file)
+
+    const doSend = (token: string | null) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', url, true)
+      if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && onProgress) {
+          onProgress(Math.round((e.loaded / e.total) * 100))
+        }
+      }
+
+      xhr.onload = () => {
+        if (xhr.status === 200 || xhr.status === 201) {
+          try {
+            resolve(JSON.parse(xhr.responseText) as Document)
+          } catch {
+            reject(new Error('上传响应解析失败'))
+          }
+          return
+        }
+        // 401：尝试 refresh + 重试一次
+        if (xhr.status === 401) {
+          void refreshAccessToken().then((newToken) => {
+            if (newToken) {
+              doSend(newToken)
+            } else {
+              handleUnauthorized()
+              reject(new ApiError(401, '登录已过期'))
+            }
+          })
+          return
+        }
+        reject(new ApiError(xhr.status, extractErrorMessage(xhr.status, xhr.responseText)))
+      }
+
+      xhr.onerror = () => reject(new ApiError(0, '网络错误，请检查连接'))
+      xhr.send(form)
+    }
+
+    doSend(getStoredToken())
   })
 }
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -10,6 +10,7 @@ import {
   Input,
   Modal,
   Popconfirm,
+  Progress,
   Select,
   Space,
   Spin,
@@ -58,9 +59,17 @@ export function DocumentsPage() {
   const [selectedKb, setSelectedKb] = useState<string>(kbId || '')
   const [documents, setDocuments] = useState<Document[]>([])
   const [uploading, setUploading] = useState(false)
+  /** 上传进度百分比，null 表示当前没有文件在上传 */
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null)
   const [previewDoc, setPreviewDoc] = useState<Document | null>(null)
-  // 前端搜索关键字（按文件名过滤）
+  /** 前端搜索关键字（按文件名过滤） */
   const [search, setSearch] = useState('')
+  /** Table rowSelection 选中行 id */
+  const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
+
+  // documents 的 ref 镜像：供轮询 effect 读取最新数组，避免把 documents 放进依赖导致定时器反复重建
+  const documentsRef = useRef<Document[]>([])
+  documentsRef.current = documents
 
   useEffect(() => {
     fetchKbs()
@@ -75,6 +84,11 @@ export function DocumentsPage() {
     if (kbId) setSelectedKb(kbId)
   }, [kbId])
 
+  // 切换知识库时清空选中行（避免跨库残留）
+  useEffect(() => {
+    setSelectedRowKeys([])
+  }, [selectedKb])
+
   useEffect(() => {
     if (!selectedKb) return
     fetchDocuments(selectedKb)
@@ -83,26 +97,52 @@ export function DocumentsPage() {
   }, [selectedKb, message])
 
   // 轮询：有 pending/parsing 文档时每 3s 刷新（手册 C6 验收）
+  // 用 ref 读取 documents 最新值，避免把 documents 数组放进依赖 → 定时器因引用变化反复销毁重建
   useEffect(() => {
-    const hasParsing = documents.some((d) => d.status === 'pending' || d.status === 'parsing')
-    if (!hasParsing || !selectedKb) return
+    if (!selectedKb) return
     const timer = setInterval(() => {
+      const current = documentsRef.current
+      const hasParsing = current.some(
+        (d) => d.status === 'pending' || d.status === 'parsing',
+      )
+      if (!hasParsing) return
       fetchDocuments(selectedKb).then(setDocuments).catch(() => undefined)
     }, 3000)
     return () => clearInterval(timer)
-  }, [documents, selectedKb])
+  }, [selectedKb])
 
   async function handleUpload(file: File) {
     if (!selectedKb) return
     setUploading(true)
+    setUploadProgress(0)
     try {
-      await uploadDocument(selectedKb, file)
+      await uploadDocument(selectedKb, file, (percent) => setUploadProgress(percent))
       message.success(`文件「${file.name}」已上传，等待解析`)
       setDocuments(await fetchDocuments(selectedKb))
     } catch (e) {
       message.error(e instanceof Error ? e.message : '上传失败')
     } finally {
       setUploading(false)
+      setUploadProgress(null)
+    }
+  }
+
+  async function handleBatchDelete(ids: React.Key[]) {
+    const uuidList = ids.map((k) => String(k))
+    let ok = 0
+    let fail = 0
+    await Promise.allSettled(uuidList.map((id) => deleteDocument(id))).then((results) => {
+      results.forEach((r) => {
+        if (r.status === 'fulfilled') ok++
+        else fail++
+      })
+    })
+    setDocuments((prev) => prev.filter((d) => !ids.includes(d.id)))
+    setSelectedRowKeys([])
+    if (fail === 0) {
+      message.success(`已删除 ${ok} 个文档`)
+    } else {
+      message.warning(`删除 ${ok} 个成功，${fail} 个失败`)
     }
   }
 
@@ -229,8 +269,30 @@ export function DocumentsPage() {
         <p className="ant-upload-hint">支持 PDF / Markdown / TXT / XLS / XLSX / DOCX，单文件不超过 100 MB</p>
       </Dragger>
 
+      {uploading && uploadProgress != null && (
+        <div style={{ marginBottom: 16, padding: '8px 12px', background: '#f5f5f5', borderRadius: 6 }}>
+          <Progress percent={uploadProgress} status={uploadProgress >= 100 ? 'success' : 'active'} size="small" />
+        </div>
+      )}
+
       <Card variant="borderless" styles={{ body: { padding: 16 } }}>
-        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, gap: 12, flexWrap: 'wrap' }}>
+          {selectedRowKeys.length > 0 ? (
+            <Popconfirm
+              title={`确定批量删除选中的 ${selectedRowKeys.length} 个文档吗？`}
+              description="删除后不可恢复。"
+              okText="全部删除"
+              okButtonProps={{ danger: true }}
+              cancelText="取消"
+              onConfirm={() => void handleBatchDelete(selectedRowKeys)}
+            >
+              <Button danger icon={<DeleteOutlined />}>
+                批量删除 ({selectedRowKeys.length})
+              </Button>
+            </Popconfirm>
+          ) : (
+            <div />
+          )}
           <Input.Search
             placeholder="按文件名搜索"
             allowClear
@@ -244,7 +306,11 @@ export function DocumentsPage() {
           columns={columns}
           dataSource={filteredDocuments}
           size="middle"
-          pagination={false}
+          pagination={{ pageSize: 10, showSizeChanger: true, showQuickJumper: true }}
+          rowSelection={{
+            selectedRowKeys,
+            onChange: (keys: React.Key[]) => setSelectedRowKeys(keys),
+          }}
           locale={{ emptyText: <Empty description={selectedKb ? (search.trim() ? '未匹配到文档' : '该知识库暂无文档') : '请先选择知识库'} /> }}
         />
       </Card>
