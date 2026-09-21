@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import uuid
 
-from arq.connections import RedisSettings, create_pool
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from arq.connections import RedisSettings
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -300,6 +300,7 @@ async def upload_document(
     file: UploadFile = File(...),
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
+    request: Request = None,
 ) -> DocumentOut:
     settings = get_settings()
 
@@ -384,14 +385,10 @@ async def upload_document(
         detail={"kb_id": str(kb_id), "filename": filename, "size_bytes": size_bytes, "level_rank": 20},
     )
 
-    # 入队 arq 任务（必须指定与 WorkerSettings.queue_name 一致）
-    redis = await create_pool(
-        RedisSettings.from_dsn(settings.redis_url)
-    )
-    await redis.enqueue_job(
+    # 入队 arq 任务（复用 lifespan 初始化的全局连接池）
+    await request.app.state.arq_pool.enqueue_job(
         "run_parse_job", str(parse_job.id), _queue_name=settings.arq_queue_name
     )
-    await redis.close()
 
     return DocumentOut(
         id=document.id,

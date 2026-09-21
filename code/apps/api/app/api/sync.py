@@ -161,26 +161,22 @@ async def trigger_sync(
     source_id: uuid.UUID,
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
+    request: Request = None,
 ) -> SyncResult:
     """手动触发同步 —— 入队 arq 异步执行，立即返回。
 
     同步过程可能涉及 git clone（大仓库 300s），HTTP 同步等待会触发网关超时。
     改为 arq 入队后立即返回，前端可轮询 sync_source.last_sync_count 查看进度。
+    连接池复用 lifespan 初始化的全局 arq pool。
     """
-    from arq.connections import RedisSettings, create_pool
-
     source = await session.get(SyncSource, source_id)
     if source is None or source.tenant_id != user.tenant_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
 
     settings = get_settings()
-    redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
-    try:
-        await redis.enqueue_job(
-            "run_sync_source", str(source_id), _queue_name=settings.arq_queue_name
-        )
-    finally:
-        await redis.close()
+    await request.app.state.arq_pool.enqueue_job(
+        "run_sync_source", str(source_id), _queue_name=settings.arq_queue_name
+    )
 
     await audit.record(
         user.tenant_id, user.user_id, "sync_source.trigger",
