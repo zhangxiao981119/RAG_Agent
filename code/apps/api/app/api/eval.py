@@ -4,11 +4,11 @@ POST /api/admin/eval/run  触发评估，返回逐条结果
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user, get_db
+from app.api.deps import CurrentUser, get_db, require_admin
 from app.services import audit
 from app.services.eval_service import run_eval
 
@@ -35,18 +35,12 @@ class EvalReportResponse(BaseModel):
     cases: list[EvalCaseResultItem]
 
 
-def _require_admin(user: CurrentUser) -> None:
-    if "role:admin" not in user.subjects:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
-
-
 @router.post("/eval/run", response_model=EvalReportResponse)
 async def eval_run(
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> EvalReportResponse:
     """触发全量评估，返回逐条结果。"""
-    _require_admin(user)
     report = await run_eval(session, user.tenant_id)
 
     # 审计记录

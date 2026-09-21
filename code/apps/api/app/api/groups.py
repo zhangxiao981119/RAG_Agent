@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user, get_db
+from app.api.deps import CurrentUser, get_current_user, get_db, require_admin
 from app.config.settings import get_settings
 from app.models import Group
 from app.schemas.group import (
@@ -56,7 +56,7 @@ async def list_groups(
 @router.post("", response_model=GroupResponse, status_code=status.HTTP_201_CREATED)
 async def create_group(
     payload: GroupCreateRequest,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> GroupResponse:
     settings = get_settings()
@@ -81,7 +81,7 @@ async def create_group(
 async def update_group(
     group_id: uuid.UUID,
     payload: GroupUpdateRequest,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> GroupResponse:
     settings = get_settings()
@@ -104,7 +104,7 @@ async def update_group(
 @router.delete("/{group_id}", response_model=GroupDeleteResponse)
 async def delete_group(
     group_id: uuid.UUID,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> GroupDeleteResponse:
     settings = get_settings()
@@ -146,7 +146,7 @@ async def list_members(
 async def add_members(
     group_id: uuid.UUID,
     payload: GroupMemberAddRequest,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> GroupMemberOpResponse:
     """批量加成员。"""
@@ -169,7 +169,7 @@ async def add_members(
 async def remove_member(
     group_id: uuid.UUID,
     user_id: uuid.UUID,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> GroupMemberOpResponse:
     """移除单个成员。"""

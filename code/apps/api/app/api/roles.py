@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user, get_db
+from app.api.deps import CurrentUser, get_current_user, get_db, require_admin
 from app.config.settings import get_settings
 from app.models import Role
 from app.schemas.role import (
@@ -53,7 +53,7 @@ async def list_roles(
 @router.post("", response_model=RoleResponse, status_code=status.HTTP_201_CREATED)
 async def create_role(
     payload: RoleCreateRequest,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> RoleResponse:
     settings = get_settings()
@@ -76,7 +76,7 @@ async def create_role(
 async def update_role(
     role_id: uuid.UUID,
     payload: RoleUpdateRequest,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> RoleResponse:
     settings = get_settings()
@@ -98,7 +98,7 @@ async def update_role(
 @router.delete("/{role_id}", response_model=RoleDeleteResponse)
 async def delete_role(
     role_id: uuid.UUID,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> RoleDeleteResponse:
     settings = get_settings()

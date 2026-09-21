@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user, get_db  # noqa: F401  (get_current_user 用于 Depends)
+from app.api.deps import CurrentUser, get_current_user, get_db, require_admin  # noqa: F401  (get_current_user 用于 Depends)
 from app.config.settings import get_settings
 from app.models import Department, Tenant
 from app.schemas.department import (
@@ -70,7 +70,7 @@ async def list_departments(
 @router.post("", response_model=DepartmentResponse, status_code=status.HTTP_201_CREATED)
 async def create_department(
     payload: DepartmentCreateRequest,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentResponse:
     settings = get_settings()
@@ -97,7 +97,7 @@ async def create_department(
 async def update_department(
     dept_id: uuid.UUID,
     payload: DepartmentUpdateRequest,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentResponse:
     settings = get_settings()
@@ -132,7 +132,7 @@ async def update_department(
 async def move_department(
     dept_id: uuid.UUID,
     payload: DepartmentMoveRequest,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentResponse:
     settings = get_settings()
@@ -154,7 +154,7 @@ async def move_department(
 @router.delete("/{dept_id}", response_model=DepartmentDeleteResponse)
 async def delete_department(
     dept_id: uuid.UUID,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentDeleteResponse:
     settings = get_settings()
