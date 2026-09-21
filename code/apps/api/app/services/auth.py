@@ -10,6 +10,7 @@ Token 体系（手册 §5.1）：
 """
 from __future__ import annotations
 
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -24,6 +25,25 @@ ALGORITHM = "HS256"
 # token 类型标识
 TOKEN_TYPE_ACCESS = "access"
 TOKEN_TYPE_REFRESH = "refresh"
+
+# dev 环境 jwt_secret 为 None 时的自动生成缓存（进程级，重启即失效）
+_dev_jwt_secret: str | None = None
+
+
+def _get_jwt_secret() -> str:
+    """获取 JWT 签名密钥。
+
+    prod 环境：settings.jwt_secret MUST 已被 model_post_init 校验非空。
+    dev 环境：settings.jwt_secret 为 None 时自动生成随机密钥（进程级缓存，重启即变）。
+    """
+    global _dev_jwt_secret
+    settings = get_settings()
+    if settings.jwt_secret:
+        return settings.jwt_secret
+    # dev 兜底：自动生成随机值
+    if _dev_jwt_secret is None:
+        _dev_jwt_secret = secrets.token_urlsafe(64)
+    return _dev_jwt_secret
 
 
 def hash_password(plain: str) -> str:
@@ -67,7 +87,7 @@ def _create_token(
     }
     if extra_claims:
         payload.update(extra_claims)
-    return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM)
+    return jwt.encode(payload, _get_jwt_secret(), algorithm=ALGORITHM)
 
 
 def create_access_token(
@@ -106,7 +126,7 @@ def verify_access_token(token: str) -> dict[str, Any]:
     ★ 不检查黑名单 —— 黑名单在 deps.get_current_user 中查 Redis。
     """
     settings = get_settings()
-    payload = jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM])
+    payload = jwt.decode(token, _get_jwt_secret(), algorithms=[ALGORITHM])
     if payload.get("typ") != TOKEN_TYPE_ACCESS:
         raise JWTError(f"token typ 不是 access：{payload.get('typ')}")
     return payload
@@ -118,7 +138,7 @@ def verify_refresh_token(token: str) -> dict[str, Any]:
     ★ 不检查黑名单 —— 黑名单在 api/auth.refresh 端点中查 Redis。
     """
     settings = get_settings()
-    payload = jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM])
+    payload = jwt.decode(token, _get_jwt_secret(), algorithms=[ALGORITHM])
     if payload.get("typ") != TOKEN_TYPE_REFRESH:
         raise JWTError(f"token typ 不是 refresh：{payload.get('typ')}")
     return payload

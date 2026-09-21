@@ -1,9 +1,12 @@
 import json
 import logging
+import os
 import traceback
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.auth import router as auth_router
@@ -27,6 +30,7 @@ from app.api.sensitive_words import router as sensitive_words_router
 from app.api.sync import router as sync_router
 from app.api.users import router as users_router
 from app.config import decisions
+from app.config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +82,40 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="知识库问答 Agent API", version="0.2.0", lifespan=lifespan)
+
+# ── CORS + 可信主机（安全基线）────────────────────────────
+settings = get_settings()
+# dev 环境允许 localhost + 局域网 IP；prod 环境应通过 CORS_ORIGINS 环境变量显式注入
+_dev_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+# prod 可通过环境变量 CORS_ORIGINS="https://foo.com,https://bar.com" 覆盖
+_cors_origins_env = os.environ.get("CORS_ORIGINS", "").strip()
+cors_origins = (
+    [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    if _cors_origins_env
+    else _dev_origins
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 可信主机：dev 允许任意（含 nginx 代理透传的 Host）；prod 应通过 TRUSTED_HOSTS 环境变量注入
+_trusted_hosts_env = os.environ.get("TRUSTED_HOSTS", "").strip()
+trusted_hosts = (
+    [h.strip() for h in _trusted_hosts_env.split(",") if h.strip()]
+    if _trusted_hosts_env
+    else ["*"]  # dev 宽松，prod 必须显式配置
+)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
 
 
 @app.exception_handler(ValueError)
