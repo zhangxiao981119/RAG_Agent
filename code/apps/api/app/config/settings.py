@@ -18,10 +18,11 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "dev"
-    secret_key: str = "change-me"
+    # ── 密钥/密码：生产 MUST 通过环境变量覆盖，dev 可用空字符串（seed 自动生成） ──
+    secret_key: str | None = None  # RSA 私钥 PEM 路径或内容；None 时 seed_prod 自动生成
     tenant_code: str = "default"
     # ── M3 JWT 认证 ──────────────────────────────────────────
-    jwt_secret: str = "change-me-jwt"
+    jwt_secret: str | None = None  # JWT 签名密钥；生产 MUST 显式注入，dev 自动生成随机值
     jwt_expire_minutes: int = 1440  # access token 默认 24 小时
     jwt_refresh_expire_days: int = 7  # refresh token 默认 7 天
     # ── M3 登录安全策略 ──────────────────────────────────────
@@ -32,8 +33,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://user:pass@postgres:5432/kagent"
     redis_url: str = "redis://redis:6379/0"
     s3_endpoint: str = "http://minio:9000"
-    s3_access_key: str = "minioadmin"
-    s3_secret_key: str = "minioadmin"
+    s3_access_key: str | None = None  # MinIO/S3 access key；None 时 seed_prod 自动生成
+    s3_secret_key: str | None = None  # MinIO/S3 secret key；None 时 seed_prod 自动生成
     s3_bucket: str = "kagent-docs"
     llm_base_url: str | None = None
     llm_api_key: str = ""
@@ -50,7 +51,7 @@ class Settings(BaseSettings):
     audit_retention_days: int = 365
     multi_tenant: bool = False
     # ── M5 生产初始化 ────────────────────────────────────────
-    admin_password: str = "ChangeMe123!"  # seed_prod 创建管理员时使用，生产 MUST 通过环境变量覆盖
+    admin_password: str | None = None  # seed_prod 创建管理员时使用；None 时自动生成随机密码
     # ── M2 模型调用 ──────────────────────────────────────────
     embedding_batch_size: int = 32
     rerank_timeout_seconds: float = 3.0
@@ -74,6 +75,24 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    def model_post_init(self, __context) -> None:
+        """生产环境启动时强制校验关键密钥。
+
+        在 model_post_init 里才能拿到所有字段值（app_env + jwt_secret 等）。
+        dev 环境 jwt_secret 允许 None（auth.py 运行时自动生成随机值）。
+        prod 环境必须显式注入，否则立即阻止启动。
+        """
+        if self.app_env == "prod":
+            missing = []
+            if not self.jwt_secret:
+                missing.append("JWT_SECRET")
+            if not self.secret_key:
+                missing.append("SECRET_KEY")
+            if missing:
+                raise ValueError(
+                    f"生产环境必须显式注入: {', '.join(missing)}（当前值为 None/空）"
+                )
 
 
 @lru_cache
