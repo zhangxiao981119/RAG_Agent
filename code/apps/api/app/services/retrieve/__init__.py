@@ -61,8 +61,9 @@ LIMIT :limit
 """)
 
 # 取 chunk 的 filename（JOIN documents）
+# 过滤 deleted_at IS NULL，避免已软删除文档的 filename 仍被带进引用展示
 _FILENAME_SQL = text("""
-SELECT id, filename FROM documents WHERE id = ANY(:doc_ids)
+SELECT id, filename FROM documents WHERE id = ANY(:doc_ids) AND deleted_at IS NULL
 """)
 
 

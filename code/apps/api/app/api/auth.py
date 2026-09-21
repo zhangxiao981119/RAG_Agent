@@ -17,7 +17,7 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, get_db, CurrentUser
+from app.api.deps import get_db
 from app.config.settings import get_settings
 from app.models import Department, Tenant, User
 from app.schemas.auth import (
@@ -189,10 +189,11 @@ async def refresh(
 
     流程：
       1. 校验 refresh token 签名 + 过期 + typ
-      2. 检查 jti 是否在黑名单（已登出 / 已 rotation 过）
-      3. 查 User，校验仍存在 + active + tenant 一致
-      4. 旧 refresh 的 jti 入黑名单（TTL=剩余有效期）—— 一次性使用
-      5. 签发新 access + 新 refresh
+      2. 查 User，校验仍存在 + active + tenant 一致
+      3. rotation：用 SET NX 原子把旧 refresh jti 入黑名单
+         - 若 SET NX 返回 False，说明并发请求已先 rotation 过，拒绝本次请求
+         - 原 EXISTS+SETEX 两步非原子，会被并发 refresh 同时通过黑名单检查
+      4. 签发新 access + 新 refresh
     """
     try:
         refresh_payload = verify_refresh_token(payload.refresh_token)
@@ -216,18 +217,26 @@ async def refresh(
     settings = get_settings()
     redis = Redis.from_url(settings.redis_url)
     try:
-        # 黑名单检查
-        if await redis.exists(_BLACKLIST_KEY.format(jti=jti)):
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "refresh token 已失效，请重新登录")
-
         user = await session.get(User, user_id)
         if user is None or user.tenant_id != tenant_id or user.username != username:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户不存在或已被替换")
         if user.status != "active":
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户已被禁用")
 
-        # rotation：旧 refresh 入黑名单
-        await _revoke_token(redis, refresh_payload)
+        # rotation：用 SET NX 原子把旧 refresh jti 入黑名单
+        # SET key value NX EX ttl：key 不存在才设置并返回 True，已存在返回 nil（False）
+        # 这样并发两次 refresh 同一 jti 只会有一个成功，另一个被拒
+        exp = refresh_payload.get("exp")
+        if not exp:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "refresh token 字段缺失")
+        now = int(time.time())
+        ttl = max(1, int(exp) - now)
+        blacklisted = await redis.set(
+            _BLACKLIST_KEY.format(jti=jti), "1", nx=True, ex=ttl
+        )
+        if not blacklisted:
+            # 已被并发 rotation 或 logout 抢先入黑名单
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "refresh token 已失效，请重新登录")
 
         new_access = create_access_token(user.id, tenant_id, user.username)
         new_refresh = create_refresh_token(user.id, tenant_id, user.username)
@@ -239,18 +248,19 @@ async def refresh(
 @router.post("/auth/logout", response_model=LogoutResponse)
 async def logout(
     payload: LogoutRequest,
-    user: CurrentUser = Depends(get_current_user),  # 用 access token 鉴权
     authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> LogoutResponse:
     """登出：把 access + refresh 的 jti 加入 Redis 黑名单。
 
-    鉴权依赖 get_current_user（已检查黑名单 + 用户状态），所以到这里 access token
-    一定是有效的。可选 body.refresh_token 一并吊销。
+    不强制依赖 get_current_user（access token 鉴权），因为 access 已过期时
+    用户无法登出会形成死锁：access 401 → 前端跳登录 → 又拿不到有效 access
+    去 logout。改为可选 access（从 Header 取，容错校验）+ 可选 refresh
+    （从 body 取，容错校验），两者都失效时也返回 revoked=True（用户本就要登出）。
     """
     settings = get_settings()
     redis = Redis.from_url(settings.redis_url)
     try:
-        # access token 入黑名单
+        # access token 入黑名单（可能已过期，跳过即可）
         if authorization and authorization.startswith("Bearer "):
             access_token = authorization.removeprefix("Bearer ").strip()
             try:
@@ -260,7 +270,7 @@ async def logout(
             except JWTError:
                 pass  # 已过期/无效，无需入黑名单
 
-        # 可选：refresh token 一并吊销
+        # refresh token 一并吊销（可能已过期，跳过即可）
         if payload.refresh_token:
             try:
                 refresh_payload = verify_refresh_token(payload.refresh_token)

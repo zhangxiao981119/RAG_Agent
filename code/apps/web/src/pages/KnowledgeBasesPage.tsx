@@ -13,6 +13,7 @@ import {
   fetchRoles,
   fetchDepartments,
   DepartmentNode,
+  getStoredUser,
   KnowledgeBase,
   KbMemberItem,
   setKbMembers,
@@ -146,7 +147,8 @@ export function KnowledgeBasesPage() {
                   extra={
                     <Space>
                       {kb.is_public && <Tag color="blue">公开</Tag>}
-                      {!kb.is_public && (
+                      {/* 成员管理按钮仅 admin（clearance >= 40）可见，避免普通用户点开触发 admin API 403 */}
+                      {!kb.is_public && (getStoredUser()?.clearance ?? 0) >= 40 && (
                         <Button
                           size="small"
                           type="text"
@@ -300,6 +302,8 @@ function MemberModal({
 
   useEffect(() => {
     if (!open) return
+    // 双重防御：按钮已按 clearance 守卫，Modal 内部再校验一次，避免任何绕过按钮的调用触发 admin API 403
+    if ((getStoredUser()?.clearance ?? 0) < 40) return
     setSelectedId(null)
     setAddLoading(true)
     const load = async (): Promise<{ value: string; label: string }[]> => {
