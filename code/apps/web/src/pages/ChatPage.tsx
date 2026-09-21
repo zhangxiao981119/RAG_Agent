@@ -785,7 +785,8 @@ function MessageBubble({
     )
   }
 
-  const canOperate = !msg.loading && msg.done && !msg.refused && !!msg.messageId && !!msg.text
+  // networkError 消息只显示断网提示行的重试按钮，隐藏正常操作栏（避免重复）
+  const canOperate = !msg.loading && msg.done && !msg.refused && !msg.networkError && !!msg.messageId && !!msg.text
 
   return (
     <div style={{ marginBottom: 12 }}>
