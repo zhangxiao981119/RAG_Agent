@@ -120,10 +120,10 @@ async def create_user(
     session.add(user)
     await session.flush()
 
-    # 新用户加入后，部门 user_count 变 + subjects 可能含 user:<id>
-    # 但 user:<id> 主体不依赖 dept，所以严格说只 dept_id 影响时才需要 +1
-    # 简化：新建用户也 +1，多算一次无害
-    await _bump_acl_epoch(session, redis, tenant_id)
+    # 仅当用户会影响租户级 ACL 缓存时才 bump epoch
+    # user:<id> 主体独立于 dept，dept_id/role_names 为空时不会影响其他用户可见性
+    if dept_id is not None or role_names:
+        await _bump_acl_epoch(session, redis, tenant_id)
     return user
 
 

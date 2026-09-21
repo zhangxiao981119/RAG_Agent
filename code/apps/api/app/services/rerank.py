@@ -37,7 +37,7 @@ class RerankService:
         try:
             async with httpx.AsyncClient(timeout=settings.rerank_timeout_seconds) as client:
                 response = await client.post(
-                    f"{settings.rerank_base_url.rstrip('/').rstrip('/v1')}/v1/rerank",
+                    f"{settings.rerank_base_url.rstrip('/').removesuffix('/v1')}/v1/rerank",
                     json={
                         "model": settings.rerank_model,
                         "query": query,

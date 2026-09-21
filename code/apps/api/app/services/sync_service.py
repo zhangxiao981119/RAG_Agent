@@ -175,7 +175,11 @@ async def sync_source(source: SyncSource) -> int:
             logger.error("未知同步源类型: %s", source.source_type)
             return 0
     except Exception as exc:
-        source.last_error = f"{type(exc).__name__}: {exc}"
+        # 异常分支必须开 session 持久化 last_error，否则失败原因永久丢失
+        async with SessionLocal() as err_session:
+            source = await err_session.merge(source)
+            source.last_error = f"{type(exc).__name__}: {exc}"
+            await err_session.commit()
         logger.error("sync.source.failed", extra={"source_id": str(source.id), "error": str(exc)})
         return 0
 

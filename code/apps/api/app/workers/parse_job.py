@@ -42,7 +42,9 @@ async def run_parse_job(
         # 锁任务
         job = await session.get(ParseJob, parse_job_id)
         if job is None:
-            raise ValueError(f"parse_job not found: {job_id}")
+            # job 不存在永远不会变存在，重试无意义，直接判 dead 避免 zombie 重试
+            logger.warning("parse_job not found, mark as dead: %s", job_id)
+            return "dead"
         if job.status in ("succeeded", "dead"):
             return job.status
 

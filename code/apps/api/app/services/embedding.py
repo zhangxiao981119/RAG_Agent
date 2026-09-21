@@ -36,7 +36,7 @@ class EmbeddingService:
             for start in range(0, len(texts), batch_size):
                 batch = texts[start : start + batch_size]
                 response = await client.post(
-                    f"{settings.embedding_base_url.rstrip('/').rstrip('/v1')}/v1/embeddings",
+                    f"{settings.embedding_base_url.rstrip('/').removesuffix('/v1')}/v1/embeddings",
                     json={"model": settings.embedding_model, "input": batch},
                 )
                 if response.status_code != 200:
