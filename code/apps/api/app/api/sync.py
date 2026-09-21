@@ -162,18 +162,34 @@ async def trigger_sync(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> SyncResult:
-    """手动触发同步（不等 cron 定时，立即执行一次）。"""
+    """手动触发同步 —— 入队 arq 异步执行，立即返回。
+
+    同步过程可能涉及 git clone（大仓库 300s），HTTP 同步等待会触发网关超时。
+    改为 arq 入队后立即返回，前端可轮询 sync_source.last_sync_count 查看进度。
+    """
+    from arq.connections import RedisSettings, create_pool
+
     source = await session.get(SyncSource, source_id)
     if source is None or source.tenant_id != user.tenant_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
 
-    # session 需要脱离 API 生命周期（sync_source 内部用自己的 session）
-    # 先 detach
-    session.expunge(source)
+    settings = get_settings()
+    redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+    try:
+        await redis.enqueue_job(
+            "run_sync_source", str(source_id), _queue_name=settings.arq_queue_name
+        )
+    finally:
+        await redis.close()
 
-    new_count = await sync_source(source)
+    await audit.record(
+        user.tenant_id, user.user_id, "sync_source.trigger",
+        object_type="sync_source", object_id=str(source_id),
+        detail={},
+    )
+
     return SyncResult(
         source_id=source_id,
-        new_count=new_count,
-        message=f"同步完成，新增/更新 {new_count} 个文件" if new_count > 0 else "无变更",
+        new_count=0,
+        message="同步已触发，请稍后查看结果",
     )

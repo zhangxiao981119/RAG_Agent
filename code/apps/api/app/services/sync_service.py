@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import logging
 import os
@@ -85,14 +86,16 @@ async def _sync_one_file(
     source: SyncSource,
     rel_path: str,
     file_info: dict,
-    session,
 ) -> uuid.UUID:
-    """将单个文件同步到目标知识库（存 MinIO -> 建 Document -> 建 ParseJob -> 入队 arq）。"""
+    """将单个文件同步到目标知识库（存 MinIO -> 建 Document -> 建 ParseJob -> 入队 arq）。
+
+    每个文件用独立 session + 事务：enqueue_job 失败时整体回滚，避免 zombie job。
+    """
     settings = get_settings()
 
     full_path = file_info["full_path"]
-    with open(full_path, "rb") as f:
-        data = f.read()
+    # open().read() 是同步阻塞，to_thread 放到线程池
+    data = await asyncio.to_thread(lambda: open(full_path, "rb").read())
 
     size_bytes = len(data)
     filename = os.path.basename(rel_path)
@@ -104,46 +107,54 @@ async def _sync_one_file(
     storage = await get_storage()
     await storage.put_object(storage_key, data, "application/octet-stream")
 
-    # 建 Document
-    document = Document(
-        tenant_id=source.tenant_id,
-        kb_id=source.kb_id,
-        doc_group_id=doc_group_id,
-        version=1,
-        is_latest=True,
-        filename=rel_path,  # 用相对路径，方便追溯来源
-        ext=ext,
-        size_bytes=size_bytes,
-        storage_key=storage_key,
-        status="pending",
-        level=1,
-        level_rank=source.level_rank,
-        owner_dept_path=None,
-        acl_tags=[],  # 同步源文档无部门归属，公开可读
-        deny_subjects=[],
-        uploaded_by=None,  # 系统同步
-    )
-    session.add(document)
-    await session.flush()
-
-    # 建 ParseJob
-    parse_job = ParseJob(
-        tenant_id=source.tenant_id,
-        document_id=document.id,
-        status="queued",
-        max_attempts=settings.arq_max_attempts,
-    )
-    session.add(parse_job)
-    await session.flush()
-
-    # 入队 arq
-    redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
-    try:
-        await redis.enqueue_job(
-            "run_parse_job", str(parse_job.id), _queue_name=settings.arq_queue_name
+    # 独立 session + 事务：enqueue_job 必须在 commit 之前成功，否则整体回滚
+    async with SessionLocal() as session:
+        # 建 Document
+        document = Document(
+            tenant_id=source.tenant_id,
+            kb_id=source.kb_id,
+            doc_group_id=doc_group_id,
+            version=1,
+            is_latest=True,
+            filename=rel_path,  # 用相对路径，方便追溯来源
+            ext=ext,
+            size_bytes=size_bytes,
+            storage_key=storage_key,
+            status="pending",
+            level=1,
+            level_rank=source.level_rank,
+            owner_dept_path=None,
+            acl_tags=[],  # 同步源文档无部门归属，公开可读
+            deny_subjects=[],
+            uploaded_by=None,  # 系统同步
         )
-    finally:
+        session.add(document)
+        await session.flush()
+
+        # 建 ParseJob
+        parse_job = ParseJob(
+            tenant_id=source.tenant_id,
+            document_id=document.id,
+            status="queued",
+            max_attempts=settings.arq_max_attempts,
+        )
+        session.add(parse_job)
+        await session.flush()
+
+        # 入队 arq —— 必须在 commit 之前执行
+        redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+        try:
+            await redis.enqueue_job(
+                "run_parse_job", str(parse_job.id), _queue_name=settings.arq_queue_name
+            )
+        except Exception:
+            await redis.close()
+            # enqueue 失败 → 事务回滚，Document/ParseJob 不入库
+            raise
         await redis.close()
+
+        # 全部成功才 commit
+        await session.commit()
 
     logger.info(
         "sync.file.indexed",
@@ -169,7 +180,8 @@ async def sync_source(source: SyncSource) -> int:
         elif source.source_type == "git":
             # Git：工作目录固定在 /data/sync/git/{source.id}
             work_dir = os.path.join(_SYNC_ROOT, "git", str(source.id))
-            _git_pull_or_clone(source.path, source.branch, work_dir)
+            # subprocess.run 阻塞，用 to_thread 放到线程池
+            await asyncio.to_thread(_git_pull_or_clone, source.path, source.branch, work_dir)
             files = _scan_directory(work_dir, patterns)
         else:
             logger.error("未知同步源类型: %s", source.source_type)
@@ -196,9 +208,9 @@ async def sync_source(source: SyncSource) -> int:
             if existing and existing.get("mtime") == file_info["mtime"] and existing.get("size") == file_info["size"]:
                 continue
 
-            # 新文件或变更文件
+            # 新文件或变更文件 —— _sync_one_file 内部用独立 session，enqueue_job 失败整体回滚
             try:
-                doc_id = await _sync_one_file(source, rel_path, file_info, session)
+                doc_id = await _sync_one_file(source, rel_path, file_info)
                 synced[rel_path] = {
                     "mtime": file_info["mtime"],
                     "size": file_info["size"],
