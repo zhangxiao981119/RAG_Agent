@@ -14,18 +14,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, get_current_user, get_db
+from app.api.deps import CurrentUser, get_current_user, get_db, require_admin
 from app.models import KnowledgeBase, SyncSource
 from app.schemas.sync import SyncSourceCreate, SyncSourceOut, SyncSourceUpdate, SyncResult
 from app.services import audit
 from app.services.sync_service import sync_source
 
 router = APIRouter(tags=["sync-sources"])
-
-
-def _require_admin(user: CurrentUser) -> None:
-    if "role:admin" not in user.subjects:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="FORBIDDEN: 需要管理员权限")
 
 
 def _to_out(source: SyncSource) -> SyncSourceOut:
@@ -56,11 +51,9 @@ def _to_out(source: SyncSource) -> SyncSourceOut:
 async def create_sync_source(
     kb_id: uuid.UUID,
     body: SyncSourceCreate,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> SyncSourceOut:
-    _require_admin(user)
-
     # 校验 KB 存在且属于当前租户
     kb = await session.get(KnowledgeBase, kb_id)
     if kb is None or kb.tenant_id != user.tenant_id:
@@ -96,7 +89,13 @@ async def list_sync_sources(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> list[SyncSourceOut]:
-    # 知识库成员即可查看同步源
+    # 校验 KB 存在 + 同租户 + G2 库级授权（admin 豁免）
+    # 避免同租户任意用户枚举他人 KB 的 git URL/path 等敏感配置
+    kb = await session.get(KnowledgeBase, kb_id)
+    if kb is None or kb.tenant_id != user.tenant_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+    if user.clearance < 40 and kb_id not in user.authorized_kb_ids:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
     result = await session.execute(
         select(SyncSource)
         .where(SyncSource.kb_id == kb_id, SyncSource.tenant_id == user.tenant_id)
@@ -110,11 +109,9 @@ async def list_sync_sources(
 async def update_sync_source(
     source_id: uuid.UUID,
     body: SyncSourceUpdate,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> SyncSourceOut:
-    _require_admin(user)
-
     source = await session.get(SyncSource, source_id)
     if source is None or source.tenant_id != user.tenant_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
@@ -142,11 +139,9 @@ async def update_sync_source(
 @router.delete("/sync-sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_sync_source(
     source_id: uuid.UUID,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> None:
-    _require_admin(user)
-
     source = await session.get(SyncSource, source_id)
     if source is None or source.tenant_id != user.tenant_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
@@ -164,12 +159,10 @@ async def delete_sync_source(
 @router.post("/sync-sources/{source_id}/sync", response_model=SyncResult)
 async def trigger_sync(
     source_id: uuid.UUID,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> SyncResult:
     """手动触发同步（不等 cron 定时，立即执行一次）。"""
-    _require_admin(user)
-
     source = await session.get(SyncSource, source_id)
     if source is None or source.tenant_id != user.tenant_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")

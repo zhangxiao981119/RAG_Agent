@@ -92,6 +92,20 @@ async def _value_error_handler(request: Request, exc: ValueError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    """全局兜底异常 → 500，仅返回通用文案。
+
+    避免未捕获异常向客户端泄露内部路径/SQL/堆栈（P2 安全修复）。
+    完整堆栈进日志，由运维侧排查。
+    """
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "INTERNAL_SERVER_ERROR"},
+    )
+
+
 app.include_router(health_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(me_router, prefix="/api")
