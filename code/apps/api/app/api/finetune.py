@@ -43,7 +43,7 @@ class FinetuneExportResponse(BaseModel):
     exported_at: str
 
 
-@router.get("/finetune/samples", response_model=FinetuneSamplePage)
+@router.get("/samples", response_model=FinetuneSamplePage)
 async def list_finetune_samples(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -88,7 +88,7 @@ async def list_finetune_samples(
     )
 
 
-@router.post("/finetune/samples/export", response_model=FinetuneExportResponse)
+@router.post("/samples/export", response_model=FinetuneExportResponse)
 async def export_finetune_samples(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
