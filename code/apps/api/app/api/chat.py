@@ -403,7 +403,17 @@ async def chat_ask(
                 )
                 return
 
-            # done
+            # done — 先做不影响客户端的 Redis/DB 操作（网络延迟不影响流式）
+            # 再 yield done，避免 yield 之后客户端已断开导致后续 await 失败
+            # ── M6 续篇：配额用量上报（Redis 计数器累加）─────────
+            try:
+                await quota_service._incr_usage(
+                    user.tenant_id, user.user_id,
+                    tokens=final_usage.get("prompt_tokens", 0) + final_usage.get("completion_tokens", 0),
+                )
+            except Exception:
+                logger.warning("quota._incr_usage 失败，忽略", exc_info=True)
+
             yield _sse("done", {
                 "finish_reason": "stopped",
                 "grounding": {"stripped_sentences": final_stripped},
@@ -438,12 +448,6 @@ async def chat_ask(
                     "prompt_tokens": final_usage.get("prompt_tokens", 0),
                     "completion_tokens": final_usage.get("completion_tokens", 0),
                 },
-            )
-
-            # ── M6 续篇：配额用量上报（Redis 计数器累加）─────────
-            await quota_service._incr_usage(
-                user.tenant_id, user.user_id,
-                tokens=final_usage.get("prompt_tokens", 0) + final_usage.get("completion_tokens", 0),
             )
 
             # 持久化

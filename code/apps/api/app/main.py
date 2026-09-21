@@ -78,7 +78,18 @@ for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     decisions.self_check()
-    yield
+    # ── 初始化 arq 全局连接池（避免每次入队 create_pool + close）──
+    from arq.connections import RedisSettings, create_pool as arq_create_pool
+    _arq_pool = await arq_create_pool(
+        RedisSettings.from_dsn(get_settings().redis_url)
+    )
+    app.state.arq_pool = _arq_pool
+    logger.info("lifespan.arq_pool.init", extra={"pool_id": id(_arq_pool)})
+    try:
+        yield
+    finally:
+        await _arq_pool.close()
+        logger.info("lifespan.arq_pool.closed")
 
 
 app = FastAPI(title="知识库问答 Agent API", version="0.2.0", lifespan=lifespan)
