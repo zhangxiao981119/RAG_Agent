@@ -119,17 +119,28 @@ async def chat_ask(
         await session.flush()
         conversation_id = conv.id
 
-    # 写 user message
+    # 写 user message，并预占位 assistant message（同一事务提交）。
+    # meta 下发的 message_id 立即指向真实行：流式中断/异常也不会留下无主引用，
+    # 流结束后由 _persist_assistant 按 id 更新这一占位行。
+    message_id = uuid.uuid4()
     user_msg = Message(
         tenant_id=user.tenant_id,
         conversation_id=conversation_id,
         role="user",
         content=payload.question,
     )
-    session.add(user_msg)
+    assistant_placeholder = Message(
+        id=message_id,
+        tenant_id=user.tenant_id,
+        conversation_id=conversation_id,
+        role="assistant",
+        content="",
+        citations=[],
+        meta={"generating": True},
+    )
+    session.add_all([user_msg, assistant_placeholder])
     await session.commit()
     await session.refresh(conv)
-    message_id = uuid.uuid4()
 
     async def event_stream() -> AsyncIterator[str]:
         import time as _time
@@ -505,18 +516,19 @@ async def _persist_assistant(
     citations: list[dict],
     meta: dict,
 ) -> None:
-    """持久化 assistant message。citations 存快照（手册 §4.2.9）。"""
+    """更新流开始前占位的 assistant message（citations 存快照，手册 §4.2.9）。
+
+    占位行已在 chat_ask 中与 user message 同事务提交，此处按 message_id 定位更新；
+    meta 去掉 generating 标记并写入 refused 等最终状态。
+    """
     async with SessionLocal() as session:
-        msg = Message(
-            id=message_id,
-            tenant_id=user.tenant_id,
-            conversation_id=conversation_id,
-            role="assistant",
-            content=text,
-            citations=citations,
-            meta={**meta, "refused": refused},
-        )
-        session.add(msg)
+        msg = await session.get(Message, message_id)
+        if msg is None:
+            # 占位行与 user message 同事务提交，正常必存在；缺失说明数据被外部清理
+            raise RuntimeError(f"assistant 占位消息不存在: {message_id}")
+        msg.content = text
+        msg.citations = citations
+        msg.meta = {**meta, "refused": refused}
         await session.commit()
 
 
@@ -589,14 +601,22 @@ async def get_conversation_messages(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> list[dict]:
-    """加载某会话的全部消息（按时间正序）。"""
+    """加载某会话的全部消息（按时间正序）。
+
+    过滤 meta.generating=true 的占位行：流式期间客户端断连会残留未落定的空
+    assistant 消息，此类消息视为本次回答作废，不在历史中展示。
+    """
     conv = await session.get(Conversation, conversation_id)
     if conv is None or conv.tenant_id != user.tenant_id or conv.user_id != user.user_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
     rows = (
         await session.execute(
             select(Message)
-            .where(Message.conversation_id == conversation_id)
+            .where(
+                Message.conversation_id == conversation_id,
+                # IS NOT true：generating 缺失(NULL)或 false 都保留，仅 true 被过滤
+                Message.meta["generating"].as_boolean().isnot(True),
+            )
             .order_by(Message.created_at)
         )
     ).scalars().all()

@@ -6,7 +6,7 @@ user_id 支持按操作人过滤。服务端分页。
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -44,8 +44,8 @@ async def list_audit_logs(
     page_size: int = Query(20, ge=1, le=100),
     action: str | None = Query(None, max_length=50, description="动作前缀过滤，如 doc.* 传 doc"),
     user_id: uuid.UUID | None = Query(None, description="按操作人过滤"),
-    start_date: str | None = Query(None, description="起始日期 YYYY-MM-DD"),
-    end_date: str | None = Query(None, description="结束日期 YYYY-MM-DD"),
+    start_date: date | None = Query(None, description="起始日期 YYYY-MM-DD"),
+    end_date: date | None = Query(None, description="结束日期 YYYY-MM-DD（含当天）"),
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> AuditLogPage:
