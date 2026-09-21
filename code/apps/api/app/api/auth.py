@@ -75,7 +75,9 @@ async def _revoke_token(redis: Redis, payload: dict[str, Any]) -> None:
 @router.get("/auth/public-key", response_model=PublicKeyResponse)
 async def get_public_key() -> PublicKeyResponse:
     """返回 RSA 公钥（SPKI DER base64），供前端 Web Crypto 加密密码。"""
-    return PublicKeyResponse(public_key=get_public_key_spki_b64())
+    import asyncio
+    key_b64 = await asyncio.to_thread(get_public_key_spki_b64)
+    return PublicKeyResponse(public_key=key_b64)
 
 
 @router.post("/auth/login", response_model=LoginResponse)
@@ -114,8 +116,13 @@ async def login(
             )
 
         # ── 3. 解密密码（前端 RSA-OAEP 加密的密文）────────────
+        # decrypt_password 内部首次调用会同步 Redis + RSA CPU 密集，
+        # 用 asyncio.to_thread 放到线程池避免阻塞事件循环
         try:
-            plain_password = decrypt_password(payload.password)
+            import asyncio
+            plain_password = await asyncio.to_thread(
+                decrypt_password, payload.password
+            )
         except Exception:  # noqa: BLE001 - 密文损坏/格式错误统一当密码错误，不泄露细节
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户名或密码错误")
 
