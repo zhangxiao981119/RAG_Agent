@@ -233,6 +233,8 @@ class Conversation(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     title: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # context 压缩次数（新开对话自动重置为 0）
+    compression_count: Mapped[int] = mapped_column(default=0, server_default="0")
 
 
 class Message(Base):

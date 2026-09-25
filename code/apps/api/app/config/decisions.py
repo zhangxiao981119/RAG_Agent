@@ -56,6 +56,11 @@ CONTEXT_WINDOW_LIMIT_TOKENS: Final[int] = 256_000
 CONTEXT_OUTPUT_RESERVE_TOKENS: Final[int] = 4_000
 """为 LLM 输出预留的 token 数（从 CONTEXT_WINDOW_LIMIT 里扣掉）。"""
 
+# ── 压缩次数告警阈值 ────────────────────────────────────
+COMPRESSION_WARN_THRESHOLD: Final[int] = 3
+"""同一个 conversation 内 context 被压缩多少次后提示用户"新开对话重置上下文"。
+新开对话 → 新建 Conversation 行 → compression_count 自动从 0 开始。"""
+
 
 # ── 分块 ──────────────────────────────────────────────────
 CHUNK_TARGET_TOKENS: Final[int] = 400

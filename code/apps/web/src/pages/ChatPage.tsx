@@ -104,6 +104,12 @@ export function ChatPage({ currentUser }: Props) {
 
   const [loadError, setLoadError] = useState<string | null>(null)
 
+  /** 上下文压缩告警：后端 SSE context_warning 事件触发，建议用户新开对话 */
+  const [contextWarning, setContextWarning] = useState<{
+    compressionCount: number
+    threshold: number
+  } | null>(null)
+
   // 组件卸载：中止进行中的 SSE，避免请求/状态更新泄漏
   useEffect(() => {
     return () => {
@@ -209,6 +215,7 @@ export function ChatPage({ currentUser }: Props) {
     ])
     setInput('')
     setSidebarCitation(null)
+    setContextWarning(null)  // 新开对话重置上下文告警
   }
 
   /** 切换到历史会话：加载消息列表。 */
@@ -321,6 +328,14 @@ export function ChatPage({ currentUser }: Props) {
         refusedMessage = event.data.message
       } else if (event.event === 'done') {
         suggestions = event.data.suggestions ?? []
+      } else if (event.event === 'context_warning') {
+        // 后端 context 压缩次数超阈值，提示用户新开对话
+        if (event.data.need_new_conversation) {
+          setContextWarning({
+            compressionCount: event.data.compression_count,
+            threshold: event.data.threshold,
+          })
+        }
       }
     }
 
@@ -518,6 +533,21 @@ export function ChatPage({ currentUser }: Props) {
         {/* 对话消息区 */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '0 16px' }}>
           {loadError && <Alert type="error" showIcon message={loadError} style={{ marginBottom: 12 }} />}
+          {contextWarning && (
+            <Alert
+              type="warning"
+              showIcon
+              closable
+              onClose={() => setContextWarning(null)}
+              message={`上下文已被压缩 ${contextWarning.compressionCount} 次，建议新开对话重置上下文以获得更好的回答效果。`}
+              action={
+                <a onClick={handleNewConversation} style={{ fontWeight: 500 }}>
+                  新开对话
+                </a>
+              }
+              style={{ marginBottom: 12 }}
+            />
+          )}
           {messages.map((m) => (
             <MessageBubble
               key={m.id}

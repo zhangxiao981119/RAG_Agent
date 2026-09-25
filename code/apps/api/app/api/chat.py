@@ -314,6 +314,25 @@ async def chat_ask(
                 logger.warning("chat.context.compressed: est_before=%d → history=%d, chunks=%d (limit=%d)",
                                est_before, len(history), len(current_chunks), limit_cap)
 
+                # ── 压缩次数追踪 ─────────────────────────────
+                # 同一个 conversation 内累计压缩次数，超阈值发 SSE 提示
+                async with SessionLocal() as comp_session:
+                    conv_for_comp = await comp_session.get(Conversation, conversation_id)
+                    if conv_for_comp is not None:
+                        conv_for_comp.compression_count = (conv_for_comp.compression_count or 0) + 1
+                        await comp_session.commit()
+                        current_count = conv_for_comp.compression_count
+                        logger.info("chat.compression.count: conv=%s, count=%d",
+                                    conversation_id, current_count)
+                        if current_count >= decisions.COMPRESSION_WARN_THRESHOLD:
+                            # 发 SSE 提示事件（在 citations 之前，前端可提前显示）
+                            yield _sse("context_warning", {
+                                "compression_count": current_count,
+                                "threshold": decisions.COMPRESSION_WARN_THRESHOLD,
+                                "need_new_conversation": True,
+                                "message": "对话上下文已被压缩多次，建议新开对话重置上下文以获得更好的回答效果。",
+                            })
+
             degraded_from = "none"
             effective_chunks = current_chunks  # context 检查后的 chunks 作为初始值
             quota_enabled = await flag_service.is_enabled(
