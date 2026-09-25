@@ -180,11 +180,14 @@ async def chat_ask(
                         continue
                     rewrite_history.append({"role": m.role, "content": m.content})
 
-            # 改写（失败静默回原始 question，不阻塞主流程）
-            retrieve_query, rewrite_intent = await rewrite_query(payload.question, rewrite_history)
-            if retrieve_query != payload.question:
-                logger.info("chat.rewrite: '%s' → '%s' (intent=%s)",
-                            payload.question[:50], retrieve_query[:50], rewrite_intent)
+            # 评分 + 改写（一次 LLM 调用完成，score >= 90 直接跳过）
+            retrieve_query, rewrite_status, rewrite_score = await rewrite_query(payload.question, rewrite_history)
+            if rewrite_status == "rewritten":
+                logger.info("chat.rewrite: score=%d, '%s' → '%s'",
+                            rewrite_score, payload.question[:50], retrieve_query[:50])
+            else:
+                logger.info("chat.rewrite: score=%d, status=%s, 使用原始问题",
+                            rewrite_score, rewrite_status)
 
             # 检索（用改写后的 query，原始 question 留给 generation）
             _t_retrieve = _time.monotonic()

@@ -29,10 +29,12 @@ MEMORY_MAX_PROFILE_CHARS: Final[int] = 800      # 长期记忆：用户画像文
 
 # ── Query 改写（RAG 前置增强）─────────────────────────
 QUERY_REWRITE_ENABLED: Final[bool] = True
-"""检索前对用户问题做意图识别 + 改写（处理口语化/指代/多义词）。
-改写后的 query 只用于 retrieval，原始 question 仍用于 generation（标准 HyDE 模式）。"""
+"""检索前对用户问题做打分 + 可选改写。一次 LLM 调用完成评分和决策。"""
 QUERY_REWRITE_TIMEOUT_SECONDS: Final[float] = 5.0
 """改写 LLM 调用超时。超时或失败 → 静默回退原始 question，不阻塞主流程。"""
+QUERY_REWRITE_SCORE_THRESHOLD: Final[int] = 90
+"""百分制改写阈值：score >= 阈值 直接跳过改写；score < 阈值 执行改写。
+打分维度 = 明确度 + 检索友好度 - 指代依赖度/2，clamp 到 [0, 100]。"""
 
 # ── 上下文窗口上限（单次请求 prompt 总 token 数）────────
 CONTEXT_WINDOW_LIMIT_TOKENS: Final[int] = 256_000
