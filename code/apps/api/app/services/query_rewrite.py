@@ -54,17 +54,47 @@ _SCORE_AND_REWRITE_PROMPT = """你是一个检索优化器。请对用户问题�
 当前问题：{question}"""
 
 
+def _estimate_tokens(text: str) -> int:
+    """估算文本 token 数（中文 2 字符 ≈ 1 token）。"""
+    if not text:
+        return 0
+    return max(1, len(text) // 2)
+
+
 def _format_history(history: list[dict]) -> str:
-    """把历史消息格式化成 prompt 可用的文本，只取最近 3 轮。"""
+    """把历史消息格式化成 prompt 可用的文本，按 token budget 从最新往前截断。
+
+    DB 层已放开到 500 行，这里不再按条数硬限制。
+    策略：从 history 末尾（最新的）开始逐条累积 token，
+    超过 QUERY_REWRITE_HISTORY_BUDGET_TOKENS 就停止，保证最新的对话优先进入改写 prompt。
+    """
     if not history:
         return "（无历史对话）"
-    recent = history[-6:]
-    lines = []
-    for m in recent:
+
+    # 从最新往前累积，保证最新对话一定在 budget 内
+    budget = decisions.QUERY_REWRITE_HISTORY_BUDGET_TOKENS
+    accumulated: list[str] = []
+    total_tokens = 0
+
+    for m in reversed(history):
         role = "用户" if m["role"] == "user" else "助手"
-        content = m.get("content", "")[:200]
-        lines.append(f"{role}: {content}")
-    return "\n".join(lines)
+        content = m.get("content", "")
+        # 每条最多 500 字，避免单条过长挤占 budget
+        if len(content) > 500:
+            content = content[:500] + "..."
+        line = f"{role}: {content}"
+        line_tokens = _estimate_tokens(line)
+
+        # 加这条会超 budget → 停止（这条更早，丢掉）
+        if total_tokens + line_tokens > budget and accumulated:
+            break
+
+        accumulated.append(line)
+        total_tokens += line_tokens
+
+    # reversed 后 accumulated 是从新到旧的，再反回来成时间正序
+    accumulated.reverse()
+    return "\n".join(accumulated)
 
 
 def _extract_json(raw: str) -> dict | None:

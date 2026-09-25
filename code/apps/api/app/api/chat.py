@@ -163,6 +163,7 @@ async def chat_ask(
 
             # ── Query 改写（检索前，用历史做指代消解）───────────
             # 提前读历史消息（用于改写指代消解 + 后续生成复用，避免读两次 DB）
+            # DB 层只做硬上限（500 行），后续各阶段按 token budget 裁剪
             rewrite_history: list[dict] = []
             async with SessionLocal() as rewrite_session:
                 rewrite_rows = (await rewrite_session.execute(
@@ -172,7 +173,7 @@ async def chat_ask(
                         Message.role.in_(["user", "assistant"]),
                     )
                     .order_by(Message.created_at.desc())
-                    .limit(max(decisions.MAX_HISTORY_TURNS + 1, decisions.MEMORY_COMPRESS_THRESHOLD + 1))
+                    .limit(decisions.HISTORY_FETCH_MAX_ROWS)
                 )).scalars().all()
                 # 按时间正序，跳过最新那条（当前正在处理的 user message）
                 for m in reversed(rewrite_rows[:-1]):
@@ -273,10 +274,8 @@ async def chat_ask(
             # 1. 复用改写阶段提前读的历史（避免重复 DB 查询），做历史压缩
             history: list[dict] = list(rewrite_history)
 
-            # 2. 历史过长时压缩（把较早的合并成摘要）
-            # >= 而非 > ：达到阈值即触发，否则 limit(N+1)+[:-1] 最多 N 条永不压缩
-            if len(history) >= decisions.MEMORY_COMPRESS_THRESHOLD:
-                history = await compress_history(history, decisions.MAX_HISTORY_TURNS)
+            # 不再按条数硬压缩（DB 已放开到 500 行），统一交给后面的
+            # ensure_context_within_limit 按 token budget 裁剪 + 超限压缩
 
             # 3. 读用户画像
             user_memory: dict = {}

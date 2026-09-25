@@ -22,10 +22,21 @@ GROUNDING_CHECK_ENABLED: Final[bool] = True     # L3；MUST NOT 置 False
 TOP_K_RECALL: Final[int] = 50                   # 每路召回条数
 TOP_K_RERANK: Final[int] = 8                    # 重排后取用条数
 RRF_K: Final[int] = 60
-MAX_HISTORY_TURNS: Final[int] = 6               # 短期记忆：最近 6 条历史消息（3 轮问答）
+MAX_HISTORY_TURNS: Final[int] = 6               # 短期记忆：最近 6 条历史消息（3 轮问答）—— generation 默认保留轮数
 MEMORY_COMPRESS_THRESHOLD: Final[int] = 12      # 历史超过 12 条时触发压缩（条数兜底，超限 token 也会触发）
 MEMORY_MAX_FACTS: Final[int] = 20                # 长期记忆：用户画像最多缓存 20 条关键事实
 MEMORY_MAX_PROFILE_CHARS: Final[int] = 800      # 长期记忆：用户画像文本上限
+
+# ── 历史消息读取上限（DB 查询）──────────────────────────
+HISTORY_FETCH_MAX_ROWS: Final[int] = 500
+"""从 Message 表一次读取的最大历史行数。DB 层只做硬上限，不参与业务裁剪。
+后续各阶段（改写/压缩/generation）均按各自 token budget 再裁剪。"""
+
+# ── Query 改写阶段的 history token budget ───────────────
+QUERY_REWRITE_HISTORY_BUDGET_TOKENS: Final[int] = 32_000
+"""改写 LLM 调用里 history 能占用的 token 数上限（占 256K 窗口的 1/8）。
+改写 prompt + 输出空间 + 当前问题 ≈ 8K，history 留 32K 足够装下 160+ 条短对话。
+截断策略：从最新的历史往前累积，超过 budget 就丢弃更早的。"""
 
 # ── Query 改写（RAG 前置增强）─────────────────────────
 QUERY_REWRITE_ENABLED: Final[bool] = True
