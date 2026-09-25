@@ -21,6 +21,7 @@ export type ChatEvent =
   | { event: 'delta'; data: { text: string } }
   | { event: 'done'; data: { finish_reason: string; grounding: { stripped_sentences: number }; usage: { prompt_tokens: number; completion_tokens: number }; suggestions?: string[] } }
   | { event: 'refused'; data: { reason: string; message: string } }
+  | { event: 'context_warning'; data: { compression_count: number; threshold: number; need_new_conversation: boolean; message: string } }
 
 export type KnowledgeBase = {
   id: string
