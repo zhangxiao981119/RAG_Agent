@@ -22,10 +22,26 @@ GROUNDING_CHECK_ENABLED: Final[bool] = True     # L3；MUST NOT 置 False
 TOP_K_RECALL: Final[int] = 50                   # 每路召回条数
 TOP_K_RERANK: Final[int] = 8                    # 重排后取用条数
 RRF_K: Final[int] = 60
-MAX_HISTORY_TURNS: Final[int] = 6               # 上下文窗口：最近 6 条历史消息（3 轮问答）
-MEMORY_COMPRESS_THRESHOLD: Final[int] = 12      # 历史超过 12 条时触发压缩
-MEMORY_MAX_FACTS: Final[int] = 20                # 用户画像最多缓存 20 条关键事实
-MEMORY_MAX_PROFILE_CHARS: Final[int] = 800      # 用户画像文本上限
+MAX_HISTORY_TURNS: Final[int] = 6               # 短期记忆：最近 6 条历史消息（3 轮问答）
+MEMORY_COMPRESS_THRESHOLD: Final[int] = 12      # 历史超过 12 条时触发压缩（条数兜底，超限 token 也会触发）
+MEMORY_MAX_FACTS: Final[int] = 20                # 长期记忆：用户画像最多缓存 20 条关键事实
+MEMORY_MAX_PROFILE_CHARS: Final[int] = 800      # 长期记忆：用户画像文本上限
+
+# ── Query 改写（RAG 前置增强）─────────────────────────
+QUERY_REWRITE_ENABLED: Final[bool] = True
+"""检索前对用户问题做意图识别 + 改写（处理口语化/指代/多义词）。
+改写后的 query 只用于 retrieval，原始 question 仍用于 generation（标准 HyDE 模式）。"""
+QUERY_REWRITE_TIMEOUT_SECONDS: Final[float] = 5.0
+"""改写 LLM 调用超时。超时或失败 → 静默回退原始 question，不阻塞主流程。"""
+
+# ── 上下文窗口上限（单次请求 prompt 总 token 数）────────
+CONTEXT_WINDOW_LIMIT_TOKENS: Final[int] = 256_000
+"""单次请求 context（system + memory + history + chunks + question）token 上限。
+超限则递归压缩 history 并裁剪 chunks 直到达标。
+★ 值 MUST 与实际 LLM 模型的 context window 对齐（deepseek-chat 实际 128K，
+此处 256K 为用户指定上限，若模型窗口更小会在 LLM 调用时报错）。"""
+CONTEXT_OUTPUT_RESERVE_TOKENS: Final[int] = 4_000
+"""为 LLM 输出预留的 token 数（从 CONTEXT_WINDOW_LIMIT 里扣掉）。"""
 
 
 # ── 分块 ──────────────────────────────────────────────────

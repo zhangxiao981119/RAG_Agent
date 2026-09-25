@@ -148,3 +148,106 @@ def build_memory_prompt(memory: dict | None) -> str:
     if not profile:
         return ""
     return f"\n\n<memory>\n{profile}\n</memory>\n（回答时可参考以上用户背景）"
+
+
+# ── 上下文窗口管理（256K token 限制）──────────────────────────
+
+def _estimate_tokens(text: str) -> int:
+    """估算文本 token 数（中文保守按 2 字符/token）。
+
+    不复用 quota.estimate_tokens 避免循环引用（quota.py import 本模块）。
+    逻辑完全同 quota.estimate_tokens，是轻量工具函数。
+    """
+    if not text:
+        return 0
+    return max(1, len(text) // decisions.QUOTA_TOKEN_ESTIMATE_CHARS_PER_TOKEN)
+
+
+def estimate_context_tokens(
+    system_prompt: str,
+    memory_prompt: str,
+    history: list[dict],
+    chunks_text: str,
+    question: str,
+) -> int:
+    """估算单次请求 prompt 总 token 数。
+
+    构成：system + memory + history + chunks(context) + user(question) + 预期输出
+    与 quota._estimate_request_tokens 口径一致，但参数更完整（含 system_prompt）。
+    """
+    total = _estimate_tokens(system_prompt)
+    total += _estimate_tokens(memory_prompt)
+    for m in history:
+        total += _estimate_tokens(m.get("content", ""))
+    total += _estimate_tokens(chunks_text)
+    total += _estimate_tokens(question)
+    # 预期输出预留（与 quota 保持一致：1024 token）
+    total += 1024
+    return total
+
+
+async def ensure_context_within_limit(
+    system_prompt: str,
+    memory_prompt: str,
+    history: list[dict],
+    chunks_text: str,
+    question: str,
+    chunks: list,
+) -> tuple[list[dict], list]:
+    """确保 context 在窗口上限内。超限则按 history 压缩 → chunks 裁剪顺序处理。
+
+    策略（与 quota 四级降级对齐，但此处不降级 memory_prompt，
+    因为 context 窗口限制是模型硬约束，必须保证 system prompt 完整）：
+      1. history 太长 → 调 compress_history 压缩早期历史（保留最近轮数逐轮减少）
+      2. 压缩后仍超限 → 裁剪 chunks（从尾部丢，保留 top-K_RERANK 不变）
+      3. 到达极限仍超限 → 只保留 system prompt + 压缩 history + top-2 chunks
+
+    返回 (最终 history, 最终 chunks)。原始参数不修改。
+    """
+    limit = decisions.CONTEXT_WINDOW_LIMIT_TOKENS - decisions.CONTEXT_OUTPUT_RESERVE_TOKENS
+    current_history = list(history)
+    current_chunks = list(chunks)
+
+    def _make_chunks_text(cs: list) -> str:
+        """从 chunks 列表拼 context 文本（用于 token 估算）。"""
+        try:
+            # 运行时导入避免循环引用（generate 不依赖 memory，memory 在运行时才需要 generate 的工具函数）
+            from app.services.generate import _build_context
+            return _build_context(cs)
+        except Exception:
+            return "\n\n".join(f"[{i+1}] {c.content}" for i, c in enumerate(cs))
+
+    # 第一轮：逐轮压缩 history（从保留 6 条 → 4 条 → 2 条）
+    for keep in (decisions.MAX_HISTORY_TURNS, 4, 2, 0):
+        if len(current_history) <= keep:
+            break
+        compressed = await compress_history(current_history, keep_recent=keep)
+        est = estimate_context_tokens(
+            system_prompt, memory_prompt, compressed,
+            _make_chunks_text(current_chunks), question,
+        )
+        if est <= limit:
+            logger.info("context 压缩后达标: history→%d 条, est=%d tokens", len(compressed), est)
+            return compressed, current_chunks
+        current_history = compressed
+
+    # 第二轮：裁剪 chunks（从尾部开始丢，保留前 N 个）
+    # 逐次减 2 个直到达标或只剩 2 个
+    while len(current_chunks) > 2:
+        current_chunks = current_chunks[:-2]
+        est = estimate_context_tokens(
+            system_prompt, memory_prompt, current_history,
+            _make_chunks_text(current_chunks), question,
+        )
+        if est <= limit:
+            logger.info("context 裁剪 chunks 后达标: chunks→%d 条, est=%d tokens", len(current_chunks), est)
+            return current_history, current_chunks
+
+    # 极限：只剩压缩 history + top-2 chunks
+    est = estimate_context_tokens(
+        system_prompt, memory_prompt, current_history,
+        _make_chunks_text(current_chunks), question,
+    )
+    logger.warning("context 到达极限: history=%d, chunks=%d, est=%d (limit=%d)",
+                   len(current_history), len(current_chunks), est, limit)
+    return current_history, current_chunks
