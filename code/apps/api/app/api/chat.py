@@ -33,7 +33,14 @@ from app.services import feature_flag as flag_service
 from app.services import quota as quota_service
 from app.services import sensitive as sensitive_service
 from app.services.generate import get_stream_generation_service
-from app.services.memory import build_memory_prompt, compress_history, extract_facts
+from app.services.memory import (
+    build_memory_prompt,
+    compress_history,
+    ensure_context_within_limit,
+    estimate_context_tokens,
+    extract_facts,
+)
+from app.services.query_rewrite import rewrite_query
 from app.services.retrieve import get_retrieval_service
 
 logger = logging.getLogger(__name__)
@@ -154,14 +161,39 @@ async def chat_ask(
                 "stage": "retrieving",
             })
 
-            # 检索
+            # ── Query 改写（检索前，用历史做指代消解）───────────
+            # 提前读历史消息（用于改写指代消解 + 后续生成复用，避免读两次 DB）
+            rewrite_history: list[dict] = []
+            async with SessionLocal() as rewrite_session:
+                rewrite_rows = (await rewrite_session.execute(
+                    select(Message)
+                    .where(
+                        Message.conversation_id == conversation_id,
+                        Message.role.in_(["user", "assistant"]),
+                    )
+                    .order_by(Message.created_at.desc())
+                    .limit(max(decisions.MAX_HISTORY_TURNS + 1, decisions.MEMORY_COMPRESS_THRESHOLD + 1))
+                )).scalars().all()
+                # 按时间正序，跳过最新那条（当前正在处理的 user message）
+                for m in reversed(rewrite_rows[:-1]):
+                    if m.role == "assistant" and not m.content:
+                        continue
+                    rewrite_history.append({"role": m.role, "content": m.content})
+
+            # 改写（失败静默回原始 question，不阻塞主流程）
+            retrieve_query, rewrite_intent = await rewrite_query(payload.question, rewrite_history)
+            if retrieve_query != payload.question:
+                logger.info("chat.rewrite: '%s' → '%s' (intent=%s)",
+                            payload.question[:50], retrieve_query[:50], rewrite_intent)
+
+            # 检索（用改写后的 query，原始 question 留给 generation）
             _t_retrieve = _time.monotonic()
             async with SessionLocal() as retrieve_session:
                 retrieval = get_retrieval_service()
                 try:
                     result = await retrieval.retrieve(
                         retrieve_session,
-                        payload.question,
+                        retrieve_query,  # 改写后的 query 只用于检索
                         user.tenant_id,
                         # 必须传 effective_kb_ids（含 admin G2 豁免 + 前端所选库交集），
                         # 传 user.authorized_kb_ids 会导致 admin 豁免失效、且检索范围
@@ -235,24 +267,8 @@ async def chat_ask(
                 return
 
             # 生成（含 L3 校验，generation 统一处理 LLM 异常）
-            # 1. 读最近 N 条历史消息作为上下文
-            history: list[dict] = []
-            async with SessionLocal() as hist_session:
-                hist_rows = (await hist_session.execute(
-                    select(Message)
-                    .where(
-                        Message.conversation_id == conversation_id,
-                        Message.role.in_(["user", "assistant"]),
-                    )
-                    .order_by(Message.created_at.desc())
-                    .limit(max(decisions.MAX_HISTORY_TURNS + 1, decisions.MEMORY_COMPRESS_THRESHOLD + 1))
-                )).scalars().all()
-                # 按时间正序，跳过最新那条（就是当前正在处理的 user message）
-                for m in reversed(hist_rows[:-1]):
-                    # 跳过被拒答的 assistant 消息（content 为空）
-                    if m.role == "assistant" and not m.content:
-                        continue
-                    history.append({"role": m.role, "content": m.content})
+            # 1. 复用改写阶段提前读的历史（避免重复 DB 查询），做历史压缩
+            history: list[dict] = list(rewrite_history)
 
             # 2. 历史过长时压缩（把较早的合并成摘要）
             # >= 而非 > ：达到阈值即触发，否则 limit(N+1)+[:-1] 最多 N 条永不压缩
@@ -271,15 +287,40 @@ async def chat_ask(
             # feature flag 开启 → 调 check_and_degrade 返回裁剪方案
             # 软阈值 90% 触发降级，硬超限直接 refused
             memory_prompt = build_memory_prompt(user_memory)
+
+            # ── Context 窗口硬约束（256K token 上限）──────────────
+            # system prompt 是 generate 模块里的 _SYSTEM_PROMPT + memory_prompt
+            # 这里直接拼出来（运行时导入避免循环引用）
+            from app.services.generate import _SYSTEM_PROMPT as _GEN_SYSTEM_PROMPT
+            system_for_estimate = _GEN_SYSTEM_PROMPT + (memory_prompt if memory_prompt else "")
+            current_chunks = list(result.chunks)
+
+            # 先估算总 token 数，超限则逐轮压缩 history + 裁剪 chunks
+            limit_cap = decisions.CONTEXT_WINDOW_LIMIT_TOKENS - decisions.CONTEXT_OUTPUT_RESERVE_TOKENS
+            chunks_text_for_est = "\n\n".join(
+                f"[{i+1}] {c.content}" for i, c in enumerate(current_chunks)
+            )
+            est_before = estimate_context_tokens(
+                system_for_estimate, memory_prompt, history,
+                chunks_text_for_est, payload.question,
+            )
+            if est_before > limit_cap:
+                history, current_chunks = await ensure_context_within_limit(
+                    system_for_estimate, memory_prompt, history,
+                    chunks_text_for_est, payload.question, current_chunks,
+                )
+                logger.warning("chat.context.compressed: est_before=%d → history=%d, chunks=%d (limit=%d)",
+                               est_before, len(history), len(current_chunks), limit_cap)
+
             degraded_from = "none"
-            effective_chunks = result.chunks
+            effective_chunks = current_chunks  # context 检查后的 chunks 作为初始值
             quota_enabled = await flag_service.is_enabled(
                 user.tenant_id, decisions.QUOTA_FEATURE_KEY, user.dept_path, user.user_id,
             )
             if quota_enabled:
                 plan = await quota_service.check_and_degrade(
                     user.tenant_id, user.user_id,
-                    payload.question, history, memory_prompt, result.chunks,
+                    payload.question, history, memory_prompt, effective_chunks,
                 )
                 if plan.refused:
                     yield _sse("refused", {
