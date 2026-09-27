@@ -290,7 +290,7 @@ async def chat_ask(
             # 软阈值 90% 触发降级，硬超限直接 refused
             memory_prompt = build_memory_prompt(user_memory)
 
-            # ── Context 窗口硬约束（256K token 上限）──────────────
+            # ── Context 窗口硬约束（128K token 上限）──────────────
             # system prompt 是 generate 模块里的 _SYSTEM_PROMPT + memory_prompt
             # 这里直接拼出来（运行时导入避免循环引用）
             from app.services.generate import _SYSTEM_PROMPT as _GEN_SYSTEM_PROMPT

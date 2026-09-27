@@ -34,7 +34,7 @@ HISTORY_FETCH_MAX_ROWS: Final[int] = 500
 
 # ── Query 改写阶段的 history token budget ───────────────
 QUERY_REWRITE_HISTORY_BUDGET_TOKENS: Final[int] = 32_000
-"""改写 LLM 调用里 history 能占用的 token 数上限（占 256K 窗口的 1/8）。
+"""改写 LLM 调用里 history 能占用的 token 数上限（占 128K 窗口的 1/4）。
 改写 prompt + 输出空间 + 当前问题 ≈ 8K，history 留 32K 足够装下 160+ 条短对话。
 截断策略：从最新的历史往前累积，超过 budget 就丢弃更早的。"""
 
@@ -48,11 +48,11 @@ QUERY_REWRITE_SCORE_THRESHOLD: Final[int] = 90
 打分维度 = 明确度 + 检索友好度 - 指代依赖度/2，clamp 到 [0, 100]。"""
 
 # ── 上下文窗口上限（单次请求 prompt 总 token 数）────────
-CONTEXT_WINDOW_LIMIT_TOKENS: Final[int] = 256_000
+CONTEXT_WINDOW_LIMIT_TOKENS: Final[int] = 128_000
 """单次请求 context（system + memory + history + chunks + question）token 上限。
 超限则递归压缩 history 并裁剪 chunks 直到达标。
-★ 值 MUST 与实际 LLM 模型的 context window 对齐（deepseek-chat 实际 128K，
-此处 256K 为用户指定上限，若模型窗口更小会在 LLM 调用时报错）。"""
+★ 与底层模型 deepseek-chat 的 128K 窗口对齐，再扣掉输出预留作为安全缓冲，
+保证 prompt 体积 + 输出不会越过模型窗口而在 LLM 调用时报错。"""
 CONTEXT_OUTPUT_RESERVE_TOKENS: Final[int] = 4_000
 """为 LLM 输出预留的 token 数（从 CONTEXT_WINDOW_LIMIT 里扣掉）。"""
 

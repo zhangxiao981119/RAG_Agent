@@ -150,7 +150,7 @@ def build_memory_prompt(memory: dict | None) -> str:
     return f"\n\n<memory>\n{profile}\n</memory>\n（回答时可参考以上用户背景）"
 
 
-# ── 上下文窗口管理（256K token 限制）──────────────────────────
+# ── 上下文窗口管理（128K token 限制）──────────────────────────
 
 def _estimate_tokens(text: str) -> int:
     """估算文本 token 数（中文保守按 2 字符/token）。
