@@ -16,7 +16,11 @@ CONTRACT_VERSION: Final[str] = "v1.1"
 
 
 # ── 回答边界 ──────────────────────────────────────────────
-RELEVANCE_THRESHOLD: Final[float] = 0.35        # L1 闸门；M2 结束前必须标定
+# L1 闸门。2026-09-25 用 30 条 eval_cases 标定：可答组 top1 ∈ [0.509, 0.764]，
+# 不可答组 top1 ∈ [0.000, 0.484]，两组无重叠，0.50 处 F1=1.000（拒答正确率 100%、漏答率 0%）。
+# ★ 口径警告：标定时 reranker 不可用（POST /v1/rerank 30s 超时），分数实为 RRF 融合分。
+#   重排恢复上线后，必须用 scripts/calibrate_threshold.py 重新标定。
+RELEVANCE_THRESHOLD: Final[float] = 0.50
 GENERATION_TEMPERATURE: Final[float] = 0.1      # L2
 GROUNDING_CHECK_ENABLED: Final[bool] = True     # L3；MUST NOT 置 False
 TOP_K_RECALL: Final[int] = 50                   # 每路召回条数

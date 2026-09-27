@@ -23,7 +23,7 @@ from sqlalchemy import delete
 from app.config.settings import get_settings
 from app.database import SessionLocal
 from app.models import Chunk, Document, ParseJob
-from app.services.chunk import chunk_blocks
+from app.services.chunk import chunk_blocks, to_embedding_text
 from app.services.embedding import get_embedding_service
 from app.services.parse import ParseError, parse_bytes
 from app.services.storage import get_storage
@@ -91,7 +91,9 @@ async def run_parse_job(
             raise ParseError("分块结果为空")
 
         embedding_service = get_embedding_service()
-        texts = [c.content for c in chunks]
+        # ★ 用 to_embedding_text 而非裸 content：补上章节标题前缀，
+        #   否则只出现在标题里的词（如"报销标准"）向量路召不回。
+        texts = [to_embedding_text(c) for c in chunks]
         vectors = await embedding_service.embed(texts)
 
     except Exception as exc:

@@ -23,11 +23,21 @@ from sqlalchemy import select
 from app.config import decisions
 from app.config.settings import get_settings
 from app.database import SessionLocal
-from app.models import EvalCase, KnowledgeBase, Tenant
+from app.models import EvalCase, KnowledgeBase, Tenant, User
+from app.services.auth import create_access_token
 
 
-async def _ask_one(client: httpx.AsyncClient, base_url: str, question: str, kb_ids: list[str]) -> dict:
-    """调 /api/chat/ask SSE，返回 {refused, citations, text}。"""
+async def _ask_one(
+    client: httpx.AsyncClient,
+    base_url: str,
+    question: str,
+    kb_ids: list[str],
+    token: str = "",
+) -> dict:
+    """调 /api/chat/ask SSE，返回 {refused, citations, text}。
+
+    ★ 全业务 API 需要 JWT，脚本必须自带 token，否则 401。
+    """
     refused = False
     refuse_reason = ""
     citations: list[dict] = []
@@ -37,7 +47,10 @@ async def _ask_one(client: httpx.AsyncClient, base_url: str, question: str, kb_i
         "POST",
         f"{base_url}/api/chat/ask",
         json={"question": question, "kb_ids": kb_ids, "conversation_id": None},
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {token}"} if token else {}),
+        },
         timeout=120,
     ) as response:
         response.raise_for_status()
@@ -108,18 +121,29 @@ async def run_eval(
         ).scalars().all()
         kb_ids = [str(kb.id) for kb in kbs]
 
+        # 全业务 API 需 JWT：签发 admin token，否则 /api/chat/ask 返回 401
+        admin = await session.scalar(
+            select(User).where(User.tenant_id == tenant.id, User.username == "admin")
+        )
+        token = ""
+        if admin is None:
+            print("未找到 admin 用户，请求不带 token，预计全部 401", file=sys.stderr)
+        else:
+            token = create_access_token(admin.id, tenant.id, admin.username)
+
     answerable = [c for c in cases if c.expected_answerable]
     unanswerable = [c for c in cases if not c.expected_answerable]
 
     correct_refusal = 0
     wrong_refusal = 0  # 可答问题被拒答（漏答）
     hit_docs = 0
+    unjudged = 0  # 未标注 expected_doc_ids，命中率不可判定的用例数
     total_citations = 0
 
     async with httpx.AsyncClient() as client:
         # 可答
         for case in answerable:
-            result = await _ask_one(client, base_url, case.question, kb_ids)
+            result = await _ask_one(client, base_url, case.question, kb_ids, token)
             if result["refused"]:
                 wrong_refusal += 1
                 print(f"[漏答] {case.question} -> refused({result['refuse_reason']})")
@@ -127,14 +151,18 @@ async def run_eval(
                 # 命中率：引用的 doc_id 是否在 expected_doc_ids
                 cited_doc_ids = {c.get("doc_id") for c in result["citations"]}
                 expected = {str(d) for d in case.expected_doc_ids}
-                if not expected or cited_doc_ids & expected:
+                if not expected:
+                    # ★ 未标注 expected_doc_ids 的用例不可判定，计入 unjudged，
+                    #   既不进分子也不进分母——否则命中率恒为 100%，指标失真
+                    unjudged += 1
+                elif cited_doc_ids & expected:
                     hit_docs += 1
                 total_citations += len(result["citations"])
                 print(f"[答] {case.question} -> {len(result['citations'])} 引用")
 
         # 不可答
         for case in unanswerable:
-            result = await _ask_one(client, base_url, case.question, kb_ids)
+            result = await _ask_one(client, base_url, case.question, kb_ids, token)
             if result["refused"]:
                 correct_refusal += 1
                 print(f"[拒答] {case.question} -> {result['refuse_reason']}")
@@ -143,12 +171,26 @@ async def run_eval(
 
     refusal_rate = correct_refusal / len(unanswerable) if unanswerable else 0
     miss_rate = wrong_refusal / len(answerable) if answerable else 0
-    hit_rate = hit_docs / len(answerable) if answerable else 0
+    # 命中率只在「已回答（未被拒答）且有标注」的用例上统计：
+    # 漏答的不进统计（它已经计入漏答率），未标注的不可判定
+    judged = len(answerable) - wrong_refusal - unjudged
+    hit_rate = hit_docs / judged if judged else 0
 
     print("\n=== 评估结果 ===")
     print(f"拒答正确率: {refusal_rate:.2%}（目标 >= 0.90）")
     print(f"漏答率:     {miss_rate:.2%}（目标 <= 0.10）")
     print(f"命中率:     {hit_rate:.2%}（目标 >= 0.80）")
+    if judged == 0:
+        print(
+            f"  ⚠ 命中率不可判定：{len(answerable)} 条可答用例中 "
+            f"{wrong_refusal} 条被拒答、{unjudged} 条未标注 expected_doc_ids，"
+            f"可判定样本为 0 —— 请先校准用例标注（scripts/seed_eval.py）"
+        )
+    elif unjudged:
+        print(
+            f"  ⚠ {unjudged} 条用例未标注 expected_doc_ids，"
+            f"命中率仅在 {judged} 条可判定的用例上统计"
+        )
     print(f"RELEVANCE_THRESHOLD = {decisions.RELEVANCE_THRESHOLD}")
 
     failed = 0

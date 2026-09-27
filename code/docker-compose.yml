@@ -87,6 +87,9 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       SECRET_KEY: ${SECRET_KEY:-change-me}
+      # ★ 必须显式注入：缺失时 auth._get_jwt_secret() 会按进程随机兜底，
+      #   导致多副本/重启后 token 全部失效（静默故障，极难排查）
+      JWT_SECRET: ${JWT_SECRET:-}
       TENANT_CODE: ${TENANT_CODE:-default}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-pass}@postgres:5432/${POSTGRES_DB:-kagent}
       REDIS_URL: redis://redis:6379/0

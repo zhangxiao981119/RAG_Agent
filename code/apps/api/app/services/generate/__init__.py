@@ -26,6 +26,12 @@ from app.services.retrieve.base import RetrievedChunk
 logger = logging.getLogger(__name__)
 
 # 手册 §3.1 L2 四条约束 + 格式要求
+# 拒答文案：提示词要求 LLM 在上下文不足时"直接回复"这句话（契约单一来源）。
+# ★ 生成层必须把这句话识别为 refused=True（见 generate() 末尾），
+#   否则会以 delta 形式当成正常回答流出，违反 chat.py 的
+#   「拒答 MUST 发 refused 事件，MUST NOT 用 delta 发拒答文案」。
+NO_ANSWER_TEXT = "知识库中未找到相关内容"
+
 _SYSTEM_PROMPT = """你是一个严格依据知识库回答问题的助手。
 
 约束（MUST 遵守）：
@@ -58,6 +64,13 @@ _SYSTEM_PROMPT = """你是一个严格依据知识库回答问题的助手。
 如果 <context> 无法回答问题，直接回复"知识库中未找到相关内容"，不要附引用编号，也不要输出 <followups>。"""
 
 # 在数字编号前自动补换行的正则：匹配行内 "1. "（编号后必须跟空格，避免误切 "2.0" 这类版本号）
+# fail-closed：提示词文案与常量一旦漂移，导入即失败，避免"说了拒答但代码不认"
+if NO_ANSWER_TEXT not in _SYSTEM_PROMPT:
+    raise RuntimeError(
+        "_SYSTEM_PROMPT 中的拒答文案与 NO_ANSWER_TEXT 不一致，"
+        "会导致生成层无法识别拒答"
+    )
+
 _LIST_ITEM_RE = re.compile(r"(?<!\n)\s+(\d+\.\s)")
 
 # 匹配 Markdown 小标题（#### / ### / ## / #），捕获小标题及其后的内容
@@ -265,15 +278,21 @@ class GenerationService:
         if decisions.MASK_PII_ENABLED:
             formatted = mask_pii(formatted)
 
+        # ★ 提示词契约闭环：LLM 只输出拒答文案 ⇒ 判定为拒答，而不是正常回答。
+        #   否则用户会看到"回答：知识库中未找到相关内容"，且下面挂着 8 条不相关引用。
+        _is_no_answer = formatted.strip().strip('"').strip("“").strip("”") == NO_ANSWER_TEXT
+
         return GenerationResult(
-            text=formatted,
+            text="" if _is_no_answer else formatted,
             raw_text=raw_text,
             stripped_sentences=grounding_result.stripped_sentences,
-            refused=False,
-            refuse_reason="",
-            citations=citations,
+            refused=_is_no_answer,
+            refuse_reason="NO_RELEVANT_CONTENT" if _is_no_answer else "",
+            # 拒答时不返回引用：这些 chunk 已被判定不足以支撑回答，
+            # 挂上去只会误导（用户点开引用看到的是不相关内容）
+            citations=[] if _is_no_answer else citations,
             usage={"prompt_tokens": 0, "completion_tokens": len(raw_text)},
-            suggestions=suggestions,
+            suggestions=[] if _is_no_answer else suggestions,
         )
 
 
@@ -459,6 +478,16 @@ class StreamGenerationService(GenerationService):
         if not full_text.strip():
             yield StreamDelta(
                 type="refused", refused=True, refuse_reason="UNGROUNDED",
+                stripped_sentences=stripped, full_text="",
+            )
+            return
+
+        # ★ 提示词契约闭环（流式）：LLM 只输出拒答文案 ⇒ 发 refused，而不是 done。
+        #   注意此时 delta 已随流发出，前端收到 refused 后应清空正文与引用，
+        #   展示统一的拒答态——内容相同，但状态正确、且不再挂 8 条误导引用。
+        if full_text.strip().strip('"').strip("“").strip("”") == NO_ANSWER_TEXT:
+            yield StreamDelta(
+                type="refused", refused=True, refuse_reason="NO_RELEVANT_CONTENT",
                 stripped_sentences=stripped, full_text="",
             )
             return

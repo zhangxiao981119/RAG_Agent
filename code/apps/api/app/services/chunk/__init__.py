@@ -24,8 +24,11 @@ from app.services.parse.base import ParsedBlock
 # tiktoken 编码器（cl100k_base 是 gpt-4 系列默认；bge-m3 用它计数近似）
 _ENCODER = tiktoken.get_encoding("cl100k_base")
 
-# 句子切分：按中文句号/问号/感叹号/换行切
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?\.])\s+|\n+")
+# 句子切分：中文句号/问号/感叹号 + 换行切
+# ★ 中文标点【后面通常没有空格】，所以不能写成 (?<=[。！？])\s+ —— 那样永远匹配不到，
+#   三级降级会直接退化成"段落 → 硬切"。这里中文标点后零宽切分，不要求空白。
+# ★ 西文句点 "." 仍要求后跟空白再切：避免把 "3.14"、"e.g." 拦腰截断。
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])|(?<=[.!?])\s+|\n+")
 # 段落切分：双换行
 _PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
 
@@ -81,34 +84,37 @@ def _block_to_units(block: ParsedBlock) -> list[tuple[str, str, int | None]]:
             return _hard_split(text_line, decisions.CHUNK_MAX_TOKENS)
 
         # 展平所有行：超长单元格被硬切（极端场景，与文本路径硬切同级降级）
+        # ★ 只切【数据行】。原实现把表头行也塞进来一起硬切，导致 flat_pieces[0]
+        #   是"表头的第一个碎片"，后续行组拿到的列定义是残缺的。
+        raw_header = lines[0]
+        header_tokens = _count_tokens(raw_header)
+
         flat_pieces: list[str] = []
-        for ln in lines:
+        for ln in lines[1:]:
             flat_pieces.extend(_line_pieces(ln))
         if not flat_pieces:
             return []
-        header_line = flat_pieces[0]  # 首片作为表头（首片即原表头或其第一片）
-        header_tokens = _count_tokens(header_line)
+
+        # 表头 + 至少一行能放进 MAX 时才携带表头；表头本身超 MAX 则无处安放，
+        # 宁可不给列定义，也不给"半个表头"（半个表头比没表头更有误导性）。
+        header_fits = header_tokens <= decisions.CHUNK_MAX_TOKENS
 
         units: list[tuple[str, str, int | None]] = []
-        buffer_lines = [header_line]  # 第一组带表头
-        buffer_tokens = header_tokens
-        for line in flat_pieces[1:]:
-            line_tokens = _count_tokens(line)
-            if buffer_tokens + line_tokens > decisions.CHUNK_MAX_TOKENS:
-                units.append(
-                    ("\n".join(buffer_lines), block.heading_path, block.page_no)
-                )
-                # 下一组优先带表头；表头 + 本行仍超 MAX 时放弃表头，本行单独成组
-                if header_tokens + line_tokens <= decisions.CHUNK_MAX_TOKENS:
-                    buffer_lines = [header_line, line]
-                    buffer_tokens = header_tokens + line_tokens
-                else:
-                    buffer_lines = [line]
-                    buffer_tokens = line_tokens
-            else:
-                buffer_lines.append(line)
-                buffer_tokens += line_tokens
-        units.append(("\n".join(buffer_lines), block.heading_path, block.page_no))
+        buffer_lines: list[str] = []
+        buffer_tokens = 0
+        for piece in flat_pieces:
+            piece_tokens = _count_tokens(piece)
+            if buffer_lines and buffer_tokens + piece_tokens > decisions.CHUNK_MAX_TOKENS:
+                # 装满一组：吐出，下一组重新尝试带表头
+                units.append(("\n".join(buffer_lines), block.heading_path, block.page_no))
+                buffer_lines, buffer_tokens = [], 0
+            if not buffer_lines and header_fits and header_tokens + piece_tokens <= decisions.CHUNK_MAX_TOKENS:
+                buffer_lines.append(raw_header)
+                buffer_tokens = header_tokens
+            buffer_lines.append(piece)
+            buffer_tokens += piece_tokens
+        if buffer_lines:
+            units.append(("\n".join(buffer_lines), block.heading_path, block.page_no))
         return units
 
     # 文本块：段落 → 句子 → 硬切
@@ -172,8 +178,11 @@ def _accumulate(units: list[tuple[str, str, int | None]]) -> list[ChunkData]:
             continue
 
         text = "\n\n".join(u[0] for u in current)
-        heading_path = current[-1][1]  # 取最深的 heading
-        page_no = current[-1][2]
+        # ★ 一块内容可能跨小节/跨页。标【起始】位置比标"最深的那个"更贴近直觉：
+        #   原实现取 current[-1]，跨小节时会把整块标成末尾小节的名字，
+        #   而引用溯源（generate/__init__.py）直接把这个 heading_path 展示给用户。
+        heading_path = current[0][1] or current[-1][1]
+        page_no = next((u[2] for u in current if u[2] is not None), None)
         chunks.append(
             ChunkData(
                 content=text,
@@ -193,6 +202,22 @@ def _accumulate(units: list[tuple[str, str, int | None]]) -> list[ChunkData]:
             overlap_tokens += _count_tokens(unit[0])
 
     return chunks
+
+
+def to_embedding_text(chunk: ChunkData) -> str:
+    """生成喂给 embedding 模型的文本 —— ≠ 落库的 content，两者刻意不同。
+
+    ★ 背景：解析层把标题行抽成了 heading_path，content 里并【没有】标题文字；
+      而 worker 原本只拿 content 去 embed，导致"报销标准"这类只出现在章节标题里的词，
+      向量召回路完全抓不回（只有关键词路的 heading_path ILIKE 能兜住）。
+
+    ★ 所以这里把章节路径作为前缀补进 embedding 输入；落库的 content 保持原文纯净，
+      前端展示/引用回跳不受影响。
+
+    ⚠ 改动本函数等价于变更索引口径：历史文档必须【重新索引】，否则新旧向量不同构。
+    """
+    prefix = f"[{chunk.heading_path}]\n" if chunk.heading_path else ""
+    return prefix + chunk.content
 
 
 def chunk_blocks(blocks: list[ParsedBlock]) -> list[ChunkData]:
