@@ -62,6 +62,49 @@ MEMORY_COMPRESS_THRESHOLD: Final[int] = 12      # 历史超过 12 条时触发�
 MEMORY_MAX_FACTS: Final[int] = 20                # 长期记忆：用户画像最多缓存 20 条关键事实
 MEMORY_MAX_PROFILE_CHARS: Final[int] = 800      # 长期记忆：用户画像文本上限
 
+# ── 三级记忆层（D-21 / 4.20）──────────────────────────────
+MEMORY_LAYERS: Final[tuple[str, ...]] = ("short", "long", "permanent")
+"""三级记忆：短期（会话）/ 长期（用户偏好）/ 永久（口径版本）。
+
+★ 长期记忆 MUST NOT 含文档内容 —— 那是**权限副本**：
+  用户今天有权看 A 文档、明天权限被收回，但画像里的副本不会跟着失效，
+  等于绕过了四层守卫的实时判定。"""
+
+MEMORY_LONG_TERM_KINDS: Final[frozenset[str]] = frozenset({"preference"})
+"""长期记忆**读取白名单**：只允许召回「偏好」类。
+
+与写入侧的 BLOCKED_MEMORY_PATTERNS 构成双保险 ——
+任一侧失守（过滤器被绕过 / 白名单漏配），另一侧仍能挡住。"""
+
+MEMORY_WRITE_CONFIDENCE_THRESHOLD: Final[float] = 0.6
+"""写入置信度门槛：低于此值的候选事实只写短期，不升长期。"""
+
+MEMORY_MIN_FACT_CHARS: Final[int] = 4
+MEMORY_MAX_FACT_CHARS: Final[int] = 60
+"""事实长度上下限。
+
+★ 上限 60 的依据：偏好是短句（「常用技术中心知识库」），
+  而文档片段是长文本 —— **长度是区分「偏好」与「片段」的粗但有效的代理指标**。
+  超过上限的一律视为疑似片段，拒绝写入长期记忆。"""
+
+BLOCKED_MEMORY_PATTERNS: Final[tuple[str, ...]] = (
+    r"\[\d+\]",                 # 引用编号痕迹：说明在抄答案，不是在提炼偏好
+    "知识库中未找到相关内容",      # 拒答文案：拒答意味着「不该回答」，更不该记住
+    "NO_RELEVANT_CONTENT",
+    "机密", "绝密", "CONFIDENTIAL", "SECRET",   # 密级标识
+    "grant_kb", "acl_tags", "deny_subjects", "level_rank",  # 内部权限字段名
+)
+"""长期记忆**写入过滤器**：命中即丢弃，并记合规事件。
+
+正则中的 `\\[\\d+\\]` 用于识别 `[1]` `[2]` 这类引用编号 ——
+出现引用编号说明这段文本是从答案里抄的，不是提炼出的偏好。"""
+
+MEMORY_SOURCE_TRACE_REQUIRED: Final[bool] = True
+"""长期记忆项 MUST 带 `source_trace_id`。
+
+★ 这是权限变更时**按文档反查清除的唯一依据**。
+  记忆项若只记内容不记来源，就永远无法回答「这条记忆来自哪次检索」。"""
+
 # ── 历史消息读取上限（DB 查询）──────────────────────────
 HISTORY_FETCH_MAX_ROWS: Final[int] = 500
 """从 Message 表一次读取的最大历史行数。DB 层只做硬上限，不参与业务裁剪。
@@ -273,6 +316,25 @@ def self_check() -> None:
         raise RuntimeError(
             "COT_REASONING_EXPOSED MUST be False —— "
             "推理链含内部规则与试探表述，不得对外输出。"
+        )
+    # ── 记忆层口径（D-21 / 4.20）──
+    if "fact" in MEMORY_LONG_TERM_KINDS:
+        raise RuntimeError(
+            "MEMORY_LONG_TERM_KINDS MUST NOT 含 'fact' —— "
+            "事实类会把文档内容沉淀为权限副本，绕过四层守卫的实时判定。"
+        )
+    if not MEMORY_LONG_TERM_KINDS:
+        raise RuntimeError("MEMORY_LONG_TERM_KINDS MUST NOT 为空（否则长期记忆无从召回）")
+    if not (0.0 < MEMORY_WRITE_CONFIDENCE_THRESHOLD < 1.0):
+        raise RuntimeError("MEMORY_WRITE_CONFIDENCE_THRESHOLD MUST ∈ (0, 1)")
+    if MEMORY_MIN_FACT_CHARS < 1 or MEMORY_MAX_FACT_CHARS <= MEMORY_MIN_FACT_CHARS:
+        raise RuntimeError("记忆事实长度上下限配置非法")
+    if not BLOCKED_MEMORY_PATTERNS:
+        raise RuntimeError("BLOCKED_MEMORY_PATTERNS MUST NOT 为空（写入过滤器是合规底线）")
+    if not MEMORY_SOURCE_TRACE_REQUIRED:
+        raise RuntimeError(
+            "MEMORY_SOURCE_TRACE_REQUIRED MUST be True —— "
+            "无 source_trace_id 则权限变更时无法按文档反查清除记忆。"
         )
 
 

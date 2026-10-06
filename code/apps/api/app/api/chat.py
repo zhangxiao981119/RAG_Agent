@@ -26,6 +26,7 @@ from app.api.deps import CurrentUser, get_current_user, get_db
 from app.api.rate_limit import check_chat_rate_limit
 from app.config import decisions
 from app.database import SessionLocal
+from app.infra import trace
 from app.models import Conversation, KnowledgeBase, Message, User
 from app.schemas.chat import ChatAskRequest
 from app.services import audit
@@ -605,7 +606,12 @@ async def _update_user_memory(
             u = await session.get(User, user_id)
             if u is None:
                 return
-            new_memory = await extract_facts(user_msg, assistant_msg, u.memory or {})
+            new_memory = await extract_facts(
+                user_msg,
+                assistant_msg,
+                u.memory or {},
+                trace_id=trace.get_trace_id() or "",
+            )
             u.memory = new_memory
             await session.commit()
     except Exception:

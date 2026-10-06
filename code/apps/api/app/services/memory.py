@@ -1,16 +1,25 @@
-"""用户画像 + 上下文压缩 + 缓存重要信息。
+"""三级记忆层 —— 短期（会话）/ 长期（用户偏好）/ 永久（口径版本）。
 
 职责：
-  1. extract_facts — 从一轮 user/assistant 对话中提取关键事实，合并到用户画像
-  2. compress_history — 历史消息过长时，用 LLM 把较早部分压缩成摘要
-  3. build_memory_prompt — 把画像拼成 system prompt 里的记忆段
+  1. extract_facts — 从一轮 user/assistant 对话中提取关键事实，经**写入过滤器**后合并到画像
+  2. compress_history — 历史消息过长时，用 LLM 把较早部分压缩成摘要（短期记忆）
+  3. build_memory_prompt — 把画像拼成 system prompt 里的记忆段（**读取白名单**）
+  4. purge_facts_by_trace_id — 权限变更 / 文档删除时按来源清除记忆项
+  5. build_caliber_snapshot — 永久记忆：口径版本快照
 
 ★ 不做 fallback：提取/压缩失败静默跳过（不阻塞主流程）。
+
+★ 长期记忆的合规约束（见《技术开发文档》D-21 / 4.20）：
+  只放**用户偏好**，MUST NOT 放文档内容 —— 那是权限副本，
+  会绕过四层守卫的实时判定（权限收回了，副本仍在）。
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from app.config import decisions
 from app.services.llm import LLMError, get_llm_service
@@ -22,6 +31,8 @@ _EXTRACT_FACTS_PROMPT = """你是一个信息抽取器。从下面这轮对话�
 
 只提取稳定的、跨对话有意义的信息（如：用户身份、偏好、常用技术领域、公司背景、关键决策）。
 不要提取临时上下文（如："让我看看文档"、"好的"）。
+★ 不要提取文档正文内容、引用片段、或具体的资料原文 —— 只提炼「偏好」与「背景」。
+★ 单条事实 MUST 简短（不超过 {max_chars} 字）。
 
 输出严格 JSON：{"facts": ["事实1", "事实2", ...]}，数组为空则表示没有新事实。
 
@@ -35,17 +46,184 @@ _COMPRESS_PROMPT = """请把下面的对话历史压缩成一段简洁摘要，�
 摘要："""
 
 
-def _merge_facts(existing: list[str], new_facts: list[str]) -> list[str]:
-    """合并事实列表，去重 + 限长。"""
-    merged: list[str] = list(existing)
-    for f in new_facts:
-        f = f.strip()
-        if not f:
+# ── 记忆项契约（D-21 / 4.20）────────────────────────────
+
+
+@dataclass
+class MemoryItem:
+    """长期记忆项。
+
+    历史上 facts 是 `list[str]`；自 v1.1 起升级为带元数据的结构，
+    以支持「按来源反查清除」与「置信度门槛」。旧数据由 normalize_facts 兼容。
+    """
+
+    content: str
+    kind: str = "preference"          # preference / caliber / fact
+    confidence: float = 1.0
+    source_trace_id: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "content": self.content,
+            "kind": self.kind,
+            "confidence": round(float(self.confidence), 3),
+            "source_trace_id": self.source_trace_id,
+        }
+
+    @classmethod
+    def from_raw(cls, raw) -> "MemoryItem | None":
+        """从 dict（新格式）或 str（旧格式）构造。无法解析返回 None。"""
+        if isinstance(raw, str):
+            text = raw.strip()
+            return cls(content=text) if text else None
+        if isinstance(raw, dict):
+            text = str(raw.get("content") or "").strip()
+            if not text:
+                return None
+            try:
+                conf = float(raw.get("confidence", 1.0))
+            except (TypeError, ValueError):
+                conf = 1.0
+            return cls(
+                content=text,
+                kind=str(raw.get("kind") or "preference"),
+                confidence=conf,
+                source_trace_id=str(raw.get("source_trace_id") or ""),
+            )
+        return None
+
+
+def normalize_facts(raw_facts: list | None) -> list[MemoryItem]:
+    """把历史 `list[str]` 与新 `list[dict]` 统一成 `list[MemoryItem]`。
+
+    旧格式项无 source_trace_id —— 这是历史遗留，无法追溯来源，
+    但至少要能读出来（不能因为升级格式就丢掉用户已有画像）。
+    """
+    out: list[MemoryItem] = []
+    for raw in raw_facts or []:
+        item = MemoryItem.from_raw(raw)
+        if item:
+            out.append(item)
+    return out
+
+
+_BLOCKED_RE = re.compile("|".join(decisions.BLOCKED_MEMORY_PATTERNS))
+
+
+def blocked_reason(text: str) -> str | None:
+    """返回命中拦截的原因；未命中返回 None。
+
+    拦截规则（见 decisions.BLOCKED_MEMORY_PATTERNS）：
+      too_short              过短，无信息量
+      too_long_suspected_fragment  过长，疑似文档片段而非偏好
+      blocked_pattern        命中黑名单（引用编号 / 拒答文案 / 密级 / 内部字段名）
+    """
+    s = (text or "").strip()
+    if len(s) < decisions.MEMORY_MIN_FACT_CHARS:
+        return "too_short"
+    if len(s) > decisions.MEMORY_MAX_FACT_CHARS:
+        return "too_long_suspected_fragment"
+    if _BLOCKED_RE.search(s):
+        return "blocked_pattern"
+    return None
+
+
+def filter_facts(
+    candidates: list[str] | list[MemoryItem],
+    *,
+    trace_id: str = "",
+    confidence: float = 1.0,
+) -> tuple[list[MemoryItem], list[tuple[str, str]]]:
+    """写入过滤器。返回 (通过的项, [(被拒文本, 原因)])。
+
+    这是长期记忆的**合规底线**：宁可少记，不可错记。
+    被拒项由调用方决定是否记合规事件。
+    """
+    passed: list[MemoryItem] = []
+    rejected: list[tuple[str, str]] = []
+    for raw in candidates:
+        text = raw.content if isinstance(raw, MemoryItem) else str(raw)
+        text = (text or "").strip()
+        reason = blocked_reason(text)
+        if reason:
+            rejected.append((text[:80], reason))
             continue
-        # 简单去重：已存在相似前缀的跳过
-        if not any(f[:20] in e or e[:20] in f for e in merged):
-            merged.append(f)
-    # 限长
+        passed.append(
+            MemoryItem(
+                content=text,
+                kind=raw.kind if isinstance(raw, MemoryItem) else "preference",
+                confidence=confidence,
+                source_trace_id=trace_id,
+            )
+        )
+    return passed, rejected
+
+
+def purge_facts_by_trace_id(
+    memory: dict | None, trace_ids: set[str]
+) -> tuple[dict, int]:
+    """按来源 trace_id 清除记忆项。返回 (新 memory, 清除条数)。
+
+    用途：权限被收回 / 文档被删除时，清除由那次检索沉淀下来的偏好项。
+    ★ 旧格式（无 source_trace_id）无法匹配，不会被清除 —— 这也是
+      为什么 MUST 要求新写入项带 source_trace_id。
+    """
+    base = dict(memory or {})
+    if not trace_ids:
+        return base, 0
+
+    items = normalize_facts(base.get("facts"))
+    kept = [
+        it for it in items
+        if not (it.source_trace_id and it.source_trace_id in trace_ids)
+    ]
+    removed = len(items) - len(kept)
+
+    base["facts"] = [it.to_dict() for it in kept]
+    if kept:
+        base["profile"] = _truncate_profile(
+            "用户背景：\n" + "\n".join(f"- {it.content}" for it in kept)
+        )
+    else:
+        base["profile"] = ""
+    return base, removed
+
+
+def build_caliber_snapshot() -> dict:
+    """永久记忆：口径版本快照。
+
+    永久记忆**不含任何用户内容** —— 只记「系统按什么口径运行」，
+    供申诉与问题回溯（「这条答案是哪个阈值/提示词版本产生的」）。
+    """
+    return {
+        "contract_version": decisions.CONTRACT_VERSION,
+        "relevance_threshold_vector": decisions.RELEVANCE_THRESHOLD_VECTOR,
+        "relevance_threshold_rerank": decisions.RELEVANCE_THRESHOLD_RERANK,
+        "rrf_k": decisions.RRF_K,
+        "top_k_recall": decisions.TOP_K_RECALL,
+        "top_k_rerank": decisions.TOP_K_RERANK,
+        "chunk_target_tokens": decisions.CHUNK_TARGET_TOKENS,
+        "cot_mode": decisions.COT_MODE,
+        "grounding_check_enabled": decisions.GROUNDING_CHECK_ENABLED,
+        "snapshot_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def _merge_facts(
+    existing: list[MemoryItem], new_facts: list[MemoryItem]
+) -> list[MemoryItem]:
+    """合并记忆项，去重 + 限长。
+
+    去重按内容前缀比对（不做语义去重 —— 成本高且引入额外 LLM 调用）。
+    新项追加在尾部；超出上限时保留最新的 MEMORY_MAX_FACTS 条。
+    """
+    merged: list[MemoryItem] = list(existing)
+    for item in new_facts:
+        text = item.content.strip()
+        if not text:
+            continue
+        if not any(text[:20] in e.content or e.content[:20] in text for e in merged):
+            merged.append(item)
     if len(merged) > decisions.MEMORY_MAX_FACTS:
         merged = merged[-decisions.MEMORY_MAX_FACTS:]
     return merged
@@ -62,40 +240,85 @@ async def extract_facts(
     user_msg: str,
     assistant_msg: str,
     existing_memory: dict | None = None,
+    trace_id: str = "",
 ) -> dict:
-    """从一轮对话提取事实，返回更新后的 memory dict。
+    """从一轮对话提取事实，**经写入过滤器**后返回更新后的 memory dict。
 
-    输入 memory 结构：{"profile": "画像文本", "facts": ["事实1", ...]}
-    返回同结构。失败返回原始 memory（或空结构）。
+    memory 结构：{"profile": "画像文本", "facts": [{content, kind, confidence, source_trace_id}, ...]}
+    （旧格式 facts 为 list[str]，由 normalize_facts 兼容读出）
+
+    trace_id 用于给新记忆项打来源标记 —— 权限变更时按它反查清除。
+
+    ★ 无论 LLM 提取出什么，一律先过 filter_facts：
+      只放行「偏好」类短句，拒绝文档片段、引用痕迹、拒答文案、密级标识。
+      提取失败则静默跳过（不阻塞主流程）。
     """
     base = existing_memory or {}
-    facts: list[str] = list(base.get("facts", []))
+    items = normalize_facts(base.get("facts"))
 
+    # ── ③ 置信度门槛：低置信不升长期（这里由调用方传入，默认 1.0 表示最高置信）──
+    confidence = 1.0
+    if len(user_msg.strip()) < 10:
+        # 用户输入过短，提炼出的"偏好"可靠度低 → 降置信，写短期即可
+        confidence = 0.4
+
+    candidates: list[str] = []
     try:
         llm = get_llm_service()
         prompt = _EXTRACT_FACTS_PROMPT.format(
-            user=user_msg[:500], assistant_msg=assistant_msg[:1000]
+            user=user_msg[:500],
+            assistant_msg=assistant_msg[:1000],
+            max_chars=decisions.MEMORY_MAX_FACT_CHARS,
         )
         raw = await llm.chat(
             [{"role": "user", "content": prompt}],
             temperature=0.1,
         )
-        # 尝试解析 JSON
         json_start = raw.find("{")
         json_end = raw.rfind("}") + 1
         if json_start >= 0 and json_end > json_start:
             parsed = json.loads(raw[json_start:json_end])
-            new_facts = parsed.get("facts", [])
-            facts = _merge_facts(facts, [str(f) for f in new_facts if str(f).strip()])
+            candidates = [str(f) for f in parsed.get("facts", []) if str(f).strip()]
     except (LLMError, json.JSONDecodeError, Exception) as exc:
         logger.warning("画像提取失败，跳过: %s", exc)
 
-    # 用 facts 拼接 profile 文本
-    profile = ""
-    if facts:
-        profile = "用户背景：\n" + "\n".join(f"- {f}" for f in facts)
+    # ── ② 过滤器（合规底线）──
+    passed, rejected = filter_facts(
+        candidates, trace_id=trace_id, confidence=confidence
+    )
+    if rejected:
+        logger.info(
+            "记忆写入过滤器拦截 %d 条",
+            len(rejected),
+            extra={
+                "rejected": [{"text": txt, "reason": r} for txt, r in rejected],
+                "trace_id": trace_id,
+            },
+        )
+        # 低置信的通过项也不升长期
+    accepted = [
+        it for it in passed
+        if it.confidence >= decisions.MEMORY_WRITE_CONFIDENCE_THRESHOLD
+    ]
+    dropped_low_conf = len(passed) - len(accepted)
 
-    return {"profile": _truncate_profile(profile), "facts": facts}
+    # ── ④ 留痕：合并时保留 source_trace_id ──
+    items = _merge_facts(items, accepted)
+
+    profile = ""
+    if items:
+        profile = "用户背景：\n" + "\n".join(f"- {it.content}" for it in items)
+
+    return {
+        "profile": _truncate_profile(profile),
+        "facts": [it.to_dict() for it in items],
+        "extract_stats": {
+            "candidates": len(candidates),
+            "accepted": len(accepted),
+            "rejected": len(rejected),
+            "low_confidence_dropped": dropped_low_conf,
+        },
+    }
 
 
 async def compress_history(
@@ -141,13 +364,31 @@ async def compress_history(
 
 
 def build_memory_prompt(memory: dict | None) -> str:
-    """把用户画像拼成注入 system 的记忆段。画像为空则返回空字符串。"""
+    """把长期记忆拼成注入 system 的记忆段。
+
+    ★ 读取侧白名单（与写入过滤器构成双保险）：
+      只召回 `kind ∈ MEMORY_LONG_TERM_KINDS` 的项。
+      即便写入过滤器被绕过（模型换种说法把文档片段写成了"偏好"），
+      读取侧仍会按 kind 过滤 —— 两道门任一失守都不至于泄漏。
+
+    ★ 不直接使用 memory["profile"] 字段：那是写入时的拼接快照，
+      无法按 kind 过滤。这里从 facts 重建，保证过滤一定生效。
+    """
     if not memory:
         return ""
-    profile = memory.get("profile", "")
-    if not profile:
+    items = normalize_facts(memory.get("facts"))
+    allowed = [
+        it for it in items
+        if it.kind in decisions.MEMORY_LONG_TERM_KINDS
+        and it.confidence >= decisions.MEMORY_WRITE_CONFIDENCE_THRESHOLD
+    ]
+    if not allowed:
         return ""
-    return f"\n\n<memory>\n{profile}\n</memory>\n（回答时可参考以上用户背景）"
+    body = "\n".join(f"- {it.content}" for it in allowed)
+    return (
+        f"\n\n<memory>\n用户背景：\n{body}\n</memory>\n"
+        "（回答时可参考以上用户偏好）"
+    )
 
 
 # ── 上下文窗口管理（128K token 限制）──────────────────────────
