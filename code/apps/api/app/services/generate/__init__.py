@@ -18,6 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from app.config import decisions
+from app.infra import metrics
 from app.services.grounding import check_grounding, check_line
 from app.services.llm import LLMError, LLMTimeout, get_llm_service
 from app.services.mask import mask_pii
@@ -70,6 +71,62 @@ if NO_ANSWER_TEXT not in _SYSTEM_PROMPT:
         "_SYSTEM_PROMPT 中的拒答文案与 NO_ANSWER_TEXT 不一致，"
         "会导致生成层无法识别拒答"
     )
+
+# 思维链指令：仅在 decisions.should_enable_cot() 为真时追加进 system prompt。
+# ★ 为什么用 prompt 契约、而不是厂商参数（如 DeepSeek 的 thinking）：
+#   本项目定位是"任意 OpenAI 兼容接口"，只有某一家认的字段会让私有化换模型时
+#   **静默失效**（参数被忽略、CoT 悄悄不生效，没人会发现）。
+#   代价是遵循度不如原生 thinking —— 所以生成层**必须**对"标签没闭合"兜底，
+#   不能假设模型一定听话（见 StreamGenerationService 里的 in_reasoning 处理）。
+_COT_INSTRUCTION = """
+
+思维链要求（本次开启）：
+- 正式回答之前，先用 <reasoning> 与 </reasoning> 两个标签包住你的推理过程，两个标签各自独占一行
+- 推理内容：确认问题到底在问什么、从 <context> 里挑出哪几条依据、核对引用编号是否一一对应
+- <reasoning> 内的文字不会展示给用户，仅供内部审计，不必修饰措辞
+- </reasoning> 之后紧接正式回答，格式要求与上面完全一致（Markdown + [n] 引用）"""
+
+
+def _build_system_content(memory_prompt: str, cot_enabled: bool) -> str:
+    """拼装 system prompt：基础约束 → 用户画像 →（可选）思维链指令。
+
+    CoT 指令放**最后**：离 user prompt 最近，模型的遵循度更高。
+    """
+    parts = [_SYSTEM_PROMPT]
+    if memory_prompt:
+        parts.append(memory_prompt)
+    if cot_enabled:
+        parts.append(_COT_INSTRUCTION)
+    return "".join(parts)
+
+
+# 思维链剥离（非流式路径用；流式在 _flush_lines 里逐行处理）
+_REASONING_BLOCK_RE = re.compile(r"<reasoning>(.*?)</reasoning>", re.DOTALL)
+_REASONING_OPEN_RE = re.compile(r"<reasoning>")
+_REASONING_CLOSE = "</reasoning>"
+
+
+def _extract_reasoning(text: str, cot_enabled: bool) -> tuple[str, str]:
+    """剥离思维链，返回 (正文, 推理链)。
+
+    ★ 未闭合时（模型写了 <reasoning> 但忘了收尾标签）**不修改正文** ——
+      整段原样返回。理由：漏出推理链只是"展示了不该展示的内容"，
+      而"未闭合就全丢"会让用户看到空白回答 —— 那是功能性故障，
+      比泄漏实现细节严重得多。这种情形记指标 `rag.cot.unclosed`，
+      用来观察模型的格式遵循率（长期偏高就该考虑换回原生 thinking 参数）。
+    """
+    if not cot_enabled:
+        return text, ""
+    m = _REASONING_BLOCK_RE.search(text)
+    if m:
+        reasoning = m.group(1).strip()
+        clean = (text[: m.start()] + text[m.end():]).strip()
+        return clean, reasoning
+    if _REASONING_OPEN_RE.search(text):
+        metrics.incr("rag.cot.unclosed")
+        logger.warning("思维链标签未闭合，正文按原样返回（推理链可能外泄）")
+    return text, ""
+
 
 _LIST_ITEM_RE = re.compile(r"(?<!\n)\s+(\d+\.\s)")
 
@@ -172,6 +229,9 @@ class GenerationResult:
     citations: list[Citation] = field(default_factory=list)
     usage: dict = field(default_factory=dict)
     suggestions: list[str] = field(default_factory=list)
+    # 思维链（开启时才有）。**不对外输出**（见 decisions.COT_REASONING_EXPOSED），
+    # 只随消息落库供审计 —— 里面含试探性表述与内部规则，直接展示会泄漏实现细节。
+    reasoning: str = ""
 
 
 class GenerationService:
@@ -182,6 +242,7 @@ class GenerationService:
         history: list[dict] | None = None,
         memory_prompt: str = "",
         tenant_id: uuid.UUID | None = None,
+        rewrite_score: int | None = None,
     ) -> GenerationResult:
         # 构造引用映射
         valid_ns: set[int] = set()
@@ -201,7 +262,8 @@ class GenerationService:
             )
 
         # 构造 messages：system(+memory) → history → 当前 user prompt
-        system_content = _SYSTEM_PROMPT + (memory_prompt if memory_prompt else "")
+        cot_enabled = decisions.should_enable_cot(rewrite_score)
+        system_content = _build_system_content(memory_prompt, cot_enabled)
         messages: list[dict] = [{"role": "system", "content": system_content}]
         if history:
             messages.extend(history)
@@ -228,6 +290,10 @@ class GenerationService:
             llm_fail_reason = "LLM_ERROR"
 
         raw_text = "".join(raw_text_parts)
+        # 剥离思维链（开启 CoT 时模型会先输出 <reasoning>...</reasoning>）。
+        # MUST 在 grounding 校验之前剥 —— 推理链里的 [n] 会被当成引用去校验，
+        # 而那部分文字根本不该进正文。
+        raw_text, reasoning = _extract_reasoning(raw_text, cot_enabled)
         if llm_failed and not raw_text:
             return GenerationResult(
                 text="",
@@ -248,6 +314,7 @@ class GenerationService:
                 refused=True,
                 refuse_reason=grounding_result.refuse_reason,
                 citations=citations,
+                reasoning=reasoning,
             )
 
         # 从正文剥离 <followups> 追问建议
@@ -273,6 +340,7 @@ class GenerationService:
                     refused=True,
                     refuse_reason="SENSITIVE_OUTPUT",
                     citations=citations,
+                    reasoning=reasoning,
                 )
 
         if decisions.MASK_PII_ENABLED:
@@ -293,6 +361,7 @@ class GenerationService:
             citations=[] if _is_no_answer else citations,
             usage={"prompt_tokens": 0, "completion_tokens": len(raw_text)},
             suggestions=[] if _is_no_answer else suggestions,
+            reasoning=reasoning,
         )
 
 
@@ -315,6 +384,8 @@ class StreamDelta:
     full_text: str = ""
     suggestions: list[str] = field(default_factory=list)
     usage: dict = field(default_factory=dict)
+    # 思维链（开启时才有）。不外发，由 done 事件带回给 API 层落库审计。
+    reasoning: str = ""
 
 
 # 匹配 <followups> 开始标签（流式中遇到即切换为收集追问模式）
@@ -338,6 +409,7 @@ class StreamGenerationService(GenerationService):
         history: list[dict] | None = None,
         memory_prompt: str = "",
         tenant_id: uuid.UUID | None = None,
+        rewrite_score: int | None = None,
     ):
         # 引用映射（同 generate）
         valid_ns: set[int] = set()
@@ -356,7 +428,8 @@ class StreamGenerationService(GenerationService):
                 )
             )
 
-        system_content = _SYSTEM_PROMPT + (memory_prompt if memory_prompt else "")
+        cot_enabled = decisions.should_enable_cot(rewrite_score)
+        system_content = _build_system_content(memory_prompt, cot_enabled)
         messages: list[dict] = [{"role": "system", "content": system_content}]
         if history:
             messages.extend(history)
@@ -369,13 +442,15 @@ class StreamGenerationService(GenerationService):
         stripped = 0
         in_followups = False
         followups_buf = ""
+        in_reasoning = False   # 思维链区（收集不推送）
+        reasoning_buf = ""
         llm_failed = False
         llm_fail_reason = ""
         aborted = False        # 敏感词命中后置 True，中止流
 
         async def _flush_lines(buf: str, is_final: bool = False):
             """把 buf 按行切分，完整行逐行校验并 yield delta。直接修改外层 line_buf。"""
-            nonlocal line_buf, full_text, stripped, in_followups, followups_buf, aborted
+            nonlocal line_buf, full_text, stripped, in_followups, followups_buf, aborted, in_reasoning, reasoning_buf
             pieces = buf.split("\n")
             if is_final:
                 complete = pieces
@@ -386,6 +461,55 @@ class StreamGenerationService(GenerationService):
             for line in complete:
                 if aborted:
                     return
+
+                # ── 思维链区：收集不推送 ──────────────────────────────
+                # MUST 排在 followups 之前：reasoning 出现在回答**最前面**，
+                # 是"头部丢弃"，与 followups 的"尾部丢弃"方向相反。
+                # 「不推给前端」是硬要求（decisions.COT_REASONING_EXPOSED = False）——
+                # 推理链含试探性表述与内部规则，展示会泄漏实现细节。
+                if in_reasoning:
+                    if _REASONING_CLOSE in line:
+                        idx = line.index(_REASONING_CLOSE)
+                        reasoning_buf += line[:idx]
+                        in_reasoning = False
+                        line = line[idx + len(_REASONING_CLOSE):]
+                        if not line.strip():
+                            continue
+                        # 闭合标签同行之后还有正文 → 落到下面按正文处理
+                    else:
+                        reasoning_buf += line + "\n"
+                        continue
+
+                # 开标签（可能独占一行，也可能行内）
+                m_reason = _REASONING_OPEN_RE.search(line)
+                if m_reason:
+                    pre = line[: m_reason.start()].strip()
+                    rest = line[m_reason.end():]
+                    if pre:
+                        keep_pre, stripped_pre = check_line(pre, valid_ns)
+                        if stripped_pre:
+                            stripped += 1
+                        elif keep_pre:
+                            out_pre = await self._post_check(pre, tenant_id)
+                            if out_pre is None:
+                                yield StreamDelta(type="refused", refused=True, refuse_reason="SENSITIVE_OUTPUT", stripped_sentences=stripped, full_text=full_text)
+                                aborted = True
+                                return
+                            to_emit = out_pre + "\n"
+                            full_text += to_emit
+                            yield StreamDelta(type="delta", text=to_emit)
+                    in_reasoning = True
+                    if _REASONING_CLOSE in rest:
+                        idx = rest.index(_REASONING_CLOSE)
+                        reasoning_buf += rest[:idx]
+                        in_reasoning = False
+                        line = rest[idx + len(_REASONING_CLOSE):]
+                        if not line.strip():
+                            continue
+                    else:
+                        reasoning_buf += rest + "\n"
+                        continue
+
                 # 进入 followups 区：收集不推送
                 if in_followups:
                     if "</followups>" in line:
@@ -471,6 +595,19 @@ class StreamGenerationService(GenerationService):
             )
             return
 
+        # ── 兜底：模型没写 </reasoning> 就把流结束了 ────────────────
+        # 把收集到的推理内容当正文推出去，而不是让它凭空消失。
+        # 取舍：漏出推理链 = 展示了不该展示的内容；丢弃 = 用户看到空白回答。
+        # 后者是功能性故障，比前者严重。记指标观察模型遵循率（长期偏高就该
+        # 考虑改用原生 thinking 参数，而不是继续靠 prompt 契约）。
+        if in_reasoning and reasoning_buf.strip():
+            metrics.incr("rag.cot.unclosed")
+            logger.warning("思维链标签未闭合（流结束），剩余内容按正文返回")
+            fallback = reasoning_buf.strip()
+            full_text += fallback + "\n"
+            in_reasoning = False
+            yield StreamDelta(type="delta", text=fallback + "\n")
+
         # 解析 followups
         suggestions = [ln.strip() for ln in followups_buf.splitlines() if ln.strip()]
 
@@ -498,6 +635,7 @@ class StreamGenerationService(GenerationService):
             stripped_sentences=stripped,
             suggestions=suggestions,
             usage={"prompt_tokens": 0, "completion_tokens": len(full_text)},
+            reasoning=reasoning_buf.strip(),
         )
 
     async def _post_check(self, text: str, tenant_id: uuid.UUID | None) -> str | None:

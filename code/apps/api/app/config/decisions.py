@@ -174,6 +174,36 @@ COT_REASONING_EXPOSED: Final[bool] = False
 MUST be False —— 推理链含试探性表述与内部规则（检索策略、阈值），
 直接展示会造成困惑并泄漏实现细节。推理链仅落库，供审计。"""
 
+
+def should_enable_cot(rewrite_score: int | None) -> bool:
+    """按 COT_MODE 决定本次请求是否开启思维链。
+
+    ★ 实现方式是 **prompt 契约**（要求模型用 <reasoning> 包裹推理后再作答），
+      而不是厂商扩展字段（如 DeepSeek 的 thinking 参数）—— 本项目定位是
+      "任意 OpenAI 兼容接口"，不能用只有某一家认的参数。推理链由生成层在
+      流式过程中剥离、不对外输出（见 COT_REASONING_EXPOSED），并随消息落库供审计。
+
+    adaptive 的判据复用 Query 改写分（见 COT_ADAPTIVE_REUSE_REWRITE_SCORE）：
+      分数低 = 问题模糊 / 强依赖上下文 = 值得想清楚；
+      分数高 = 自包含的简单问题，直接答更划算（省 30–60% token 与延迟）。
+
+    ★ rewrite_score 为 None 时**不开**：那意味着调用方跳过了改写流程、拿不到复杂度
+      信号。宁可不生效，也不要在无法判断时无差别开启 —— 无差别开启正是这条口径
+      要避免的成本。
+    """
+    if COT_MODE == "off":
+        return False
+    if COT_MODE == "full":
+        return True
+    # adaptive
+    if not COT_ADAPTIVE_REUSE_REWRITE_SCORE:
+        # 没有别的复杂度信号来源。关掉复用即等于 adaptive 退化为 off ——
+        # 与其临时接一个未经验证的判据，不如明确不生效。
+        return False
+    if rewrite_score is None:
+        return False
+    return rewrite_score < QUERY_REWRITE_SCORE_THRESHOLD
+
 # ── 上下文窗口上限（单次请求 prompt 总 token 数）────────
 CONTEXT_WINDOW_LIMIT_TOKENS: Final[int] = 32_000
 """单次请求 context（system + memory + history + chunks + question）token 上限。
@@ -286,7 +316,12 @@ MULTI_TENANT_ENABLED: Final[bool] = False
 
 # ── 上传限制（§8 D-04 / D-16）────────────────────────────
 MAX_UPLOAD_MB: Final[int] = 100
-ALLOWED_EXT: Final[frozenset[str]] = frozenset({"pdf", "md", "txt", "xls", "xlsx"})
+# ★ 这里**故意没有** ALLOWED_EXT。
+#   上传格式白名单的真源是 `settings.allowed_ext`（可用环境变量 ALLOWED_EXT 覆盖），
+#   校验点在 kbs.py 的 upload_document。
+#   曾经这里有一份同名的 decisions.ALLOWED_EXT，但全项目**无人引用**、且值里漏了 docx
+#   —— 两个"真源"比一个都没有更危险：改了不生效，看着却像改了；照它读还会得出
+#   "不支持 docx"的错误结论。既然它是**部署可变项**而不是冻结口径，就不该放在本文件。
 OCR_ENABLED: Final[bool] = False
 """扫描件 OCR 明确不做（§1.4 Non-Goals）。带 OCR 需求的文件 MUST 在解析层显式拒绝并提示用户。"""
 

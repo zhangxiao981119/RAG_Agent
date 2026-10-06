@@ -35,6 +35,7 @@ from app.services import quota as quota_service
 from app.services import sensitive as sensitive_service
 from app.services.generate import get_stream_generation_service
 from app.services.guard import injection as injection_guard
+from app.services.mask import mask_pii
 from app.services.memory import (
     build_memory_prompt,
     ensure_context_within_limit,
@@ -422,11 +423,19 @@ async def chat_ask(
             final_stripped = 0
             final_suggestions: list[str] = []
             final_usage: dict = {}
+            final_reasoning = ""
+            # 开 CoT 时，前端在收到首个 delta 之前要等"推理段"跑完（推理链不推送），
+            # 这里先发一个 stage 事件，让前端有机会显示"思考中"。
+            # 前端目前忽略未知 stage 值，所以不加处理也不会坏。
+            if decisions.should_enable_cot(rewrite_score):
+                yield _sse("stage", {"stage": "reasoning"})
+
             async for stream_evt in generation.stream_generate(
                 payload.question, effective_chunks,
                 history=history,
                 memory_prompt=memory_prompt,
                 tenant_id=user.tenant_id,
+                rewrite_score=rewrite_score,
             ):
                 if stream_evt.type == "delta":
                     yield _sse("delta", {"text": stream_evt.text})
@@ -439,6 +448,7 @@ async def chat_ask(
                     final_stripped = stream_evt.stripped_sentences
                     final_suggestions = stream_evt.suggestions
                     final_usage = stream_evt.usage
+                    final_reasoning = stream_evt.reasoning
 
             if gen_result is not None and gen_result.refused:
                 reason = gen_result.refuse_reason
@@ -542,6 +552,10 @@ async def chat_ask(
                     "usage": final_usage,
                     "suggestions": final_suggestions,
                     "quota_degraded_from": degraded_from,
+                    # 思维链只落库、不外发（decisions.COT_REASONING_EXPOSED = False）。
+                    # 落库前**必须脱敏**：推理里常直接抄 <context> 内容，
+                    # 那里面可能带手机号/身份证（正文走 mask_pii，推理链不经过那条路）。
+                    "reasoning": mask_pii(final_reasoning) if final_reasoning else "",
                 },
             )
 

@@ -52,6 +52,7 @@
 | 引用溯源 | 回答与 chunk 双向绑定，引用角标点击回跳原文 | [ChatPage.tsx](code/apps/web/src/pages/ChatPage.tsx) · [services/generate](code/apps/api/app/services/generate/) |
 | 回答边界 | 检索为空 → 拒答；有答案则走**引用双向校验**（答案→引用剥离无效行 / 引用→检索结果只留模型真用过的），严格只依据知识库作答 | [services/grounding](code/apps/api/app/services/grounding/) |
 | **三级记忆层** | 短期（会话）/ 长期（用户偏好）/ 永久（系统口径）+ **写入过滤器** + 来源可反查 + 用户可查看可删除 | [services/memory.py](code/apps/api/app/services/memory.py) |
+| **思维链分级** | `adaptive`：复用 Query 改写分当复杂度信号（省掉一次额外 LLM 调用），**只对难问题开启**；推理链用 `<reasoning>` 包裹，流式层剥离不外发、仅落库审计 | [services/generate](code/apps/api/app/services/generate/__init__.py) |
 | 上下文治理 | 短期记忆（最近 3 轮）+ 长期画像（≤20 条事实）+ 128K 窗口预算 + 递归压缩 + 压缩超阈值提示新开对话 | [services/memory.py](code/apps/api/app/services/memory.py) |
 | chunk 级权限 | 四闸门判定（KB 成员 + 密级 + 拒绝标签 + 部门可见），权限过滤以 SQL WHERE **下推到检索层**，变更即时失效 Redis 缓存 | [services/acl](code/apps/api/app/services/acl/visibility.py) |
 | 提示注入防护 | 8 条规则 / 4 类模式（指令覆盖 / 角色改写 / 数据外发 / 越权诱导）检测召回片段，命中**降权不丢弃** + 指标 `rag.injection.hit` | [services/guard/injection.py](code/apps/api/app/services/guard/injection.py) |
@@ -247,6 +248,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 | F22 | 安全加固 | 提示注入检测（8 规则/4 类，命中降权）+ 令牌桶限流（20 次/分钟）+ 配额四级降级 + 敏感词双向拦截 + 按部门灰度开关 |
 | F23 | 前端体验 | 上传进度、批量删除、列表分页、SSE 断网提示与一键重试（保留已流出文本） |
 | F24 | **三级记忆层** | 短期/长期/永久分层契约 + 11 条写入过滤器 + 来源 trace 反查清除 + 用户可查看/可删除（物理删除） |
+| F25 | **思维链分级** | `COT_MODE`（off/adaptive/full）；adaptive 复用 Query 改写分判断复杂度，仅对难问题开启；推理链不外发、仅落库审计 |
 
 **管理面板（admin 可见，共 10 个）**：组织架构 / 用户管理 / 用户组 / 角色管理 / 审计日志 / 系统监控（P50/P95/P99 延迟 + 拒答率）/ 评估门禁 / 配额管理 / 敏感词 / 灰度开关。
 
