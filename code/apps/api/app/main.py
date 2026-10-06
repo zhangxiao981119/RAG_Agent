@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 import traceback
 from contextlib import asynccontextmanager
 
@@ -23,6 +24,7 @@ from app.api.jobs import router as jobs_router
 from app.api.kbs import router as kbs_router
 from app.api.me import router as me_router
 from app.api.messages import router as messages_router
+from app.api.metrics import router as metrics_router
 from app.api.quota import router as quota_router
 from app.api.rate_limit import check_chat_rate_limit  # noqa: F401 — 限流依赖
 from app.api.roles import router as roles_router
@@ -31,6 +33,7 @@ from app.api.sync import router as sync_router
 from app.api.users import router as users_router
 from app.config import decisions
 from app.config.settings import get_settings
+from app.infra import metrics, trace
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +77,9 @@ for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
     _logger.handlers = [_json_handler]
     _logger.propagate = False
 
+# trace_id 注入：给所有 handler 挂过滤器，之后每条日志自动带 trace_id 字段
+trace.install_log_filter()
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -85,6 +91,26 @@ async def lifespan(_: FastAPI):
     )
     app.state.arq_pool = _arq_pool
     logger.info("lifespan.arq_pool.init", extra={"pool_id": id(_arq_pool)})
+
+    # ── 重排服务启动探活 ──────────────────────────────────
+    # 降级是设计允许的，因此探活失败**不拒绝启动**，只告警 + 打点。
+    # 目的：让「重排服务不可用」这件事在启动时就被看见，
+    # 而不是等某个请求静默降级后才在日志里浮现。
+    try:
+        from app.services.rerank import get_rerank_service
+        _rerank_ok = await get_rerank_service().healthcheck()
+        if not _rerank_ok:
+            metrics.incr("rag.rerank.startup_probe", result="unhealthy")
+            logger.warning(
+                "启动探活：重排服务不可用，检索将走降级链路（用向量余弦分）",
+                extra={"hint": "检查 RERANK_BASE_URL 与推理服务；降级态下阈值口径为 vector"},
+            )
+        else:
+            metrics.incr("rag.rerank.startup_probe", result="healthy")
+            logger.info("启动探活：重排服务可用")
+    except Exception:
+        logger.warning("重排启动探活异常", exc_info=True)
+
     try:
         yield
     finally:
@@ -127,6 +153,33 @@ trusted_hosts = (
     else ["*"]  # dev 宽松，prod 必须显式配置
 )
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
+
+
+@app.middleware("http")
+async def trace_id_middleware(request: Request, call_next):
+    """为每个请求建立 trace_id，贯穿全部环节并回写响应头。
+
+    放在最外层（最后注册 = 最外层）：即便请求在 CORS / 可信主机环节被拒，
+    也能留下可追溯的 trace_id。
+
+    客户端可传 X-Trace-Id 串联上下游（如网关已生成）；未传则新生成。
+    """
+    incoming = request.headers.get("X-Trace-Id")
+    trace_id = incoming.strip()[:64] if incoming and incoming.strip() else trace.new_trace_id()
+    token = trace.set_trace_id(trace_id)
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+        response.headers["X-Trace-Id"] = trace_id
+        metrics.observe_ms(
+            "http.request.duration",
+            (time.perf_counter() - started) * 1000,
+            path=request.url.path,
+            status=str(response.status_code),
+        )
+        return response
+    finally:
+        trace.reset_trace_id(token)
 
 
 @app.exception_handler(ValueError)
@@ -175,3 +228,4 @@ app.include_router(eval_router, prefix="/api")
 app.include_router(quota_router, prefix="/api")
 app.include_router(sensitive_words_router, prefix="/api")
 app.include_router(feature_flags_router, prefix="/api")
+app.include_router(metrics_router, prefix="/api")

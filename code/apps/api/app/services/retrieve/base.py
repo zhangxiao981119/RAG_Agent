@@ -32,9 +32,16 @@ class RetrievedChunk:
 
 @dataclass
 class RetrievalResult:
-    """检索结果。refused=True 表示 L1 闸门拒答。"""
+    """检索结果。refused=True 表示 L1 闸门拒答。
+
+    `score_source` 记录本次打分口径（"rerank" / "vector"），
+    用于审计与排查：同一个 final_score 在不同口径下含义不同，
+    不记录来源则无法解释「为什么这条被拒了」。
+    """
 
     chunks: list[RetrievedChunk] = field(default_factory=list)
     refused: bool = False
     refuse_reason: str = ""
     stage_ms: dict[str, int] = field(default_factory=dict)
+    score_source: str = ""
+    use_rerank: bool = True

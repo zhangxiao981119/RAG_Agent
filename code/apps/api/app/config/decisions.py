@@ -16,11 +16,42 @@ CONTRACT_VERSION: Final[str] = "v1.1"
 
 
 # ── 回答边界 ──────────────────────────────────────────────
-# L1 闸门。2026-09-25 用 30 条 eval_cases 标定：可答组 top1 ∈ [0.509, 0.764]，
-# 不可答组 top1 ∈ [0.000, 0.484]，两组无重叠，0.50 处 F1=1.000（拒答正确率 100%、漏答率 0%）。
-# ★ 口径警告：标定时 reranker 不可用（POST /v1/rerank 30s 超时），分数实为 RRF 融合分。
-#   重排恢复上线后，必须用 scripts/calibrate_threshold.py 重新标定。
-RELEVANCE_THRESHOLD: Final[float] = 0.50
+# ★ 阈值必须拆两套：final_score 有两种来源，分布不同，不能用同一个数判定。
+#   - 重排在线：final_score = rerank 服务的绝对相关性分
+#   - 重排降级：final_score = 向量余弦分
+#   重排服务抖动时会自动降级，两种口径会**交替出现** —— 单一阈值不可预测。
+#
+# 2026-09-25 用 30 条 eval_cases 标定（降级态 / 余弦分口径）：
+#   可答组 top1 ∈ [0.509, 0.764]，不可答组 top1 ∈ [0.000, 0.484]，
+#   两组无重叠，0.50 处 F1=1.000。
+# ★ 口径警告：分离度仅 0.025，样本仅 30 条，偏窄。
+#   用例扩到 50+ 条后必须用 scripts/calibrate_threshold.py 重标。
+RELEVANCE_THRESHOLD_VECTOR: Final[float] = 0.50
+"""重排降级时的阈值。口径 = 向量余弦分。"""
+
+RELEVANCE_THRESHOLD_RERANK: Final[float] = 0.50
+"""重排在线时的阈值。口径 = rerank 绝对相关性分。
+★ 该值尚未标定（重排服务此前不可用），沿用向量口径值仅为占位；
+  重排恢复后 MUST 用 scripts/calibrate_threshold.py --mode rerank 重新标定。"""
+
+
+def active_threshold(use_rerank: bool) -> float:
+    """按当前打分口径返回应当使用的阈值。
+
+    判定 MUST 走本函数，MUST NOT 在业务代码里直接读某个阈值常量 ——
+    否则重排在线/降级切换时会出现「用错口径的阈值」。
+    """
+    return (
+        RELEVANCE_THRESHOLD_RERANK if use_rerank else RELEVANCE_THRESHOLD_VECTOR
+    )
+
+
+# ── 关键词召回路径 ────────────────────────────────────────
+KEYWORD_TSQUERY_ENABLED: Final[bool] = True
+"""启用 tsquery 路径（走 idx_chunk_fts 全文索引）。仅对 ASCII/数字词元生效 ——
+PostgreSQL 的 'simple' 配置不做中文分词，中文仍走 ILIKE 子串匹配。
+两路结果共同进入 RRF，互不替代。"""
+
 GENERATION_TEMPERATURE: Final[float] = 0.1      # L2
 GROUNDING_CHECK_ENABLED: Final[bool] = True     # L3；MUST NOT 置 False
 TOP_K_RECALL: Final[int] = 50                   # 每路召回条数
@@ -50,6 +81,24 @@ QUERY_REWRITE_TIMEOUT_SECONDS: Final[float] = 5.0
 QUERY_REWRITE_SCORE_THRESHOLD: Final[int] = 90
 """百分制改写阈值：score >= 阈值 直接跳过改写；score < 阈值 执行改写。
 打分维度 = 明确度 + 检索友好度 - 指代依赖度/2，clamp 到 [0, 100]。"""
+
+# ── 思维链（Chain-of-Thought）分级 ──────────────────────
+COT_MODE: Final[str] = "adaptive"
+"""思维链开关策略：
+  - "off"      关闭，不输出推理过程（最省）
+  - "adaptive" 按问题复杂度分级（默认）
+  - "full"     全量开启
+★ 开启思维链使 token 与延迟增加约 30–60%，MUST NOT 无差别全量开启。"""
+
+COT_ADAPTIVE_REUSE_REWRITE_SCORE: Final[bool] = True
+"""adaptive 模式复用 Query 改写阶段的百分制打分作为「问题复杂度」信号，
+避免为判断复杂度额外增加一次 LLM 调用。
+复用规则：改写分 >= QUERY_REWRITE_SCORE_THRESHOLD 视为简单问题 → 不开 CoT。"""
+
+COT_REASONING_EXPOSED: Final[bool] = False
+"""推理过程是否对外（SSE）输出。
+MUST be False —— 推理链含试探性表述与内部规则（检索策略、阈值），
+直接展示会造成困惑并泄漏实现细节。推理链仅落库，供审计。"""
 
 # ── 上下文窗口上限（单次请求 prompt 总 token 数）────────
 CONTEXT_WINDOW_LIMIT_TOKENS: Final[int] = 128_000
@@ -205,6 +254,26 @@ def self_check() -> None:
         raise RuntimeError("level_rank 与 LEVEL_RANK_* 常量不一致")
     if level_rank(Level.PUBLIC) != LEVEL_RANK_PUBLIC:
         raise RuntimeError("level_rank 与 LEVEL_RANK_* 常量不一致")
+    # ── 阈值口径（拆两套后新增校验）──
+    for _name, _val in (
+        ("RELEVANCE_THRESHOLD_VECTOR", RELEVANCE_THRESHOLD_VECTOR),
+        ("RELEVANCE_THRESHOLD_RERANK", RELEVANCE_THRESHOLD_RERANK),
+    ):
+        if not (0.0 < _val < 1.0):
+            raise RuntimeError(f"{_name} MUST ∈ (0, 1)，当前 {_val}")
+    # active_threshold 必须能正确区分两种口径
+    if active_threshold(True) is not RELEVANCE_THRESHOLD_RERANK:
+        raise RuntimeError("active_threshold(True) 未返回 RERANK 阈值")
+    if active_threshold(False) is not RELEVANCE_THRESHOLD_VECTOR:
+        raise RuntimeError("active_threshold(False) 未返回 VECTOR 阈值")
+    # ── 思维链口径 ──
+    if COT_MODE not in {"off", "adaptive", "full"}:
+        raise RuntimeError(f"COT_MODE MUST ∈ {{off, adaptive, full}}，当前 {COT_MODE!r}")
+    if COT_REASONING_EXPOSED:
+        raise RuntimeError(
+            "COT_REASONING_EXPOSED MUST be False —— "
+            "推理链含内部规则与试探表述，不得对外输出。"
+        )
 
 
 if __name__ == "__main__":

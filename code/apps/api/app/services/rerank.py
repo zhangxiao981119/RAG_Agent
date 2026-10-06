@@ -63,6 +63,20 @@ class RerankService:
             logger.warning("rerank 连接失败，跳过重排: %s", exc)
             raise RerankTimeout("rerank 不可用") from exc
 
+    async def healthcheck(self) -> bool:
+        """探活：发一次最小 rerank 请求，判断服务是否真的可用。
+
+        ★ 为什么需要它：「容器 healthy」不等于「接口可用」。
+        实测曾出现容器 /health 返回 200，但 POST /v1/rerank 永不返回
+        （推理引擎侧问题），导致重排静默降级而无人知晓。
+        探活走真实调用路径，能发现这类「healthy 但不可用」的情况。
+        """
+        try:
+            await self.rerank("ping", ["pong"], top_n=1)
+            return True
+        except Exception:
+            return False
+
 
 def get_rerank_service() -> RerankService:
     return RerankService()

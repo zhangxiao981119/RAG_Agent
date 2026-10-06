@@ -191,7 +191,10 @@ async def run_eval(
             f"  ⚠ {unjudged} 条用例未标注 expected_doc_ids，"
             f"命中率仅在 {judged} 条可判定的用例上统计"
         )
-    print(f"RELEVANCE_THRESHOLD = {decisions.RELEVANCE_THRESHOLD}")
+    print(
+        f"阈值口径 = vector:{decisions.RELEVANCE_THRESHOLD_VECTOR} / "
+        f"rerank:{decisions.RELEVANCE_THRESHOLD_RERANK}"
+    )
 
     failed = 0
     if assert_refusal_rate is not None and refusal_rate < assert_refusal_rate:
