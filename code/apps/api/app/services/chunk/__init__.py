@@ -8,6 +8,11 @@
 切分优先级：① 标题层级 → ② 段落 → ③ 句子 → ④ 硬切
 表格：整表不切，超限时按行组切并保留表头
 
+★ 不变量：交给 _accumulate 的每个 unit MUST <= CHUNK_MAX_TOKENS。
+  这不是"应该"，而是 _accumulate 不挂死的前提 —— 见 _accumulate 中
+  consumed == 0 分支的注释：unit 自身超限时清空 overlap 也装不下，
+  index 永不推进，worker 永久循环。
+
 输入：ParsedBlock 列表（来自 parse 服务）
 输出：ChunkData 列表（待写入 chunks 表）
 """
@@ -104,7 +109,15 @@ def _block_to_units(block: ParsedBlock) -> list[tuple[str, str, int | None]]:
         buffer_tokens = 0
         for piece in flat_pieces:
             piece_tokens = _count_tokens(piece)
-            if buffer_lines and buffer_tokens + piece_tokens > decisions.CHUNK_MAX_TOKENS:
+            # ★ 条件里必须含"或 buffer_lines 为空"。原实现只在 buffer_lines 非空时
+            #   吐出，导致「单行数据本身就超 MAX」时永远不吐 —— buffer 一直为空，
+            #   累积到超过 MAX 才返回，于是产出一个超限 unit。
+            #   而 _accumulate 遇到超限 unit 会死循环（见 _accumulate 的注释）：
+            #   清空 overlap 后仍装不下 → consumed 恒为 0 → index 永不推进。
+            #   首次由PDF 表格识别暴露：表头 + 一行数据 = 836 tokens > MAX=800。
+            if (buffer_lines and buffer_tokens + piece_tokens > decisions.CHUNK_MAX_TOKENS) or (
+                not buffer_lines and piece_tokens > decisions.CHUNK_MAX_TOKENS
+            ):
                 # 装满一组：吐出，下一组重新尝试带表头
                 units.append(("\n".join(buffer_lines), block.heading_path, block.page_no))
                 buffer_lines, buffer_tokens = [], 0
@@ -167,9 +180,18 @@ def _accumulate(units: list[tuple[str, str, int | None]]) -> list[ChunkData]:
         if consumed == 0:
             # 重叠单元挤占了空间（overlap 构造是先取后判，可能含大单元），
             # 导致本轮一个新单元都装不下：丢弃重叠重新累积。
-            # 空累积必然能装下至少一个单元（每个单元 <= CHUNK_MAX_TOKENS），
-            # 保证 index 必然推进，避免死循环。
-            overlap_units = []
+            if current:
+                # ★ 还有重叠 → 丢弃后下一轮必然能装下（见文件头「死循环」注释）
+                overlap_units = []
+                continue
+            # ★ 重叠已清空、current 为空，仍然装不下 → 说明这个单元自己就超
+            #   CHUNK_MAX_TOKENS。上游（_hard_split / 表格路径）本应保证每个
+            #   unit <= MAX，但那是"应该"不是"保证"。此处必须硬推进 index，
+            #   否则整个 worker 永久挂死（实测：PDF 表格表头 + 一行数据
+            #   = 836 tokens > MAX=800 时必现）。
+            #   代价是这个超限单元原样进入 chunk，突破 MAX —— 但
+            #   "略微超限"远优于"无限循环"。
+            index += 1
             continue
 
         if not current:
