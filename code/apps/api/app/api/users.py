@@ -17,7 +17,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_db, require_admin
-from app.config.settings import get_settings
 from app.infra.redis_client import get_redis
 from app.models import User
 from app.schemas.user import (
@@ -83,7 +82,6 @@ async def create_user(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> UserResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:
@@ -119,7 +117,6 @@ async def update_user(
     session: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     """修改用户属性。用 model_dump(exclude_unset=True) 只取客户端实际传的字段。"""
-    settings = get_settings()
     redis = await get_redis()
     try:
         changes = payload.model_dump(exclude_unset=True)
@@ -148,7 +145,6 @@ async def reset_password(
     current: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> UserResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:
@@ -179,7 +175,6 @@ async def delete_user(
     if user_id == current.user_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "不能删除自己")
 
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:

@@ -19,7 +19,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import (
     Department,
     Group,
-    KnowledgeBase,
     KnowledgeBaseMember,
     Role,
     User,

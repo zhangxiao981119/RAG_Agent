@@ -222,7 +222,6 @@ async def refresh(
     except (ValueError, TypeError) as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "refresh token 字段格式错误") from exc
 
-    settings = get_settings()
     redis = await get_redis()
     try:
         user = await session.get(User, user_id)
@@ -265,7 +264,6 @@ async def logout(
     去 logout。改为可选 access（从 Header 取，容错校验）+ 可选 refresh
     （从 body 取，容错校验），两者都失效时也返回 revoked=True（用户本就要登出）。
     """
-    settings = get_settings()
     redis = await get_redis()
     try:
         # access token 入黑名单（可能已过期，跳过即可）

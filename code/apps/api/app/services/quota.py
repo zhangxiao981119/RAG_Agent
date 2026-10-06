@@ -17,7 +17,6 @@ from datetime import datetime, timezone
 
 from redis.asyncio import Redis
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import decisions
 from app.config.settings import get_settings

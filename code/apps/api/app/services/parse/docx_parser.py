@@ -17,7 +17,7 @@ from app.services.parse.base import ParsedBlock, ParseError
 
 try:
     from docx import Document  # type: ignore[import-untyped]
-except ImportError as exc:  # pragma: no cover
+except ImportError:  # pragma: no cover
     raise
 
 

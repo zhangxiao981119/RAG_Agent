@@ -21,9 +21,7 @@ import uuid
 
 from redis.asyncio import Redis
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config.settings import get_settings
 from app.database import SessionLocal
 from app.infra.redis_client import get_redis
 from app.models import SensitiveWord

@@ -10,15 +10,15 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db, require_admin
+from app.config.settings import get_settings
 from app.models import KnowledgeBase, SyncSource
 from app.schemas.sync import SyncSourceCreate, SyncSourceOut, SyncSourceUpdate, SyncResult
 from app.services import audit
-from app.services.sync_service import sync_source
 
 router = APIRouter(tags=["sync-sources"])
 
@@ -159,9 +159,9 @@ async def delete_sync_source(
 @router.post("/sync-sources/{source_id}/sync", response_model=SyncResult)
 async def trigger_sync(
     source_id: uuid.UUID,
+    request: Request,
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
-    request: Request = None,
 ) -> SyncResult:
     """手动触发同步 —— 入队 arq 异步执行，立即返回。
 

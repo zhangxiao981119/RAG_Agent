@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 
 from redis.asyncio import Redis
-from sqlalchemy import select, func, delete, insert
+from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Group, User, UserGroup

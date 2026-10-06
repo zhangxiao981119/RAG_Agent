@@ -17,7 +17,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db, require_admin
-from app.config.settings import get_settings
 from app.infra.redis_client import get_redis
 from app.models import Role
 from app.schemas.role import (
@@ -52,7 +51,6 @@ async def create_role(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> RoleResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:
@@ -74,7 +72,6 @@ async def update_role(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> RoleResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:
@@ -95,7 +92,6 @@ async def delete_role(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> RoleDeleteResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:

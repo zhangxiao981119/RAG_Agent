@@ -10,7 +10,6 @@ from __future__ import annotations
 import time
 
 from fastapi import Depends, HTTPException, status
-from redis.asyncio import Redis
 
 from app.api.deps import CurrentUser, get_current_user
 from app.config.settings import get_settings

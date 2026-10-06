@@ -13,7 +13,6 @@ import pytest
 
 from app.config import decisions
 from app.services.memory import (
-    MemoryItem,
     blocked_reason,
     build_caliber_snapshot,
     build_memory_prompt,

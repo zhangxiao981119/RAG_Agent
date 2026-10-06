@@ -4,13 +4,12 @@ xlrd 只支持 .xls（BIFF），不支持 .xlsx（openpyxl 处理）。
 """
 from __future__ import annotations
 
-import io
 
 from app.services.parse.base import ParsedBlock, ParseError
 
 try:
     import xlrd  # type: ignore[import-untyped]
-except ImportError as exc:  # pragma: no cover - 依赖必装
+except ImportError:  # pragma: no cover - 依赖必装
     raise
 
 

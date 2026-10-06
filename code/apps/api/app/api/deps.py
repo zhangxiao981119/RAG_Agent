@@ -14,7 +14,6 @@ from fastapi import Depends, Header, HTTPException, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config.settings import get_settings
 from app.database import SessionLocal
 from app.infra.redis_client import get_redis
 from app.models import User
@@ -94,7 +93,6 @@ async def get_current_user(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "认证信息字段格式错误") from exc
 
     # ── 黑名单检查（Redis）─────────────────────────────────
-    settings = get_settings()
     redis: Redis | None = None
     try:
         redis = await get_redis()

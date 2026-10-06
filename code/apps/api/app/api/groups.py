@@ -17,7 +17,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db, require_admin
-from app.config.settings import get_settings
 from app.infra.redis_client import get_redis
 from app.models import Group
 from app.schemas.group import (
@@ -55,7 +54,6 @@ async def create_group(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> GroupResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:
@@ -79,7 +77,6 @@ async def update_group(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> GroupResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         changes = payload.model_dump(exclude_unset=True)
@@ -101,7 +98,6 @@ async def delete_group(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> GroupDeleteResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:
@@ -142,7 +138,6 @@ async def add_members(
     session: AsyncSession = Depends(get_db),
 ) -> GroupMemberOpResponse:
     """批量加成员。"""
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:
@@ -164,7 +159,6 @@ async def remove_member(
     session: AsyncSession = Depends(get_db),
 ) -> GroupMemberOpResponse:
     """移除单个成员。"""
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:

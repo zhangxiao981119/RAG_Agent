@@ -37,7 +37,6 @@ from app.services.generate import get_stream_generation_service
 from app.services.guard import injection as injection_guard
 from app.services.memory import (
     build_memory_prompt,
-    compress_history,
     ensure_context_within_limit,
     estimate_context_tokens,
     extract_facts,
@@ -208,7 +207,7 @@ async def chat_ask(
                         user.clearance,
                         user.subjects,
                     )
-                except Exception as exc:
+                except Exception:
                     logger.exception("检索失败")
                     yield _sse("refused", {
                         "reason": "VECTOR_STORE_DOWN",

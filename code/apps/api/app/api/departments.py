@@ -17,9 +17,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db, require_admin  # noqa: F401  (get_current_user 用于 Depends)
-from app.config.settings import get_settings
 from app.infra.redis_client import get_redis
-from app.models import Department, Tenant
+from app.models import Department
 from app.schemas.department import (
     DepartmentCreateRequest,
     DepartmentDeleteResponse,
@@ -69,7 +68,6 @@ async def create_department(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:
@@ -95,7 +93,6 @@ async def update_department(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         # 重命名走 rename_dept（触发子树 path 级联重写）
@@ -129,7 +126,6 @@ async def move_department(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:
@@ -150,7 +146,6 @@ async def delete_department(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentDeleteResponse:
-    settings = get_settings()
     redis = await get_redis()
     try:
         try:

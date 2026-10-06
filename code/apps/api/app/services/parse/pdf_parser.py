@@ -22,7 +22,7 @@ _HEADING_PATTERNS = [
 # pypdf 延迟导入，避免无 PDF 时影响其他 parser
 try:
     from pypdf import PdfReader  # type: ignore[import-untyped]
-except ImportError as exc:  # pragma: no cover - 依赖必装
+except ImportError:  # pragma: no cover - 依赖必装
     raise
 
 

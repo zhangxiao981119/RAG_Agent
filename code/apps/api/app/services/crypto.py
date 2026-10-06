@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import base64
-from typing import Any
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa

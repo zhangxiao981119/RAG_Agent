@@ -73,7 +73,6 @@ def _create_token(
     extra_claims: dict[str, Any] | None = None,
 ) -> str:
     """签发 JWT 内部函数，typ 字段区分 access/refresh。"""
-    settings = get_settings()
     now = datetime.now(timezone.utc)
     expire = now + expire_delta
     payload: dict[str, Any] = {
@@ -125,7 +124,6 @@ def verify_access_token(token: str) -> dict[str, Any]:
 
     ★ 不检查黑名单 —— 黑名单在 deps.get_current_user 中查 Redis。
     """
-    settings = get_settings()
     payload = jwt.decode(token, _get_jwt_secret(), algorithms=[ALGORITHM])
     if payload.get("typ") != TOKEN_TYPE_ACCESS:
         raise JWTError(f"token typ 不是 access：{payload.get('typ')}")
@@ -137,7 +135,6 @@ def verify_refresh_token(token: str) -> dict[str, Any]:
 
     ★ 不检查黑名单 —— 黑名单在 api/auth.refresh 端点中查 Redis。
     """
-    settings = get_settings()
     payload = jwt.decode(token, _get_jwt_secret(), algorithms=[ALGORITHM])
     if payload.get("typ") != TOKEN_TYPE_REFRESH:
         raise JWTError(f"token typ 不是 refresh：{payload.get('typ')}")

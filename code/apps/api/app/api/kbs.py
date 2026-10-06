@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import uuid
 
-from arq.connections import RedisSettings
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
-from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -84,7 +82,6 @@ async def create_kb(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> KnowledgeBaseOut:
-    settings = get_settings()
     redis = await get_redis()
     try:
         # 公开库互斥（手册 §3.2.4 + entities 唯一索引）
@@ -150,7 +147,6 @@ async def delete_kb(
     if user.clearance < 40 and kb.owner_id != user.user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
 
-    settings = get_settings()
     redis = await get_redis()
     try:
         await invalidate_tenant_acl(session, redis, user.tenant_id)
@@ -225,7 +221,6 @@ async def set_kb_members(
     成员实际变化时由 services/kb_member 触发 tenant_acl_epoch+1。
     权限：admin（clearance >= 40）或库 owner 可改，避免普通用户给自己加成员。
     """
-    settings = get_settings()
     redis = await get_redis()
     try:
         kb = await session.get(KnowledgeBase, kb_id)

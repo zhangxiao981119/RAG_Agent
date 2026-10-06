@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Literal, Union
+from typing import Union
 
 from pydantic import BaseModel
 

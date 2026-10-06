@@ -14,10 +14,10 @@ import uuid
 from dataclasses import dataclass
 
 from redis.asyncio import Redis
-from sqlalchemy import select, func, text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Role, User
+from app.models import Role
 from app.services.acl import invalidate_tenant_acl
 
 

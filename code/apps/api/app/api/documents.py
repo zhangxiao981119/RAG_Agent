@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.models import Chunk, Document
-from app.schemas.documents import ChunkPreview, DocumentDetail, DocumentOut
+from app.schemas.documents import ChunkPreview, DocumentDetail
 from app.services.storage import get_storage
 
 router = APIRouter(tags=["documents"])

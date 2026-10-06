@@ -18,7 +18,7 @@ from redis.asyncio import Redis
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Department, Tenant, User
+from app.models import Department, User
 from app.services.acl import invalidate_tenant_acl
 
 
