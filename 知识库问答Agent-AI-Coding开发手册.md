@@ -1728,7 +1728,7 @@ S3_BUCKET=kagent-docs
 # ── 模型（全部走 OpenAI 兼容协议）─────────
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_API_KEY=
-LLM_MODEL=deepseek-chat
+LLM_MODEL=deepseek-v4-flash
 
 EMBEDDING_BASE_URL=http://embedding:8000/v1   # 指向本地 bge-m3 服务
 EMBEDDING_MODEL=bge-m3

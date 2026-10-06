@@ -47,6 +47,10 @@ class LLMService:
             "messages": messages,
             "temperature": temperature,
             "stream": True,
+            # ★ 显式设输出上限。不设时长度完全由服务端默认值决定，
+            #   而 decisions.CONTEXT_OUTPUT_RESERVE_TOKENS 已按 4K 扣过预算 ——
+            #   不显式限制，那部分"预留"就是空的（启动时校验两者关系）。
+            "max_tokens": settings.llm_max_output_tokens,
         }
 
         first_token_seen = False

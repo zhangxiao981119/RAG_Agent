@@ -190,7 +190,7 @@
 | 前端 | React 18 · TypeScript · Vite · Ant Design |
 | 后端 | FastAPI · Python 3.12 · asyncpg · SQLAlchemy · Alembic |
 | 数据/存储 | PostgreSQL 16 + pgvector 0.7 · Redis 7（缓存 + 令牌桶 + arq 队列）· MinIO |
-| AI | bge-m3（1024 维）· bge-reranker-v2-m3（本地 CPU 推理）· OpenAI 兼容 LLM 接口（默认 deepseek-chat） |
+| AI | bge-m3（1024 维）· bge-reranker-v2-m3（本地 CPU 推理）· OpenAI 兼容 LLM 接口（默认 deepseek-v4-flash） |
 | 部署 | Docker Compose（开发/生产各 8 服务，生产 `api` 起 2 个 uvicorn worker 进程）· Nginx |
 
 ---

@@ -86,6 +86,11 @@ trace.install_log_filter()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     decisions.self_check()
+    # LLM 预算校验：窗口上限 / 输出预留 / 模型窗口三者必须对齐。
+    # 模型名来自配置（.env），只有这里拿得到，故不放进 decisions.self_check() 内部。
+    decisions.check_llm_budget(
+        get_settings().llm_model, get_settings().llm_max_output_tokens
+    )
 
     # ── crypto 私钥预热 ────────────────────────────────────
     # 见 app/services/crypto.py::warm_up —— 该模块用同步 Redis 客户端，

@@ -40,7 +40,12 @@ class Settings(BaseSettings):
     s3_bucket: str = "kagent-docs"
     llm_base_url: str | None = None
     llm_api_key: str = ""
-    llm_model: str = "deepseek-chat"
+    # ★ 模型 ID 会退役，别把它当稳定常量：
+    #   `deepseek-chat` / `deepseek-reasoner` 已于 2026-07-24 15:59 UTC **永久停服**
+    #   （调用直接返回 HTTP 错误，无宽限期）。官方现役 ID 只有 deepseek-v4-flash
+    #   与 deepseek-v4-pro；旧别名等价迁到 v4-flash（**同价**，迁到 v4-pro 贵约 3.1 倍）。
+    #   ⚠ 换模型时 MUST 同步核对 decisions.MODEL_CONTEXT_WINDOWS —— 启动会校验窗口。
+    llm_model: str = "deepseek-v4-flash"
     embedding_base_url: str | None = None
     embedding_model: str = "bge-m3"
     embedding_dim: int = 1024
@@ -59,6 +64,10 @@ class Settings(BaseSettings):
     rerank_timeout_seconds: float = 3.0
     llm_first_token_timeout_seconds: float = 15.0
     llm_total_timeout_seconds: float = 60.0
+    # ★ 单次生成的最大输出 token 数。MUST <= decisions.CONTEXT_OUTPUT_RESERVE_TOKENS
+    #   —— 后者是从上下文窗口里**预先扣掉**的那部分；两者不一致（预留 4K 却允许多写
+    #   8K）会让"预留"名不副实，prompt 体积 + 输出就越过了模型窗口。
+    llm_max_output_tokens: int = 4_000
     # ── M2 异步任务 ──────────────────────────────────────────
     arq_queue_name: str = "arq:parse"
     arq_max_attempts: int = 3

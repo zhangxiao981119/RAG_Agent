@@ -9,9 +9,12 @@ MUST NOT 在业务文件里写 `from .decisions import X` 那种把值拷进命�
 """
 from __future__ import annotations
 
+import logging
 import re
 from enum import Enum
 from typing import Final
+
+logger = logging.getLogger(__name__)
 
 CONTRACT_VERSION: Final[str] = "v1.1"
 
@@ -172,13 +175,37 @@ MUST be False —— 推理链含试探性表述与内部规则（检索策略�
 直接展示会造成困惑并泄漏实现细节。推理链仅落库，供审计。"""
 
 # ── 上下文窗口上限（单次请求 prompt 总 token 数）────────
-CONTEXT_WINDOW_LIMIT_TOKENS: Final[int] = 128_000
+CONTEXT_WINDOW_LIMIT_TOKENS: Final[int] = 32_000
 """单次请求 context（system + memory + history + chunks + question）token 上限。
 超限则递归压缩 history 并裁剪 chunks 直到达标。
-★ 与底层模型 deepseek-chat 的 128K 窗口对齐，再扣掉输出预留作为安全缓冲，
-保证 prompt 体积 + 输出不会越过模型窗口而在 LLM 调用时报错。"""
+
+★ 这是**护栏**，不是"目标预算"。它的职责是在成本与质量失控前拦住请求，
+  而不是把上下文塞到模型上限 —— 所以定值看的是「实际需要多少」，
+  不是「模型能吃多少」。
+★ 实际需要（按本文件各常量推算）：
+    system ≈1.5K + 长期画像 ≤0.5K + 短期历史 6 条 ≈3~6K
+    + 检索片段 8 × 800 ≤6.4K + 当前问题 ≈ 10~15K，取约 2 倍余量即 32K。
+★ 这里曾经是 128K，依据是"与 deepseek-chat 的 128K 窗口对齐"——该依据已**双重失效**：
+  ① `deepseek-chat` 别名 2026-07-24 已停服；
+  ② 现役 V4 的窗口是 1M，不是 128K。
+  更要紧的是方向错了：128K 会让压缩/裁剪在正常流量下**永不触发**，护栏形同虚设；
+  而在 15K~128K 这段区间里被无脑放行的请求，恰恰是"lost in the middle"
+  （长上下文中段注意力衰减）最容易发生的区间 —— 塞得多 ≠ 答得准。"""
+
 CONTEXT_OUTPUT_RESERVE_TOKENS: Final[int] = 4_000
-"""为 LLM 输出预留的 token 数（从 CONTEXT_WINDOW_LIMIT 里扣掉）。"""
+"""为 LLM 输出预留的 token 数（从 CONTEXT_WINDOW_LIMIT 里扣掉）。
+MUST >= settings.llm_max_output_tokens —— 否则预留名不副实（启动时校验）。"""
+
+# ── 模型上下文窗口登记表（启动校验用）────────────────────
+MODEL_CONTEXT_WINDOWS: Final[dict[str, int]] = {
+    "deepseek-v4-flash": 1_000_000,   # 旧 deepseek-chat 的等价迁移目标（同价）
+    "deepseek-v4-pro": 1_000_000,     # 重度推理档，约 3.1 倍价格
+}
+"""已知模型的上下文窗口（token）。只登记"会用到"的，不追求覆盖全市场。
+
+用途见 check_model_context_window()：校验「窗口上限 + 输出预留」是否超过模型能力。
+未登记的模型（私有化常接自建网关，模型名不可枚举）跳过校验并告警 ——
+无法验证不等于有问题，但也不能假装验证过了。"""
 
 # ── 压缩次数告警阈值 ────────────────────────────────────
 COMPRESSION_WARN_THRESHOLD: Final[int] = 3
@@ -293,6 +320,49 @@ SENSITIVE_FILTER_ENABLED: Final[bool] = True
 
 SENSITIVE_FEATURE_KEY: Final[str] = "sensitive_filter"
 """敏感词过滤的 feature flag key，关闭即放行。"""
+
+
+def check_llm_budget(llm_model: str, max_output_tokens: int) -> None:
+    """校验 LLM 的两项预算配置（启动期执行，fail-closed）。
+
+    ① **输出预留要名实相符**：`settings.llm_max_output_tokens` MUST <=
+       `CONTEXT_OUTPUT_RESERVE_TOKENS`。预留 4K 却允许模型写 8K，等于没有预留 ——
+       prompt 体积 + 输出就越过了模型窗口。
+    ② **窗口 + 预留不得越过模型能力**：窗口上限（本文件）与模型（settings）是
+       两个独立配置，改一个忘一个不会在任何地方报错，只会在某个超长请求上炸 400，
+       而那种请求往往出现在演示或压测现场。
+
+    未登记的模型 → 打告警但**不阻断**：私有化部署常接自建网关，模型名不可枚举，
+    无法验证不等于配置有错 —— 但也不能假装验证过了，所以留一条 warning。
+
+    ★ 模型名来自配置（.env），只有调用方（main.py 的 lifespan）拿得到，
+      所以本函数由那里调用，而不是塞进 self_check() 内部。
+    """
+    if max_output_tokens > CONTEXT_OUTPUT_RESERVE_TOKENS:
+        raise RuntimeError(
+            f"llm_max_output_tokens({max_output_tokens}) 大于 "
+            f"CONTEXT_OUTPUT_RESERVE_TOKENS({CONTEXT_OUTPUT_RESERVE_TOKENS})："
+            "输出上限超过了从上下文窗口里扣掉的预留，prompt + 输出可能越过模型窗口。"
+        )
+
+    needed = CONTEXT_WINDOW_LIMIT_TOKENS + CONTEXT_OUTPUT_RESERVE_TOKENS
+    window = MODEL_CONTEXT_WINDOWS.get(llm_model)
+    if window is None:
+        logger.warning(
+            "模型 %r 未登记在 MODEL_CONTEXT_WINDOWS，跳过上下文窗口校验"
+            "（本配置需要 %d tokens；登记表：%s）。若其窗口小于该值请补登记。",
+            llm_model,
+            needed,
+            ", ".join(sorted(MODEL_CONTEXT_WINDOWS)) or "空",
+        )
+        return
+    if needed > window:
+        raise RuntimeError(
+            f"上下文窗口配置超过模型能力：{llm_model} 窗口 {window} tokens，但 "
+            f"CONTEXT_WINDOW_LIMIT_TOKENS({CONTEXT_WINDOW_LIMIT_TOKENS}) + "
+            f"CONTEXT_OUTPUT_RESERVE_TOKENS({CONTEXT_OUTPUT_RESERVE_TOKENS}) = {needed}。"
+            "请调小 CONTEXT_WINDOW_LIMIT_TOKENS，或改用窗口更大的模型。"
+        )
 
 
 def self_check() -> None:
