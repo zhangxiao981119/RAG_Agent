@@ -14,11 +14,11 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db, require_admin  # noqa: F401  (get_current_user 用于 Depends)
 from app.config.settings import get_settings
+from app.infra.redis_client import get_redis
 from app.models import Department, Tenant
 from app.schemas.department import (
     DepartmentCreateRequest,
@@ -32,7 +32,6 @@ from app.services import dept as dept_service
 
 router = APIRouter(prefix="/departments", tags=["departments"])
 
-
 def _to_response(d: Department) -> DepartmentResponse:
     return DepartmentResponse(
         id=d.id,
@@ -42,7 +41,6 @@ def _to_response(d: Department) -> DepartmentResponse:
         sort_order=d.sort_order,
         visible_to_parent=d.visible_to_parent,
     )
-
 
 def _to_node_dto(node) -> DepartmentNode:  # node: dept_service.DeptNode
     return DepartmentNode(
@@ -56,7 +54,6 @@ def _to_node_dto(node) -> DepartmentNode:  # node: dept_service.DeptNode
         children=[_to_node_dto(c) for c in node.children],
     )
 
-
 @router.get("", response_model=list[DepartmentNode])
 async def list_departments(
     user: CurrentUser = Depends(get_current_user),
@@ -66,7 +63,6 @@ async def list_departments(
     tree = await dept_service.build_tree(session, user.tenant_id)
     return [_to_node_dto(n) for n in tree]
 
-
 @router.post("", response_model=DepartmentResponse, status_code=status.HTTP_201_CREATED)
 async def create_department(
     payload: DepartmentCreateRequest,
@@ -74,7 +70,7 @@ async def create_department(
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentResponse:
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         try:
             dept = await dept_service.create_dept(
@@ -92,7 +88,6 @@ async def create_department(
     finally:
         await redis.aclose()
 
-
 @router.patch("/{dept_id}", response_model=DepartmentResponse)
 async def update_department(
     dept_id: uuid.UUID,
@@ -101,7 +96,7 @@ async def update_department(
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentResponse:
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         # 重命名走 rename_dept（触发子树 path 级联重写）
         if payload.name is not None:
@@ -127,7 +122,6 @@ async def update_department(
     finally:
         await redis.aclose()
 
-
 @router.post("/{dept_id}/move", response_model=DepartmentResponse)
 async def move_department(
     dept_id: uuid.UUID,
@@ -136,7 +130,7 @@ async def move_department(
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentResponse:
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         try:
             dept = await dept_service.move_dept(
@@ -150,7 +144,6 @@ async def move_department(
     finally:
         await redis.aclose()
 
-
 @router.delete("/{dept_id}", response_model=DepartmentDeleteResponse)
 async def delete_department(
     dept_id: uuid.UUID,
@@ -158,7 +151,7 @@ async def delete_department(
     session: AsyncSession = Depends(get_db),
 ) -> DepartmentDeleteResponse:
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         try:
             await dept_service.delete_dept(session, redis, user.tenant_id, dept_id)

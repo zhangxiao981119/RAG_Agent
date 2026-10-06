@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import get_settings
 from app.database import SessionLocal
+from app.infra.redis_client import get_redis
 from app.models import SensitiveWord
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,7 @@ async def _load_words(tenant_id: uuid.UUID) -> set[str]:
     """加载租户的全部敏感词。Redis 缓存优先，未命中走 SQL。"""
     redis: Redis | None = None
     try:
-        redis = Redis.from_url(get_settings().redis_url)
+        redis = await get_redis()
         cached = await redis.get(_CACHE_KEY.format(tenant_id=tenant_id))
         if cached:
             # 缓存里存的是 JSON 数组，set 化
@@ -87,7 +88,7 @@ async def _load_words(tenant_id: uuid.UUID) -> set[str]:
     if words:
         redis = None
         try:
-            redis = Redis.from_url(get_settings().redis_url)
+            redis = await get_redis()
             import json
             await redis.set(
                 _CACHE_KEY.format(tenant_id=tenant_id),
@@ -109,7 +110,7 @@ async def _invalidate_cache(tenant_id: uuid.UUID) -> None:
     """写操作后清缓存，下次查询走 SQL 重建。"""
     redis = None
     try:
-        redis = Redis.from_url(get_settings().redis_url)
+        redis = await get_redis()
         await redis.delete(_CACHE_KEY.format(tenant_id=tenant_id))
     except Exception:
         logger.warning("Redis 缓存清理失败（不影响写操作）", exc_info=True)

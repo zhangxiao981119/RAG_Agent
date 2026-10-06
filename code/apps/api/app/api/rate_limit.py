@@ -14,6 +14,7 @@ from redis.asyncio import Redis
 
 from app.api.deps import CurrentUser, get_current_user
 from app.config.settings import get_settings
+from app.infra.redis_client import get_redis
 
 
 async def check_chat_rate_limit(user: CurrentUser = Depends(get_current_user)) -> None:
@@ -24,7 +25,7 @@ async def check_chat_rate_limit(user: CurrentUser = Depends(get_current_user)) -
     window = int(time.time() // 60)
     key = f"rate_limit:chat:{user.tenant_id}:{user.user_id}:{window}"
 
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         count = await redis.incr(key)
         if count == 1:

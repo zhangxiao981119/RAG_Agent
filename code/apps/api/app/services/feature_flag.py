@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import get_settings
 from app.database import SessionLocal
+from app.infra.redis_client import get_redis
 from app.models import FeatureFlag
 
 logger = logging.getLogger(__name__)
@@ -50,7 +51,7 @@ async def _load_rules(tenant_id: uuid.UUID, feature_key: str) -> list[dict]:
     cache_key = _CACHE_KEY.format(tenant_id=tenant_id, feature_key=feature_key)
     redis: Redis | None = None
     try:
-        redis = Redis.from_url(get_settings().redis_url)
+        redis = await get_redis()
         cached = await redis.get(cache_key)
         if cached:
             return json.loads(cached)
@@ -82,7 +83,7 @@ async def _load_rules(tenant_id: uuid.UUID, feature_key: str) -> list[dict]:
     if rules:
         redis = None
         try:
-            redis = Redis.from_url(get_settings().redis_url)
+            redis = await get_redis()
             await redis.set(cache_key, json.dumps(rules), ex=_CACHE_TTL)
         except Exception:
             logger.warning("Redis feature flag 缓存写失败（不影响查询）", exc_info=True)
@@ -99,7 +100,7 @@ async def _invalidate(tenant_id: uuid.UUID, feature_key: str) -> None:
     """写操作后清缓存，下次查询走 SQL 重建。"""
     redis = None
     try:
-        redis = Redis.from_url(get_settings().redis_url)
+        redis = await get_redis()
         await redis.delete(_CACHE_KEY.format(tenant_id=tenant_id, feature_key=feature_key))
     except Exception:
         logger.warning("Redis feature flag 缓存清理失败（不影响写操作）", exc_info=True)

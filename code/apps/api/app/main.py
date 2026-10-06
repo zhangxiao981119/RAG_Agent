@@ -34,6 +34,7 @@ from app.api.users import router as users_router
 from app.config import decisions
 from app.config.settings import get_settings
 from app.infra import metrics, trace
+from app.infra.redis_client import close_redis
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,14 @@ trace.install_log_filter()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     decisions.self_check()
+
+    # ── crypto 私钥预热 ────────────────────────────────────
+    # 见 app/services/crypto.py::warm_up —— 该模块用同步 Redis 客户端，
+    # 首次调用若发生在请求期会阻塞整个事件循环。提前到启动阶段执行。
+    from app.services import crypto as crypto_service
+
+    crypto_service.warm_up()
+
     # ── 初始化 arq 全局连接池（避免每次入队 create_pool + close）──
     from arq.connections import RedisSettings, create_pool as arq_create_pool
     _arq_pool = await arq_create_pool(
@@ -116,6 +125,9 @@ async def lifespan(_: FastAPI):
     finally:
         await _arq_pool.close()
         logger.info("lifespan.arq_pool.closed")
+        # Redis 连接池是进程级共享资源，统一在这里释放。
+        # 请求级调用点拿到的 aclose() 是 no-op（见 app/infra/redis_client.py）
+        await close_redis()
 
 
 app = FastAPI(title="知识库问答 Agent API", version="0.2.0", lifespan=lifespan)

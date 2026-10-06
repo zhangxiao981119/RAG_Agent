@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import get_settings
 from app.database import SessionLocal
+from app.infra.redis_client import get_redis
 from app.models import User
 from app.services.acl import load_principal_from_db
 from app.services.auth import JWTError, verify_access_token
@@ -96,7 +97,7 @@ async def get_current_user(
     settings = get_settings()
     redis: Redis | None = None
     try:
-        redis = Redis.from_url(settings.redis_url)
+        redis = await get_redis()
         if await _is_token_blacklisted(redis, jti):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "认证信息已失效（已登出）")
 

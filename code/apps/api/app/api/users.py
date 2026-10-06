@@ -14,11 +14,11 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_db, require_admin
 from app.config.settings import get_settings
+from app.infra.redis_client import get_redis
 from app.models import User
 from app.schemas.user import (
     UserCreateRequest,
@@ -33,7 +33,6 @@ from app.services import user as user_service
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-
 def _row_to_node(r: user_service.UserRow) -> UserNode:
     return UserNode(
         id=r.id,
@@ -47,7 +46,6 @@ def _row_to_node(r: user_service.UserRow) -> UserNode:
         status=r.status,
     )
 
-
 def _user_to_response(u: User, dept_path: str | None) -> UserResponse:
     return UserResponse(
         id=u.id,
@@ -60,7 +58,6 @@ def _user_to_response(u: User, dept_path: str | None) -> UserResponse:
         role_names=list(u.role_names or []),
         status=u.status,
     )
-
 
 @router.get("", response_model=UserPageResponse)
 async def list_users(
@@ -80,7 +77,6 @@ async def list_users(
         page_size=page_size,
     )
 
-
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(
     payload: UserCreateRequest,
@@ -88,7 +84,7 @@ async def create_user(
     session: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         try:
             new_user = await user_service.create_user(
@@ -115,7 +111,6 @@ async def create_user(
     finally:
         await redis.aclose()
 
-
 @router.patch("/{user_id}", response_model=UserResponse)
 async def update_user(
     user_id: uuid.UUID,
@@ -125,7 +120,7 @@ async def update_user(
 ) -> UserResponse:
     """修改用户属性。用 model_dump(exclude_unset=True) 只取客户端实际传的字段。"""
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         changes = payload.model_dump(exclude_unset=True)
         try:
@@ -146,7 +141,6 @@ async def update_user(
     finally:
         await redis.aclose()
 
-
 @router.post("/{user_id}/reset-password", response_model=UserResponse)
 async def reset_password(
     user_id: uuid.UUID,
@@ -155,7 +149,7 @@ async def reset_password(
     session: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         try:
             updated = await user_service.reset_password(
@@ -175,7 +169,6 @@ async def reset_password(
     finally:
         await redis.aclose()
 
-
 @router.delete("/{user_id}", response_model=UserDeleteResponse)
 async def delete_user(
     user_id: uuid.UUID,
@@ -187,7 +180,7 @@ async def delete_user(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "不能删除自己")
 
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         try:
             await user_service.delete_user(session, redis, current.tenant_id, user_id)

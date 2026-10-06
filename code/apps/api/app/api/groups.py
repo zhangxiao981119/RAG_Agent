@@ -14,11 +14,11 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db, require_admin
 from app.config.settings import get_settings
+from app.infra.redis_client import get_redis
 from app.models import Group
 from app.schemas.group import (
     GroupCreateRequest,
@@ -34,14 +34,11 @@ from app.services import group as group_service
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
-
 def _row_to_node(r: group_service.GroupRow) -> GroupNode:
     return GroupNode(id=r.id, name=r.name, kind=r.kind, member_count=r.member_count)
 
-
 def _group_to_response(g: Group) -> GroupResponse:
     return GroupResponse(id=g.id, name=g.name, kind=g.kind)
-
 
 @router.get("", response_model=list[GroupNode])
 async def list_groups(
@@ -52,7 +49,6 @@ async def list_groups(
     rows = await group_service.list_groups(session, user.tenant_id)
     return [_row_to_node(r) for r in rows]
 
-
 @router.post("", response_model=GroupResponse, status_code=status.HTTP_201_CREATED)
 async def create_group(
     payload: GroupCreateRequest,
@@ -60,7 +56,7 @@ async def create_group(
     session: AsyncSession = Depends(get_db),
 ) -> GroupResponse:
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         try:
             group = await group_service.create_group(
@@ -76,7 +72,6 @@ async def create_group(
     finally:
         await redis.aclose()
 
-
 @router.patch("/{group_id}", response_model=GroupResponse)
 async def update_group(
     group_id: uuid.UUID,
@@ -85,7 +80,7 @@ async def update_group(
     session: AsyncSession = Depends(get_db),
 ) -> GroupResponse:
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         changes = payload.model_dump(exclude_unset=True)
         try:
@@ -100,7 +95,6 @@ async def update_group(
     finally:
         await redis.aclose()
 
-
 @router.delete("/{group_id}", response_model=GroupDeleteResponse)
 async def delete_group(
     group_id: uuid.UUID,
@@ -108,7 +102,7 @@ async def delete_group(
     session: AsyncSession = Depends(get_db),
 ) -> GroupDeleteResponse:
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         try:
             await group_service.delete_group(session, redis, user.tenant_id, group_id)
@@ -118,7 +112,6 @@ async def delete_group(
         return GroupDeleteResponse(deleted=True)
     finally:
         await redis.aclose()
-
 
 # ── 成员管理 ────────────────────────────────────────────────
 
@@ -141,7 +134,6 @@ async def list_members(
         ],
     )
 
-
 @router.post("/{group_id}/members", response_model=GroupMemberOpResponse)
 async def add_members(
     group_id: uuid.UUID,
@@ -151,7 +143,7 @@ async def add_members(
 ) -> GroupMemberOpResponse:
     """批量加成员。"""
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         try:
             added = await group_service.add_members(
@@ -164,7 +156,6 @@ async def add_members(
     finally:
         await redis.aclose()
 
-
 @router.delete("/{group_id}/members/{user_id}", response_model=GroupMemberOpResponse)
 async def remove_member(
     group_id: uuid.UUID,
@@ -174,7 +165,7 @@ async def remove_member(
 ) -> GroupMemberOpResponse:
     """移除单个成员。"""
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         try:
             await group_service.remove_member(session, redis, user.tenant_id, group_id, user_id)

@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import decisions
 from app.config.settings import get_settings
 from app.database import SessionLocal
+from app.infra.redis_client import get_redis
 from app.models import AuditLog, TenantQuota
 from app.services.memory import compress_history
 from app.services.retrieve.base import RetrievedChunk
@@ -77,9 +78,7 @@ class DegradationPlan:
 
 
 async def _get_redis() -> Redis:
-    return Redis.from_url(get_settings().redis_url)
-
-
+    return await get_redis()
 async def get_limits(tenant_id: uuid.UUID) -> QuotaLimits:
     """读取租户配额上限。tenant_quotas 无记录 → 用 settings 默认值。"""
     settings = get_settings()

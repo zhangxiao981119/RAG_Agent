@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
 from app.config.settings import get_settings
+from app.infra.redis_client import get_redis
 from app.models import Department, Tenant, User
 from app.schemas.auth import (
     LoginRequest,
@@ -93,7 +94,7 @@ async def login(
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "租户未初始化，请先运行 scripts/seed.py")
 
     client_ip = _client_ip(request)
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         # ── 1. IP 速率限制 ────────────────────────────────────
         rate_key = _RATE_KEY.format(ip=client_ip)
@@ -222,7 +223,7 @@ async def refresh(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "refresh token 字段格式错误") from exc
 
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         user = await session.get(User, user_id)
         if user is None or user.tenant_id != tenant_id or user.username != username:
@@ -265,7 +266,7 @@ async def logout(
     （从 body 取，容错校验），两者都失效时也返回 revoked=True（用户本就要登出）。
     """
     settings = get_settings()
-    redis = Redis.from_url(settings.redis_url)
+    redis = await get_redis()
     try:
         # access token 入黑名单（可能已过期，跳过即可）
         if authorization and authorization.startswith("Bearer "):

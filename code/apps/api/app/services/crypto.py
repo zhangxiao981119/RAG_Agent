@@ -90,4 +90,34 @@ def clear_key_cache() -> None:
     _private_key = None
 
 
-__all__: list[str] = ["get_public_key_spki_b64", "decrypt_password", "clear_key_cache"]
+def warm_up() -> None:
+    """启动预热：提前把私钥加载进内存缓存。
+
+    ★ 为什么必须在启动阶段做 ——
+      本模块用的是**同步** Redis 客户端（`from redis import Redis`），
+      `_ensure_key()` 里的 `redis.get()` 是阻塞调用。如果在 async 路由里
+      首次触发（登录解密），会**阻塞整个事件循环** —— 所有并发请求一起
+      等这一次 Redis 往返。
+
+      放到启动阶段执行，阻塞只影响启动（可接受）；
+      运行期全程命中 `_private_key` 内存缓存，不再触碰 Redis。
+
+    失败不抛：密钥加载失败会让登录解密回退到首次调用时再加载（仍是原行为），
+    但不该因此阻止整个服务启动 —— 其他功能照常可用。
+    """
+    import logging
+
+    try:
+        _ensure_key()
+    except Exception:  # noqa: BLE001 — 预热失败不阻断启动
+        logging.getLogger(__name__).warning(
+            "crypto.warm_up 失败，登录解密将回退到首次调用时同步加载", exc_info=True
+        )
+
+
+__all__: list[str] = [
+    "get_public_key_spki_b64",
+    "decrypt_password",
+    "clear_key_cache",
+    "warm_up",
+]

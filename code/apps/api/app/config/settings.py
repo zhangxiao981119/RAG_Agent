@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     login_rate_per_minute: int = 10  # 单 IP 每分钟最多登录尝试次数
     database_url: str = "postgresql+asyncpg://user:pass@postgres:5432/kagent"
     redis_url: str = "redis://redis:6379/0"
+    redis_max_connections: int = 20  # 单进程连接池上限；× 副本数应 ≤ Redis maxclients 的余量
+    redis_socket_timeout_s: float = 3.0  # 建连/读写超时（秒）—— 避免 Redis 抖动时请求无限等待
     s3_endpoint: str = "http://minio:9000"
     s3_access_key: str | None = None  # MinIO/S3 access key；None 时 seed_prod 自动生成
     s3_secret_key: str | None = None  # MinIO/S3 secret key；None 时 seed_prod 自动生成
