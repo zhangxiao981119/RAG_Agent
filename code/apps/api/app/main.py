@@ -34,6 +34,7 @@ from app.api.users import router as users_router
 from app.config import decisions
 from app.config.settings import get_settings
 from app.infra import metrics, trace
+from app.infra.arq_pool import close_arq_pool, get_arq_pool
 from app.infra.redis_client import close_redis
 
 logger = logging.getLogger(__name__)
@@ -93,13 +94,10 @@ async def lifespan(_: FastAPI):
 
     crypto_service.warm_up()
 
-    # ── 初始化 arq 全局连接池（避免每次入队 create_pool + close）──
-    from arq.connections import RedisSettings, create_pool as arq_create_pool
-    _arq_pool = await arq_create_pool(
-        RedisSettings.from_dsn(get_settings().redis_url)
-    )
-    app.state.arq_pool = _arq_pool
-    logger.info("lifespan.arq_pool.init", extra={"pool_id": id(_arq_pool)})
+    # ── arq 连接池（进程级单例）──────────────────────────────
+    # 见 app/infra/arq_pool.py —— 请求路径与后台任务共用同一个池，
+    # 不再每次入队 create_pool + close
+    app.state.arq_pool = await get_arq_pool()
 
     # ── 重排服务启动探活 ──────────────────────────────────
     # 降级是设计允许的，因此探活失败**不拒绝启动**，只告警 + 打点。
@@ -123,10 +121,10 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
-        await _arq_pool.close()
-        logger.info("lifespan.arq_pool.closed")
-        # Redis 连接池是进程级共享资源，统一在这里释放。
-        # 请求级调用点拿到的 aclose() 是 no-op（见 app/infra/redis_client.py）
+        # 连接池都是进程级共享资源，统一在这里释放。
+        # 请求级调用点拿到的 aclose() / close() 都是 no-op
+        # （见 app/infra/redis_client.py 与 app/infra/arq_pool.py）
+        await close_arq_pool()
         await close_redis()
 
 

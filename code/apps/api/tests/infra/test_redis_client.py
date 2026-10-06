@@ -106,3 +106,74 @@ def test_settings_has_pool_knobs():
     settings = get_settings()
     assert settings.redis_max_connections > 0
     assert settings.redis_socket_timeout_s > 0
+
+
+@pytest.mark.asyncio
+async def test_login_path_commands_are_forwarded():
+    """★ 登录 / 刷新 / 登出链路用到的 Redis 命令 MUST 全部可用。
+
+    清单来自 `app/api/auth.py`：
+      · login   —— IP 限流（incr/expire）、账户锁定（exists/ttl/incr/setex/delete）、
+                    失败计数（delete）
+      · refresh —— 黑名单校验（set）
+      · logout  —— access/refresh 入黑名单（set）
+
+    **为什么必须单独测这条**：wrapper 靠 `__getattr__` 转发，
+    漏掉某个命令不会有编译错误、也不会被静态检查发现 ——
+    只在**运行时**才炸，而且炸的是登录接口。
+    """
+    wrapper = await redis_client.get_redis()
+    for cmd in ("setex", "incr", "expire", "exists", "ttl", "delete", "set"):
+        assert callable(getattr(wrapper, cmd)), f"wrapper 未支持 redis.{cmd}"
+
+
+@pytest.mark.asyncio
+async def test_connection_target_unchanged():
+    """连接目标 MUST 与原配置一致（host / port / db / 解码方式）。
+
+    池化只改「怎么连」，不改「连什么」——
+    目标变了就是数据读错库，比不池化严重得多。
+    """
+    wrapper = await redis_client.get_redis()
+    kwargs = wrapper._client.connection_pool.connection_kwargs
+    assert kwargs.get("db") == 0, "默认 db 必须仍是 0"
+    # decode_responses 未显式设置 → 保持库默认（与改造前一致）
+    assert kwargs.get("decode_responses") is None
+
+
+def _redis_reachable() -> bool:
+    """探测 Redis 是否可达。
+
+    ★ 与 `redis_client` 的测试不同，arq 的 `create_pool()` 会**实际发起连接**
+      （内部带重试与 ping），不是只创建客户端对象 ——
+      所以在没有 Redis 的机器上会卡到超时。这里探测后决定是否跳过。
+    """
+    import socket
+
+    from app.config.settings import get_settings
+
+    url = get_settings().redis_url  # redis://host:6379/0
+    host_port = url.split("://", 1)[-1].split("/", 1)[0]
+    host, _, port = host_port.partition(":")
+    try:
+        with socket.create_connection((host, int(port or 6379)), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not _redis_reachable(), reason="需要真实 Redis（arq create_pool 会实际连接）")
+@pytest.mark.asyncio
+async def test_arq_pool_is_singleton_and_shares_with_request_path():
+    """arq 池同样 MUST 是进程级单例。
+
+    `sync_service` 曾经每次同步文件都 create_pool + close，
+    批量同步 N 个文件 = N 次建连。本测试钉住修复后的行为。
+    """
+    from app.infra import arq_pool
+
+    arq_pool.reset_for_tests()
+    a = await arq_pool.get_arq_pool()
+    b = await arq_pool.get_arq_pool()
+    assert a is b, "arq 池 MUST 进程内单例"
+    arq_pool.reset_for_tests()
