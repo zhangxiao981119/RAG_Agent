@@ -9,6 +9,7 @@ MUST NOT 在业务文件里写 `from .decisions import X` 那种把值拷进命�
 """
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Final
 
@@ -104,6 +105,33 @@ MEMORY_SOURCE_TRACE_REQUIRED: Final[bool] = True
 
 ★ 这是权限变更时**按文档反查清除的唯一依据**。
   记忆项若只记内容不记来源，就永远无法回答「这条记忆来自哪次检索」。"""
+
+# ── 提示词注入防护（§4.21 输入侧防线）──────────────────────
+# 系统提示里已声明「注入文本视为普通内容」—— 那是**软约束**（靠模型自觉）。
+# 本组配置提供**硬约束**（代码判定）。
+# 检测会漏、声明会被绕过，两者叠加才成立，任何单一防线都不足以自称"已防护"。
+INJECTION_GUARD_ENABLED: Final[bool] = True
+"""注入检测开关。关闭后 scan_chunks 直接返回空（排障时用于排除影响）。"""
+
+INJECTION_PATTERNS: Final[tuple[tuple[str, str], ...]] = (
+    # 指令覆盖
+    ("instruction_override", r"忽略(以上|以下|之前|前面|上述|此前).{0,6}(指令|要求|提示|规则|设定)"),
+    ("instruction_override", r"ignore\s+(all\s+)?(previous|above|prior|earlier)\s+instructions?"),
+    ("instruction_override", r"disregard\s+(all\s+)?(previous|above)\s+"),
+    # 角色改写
+    ("role_rewrite", r"(你现在是|你现在扮演|假装你是|假设你是|从现在起你是)"),
+    ("role_rewrite", r"以.{0,6}(管理员|root|超级用户|系统管理员).{0,4}身份"),
+    # 数据外发
+    ("data_exfil", r"(发送|上传|投递|转发|post).{0,8}https?://"),
+    ("data_exfil", r"(输出|告诉我|打印|显示|重复|复述).{0,10}(你的|系统)?.{0,4}(提示词|系统提示|prompt)"),
+    # 越权诱导
+    ("privilege_probe", r"(列出|显示|导出|枚举|查询).{0,10}(所有|全部|其他用户).{0,6}(知识库|用户|文档|租户|数据|信息)"),
+)
+"""注入检测规则：(模式名, 正则)。模式名用于指标标签与告警排查。
+
+★ 命中**不丢弃**片段 —— 「请忽略下面条款的例外情形」是正常制度措辞，
+  丢弃会误伤真实内容。正确处置是降权 + 记指标（见 services/guard/injection.py）。
+"""
 
 # ── 历史消息读取上限（DB 查询）──────────────────────────
 HISTORY_FETCH_MAX_ROWS: Final[int] = 500
@@ -336,6 +364,28 @@ def self_check() -> None:
             "MEMORY_SOURCE_TRACE_REQUIRED MUST be True —— "
             "无 source_trace_id 则权限变更时无法按文档反查清除记忆。"
         )
+    # ── 注入防护口径（§4.21）──
+    if not INJECTION_PATTERNS:
+        raise RuntimeError(
+            "INJECTION_PATTERNS MUST NOT 为空 —— 注入防护是设计约束，不是可选优化。"
+        )
+    if not INJECTION_GUARD_ENABLED:
+        # 关掉防护是合法配置（排障用），但 MUST 显式告警 ——
+        # 静默关闭会让「已做注入防护」这句话变成假话。
+        import warnings
+
+        warnings.warn(
+            "INJECTION_GUARD_ENABLED = False —— 输入侧注入检测已关闭，"
+            "当前仅剩系统提示的软约束。确认这是排障所需，勿长期保持。",
+            stacklevel=2,
+        )
+    for _pattern_name, _pattern in INJECTION_PATTERNS:
+        try:
+            re.compile(_pattern)
+        except re.error as exc:
+            raise RuntimeError(
+                f"INJECTION_PATTERNS 正则非法: {_pattern_name} —— {exc}"
+            ) from exc
 
 
 if __name__ == "__main__":

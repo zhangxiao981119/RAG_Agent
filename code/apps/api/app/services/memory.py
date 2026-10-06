@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -49,6 +50,11 @@ _COMPRESS_PROMPT = """请把下面的对话历史压缩成一段简洁摘要，�
 # ── 记忆项契约（D-21 / 4.20）────────────────────────────
 
 
+# memory_id 的 uuid5 命名空间 —— **固定值，不得修改**：
+# 一旦变更，所有历史记忆项的 ID 都会变，用户手上的删除 ID 立即失效。
+_MEMORY_ID_NAMESPACE = uuid.UUID("6f1c9d3e-2b47-4a8f-9c15-7e3d0b5a8f21")
+
+
 @dataclass
 class MemoryItem:
     """长期记忆项。
@@ -58,17 +64,33 @@ class MemoryItem:
     """
 
     content: str
-    kind: str = "preference"          # preference / caliber / fact
+    kind: str = "preference"          # preference / correction / caliber / fact
     confidence: float = 1.0
     source_trace_id: str = ""
 
+    @property
+    def memory_id(self) -> str:
+        """确定性 ID —— 由 content 经 uuid5 派生。
+
+        ★ 不落库、不需要数据迁移：旧数据（没有 ID 字段）也能算出同一个 ID，
+          所以「查看/单条删除自己的记忆」不必先做一次数据迁移就能工作。
+        ★ 用 uuid5 而不是随机 uuid4：同一内容必须稳定映射到同一 ID，
+          否则刷新页面后 ID 变化，用户拿到手的删除 ID 立刻就失效。
+        """
+        return str(uuid.uuid5(_MEMORY_ID_NAMESPACE, self.content))
+
     def to_dict(self) -> dict:
+        """落库结构。**不含 memory_id** —— 它是派生的，存下来只会带来不一致风险。"""
         return {
             "content": self.content,
             "kind": self.kind,
             "confidence": round(float(self.confidence), 3),
             "source_trace_id": self.source_trace_id,
         }
+
+    def to_public_dict(self) -> dict:
+        """对外展示结构（§4.20.5「我被记住了什么」），含派生 ID。"""
+        return {**self.to_dict(), "memory_id": self.memory_id}
 
     @classmethod
     def from_raw(cls, raw) -> "MemoryItem | None":
@@ -234,6 +256,48 @@ def _truncate_profile(profile: str) -> str:
     if len(profile) <= decisions.MEMORY_MAX_PROFILE_CHARS:
         return profile
     return profile[:decisions.MEMORY_MAX_PROFILE_CHARS] + "..."
+
+
+# ══════════════════════════════════════════════════════════
+# §4.20.5 用户可查看 / 可删除（合规要求）
+# ══════════════════════════════════════════════════════════
+def rebuild_memory(items: list[MemoryItem]) -> dict:
+    """由记忆项重建 memory 结构。
+
+    profile 与 facts **必须从同一份 items 重建** ——
+    只改一个会导致读路径（从 facts 重建 prompt）与展示路径（读 profile）不一致。
+    """
+    facts = [item.to_dict() for item in items]
+    profile = ""
+    if items:
+        profile = "用户背景：\n" + "\n".join(f"- {item.content}" for item in items)
+    return {"profile": _truncate_profile(profile), "facts": facts}
+
+
+def list_memory_items(memory: dict | None) -> list[dict]:
+    """列出全部长期记忆项（供「我被记住了什么」）。"""
+    items = normalize_facts((memory or {}).get("facts"))
+    return [item.to_public_dict() for item in items]
+
+
+def delete_memory_item(memory: dict | None, memory_id: str) -> tuple[dict, bool]:
+    """按 memory_id 删除一条。返回 `(新 memory, 是否真的删到了)`。
+
+    ★ **物理删除**，不是标记删除 —— 标记删除的副本仍在 JSONB 里，等于没删。
+      这与 §4.20.4「权限变更后残留」是同一条原则：
+      **副本不随规则变化，只能显式清除**。
+    """
+    base = dict(memory or {})
+    items = normalize_facts(base.get("facts"))
+    kept = [item for item in items if item.memory_id != memory_id]
+    if len(kept) == len(items):
+        return base, False
+    return rebuild_memory(kept), True
+
+
+def clear_memory() -> dict:
+    """清空全部长期记忆（合规兜底：账号注销 / 用户申诉）。"""
+    return rebuild_memory([])
 
 
 async def extract_facts(

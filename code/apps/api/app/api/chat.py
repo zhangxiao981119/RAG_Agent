@@ -34,6 +34,7 @@ from app.services import feature_flag as flag_service
 from app.services import quota as quota_service
 from app.services import sensitive as sensitive_service
 from app.services.generate import get_stream_generation_service
+from app.services.guard import injection as injection_guard
 from app.services.memory import (
     build_memory_prompt,
     compress_history,
@@ -376,6 +377,14 @@ async def chat_ask(
                         "history_kept": len(history),
                         "chunks_kept": len(effective_chunks),
                     })
+
+            # ── 注入防护（§4.21 输入侧防线）──
+            # 命中**不丢弃**片段（制度文本里「请忽略」是正常措辞），只标记降权 + 打指标。
+            # 必须在 citations 构造之前执行 —— 降权会改变顺序，
+            # 而 citations 的 [n] 编号必须与生成 prompt 中的编号一致。
+            injection_hits = injection_guard.scan_chunks(effective_chunks)
+            if injection_hits:
+                effective_chunks = injection_guard.demote(effective_chunks, injection_hits)
 
             # citations 基于 effective_chunks 构造：编号必须与生成 prompt 中的 [n] 一致，
             # 否则配额裁剪后 prompt 重编号会与前端引用载荷错位。MUST 在 delta 之前下发。
