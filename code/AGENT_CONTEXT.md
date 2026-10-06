@@ -28,16 +28,18 @@
 3. API 响应严格遵循 §5.2 schema ({"code":0, "data":..., "msg":""})
 4. LLM 流式序列: meta→stage→citations→delta...→done / refused
 5. 文档解析覆盖 PDF/xlsx/md/txt/docx/xls，扫描版 PDF 抛错
-6. 分块保留表格为整体，不能拆分
-7. Embedding 维度固定 1024
-8. Rerank 超时 3s，超时降级为 vector_score 显示
-9. LLM 首 token 超时 15s
-10. 检索: vector + ILIKE → RRF(k=60) → rerank，阈值 0.35
-11. Grounding 检查剥离无归因句子，空时降级拒答
-12. Parse 失败重试 3 次后进死信队列
-13. LLM 编号列表每项单独一行
-14. 对话历史压缩到最近 6 条（3 轮问答）
-15. 所有业务 API 需要 JWT Bearer Token
+6. 表格整表作为一个chunk；超 CHUNK_MAX_TOKENS 时按行组切，**每组重复注入表头**
+7. PDF 表格由 pdfplumber 识别（pypdf 只出文本层，会把列关系拍平）；
+   同页正文用词坐标排除表格区域，避免同一数据入块两次
+8. Embedding 维度固定 1024
+9. Rerank 超时 3s，超时降级为 vector_score 显示
+10. LLM 首 token 超时 15s
+11. 检索: vector + tsquery + ILIKE → RRF(k=60) → rerank，阈值 0.50
+12. Grounding 检查剥离无归因句子，空时降级拒答
+13. Parse 失败重试 3 次后进死信队列
+14. LLM 编号列表每项单独一行
+15. 对话历史压缩到最近 6 条（3 轮问答）
+16. 所有业务 API 需要 JWT Bearer Token
 ```
 
 ---
@@ -144,6 +146,9 @@
 | PostgreSQL public schema | pgvector 扩展需在 public 创建 | alembic 0001 里 CREATE EXTENSION vector |
 | reranker 超时 3s 后显示_score 乱 | 自动降级 vector_score 但名字没换 | display_score fallback 到 rerank_score → vector_score |
 | 扫描版 PDF 无文本层 | pypdf 提取为空 | 抛错提示用户 |
+| PDF 里的表格检索不到列含义 | pypdf 只出文本层，表格被拍平成字符流 | 用 pdfplumber 填 `is_table` / `table_header` |
+| 同一份表格数据被 embedding 两次 | 表格块 + 拍平的文本块各存一份 | 同页正文用词坐标排除表格区域 |
+| 分块任务卡死不报错 | 表格「表头+一行数据」超 MAX → `_accumulate` 死循环 | 见硬约束 6；已加单测钉住 |
 | arq worker 3 次失败后指数退避 | 31499s 约 8.7 小时 | 清 Redis retry record + 手动 parse |
 | 本地路径 hash 换电脑对不上 | Trae project_id 含绝对路径 hash | 手动读 memory 目录里的 topics.md |
 
