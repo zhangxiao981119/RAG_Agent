@@ -1412,7 +1412,7 @@ async def consistency_check(sample_rate: float) -> dict: ...
 - **验收**：`pytest tests/integration/test_session_isolation.py -q`
 - **DoD**：A 用户的 session_id 被 B 用户访问时，返回 404 而非 403
 
-**GATE-1**：上传 5 种格式文件均能走完解析→分块→入库；库中无 `acl_tags` 为空的 chunk；进度可观测；`tests/integration/test_ingest_*.py` 全绿。
+**GATE-1**：上传 6 种格式文件均能走完解析→分块→入库；库中无 `acl_tags` 为空的 chunk；进度可观测；`tests/integration/test_ingest_*.py` 全绿。
 
 ---
 
@@ -2291,7 +2291,7 @@ MATRIX = [
 | 变量 | 默认 | 备注 |
 |---|---|---|
 | `UPLOAD_MAX_SIZE_MB` | `100` | |
-| `ALLOWED_FILE_TYPES` | `pdf,md,txt,xls,xlsx,docx` | 白名单 |
+| `ALLOWED_EXT` | `pdf,md,txt,xls,xlsx,docx` | 白名单 |
 | `OCR_ENABLED` | `true` | |
 | `QUEUE_HEAVY_THRESHOLD_MB` | `20` | 超过则进 `heavy` 队列 |
 

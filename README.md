@@ -53,7 +53,7 @@
 | 回答边界 | 检索为空 → 拒答；有答案则走**引用双向校验**（答案→引用剥离无效行 / 引用→检索结果只留模型真用过的），严格只依据知识库作答 | [services/grounding](code/apps/api/app/services/grounding/) |
 | **三级记忆层** | 短期（会话）/ 长期（用户偏好）/ 永久（系统口径）+ **写入过滤器** + 来源可反查 + 用户可查看可删除 | [services/memory.py](code/apps/api/app/services/memory.py) |
 | **思维链分级** | `adaptive`：复用 Query 改写分当复杂度信号（省掉一次额外 LLM 调用），**只对难问题开启**；推理链用 `<reasoning>` 包裹，流式层剥离不外发、仅落库审计 | [services/generate](code/apps/api/app/services/generate/__init__.py) |
-| 上下文治理 | 短期记忆（最近 3 轮）+ 长期画像（≤20 条事实）+ 128K 窗口预算 + 递归压缩 + 压缩超阈值提示新开对话 | [services/memory.py](code/apps/api/app/services/memory.py) |
+| 上下文治理 | 短期记忆（最近 3 轮）+ 长期画像（≤20 条事实）+ 32K 窗口预算 + 递归压缩 + 压缩超阈值提示新开对话 | [services/memory.py](code/apps/api/app/services/memory.py) |
 | chunk 级权限 | 四闸门判定（KB 成员 + 密级 + 拒绝标签 + 部门可见），权限过滤以 SQL WHERE **下推到检索层**，变更即时失效 Redis 缓存 | [services/acl](code/apps/api/app/services/acl/visibility.py) |
 | 提示注入防护 | 8 条规则 / 4 类模式（指令覆盖 / 角色改写 / 数据外发 / 越权诱导）检测召回片段，命中**降权不丢弃** + 指标 `rag.injection.hit` | [services/guard/injection.py](code/apps/api/app/services/guard/injection.py) |
 | 密级脱敏 | 4 档密级（公开/内部/机密/绝密），回答中手机号/身份证/银行卡自动打码（引用原文不打码） | [services/mask.py](code/apps/api/app/services/mask.py) |
@@ -105,7 +105,7 @@
 |------|-----|--------|
 | 短期记忆 | 最近 6 条（3 轮） | 再往后对当前轮的价值衰减很快，占的却是最贵的 prompt 预算 |
 | 长期记忆 | 只收 `preference` / ≤20 条事实 / ≤800 字符 | 只留跨对话稳定的信息，"好的""让我看看"这类不进画像 |
-| 单请求窗口 | **128K token**（预留 4K 输出） | 超限则**递归压缩** history（逐轮减少保留轮数）+ 裁剪 chunks 直到达标 |
+| 单请求窗口 | **32K token**（预留 4K 输出） | 超限则**递归压缩** history（逐轮减少保留轮数）+ 裁剪 chunks 直到达标 |
 | 历史读取上限 | DB 单次 500 行硬上限 | DB 层只做保护，不做业务裁剪；改写 32K、压缩、生成各自按自己的 token budget 裁 |
 
 同一会话被压缩超过 **3 次**，后端通过 SSE `context_warning` 事件提示用户"新开对话重置上下文"—— 与其让模型在一条被压扁的历史上下文中越答越糊，不如把选择权交给用户且说清楚原因。
@@ -230,7 +230,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 | F04 | Query 改写 | 百分制打分（≥90 跳过），改写结果仅用于检索；5s 超时静默回退，不阻塞主链路 |
 | F05 | 生成回答 | LLM SSE 流式输出，事件序列 `meta → stage → [refused \| citations → delta… → done]` |
 | F06 | 回答边界 | 只依据检索到的知识库作答，检索为空 → 拒答；**引用双向校验**（答案→引用剥离 / 引用→检索去幻） |
-| F07 | **上下文治理** | 短期 3 轮 + 长期画像（≤20 条）+ 128K 预算 + 递归压缩 + 压缩 ≥3 次 SSE 提示新开对话 |
+| F07 | **上下文治理** | 短期 3 轮 + 长期画像（≤20 条）+ 32K 预算 + 递归压缩 + 压缩 ≥3 次 SSE 提示新开对话 |
 | F08 | 账号登录 | Web Crypto RSA-OAEP 前端加密密码 + JWT access/refresh token + Redis 黑名单 |
 | F09 | 组织架构 | 部门树（物化路径）+ 用户组 + 角色 |
 | F10 | 知识库成员 | 用户/部门/组/角色四种主体，支持加/删/替换 |

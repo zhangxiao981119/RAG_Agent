@@ -2623,7 +2623,7 @@ async def pick_model(question: str, gate: GateResult) -> str:
 **M6 · Web 可用**
 - [ ] 流式首 token < 1.2s
 - [ ] 引用卡可点开定位原文
-- [ ] 上传 5 种格式全部成功
+- [ ] 上传 6 种格式全部成功
 - [ ] 拒答态视觉可辨
 
 **M9 · 可上线**
