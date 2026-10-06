@@ -207,9 +207,15 @@ def _accumulate(units: list[tuple[str, str, int | None]]) -> list[ChunkData]:
 def to_embedding_text(chunk: ChunkData) -> str:
     """生成喂给 embedding 模型的文本 —— ≠ 落库的 content，两者刻意不同。
 
-    ★ 背景：解析层把标题行抽成了 heading_path，content 里并【没有】标题文字；
-      而 worker 原本只拿 content 去 embed，导致"报销标准"这类只出现在章节标题里的词，
-      向量召回路完全抓不回（只有关键词路的 heading_path ILIKE 能兜住）。
+    ★ 背景：markdown / pdf 解析层把标题行抽成了 heading_path，content 里并【没有】
+      标题文字；而 worker 原本只拿 content 去 embed，导致"报销标准"这类只出现在
+      章节标题里的词，向量召回路完全抓不回（只有关键词路的 heading_path ILIKE 能兜住）。
+
+    ★ docx 解析器是例外：它把标题也作为一个 block，标题正文本就在 content 里。
+      所以这里的前缀会让 docx 的标题**重复出现一次**（"[报销标准]\n报销标准"）。
+      这是刻意接受的轻微冗余 —— 与其为去重引入 parser 来源判断（本层看不到来源，
+      且一个 chunk 会混合多个 block），不如让标题词权重略高。标题词本就是典型
+      检索词，权重高一点不吃亏。
 
     ★ 所以这里把章节路径作为前缀补进 embedding 输入；落库的 content 保持原文纯净，
       前端展示/引用回跳不受影响。

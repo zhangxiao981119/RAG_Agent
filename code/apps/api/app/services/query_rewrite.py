@@ -19,6 +19,7 @@ import json
 import logging
 
 from app.config import decisions
+from app.infra import metrics
 from app.services.llm import LLMError, get_llm_service
 
 logger = logging.getLogger(__name__)
@@ -178,8 +179,10 @@ async def rewrite_query(
                         score, decisions.QUERY_REWRITE_SCORE_THRESHOLD)
             return question, "skip_high_score", score
 
-        # 分数低但 LLM 判断不需要改写 → 信任 score（分低就该改写）
-        # 或者 need_rewrite=true → 都走改写分支
+        # ★ 唯一判据是「query 字段是否给出了实质不同的值」——need_rewrite 不参与决策：
+        #   · score 低说明检索不友好 → 只要 LLM 给了改写版就用它，**即使它标了
+        #     need_rewrite=false**。这是有意的「信任 score」，不是漏判；
+        #   · need_rewrite 只用于下方识别「声明要改却没给内容」的契约违反。
         rewritten = str(parsed.get("query", "")).strip()
         intent = str(parsed.get("intent", "unknown")).strip()[:20]
 
@@ -189,7 +192,24 @@ async def rewrite_query(
                         question[:50], rewritten[:50], intent)
             return rewritten, "rewritten", score
 
-        # 分低但改写结果和原问题一样 → 记录日志，还是用原问题
+        # ── 分数低（< 阈值）却没能改写。两种情形**必须区分**，否则会掩盖功能缺失 ──
+        # ① need_rewrite=true 但 LLM 没给出 query → **LLM 违反输出契约**。
+        #    原实现把它和 ② 合并打「改写结果未变化」，这句日志是**错的** ——
+        #    LLM 根本没给改写结果，不是"给了但一样"。看日志的人会误判成
+        #    "改写不起作用"，而真因是契约未履行。拆出独立标签 + 计数器让它可观测。
+        # ② need_rewrite=false（或给了但与原问相同）→ 合法的未改写。
+        # ★ 两种情形的主流程行为一致（没有改写内容就无从改写，只能回退原问题）：
+        #   拆标签是为了**可观测**，不是为了改变行为。
+        if need_rewrite and not rewritten:
+            logger.warning(
+                "Query 评分改写: LLM 声明 need_rewrite=true 却未给出 query"
+                "（score=%d < 阈值=%d），回退原始问题",
+                score,
+                decisions.QUERY_REWRITE_SCORE_THRESHOLD,
+            )
+            metrics.incr("rag.rewrite.contract_violation")
+            return question, "rewrite_contract_violated", score
+
         logger.info("Query 评分改写: score=%d < 阈值=%d，但改写结果未变化，跳过",
                     score, decisions.QUERY_REWRITE_SCORE_THRESHOLD)
         return question, "rewrite_no_change", score

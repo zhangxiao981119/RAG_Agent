@@ -51,7 +51,16 @@ def parse_docx(data: bytes) -> list[ParsedBlock]:
 
     blocks: list[ParsedBlock] = []
     heading_stack: list[str] = []  # 当前活动的标题路径栈
-    prev_item: str | None = None  # 上一个段落类型，用于合并连续段落
+    # ★ 与 markdown/pdf parser 的两处差异 —— **有意为之，不是遗漏**：
+    #   ① 段落：每段独立成 block（那两个是 buffer 累积、遇标题才 flush）。
+    #      解析层不做合并，交给下游分块服务：chunk._accumulate 会按 token 预算
+    #      重组，而「一段一 unit」把段落边界保留到了 unit 层，比"整块再按句子切"
+    #      更不容易拦腰截断段落。
+    #   ② 标题：标题文本**既进 heading_path、也作为一个 block 进 content**。
+    #      那两个 parser 的标题只进 heading_path。保留标题正文对向量召回有利
+    #      （标题词本就是典型检索词）。代价见 chunk.to_embedding_text() 的说明。
+    #   （原先这里有个 `prev_item` 变量，注释写「用于合并连续段落」，
+    #     但只赋值、从未被读取，按 ① 的判断也不需要 —— 已删除。）
 
     for para in doc.paragraphs:
         text = para.text.strip()
@@ -83,7 +92,6 @@ def parse_docx(data: bytes) -> list[ParsedBlock]:
                     heading_path=heading_path,
                 )
             )
-        prev_item = style_name
 
     # 处理表格
     for table in doc.tables:
