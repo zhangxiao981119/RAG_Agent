@@ -188,6 +188,8 @@ class WorkerSettings:
     queue_name = get_settings().arq_queue_name
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     max_tries = get_settings().arq_max_attempts
+    # ★ 不设此值时 arq 用自带默认 300s，长文档（如 283 页 PDF）会在中途被杀
+    job_timeout = get_settings().parse_job_timeout_seconds
     # M6 任务 1：每 30 分钟扫描所有 active 同步源
     cron_jobs = [
         cron(run_sync_all, minute={0, 30}),

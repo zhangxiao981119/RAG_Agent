@@ -56,8 +56,21 @@ _DISPATCH = {
 
 
 def parse_bytes(ext: str, data: bytes) -> list[ParsedBlock]:
-    """按扩展名分派。未知扩展名 / 扫描件 → ParseError。"""
+    """按扩展名分派。未知扩展名 / 扫描件 → ParseError。
+
+    ★ 出口统一清掉 NUL 字节（0x00）：PDF 文本层抽取会把字形噪声抽成 NUL
+      （实测某 283 页 PDF 的第 282/283 页就有 `\\x001\\x002...` 这种序列），
+      而 PostgreSQL 的 TEXT 明确拒收 0x00，报 invalid byte sequence for encoding "UTF8" ——
+      一条 chunk 就能让整篇文档的 INSERT 整批失败。收口在这里而不是各 parser 内部，
+      因为这是所有解析结果的唯一出口。
+      ★ 只清 0x00：TEXT 接受其它 C0 控制字符（\\x01、\\x0b 等都能存），
+      多删就是对解析内容做静默篡改。
+    """
     handler = _DISPATCH.get(ext.lower())
     if handler is None:
         raise ParseError(f"不支持的文件类型: {ext}")
-    return handler(data)
+    blocks = handler(data)
+    for block in blocks:
+        if "\x00" in block.text:
+            block.text = block.text.replace("\x00", "")
+    return blocks

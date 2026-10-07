@@ -3,6 +3,8 @@
 端点：POST {EMBEDDING_BASE_URL}/embeddings（BASE_URL 含 /v1 版本前缀）
 维度：MUST == settings.embedding_dim（默认 1024，与 chunks.embedding vector(1024) 对齐）
 批量：按 settings.embedding_batch_size 分批，超限会被模型静默截断
+超时：客户端 60s —— 与批大小强耦合：一批的实际计算时间 MUST 明显小于 60s，
+      否则 ReadTimeout（settings.embedding_batch_size 的注释里有实测数据）
 
 ★ 不做 fallback：服务挂了直接抛错，让 worker 重试（手册 §3.4 故障表里
   embedding 失败不在"降级"列表里，属于硬失败）。
