@@ -333,11 +333,34 @@ class RetrievalService:
             )
 
         metrics.incr("rag.gate.passed", source="rerank" if use_rerank else "vector")
+
+        # ⑥ 三路召回贡献打点
+        #    covered = 最终 top-K 中该路召回到的条数（多路可重叠）
+        #    unique  = 最终 top-K 中**只有**该路能召回到的条数
+        #    口径以最终 top-K 为准，而不是各路原始候选数 —— 后者只说明"捞了多少"，
+        #    前者才说明"真正被用上的有多少"。
+        final_ids = {c.chunk_id for c in retrieved}
+        path_sets = {
+            "vector": set(vector_ranks),
+            "tsquery": set(fts_ranks),
+            "ilike": set(keyword_ranks),
+        }
+        path_stats: dict[str, int] = {}
+        for name, ids in path_sets.items():
+            covered = final_ids & ids
+            others: set[uuid.UUID] = set()
+            for other_name, other_ids in path_sets.items():
+                if other_name != name:
+                    others |= other_ids
+            path_stats[f"{name}_covered"] = len(covered)
+            path_stats[f"{name}_unique"] = len(covered - others)
+
         return RetrievalResult(
             chunks=retrieved,
             stage_ms=stages,
             score_source="rerank" if use_rerank else "vector",
             use_rerank=use_rerank,
+            path_stats=path_stats,
         )
 
 

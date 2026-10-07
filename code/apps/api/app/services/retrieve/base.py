@@ -45,3 +45,7 @@ class RetrievalResult:
     stage_ms: dict[str, int] = field(default_factory=dict)
     score_source: str = ""
     use_rerank: bool = True
+    # 三路召回贡献：`{路径}_covered` = 最终 top-K 中该路召回到的条数（多路可重叠），
+    # `{路径}_unique` = 仅该路能召回到的条数。后者直接量化"去掉这路会漏多少"，
+    # 是"三路是否冗余"的唯一证据。路径键：vector / tsquery / ilike。
+    path_stats: dict[str, int] = field(default_factory=dict)

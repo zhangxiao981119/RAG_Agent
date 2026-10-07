@@ -424,6 +424,8 @@ async def chat_ask(
             final_suggestions: list[str] = []
             final_usage: dict = {}
             final_reasoning = ""
+            # 首字延迟：从请求起点 _t0（含敏感词/改写/检索）到第一个非空 delta 的间隔
+            _ttft_ms: int | None = None
             # 开 CoT 时，前端在收到首个 delta 之前要等"推理段"跑完（推理链不推送），
             # 这里先发一个 stage 事件，让前端有机会显示"思考中"。
             # 前端目前忽略未知 stage 值，所以不加处理也不会坏。
@@ -438,6 +440,9 @@ async def chat_ask(
                 rewrite_score=rewrite_score,
             ):
                 if stream_evt.type == "delta":
+                    # 以第一个**非空** delta 为准：空 delta 不代表用户看到内容
+                    if stream_evt.text and _ttft_ms is None:
+                        _ttft_ms = int((_time.monotonic() - _t0) * 1000)
                     yield _sse("delta", {"text": stream_evt.text})
                 elif stream_evt.type == "refused":
                     gen_result = stream_evt
@@ -491,6 +496,7 @@ async def chat_ask(
                         "refuse_reason": reason,
                         "chunks_count": len(result.chunks),
                         "grounding_stripped": gen_result.stripped_sentences,
+                        **result.path_stats,
                     },
                 )
                 return
@@ -518,6 +524,7 @@ async def chat_ask(
             logger.info("chat.ask.complete", extra={
                 "user_id": str(user.user_id),
                 "total_ms": _total_ms,
+                "ttft_ms": _ttft_ms,
                 "retrieve_ms": _retrieve_ms,
                 "refused": False,
                 "refuse_reason": None,
@@ -532,6 +539,7 @@ async def chat_ask(
                 object_type="conversation", object_id=str(conversation_id),
                 detail={
                     "total_ms": _total_ms,
+                    "ttft_ms": _ttft_ms,
                     "retrieve_ms": _retrieve_ms,
                     "refused": False,
                     "refuse_reason": None,
@@ -539,6 +547,7 @@ async def chat_ask(
                     "grounding_stripped": final_stripped,
                     "prompt_tokens": final_usage.get("prompt_tokens", 0),
                     "completion_tokens": final_usage.get("completion_tokens", 0),
+                    **result.path_stats,
                 },
             )
 

@@ -65,6 +65,25 @@ async def list_audit_logs(
 # M6 可观测：P95 延迟聚合统计
 # ─────────────────────────────────────────────────────────────
 
+class RecallContribution(BaseModel):
+    """三路召回贡献均值。
+
+    口径：以**最终 top-K**为准，不是各路原始候选数。
+    `covered` = top-K 中该路召回到的条数（多路可重叠）；
+    `unique`  = 仅该路能召回到的条数 —— 直接量化"去掉这路会漏多少"，
+    是"三路是否冗余"的唯一证据。
+    只统计成功作答的请求（拒答请求没有最终 top-K）。
+    """
+    # 平均最终 top-K 条数（covered/unique 的分母参考）
+    topk_avg: float
+    vector_covered: float
+    vector_unique: float
+    tsquery_covered: float
+    tsquery_unique: float
+    ilike_covered: float
+    ilike_unique: float
+
+
 class MetricSummary(BaseModel):
     """聚合指标响应体。"""
     # 时间窗口描述
@@ -84,6 +103,13 @@ class MetricSummary(BaseModel):
     retrieve_p95: float
     retrieve_p99: float
     retrieve_avg: float
+    # 首字延迟（毫秒）分位数：从请求起点到第一个非空 delta，仅成功作答路径有值
+    ttft_p50: float
+    ttft_p95: float
+    ttft_p99: float
+    ttft_avg: float
+    # 三路召回贡献
+    recall: RecallContribution
 
 
 @router.get("/metrics", response_model=MetricSummary)
@@ -106,7 +132,19 @@ async def get_metrics(
           COALESCE(percentile_cont(0.50) WITHIN GROUP (ORDER BY (detail->>'retrieve_ms')::int), 0) AS retrieve_p50,
           COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY (detail->>'retrieve_ms')::int), 0) AS retrieve_p95,
           COALESCE(percentile_cont(0.99) WITHIN GROUP (ORDER BY (detail->>'retrieve_ms')::int), 0) AS retrieve_p99,
-          COALESCE(avg((detail->>'retrieve_ms')::int), 0)                                            AS retrieve_avg
+          COALESCE(avg((detail->>'retrieve_ms')::int), 0)                                            AS retrieve_avg,
+          COALESCE(percentile_cont(0.50) WITHIN GROUP (ORDER BY (detail->>'ttft_ms')::int), 0) AS ttft_p50,
+          COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY (detail->>'ttft_ms')::int), 0) AS ttft_p95,
+          COALESCE(percentile_cont(0.99) WITHIN GROUP (ORDER BY (detail->>'ttft_ms')::int), 0) AS ttft_p99,
+          COALESCE(avg((detail->>'ttft_ms')::int), 0)                                          AS ttft_avg,
+          COALESCE(avg((detail->>'chunks_count')::int)
+                   FILTER (WHERE NOT (detail->>'refused')::bool), 0)                          AS topk_avg,
+          COALESCE(avg((detail->>'vector_covered')::int), 0)                                    AS vector_covered,
+          COALESCE(avg((detail->>'vector_unique')::int), 0)                                      AS vector_unique,
+          COALESCE(avg((detail->>'tsquery_covered')::int), 0)                                    AS tsquery_covered,
+          COALESCE(avg((detail->>'tsquery_unique')::int), 0)                                      AS tsquery_unique,
+          COALESCE(avg((detail->>'ilike_covered')::int), 0)                                      AS ilike_covered,
+          COALESCE(avg((detail->>'ilike_unique')::int), 0)                                        AS ilike_unique
         FROM audit_logs
         WHERE tenant_id = :tenant_id
           AND action = 'chat.ask.metric'
@@ -128,4 +166,17 @@ async def get_metrics(
         retrieve_p95=round(float(row.retrieve_p95), 1),
         retrieve_p99=round(float(row.retrieve_p99), 1),
         retrieve_avg=round(float(row.retrieve_avg), 1),
+        ttft_p50=round(float(row.ttft_p50), 1),
+        ttft_p95=round(float(row.ttft_p95), 1),
+        ttft_p99=round(float(row.ttft_p99), 1),
+        ttft_avg=round(float(row.ttft_avg), 1),
+        recall=RecallContribution(
+            topk_avg=round(float(row.topk_avg), 1),
+            vector_covered=round(float(row.vector_covered), 1),
+            vector_unique=round(float(row.vector_unique), 1),
+            tsquery_covered=round(float(row.tsquery_covered), 1),
+            tsquery_unique=round(float(row.tsquery_unique), 1),
+            ilike_covered=round(float(row.ilike_covered), 1),
+            ilike_unique=round(float(row.ilike_unique), 1),
+        ),
     )
