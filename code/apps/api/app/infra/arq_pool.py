@@ -62,12 +62,12 @@ async def get_arq_pool() -> ArqRedis:
 
 
 async def close_arq_pool() -> None:
-    """进程退出时释放连接池。**这是唯一允许 `close()` 的地方。**"""
+    """进程退出时释放连接池。**这是唯一允许 `aclose()` 的地方。**"""
     global _pool
     if _pool is None:
         return
     try:
-        await _pool.close()
+        await _pool.aclose()
         logger.info("arq.pool.closed")
     except Exception:
         logger.warning("arq.pool.close_failed", exc_info=True)

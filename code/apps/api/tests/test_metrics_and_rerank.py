@@ -87,14 +87,17 @@ def test_reset_clears_everything():
 @pytest.mark.asyncio
 async def test_rerank_raises_timeout_when_url_not_configured(monkeypatch):
     """未配置 RERANK_BASE_URL 时必须抛 RerankTimeout（走降级），而不是崩。"""
-    from app.config import settings as settings_mod
+    from app.services import rerank as rerank_mod
 
     class _S:
         rerank_base_url = ""
         rerank_model = "bge-reranker-v2-m3"
         rerank_timeout_seconds = 3.0
 
-    monkeypatch.setattr(settings_mod, "get_settings", lambda: _S())
+    # 必须打进 rerank 模块自身的命名空间：它在 import 时就把 get_settings 绑定到了
+    # 自己模块，改 app.config.settings 上的同名属性影响不到这里的引用。
+    # 否则本用例会退化成"依赖真实重排服务不可达"，环境一变（服务活着）就假红。
+    monkeypatch.setattr(rerank_mod, "get_settings", lambda: _S())
 
     with pytest.raises(RerankTimeout):
         await RerankService().rerank("q", ["d"], top_n=1)
@@ -103,14 +106,15 @@ async def test_rerank_raises_timeout_when_url_not_configured(monkeypatch):
 @pytest.mark.asyncio
 async def test_healthcheck_returns_false_when_unavailable(monkeypatch):
     """探活必须走真实调用路径 —— 容器 healthy ≠ 接口可用。"""
-    from app.config import settings as settings_mod
+    from app.services import rerank as rerank_mod
 
     class _S:
         rerank_base_url = ""  # 未配置 → 必然不可用
         rerank_model = "bge-reranker-v2-m3"
         rerank_timeout_seconds = 0.1
 
-    monkeypatch.setattr(settings_mod, "get_settings", lambda: _S())
+    # 同 test_rerank_raises_timeout_when_url_not_configured：必须打 rerank 模块自身。
+    monkeypatch.setattr(rerank_mod, "get_settings", lambda: _S())
 
     assert await RerankService().healthcheck() is False
 

@@ -293,10 +293,10 @@ async def list_documents(
 )
 async def upload_document(
     kb_id: uuid.UUID,
+    request: Request,
     file: UploadFile = File(...),
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
-    request: Request = None,
 ) -> DocumentOut:
     settings = get_settings()
 
