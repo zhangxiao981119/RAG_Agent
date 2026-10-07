@@ -65,11 +65,13 @@ LIMIT :limit
 # ★ 关键词召回（tsquery 路径）—— 走 entities.py 里已建但此前未使用的 idx_chunk_fts
 #   收益：索引可用 + 词元级匹配（不再只靠子串），且 ts_rank 提供真实排序分。
 #   限制：PostgreSQL 'simple' 配置不做中文分词，中文仍靠上面的 ILIKE 路径。
+#   ★ 别名必须写成 AS q(query)：to_tsquery 是标量函数，不给列别名时它的输出列
+#     名是函数名本身，`q.query` 会直接报 column does not exist。
 _KEYWORD_FTS_SQL = text(f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
        c.level_rank, c.acl_tags,
        ts_rank(to_tsvector('simple', c.content), q.query) AS keyword_score
-FROM chunks c, to_tsquery('simple', :tsquery) q
+FROM chunks c, to_tsquery('simple', :tsquery) AS q(query)
 {_WHERE_BASE}
   AND to_tsvector('simple', c.content) @@ q.query
 ORDER BY keyword_score DESC

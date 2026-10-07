@@ -41,7 +41,8 @@ async def eval_run(
     session: AsyncSession = Depends(get_db),
 ) -> EvalReportResponse:
     """触发全量评估，返回逐条结果。"""
-    report = await run_eval(session, user.tenant_id)
+    # 传 admin 自身的主体与密级：评估必须与真实问答走同一份权限口径
+    report = await run_eval(session, user.tenant_id, user.subjects, user.clearance)
 
     # 审计记录
     await audit.record(

@@ -56,8 +56,16 @@ class EvalReport:
 async def run_eval(
     session: AsyncSession,
     tenant_id: uuid.UUID,
+    subjects: list[str],
+    clearance: int,
 ) -> EvalReport:
-    """跑全量 eval_cases，返回评估报告。"""
+    """跑全量 eval_cases，返回评估报告。
+
+    subjects / clearance MUST 由调用方（admin 接口）从 CurrentUser 传入 ——
+    与 chat.py 走同一份主体解析结果。此前这里硬编码 `["role:admin"]`，
+    漏掉了 `public`，被 G4 闸门（`acl_tags && user_subjects`）全量过滤，
+    导致公开库文档一条都召不回、评估恒为「可答 0% / 拒答 100%」。
+    """
     rows = (
         await session.execute(
             select(EvalCase)
@@ -74,7 +82,7 @@ async def run_eval(
     generation = get_generation_service()
     t0 = time.monotonic()
 
-    # 评估用的固定参数：admin 级权限，能看所有 KB
+    # 评估用的权限口径来自调用方传入的 admin 主体（含 public），
     # kb_id 来自 eval_case
     answerable_total = 0
     answerable_passed = 0
@@ -89,8 +97,8 @@ async def run_eval(
         result = await retrieval.retrieve(
             session, case.question, tenant_id,
             authorized_kb_ids=kb_ids,
-            clearance=40,
-            user_subjects=["role:admin"],
+            clearance=clearance,
+            user_subjects=subjects,
         )
 
         # 如果检索阶段就拒答
