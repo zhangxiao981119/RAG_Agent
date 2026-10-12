@@ -161,6 +161,7 @@ cp .env.prod.example .env
 | 变量 | 怎么填 |
 |------|--------|
 | `JWT_SECRET` | `openssl rand -hex 32` |
+| `SITE_ADDRESS` | 对外访问地址：内网 IP 或内部主机名（如 `192.168.1.100` / `rag.corp.local`） |
 | `ADMIN_PASSWORD` | admin 初始密码（≥10 位，含大小写与数字） |
 | `LLM_API_KEY` | OpenAI 兼容服务的 Key；同时确认 `LLM_MODEL` 是**现役**模型 ID |
 
@@ -175,11 +176,13 @@ bash scripts/init-prod.sh
 
 # 或手动：
 docker compose -p kagent -f docker-compose.prod.yml up -d --build
-curl http://localhost/api/health          # 数据库 / Redis / 模型全部 ok 即正常
+curl -fsSk https://<站点地址>/api/health     # 数据库 / Redis / 模型全部 ok 即正常
 ```
 
-生产编排的对外入口**只有 web 容器的 `WEB_PORT`**（默认 80），
-其余服务均不绑定宿主机端口。建议在宿主机前置 Nginx 终止 HTTPS。
+生产编排的对外入口**只有 gateway（Caddy）容器的 80 / 443**（TLS 终止 + 安全头），
+反代到 web；web、api 及其余服务均不绑定宿主机端口。证书为**内网自签**
+（Caddy 内置 CA 自动签发与续期），客户端需导入根证书消除告警，见
+[docs/DEPLOY.md §7](docs/DEPLOY.md)。
 
 **详细步骤（手动部署、观察启动、拓扑与安全说明、常见报错）见
 [docs/DEPLOY.md](docs/DEPLOY.md)。**
@@ -237,7 +240,8 @@ $COMPOSE up -d                    # 重新启动
 ```
 
 **数据卷**：`kagent_postgres_data`（账号/权限/对话/审计）与 `kagent_minio_data`
-（原始文档）**必须备份**；`kagent_redis_data` 与 `kagent_hf_cache` 可重建。
+（原始文档）**必须备份**；`kagent_redis_data`、`kagent_hf_cache` 可重建；
+`kagent_caddy_data`（Caddy 内置 CA 与证书）建议备份，丢失后客户端需重新导入根证书。
 
 **备份与恢复的完整命令见 [docs/DEPLOY.md §5](docs/DEPLOY.md)。**
 
@@ -254,7 +258,7 @@ $COMPOSE up -d                    # 重新启动
 | LLM 调用返回 400 | **检查 `LLM_MODEL` 是否为现役模型 ID**（模型 ID 会退役） |
 | 登录提示密码错误 | `ADMIN_PASSWORD` 只在首次创建时生效，改值不会重置已有账号 |
 | 上传文档后一直解析中 | `logs worker`；失败自动重试 3 次后进死信队列。也检查格式是否在白名单内 |
-| 端口被占用 | 改 `.env` 的 `WEB_PORT` |
+| 端口被占用 | gateway 固定监听 80/443，需停掉占用进程 |
 
 更多排查项见 [docs/DEPLOY.md §8](docs/DEPLOY.md)。
 

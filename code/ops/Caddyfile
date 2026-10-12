@@ -1,0 +1,32 @@
+# 生产 TLS 入口 —— gateway（Caddy）唯一对外暴露的服务
+#
+# 证书：内网自签，使用 Caddy 内置 CA（tls internal）自动签发与续期，
+#       无需公网域名 / ACME，也不依赖外部 CA 服务。
+#   ★ 客户端需信任根证书才能消除浏览器告警；导出方式：
+#     docker compose -p kagent -f docker-compose.prod.yml exec gateway \
+#       cat /data/caddy/pki/authorities/local/root.crt > kagent-root.crt
+#     将 kagent-root.crt 导入客户端「受信任的根证书颁发机构」后生效。
+#   ★ 根证书由 caddy_data 卷持久化 —— 卷丢失会重新生成 CA，客户端需重新导入。
+#
+# 反代：web 容器内的 nginx 已负责 / 静态资源与 /api -> api:8000 的转发，
+#       故此处整体反代到 web:80 即可（网关只做 TLS 终止与安全头）。
+#
+# 站点地址（SITE_ADDRESS）由 .env 注入，取值为内网 IP 或内部主机名，例如
+#   192.168.1.100   或   rag.corp.local
+
+{$SITE_ADDRESS} {
+	tls internal
+
+	encode gzip
+
+	header {
+		# 自签场景下 HSTS 仅在根证书被信任后才生效
+		# （浏览器不会从"证书错误"页面应用 HSTS，故未信任前无副作用、不会锁死）
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	reverse_proxy web:80
+}

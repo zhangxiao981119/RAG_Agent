@@ -3,7 +3,8 @@
 # 与开发用 docker-compose.yml 的差异：
 #   1. APP_ENV=prod；api 启动只跑 alembic + seed_prod（不建测试用户/评估用例）
 #   2. 关键密钥无弱默认值，MUST 在 .env 中提供（${VAR:?提示} 缺失即报错，拒绝启动）
-#   3. 只暴露 web 的 HTTP 端口；postgres/redis/minio/模型服务/api 均不绑定宿主端口
+#   3. 唯一对外暴露的是 gateway（Caddy）的 80/443（TLS 终止 + 自签证书）；
+#      web/api/postgres/redis/minio/模型服务 均只在容器内网通信，不绑定宿主端口
 #   4. 全部服务 restart: unless-stopped + 日志轮转
 #
 # 使用：cp .env.prod.example .env 并改密后
@@ -214,8 +215,9 @@ services:
   web:
     build: ./apps/web
     restart: unless-stopped
-    ports:
-      - "${WEB_PORT:-80}:80"
+    # 仅内网暴露：由 gateway 反代访问，宿主机不绑端口，杜绝绕过 TLS 明文直连
+    expose:
+      - "80"
     depends_on:
       api:
         condition: service_healthy
@@ -226,8 +228,36 @@ services:
       timeout: 5s
       retries: 20
 
+  # TLS 入口（唯一对外暴露）—— Caddy 内置 CA 自签，反代到 web
+  gateway:
+    image: ${CADDY_IMAGE:-docker.m.daocloud.io/library/caddy:2-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f}
+    restart: unless-stopped
+    environment:
+      # 内网 IP 或内部主机名（如 192.168.1.100 / rag.corp.local），供 Caddyfile 的站点块使用
+      SITE_ADDRESS: ${SITE_ADDRESS:?必须在 .env 设置（内网 IP 或内部主机名）}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./ops/Caddyfile:/etc/caddy/Caddyfile:ro
+      # ★ caddy_data 持久化内置 CA 与证书 —— 卷丢失会重新生成 CA，客户端需重新导入根证书
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    logging: *default-logging
+    healthcheck:
+      # 探 Caddy 本地管理接口（默认 127.0.0.1:2019），验证进程存活；不触达 TLS 链路
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
 volumes:
   postgres_data:
   redis_data:
   minio_data:
   hf_cache:
+  caddy_data:
+  caddy_config:

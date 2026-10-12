@@ -30,11 +30,11 @@
 # 1. 解压交付包，进入编排目录
 cd code
 
-# 2. 执行一键初始化（自动生成密钥、收集 LLM API Key 与管理员密码、构建、启动、健康等待）
+# 2. 执行一键初始化（自动生成密钥、收集 LLM API Key / 管理员密码 / 访问地址、构建、启动、健康等待）
 bash scripts/init-prod.sh
 ```
 
-脚本完成后访问 `http://<服务器IP>`，使用 `admin` + 初始化时设置的密码登录。
+脚本完成后访问 `https://<站点地址>`（自签证书，浏览器首次访问有告警，详见 §7），使用 `admin` + 初始化时设置的密码登录。
 
 脚本是**幂等**的：重复执行不会覆盖已有的 `.env`，也不会删除数据。
 
@@ -56,6 +56,7 @@ cp .env.prod.example .env
 | 变量 | 说明 |
 |------|------|
 | `JWT_SECRET` | `openssl rand -hex 32` 生成（Windows 可用 Git Bash） |
+| `SITE_ADDRESS` | 对外访问地址：内网 IP 或内部主机名（如 `192.168.1.100` / `rag.corp.local`） |
 | `ADMIN_PASSWORD` | admin 初始密码，至少 10 位含大小写与数字 |
 | `POSTGRES_PASSWORD` / `REDIS_PASSWORD` / `MINIO_ROOT_PASSWORD` | 基础设施强密码 |
 | `LLM_API_KEY` | DeepSeek（或其他 OpenAI 兼容服务）的 API Key |
@@ -84,7 +85,8 @@ docker compose -p kagent -f docker-compose.prod.yml logs -f api
 ### 3.4 验证健康
 
 ```bash
-curl http://localhost/api/health
+# 推荐用 /api/health 探针（自签证书加 -k 跳过校验）
+curl -fsSk https://<站点地址>/api/health
 # 返回数据库、Redis、模型服务的可达状态，全部为 ok 即正常
 ```
 
@@ -94,7 +96,7 @@ curl http://localhost/api/health
 
 | # | 操作 | 期望结果 |
 |---|------|----------|
-| F1 | 浏览器访问 `http://<服务器IP>`，用 admin 登录 | 进入知识问答界面，左侧自动加载最近对话 |
+| F1 | 浏览器访问 `https://<站点地址>`，用 admin 登录 | 进入知识问答界面，左侧自动加载最近对话 |
 | F1 | 在「知识库」新建业务库 → 上传一份 pdf/docx/xlsx/md 文档 | 文档解析完成，状态变为可用 |
 | F1 | 针对文档内容提问 | 流式返回答案，右侧引用栏显示来源文档与片段 |
 | F3 | 提问含手机号/身份证/银行卡的文档 | **回答中号码已打码**（如 `138****5678`），引用原文保持不打码 |
@@ -114,6 +116,7 @@ curl http://localhost/api/health
 | `kagent_minio_data` | 上传的原始文档文件 | 必须 |
 | `kagent_redis_data` | 缓存/异步任务队列 | 不需要（可重建） |
 | `kagent_hf_cache` | 模型权重缓存 | 不需要（可重新下载） |
+| `kagent_caddy_data` | Caddy 内置 CA 与站点证书 | 建议（丢失后 CA 重新生成，客户端需重新信任根证书） |
 
 ### 5.1 备份（逻辑备份，推荐）
 
@@ -182,12 +185,28 @@ $COMPOSE up -d --build api worker web
 
 ## 7. 生产拓扑与安全说明
 
-- **唯一入口**是 web 容器的 `WEB_PORT`（默认 80）。PostgreSQL / Redis / MinIO / 模型服务 / api 均**不绑定宿主机端口**，只在容器内网通信。
+- **唯一入口**是 gateway（Caddy）容器的宿主机 `80` / `443`，负责 TLS 终止与安全响应头（HSTS / nosniff / X-Frame-Options / Referrer-Policy），并反代到 web。web / api / PostgreSQL / Redis / MinIO / 模型服务均**不绑定宿主机端口**，只在容器内网通信（web 仅 `expose`）。
+- **TLS 证书**：内网自签，由 Caddy 内置 CA 自动签发与续期（`tls internal`），无需公网域名与 ACME；HTTP（80）自动 301 跳转到 HTTPS（443）。
 - Redis 在生产编排中启用了 `requirepass`。
 - 所有服务配置 `restart: unless-stopped`，宿主机重启后自动拉起。
 - 容器日志统一轮转：单文件 50MB、最多 5 个，防止打满磁盘。
-- 建议在宿主机前置 Nginx/负载均衡终止 HTTPS（证书由部署方提供）。
 - `admin` 初始密码仅用于首次登录，**登录后请立即修改**。
+
+### 7.1 信任自签根证书（消除浏览器告警）
+
+```bash
+# 导出 Caddy 内置 CA 的根证书到当前目录
+docker compose -p kagent -f docker-compose.prod.yml exec gateway \
+  cat /data/caddy/pki/authorities/local/root.crt > kagent-root.crt
+```
+
+将 `kagent-root.crt` 分发到各客户端并导入「受信任的根证书颁发机构」：
+
+- Windows：双击证书 → 安装到「本地计算机」→ 放入「受信任的根证书颁发机构」
+- macOS：钥匙串访问 → 系统 → 导入后设为「始终信任」
+- Linux：导入系统或浏览器信任库
+
+导入后重开页面即无告警。根证书由 `kagent_caddy_data` 卷持久化，**若删除该数据卷，CA 会重新生成，客户端需重新导入**。
 
 ---
 
@@ -200,7 +219,7 @@ $COMPOSE up -d --build api worker web
 | `/api/health` 数据库/Redis 报错 | `$COMPOSE logs postgres redis`；确认 `.env` 中密码未在首次初始化后被修改（改密码需同步重建数据卷） |
 | api 反复重启 | `logs api` 查看 traceback；常见为 `LLM_API_KEY` 未配置或迁移失败 |
 | 登录提示密码错误 | 确认 seed_prod 日志出现「创建管理员」；`ADMIN_PASSWORD` 只在首次创建时生效，改值不会重置已有账号 |
-| 80 端口被占用 | 修改 `.env` 的 `WEB_PORT=8080`，访问时带端口 |
+| 80 / 443 端口被占用 | gateway 固定监听 80/443，如被占用需停掉占用进程（Linux `ss -ltnp`，Windows `netstat -ano | findstr :443`） |
 | 文档预览/上传失败 | 确认 `worker` 服务在线且 `minio` 健康；解析任务失败会自动重试 3 次 |
 
 ---
@@ -296,6 +315,8 @@ $COMPOSE logs -f api
 code/
 ├── docker-compose.prod.yml     # 生产编排
 ├── .env.prod.example           # 生产配置模板（复制为 .env 使用）
+├── ops/
+│   └── Caddyfile               # TLS 入口配置（Caddy 自签 + 安全头 + 反代 web）
 ├── scripts/
 │   └── init-prod.sh            # 一键初始化脚本
 ├── docs/
