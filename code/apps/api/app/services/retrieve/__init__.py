@@ -20,6 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import decisions
+from app.config.index_profile import current_index_profile
 from app.infra import metrics, trace
 from app.services.acl.visibility import pushdown_params  # noqa: F401  (外部引用，保留导出)
 from app.services.embedding import get_embedding_service
@@ -40,6 +41,11 @@ _WHERE_BASE = """WHERE c.tenant_id = :tenant_id
   AND c.acl_tags && :user_subjects"""
 
 # 向量召回 SQL（余弦距离 <=>，取 top K）
+# ★ 索引口径过滤（方案一）：只比对「向量是否同构」的三要素（模型 + 文本公式），
+#   与写入侧 parse_job 记录的口径对齐。改模型/改向量文本公式后，旧 chunk 向量
+#   被判为不同构而**排除**——宁可在重算前查不到，也不能把不同构向量混进来算相似度
+#   （那是"静默劣化"：不报错，只是答不准）。
+#   ★ 该过滤**只加在向量路径**：关键词路（ILIKE / tsquery）与向量空间无关，加会误伤。
 _VECTOR_SQL_TEMPLATE = f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
        c.level_rank, c.acl_tags,
@@ -47,6 +53,8 @@ SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
 FROM chunks c
 {_WHERE_BASE}
   AND c.embedding IS NOT NULL
+  AND c.embedding_model = :embedding_model
+  AND c.embedding_text_version = :embedding_text_version
 ORDER BY c.embedding <=> '{{query_vec}}'::vector
 LIMIT :limit
 """
@@ -161,9 +169,16 @@ class RetrievalService:
         # pgvector 输入格式："[0.1,0.2,...]" 字符串，直接嵌入 SQL
         query_vec_str = "[" + ",".join(repr(float(x)) for x in query_vec) + "]"
         vector_sql = text(_VECTOR_SQL_TEMPLATE.format(query_vec=query_vec_str))
+        # 按当前索引口径过滤：只召回与本查询向量同构（同模型 + 同文本公式）的 chunk
+        profile = current_index_profile()
         vector_result = await session.execute(
             vector_sql,
-            {**pushdown, "limit": decisions.TOP_K_RECALL},
+            {
+                **pushdown,
+                "limit": decisions.TOP_K_RECALL,
+                "embedding_model": profile.embedding_model,
+                "embedding_text_version": profile.embedding_text_version,
+            },
         )
         vector_rows = vector_result.fetchall()
         stages["retrieving"] = int((time.perf_counter() - t0) * 1000)

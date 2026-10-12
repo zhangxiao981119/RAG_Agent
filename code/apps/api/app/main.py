@@ -25,6 +25,7 @@ from app.api.kbs import router as kbs_router
 from app.api.me import router as me_router
 from app.api.messages import router as messages_router
 from app.api.metrics import router as metrics_router
+from app.api.prompts import router as prompts_router
 from app.api.quota import router as quota_router
 from app.api.rate_limit import check_chat_rate_limit  # noqa: F401 — 限流依赖
 from app.api.roles import router as roles_router
@@ -92,6 +93,20 @@ async def lifespan(_: FastAPI):
         get_settings().llm_model, get_settings().llm_max_output_tokens
     )
 
+    # ── 运行时配置口径（方案三：配置版本）──
+    # 打印脱敏配置 + 指纹，让「这台机器按什么配置跑」在启动时留痕 ——
+    # 出问题时可拿预发 / 生产的指纹直接比对，无需逐项核对 .env。
+    from app.config.config_profile import config_fingerprint, runtime_config_snapshot
+
+    _cfg_snapshot = runtime_config_snapshot()
+    logger.info(
+        "启动配置口径",
+        extra={
+            "config_fingerprint": config_fingerprint(_cfg_snapshot),
+            "runtime_config": _cfg_snapshot,
+        },
+    )
+
     # ── crypto 私钥预热 ────────────────────────────────────
     # 见 app/services/crypto.py::warm_up —— 该模块用同步 Redis 客户端，
     # 首次调用若发生在请求期会阻塞整个事件循环。提前到启动阶段执行。
@@ -122,6 +137,47 @@ async def lifespan(_: FastAPI):
             logger.info("启动探活：重排服务可用")
     except Exception:
         logger.warning("重排启动探活异常", exc_info=True)
+
+    # ── 索引口径启动检查（方案一：索引/模型版本）──────────
+    # 统计口径与当前不一致的 chunk（换模型 / 改向量公式后未重算的那批）。
+    # 不拒绝启动：服务需在线继续服务旧数据，同时给运维窗口去重算；
+    # 但必须让「有过期 chunk」这件事在启动时就被看见，而不是等检索悄悄查空才浮现。
+    try:
+        from sqlalchemy import text as _sa_text
+
+        from app.config.index_profile import current_index_profile
+        from app.database import SessionLocal
+
+        _profile = current_index_profile()
+        async with SessionLocal() as _session:
+            _stale = (
+                await _session.execute(
+                    _sa_text(
+                        "SELECT count(*) FROM chunks WHERE is_latest = true "
+                        "AND (embedding_model <> :m OR embedding_text_version <> :tv)"
+                    ),
+                    {
+                        "m": _profile.embedding_model,
+                        "tv": _profile.embedding_text_version,
+                    },
+                )
+            ).scalar_one()
+        if _stale:
+            metrics.incr("rag.index.stale_chunks_found")
+            logger.warning(
+                "启动检查：%d 个 chunk 的索引口径与当前不一致，向量路径将排除它们",
+                _stale,
+                extra={
+                    "current_embedding_model": _profile.embedding_model,
+                    "current_embedding_text_version": _profile.embedding_text_version,
+                    "hint": "执行 python scripts/reindex_embeddings.py 重算",
+                },
+            )
+        else:
+            logger.info("启动检查：索引口径一致，无过期 chunk")
+    except Exception:
+        # 首次启动表可能尚未迁移 / DB 未就绪 —— 检查失败不阻断启动，仅告警
+        logger.warning("索引口径启动检查跳过", exc_info=True)
 
     try:
         yield
@@ -244,3 +300,4 @@ app.include_router(quota_router, prefix="/api")
 app.include_router(sensitive_words_router, prefix="/api")
 app.include_router(feature_flags_router, prefix="/api")
 app.include_router(metrics_router, prefix="/api")
+app.include_router(prompts_router, prefix="/api")

@@ -5,15 +5,17 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import EvalCase
+from app.models import EvalCase, EvalRun
 from app.services.generate import get_generation_service
 from app.services.retrieve import RetrievalService
 
@@ -177,3 +179,64 @@ async def run_eval(
     )
 
     return report
+
+
+def case_set_fingerprint(cases: Sequence[EvalCase]) -> str:
+    """用例集指纹 = sha1(排序后的用例身份集合)[:12]（项2：评估基线版本）。
+
+    身份取「可答性 + 题面 + 期望文档」三者 —— 改题面或改标注都会换指纹，
+    提示「与旧基线比对已经没有意义」。排序保证与 DB 返回顺序无关。
+    """
+    items = sorted(
+        f"{c.expected_answerable}|{c.question}|"
+        f"{','.join(sorted(str(d) for d in (c.expected_doc_ids or [])))}"
+        for c in cases
+    )
+    raw = "\n".join(items)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+async def save_eval_run(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    metrics: dict,
+    case_fingerprint: str,
+    case_count: int,
+    caliber: dict,
+    passed: bool,
+    note: str | None = None,
+) -> EvalRun:
+    """落一条评估基线运行记录。"""
+    row = EvalRun(
+        tenant_id=tenant_id,
+        metrics=metrics,
+        case_fingerprint=case_fingerprint,
+        case_count=case_count,
+        caliber=caliber,
+        passed=passed,
+        note=note,
+    )
+    session.add(row)
+    await session.commit()
+    return row
+
+
+async def latest_eval_run(
+    session: AsyncSession, tenant_id: uuid.UUID, case_fingerprint: str
+) -> EvalRun | None:
+    """取最近一条**同一用例集指纹**的运行，作为基线。
+
+    指纹不一致的历史运行不纳入 —— 那代表另一批用例，比了会得到误导性结论。
+    """
+    return (
+        await session.execute(
+            select(EvalRun)
+            .where(
+                EvalRun.tenant_id == tenant_id,
+                EvalRun.case_fingerprint == case_fingerprint,
+            )
+            .order_by(EvalRun.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()

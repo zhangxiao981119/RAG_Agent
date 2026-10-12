@@ -2,6 +2,7 @@
 
 用法：
   python scripts/run_eval.py [--assert-refusal-rate 0.9] [--assert-miss-rate 0.1]
+                             [--baseline] [--max-regression 0.02] [--note "发布 v1.2"]
 
 跑 eval_cases 表里所有 case，调 /api/chat/ask（SSE），统计：
   · 拒答正确率 = 不可答问题中正确拒答的比例（目标 >= 0.9）
@@ -9,6 +10,10 @@
   · 命中率     = 可答问题中引用到期望文档的比例（目标 >= 0.8）
 
 ★ 用于标定 RELEVANCE_THRESHOLD（手册 §3.3.2 阈值标定）。
+
+项2（评估基线版本）：每次运行都会落一条 eval_runs 记录（指标 + 用例集指纹 + 运行口径）。
+  --baseline 与最近一次**同用例集指纹**的运行比对，任一指标回退超过 --max-regression
+  即以非零退出码阻断发布。用例集指纹变化（增删改用例）时自动跳过对比。
 """
 from __future__ import annotations
 
@@ -25,6 +30,12 @@ from app.config.settings import get_settings
 from app.database import SessionLocal
 from app.models import EvalCase, KnowledgeBase, Tenant, User
 from app.services.auth import create_access_token
+from app.services.caliber import snapshot_for_message
+from app.services.eval_service import (
+    case_set_fingerprint,
+    latest_eval_run,
+    save_eval_run,
+)
 
 
 async def _ask_one(
@@ -89,9 +100,36 @@ async def _ask_one(
     }
 
 
+def _compare_baseline(base: dict, now: dict, max_regression: float) -> int:
+    """把本次指标与基线比对，返回是否有回退（0/1）。
+
+    方向：refusal_rate / hit_rate 越高越好，miss_rate 越低越好。
+    ★ hit_rate 只在两次都「可判定」（judged > 0）时比对 —— 基线不可判定时其值恒为 0，
+      硬比会把「本次已可判定」误判成回退。
+    """
+    directions = (("refusal_rate", 1), ("hit_rate", 1), ("miss_rate", -1))
+    failed = 0
+    for name, higher_better in directions:
+        if name == "hit_rate" and (base.get("judged", 0) <= 0 or now.get("judged", 0) <= 0):
+            print(f"基线对比 {name}: 有一次不可判定（judged=0），跳过比对")
+            continue
+        b = float(base.get(name, 0.0))
+        n = float(now.get(name, 0.0))
+        regress = (b - n) if higher_better == 1 else (n - b)
+        print(f"基线对比 {name}: 基线 {b:.2%} -> 本次 {n:.2%}，回退量 {regress:+.2%}")
+        if regress > max_regression:
+            failed = 1
+    if failed:
+        print(f"FAIL: 指标回退超过阈值 {max_regression:.2%}（--max-regression）")
+    return failed
+
+
 async def run_eval(
     assert_refusal_rate: float | None = None,
     assert_miss_rate: float | None = None,
+    baseline: bool = False,
+    max_regression: float = 0.02,
+    note: str | None = None,
 ) -> int:
     settings = get_settings()
     base_url = "http://localhost:8000"
@@ -120,6 +158,10 @@ async def run_eval(
             )
         ).scalars().all()
         kb_ids = [str(kb.id) for kb in kbs]
+
+        # 项2：用例集指纹在本次会话内算好 —— 落库与基线取数共用同一个值
+        tenant_id = tenant.id
+        fingerprint = case_set_fingerprint(cases)
 
         # 全业务 API 需 JWT：签发 admin token，否则 /api/chat/ask 返回 401
         admin = await session.scalar(
@@ -196,6 +238,15 @@ async def run_eval(
         f"rerank:{decisions.RELEVANCE_THRESHOLD_RERANK}"
     )
 
+    metrics = {
+        "refusal_rate": round(refusal_rate, 4),
+        "miss_rate": round(miss_rate, 4),
+        "hit_rate": round(hit_rate, 4),
+        "answerable": len(answerable),
+        "unanswerable": len(unanswerable),
+        "judged": judged,
+    }
+
     failed = 0
     if assert_refusal_rate is not None and refusal_rate < assert_refusal_rate:
         print(f"FAIL: 拒答正确率 {refusal_rate:.2%} < {assert_refusal_rate:.2%}")
@@ -203,6 +254,31 @@ async def run_eval(
     if assert_miss_rate is not None and miss_rate > assert_miss_rate:
         print(f"FAIL: 漏答率 {miss_rate:.2%} > {assert_miss_rate:.2%}")
         failed = 1
+
+    # ── 项2：基线对比 + 落库 ──────────────────────────────
+    async with SessionLocal() as session:
+        if baseline:
+            base_row = await latest_eval_run(session, tenant_id, fingerprint)
+            if base_row is None:
+                print(f"基线：无同用例集（{fingerprint}）的历史运行，本次作为首个基线")
+            else:
+                failed |= _compare_baseline(base_row.metrics, metrics, max_regression)
+        # 口径快照：记录本批指标是在什么口径下得到的（含配置指纹，见项3）
+        caliber = await snapshot_for_message(tenant_id)
+        await save_eval_run(
+            session,
+            tenant_id=tenant_id,
+            metrics=metrics,
+            case_fingerprint=fingerprint,
+            case_count=len(cases),
+            caliber=caliber,
+            passed=(failed == 0),
+            note=note,
+        )
+    print(
+        f"已落库评估基线: fingerprint={fingerprint} "
+        f"case_count={len(cases)} passed={failed == 0}"
+    )
     return failed
 
 
@@ -210,5 +286,27 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--assert-refusal-rate", type=float, default=None)
     parser.add_argument("--assert-miss-rate", type=float, default=None)
+    parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="与最近一次同用例集运行比对，指标回退超过 --max-regression 即非零退出",
+    )
+    parser.add_argument(
+        "--max-regression",
+        type=float,
+        default=0.02,
+        help="允许的最大回退幅度（比率，默认 0.02 即 2 个百分点）",
+    )
+    parser.add_argument("--note", type=str, default=None, help="本次运行的备注（如版本号）")
     args = parser.parse_args()
-    sys.exit(asyncio.run(run_eval(args.assert_refusal_rate, args.assert_miss_rate)))
+    sys.exit(
+        asyncio.run(
+            run_eval(
+                args.assert_refusal_rate,
+                args.assert_miss_rate,
+                args.baseline,
+                args.max_regression,
+                args.note,
+            )
+        )
+    )

@@ -12,9 +12,9 @@ from __future__ import annotations
 import pytest
 
 from app.config import decisions
+from app.services.caliber import build_caliber_snapshot
 from app.services.memory import (
     blocked_reason,
-    build_caliber_snapshot,
     build_memory_prompt,
     filter_facts,
     normalize_facts,

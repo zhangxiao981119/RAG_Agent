@@ -33,7 +33,8 @@ from app.services import audit
 from app.services import feature_flag as flag_service
 from app.services import quota as quota_service
 from app.services import sensitive as sensitive_service
-from app.services.generate import get_stream_generation_service
+from app.services.caliber import snapshot_for_message
+from app.services.generate import build_system_prompt, get_stream_generation_service
 from app.services.guard import injection as injection_guard
 from app.services.mask import mask_pii
 from app.services.memory import (
@@ -184,7 +185,9 @@ async def chat_ask(
                     rewrite_history.append({"role": m.role, "content": m.content})
 
             # 评分 + 改写（一次 LLM 调用完成，score >= 90 直接跳过）
-            retrieve_query, rewrite_status, rewrite_score = await rewrite_query(payload.question, rewrite_history)
+            retrieve_query, rewrite_status, rewrite_score = await rewrite_query(
+                payload.question, rewrite_history, user.tenant_id,
+            )
             if rewrite_status == "rewritten":
                 logger.info("chat.rewrite: score=%d, '%s' → '%s'",
                             rewrite_score, payload.question[:50], retrieve_query[:50])
@@ -292,11 +295,10 @@ async def chat_ask(
             # 软阈值 90% 触发降级，硬超限直接 refused
             memory_prompt = build_memory_prompt(user_memory)
 
-            # ── Context 窗口硬约束（128K token 上限）──────────────
-            # system prompt 是 generate 模块里的 _SYSTEM_PROMPT + memory_prompt
-            # 这里直接拼出来（运行时导入避免循环引用）
-            from app.services.generate import _SYSTEM_PROMPT as _GEN_SYSTEM_PROMPT
-            system_for_estimate = _GEN_SYSTEM_PROMPT + (memory_prompt if memory_prompt else "")
+            # ── Context 窗口硬约束 ────────────────────────────────
+            # system prompt = qa_system（注册表生效版本）+ memory_prompt，
+            # 与实际生成阶段拼装口径保持一致
+            system_for_estimate = await build_system_prompt(memory_prompt, False, user.tenant_id)
             current_chunks = list(result.chunks)
 
             # 先估算总 token 数，超限则逐轮压缩 history + 裁剪 chunks
@@ -312,6 +314,7 @@ async def chat_ask(
                 history, current_chunks = await ensure_context_within_limit(
                     system_for_estimate, memory_prompt, history,
                     chunks_text_for_est, payload.question, current_chunks,
+                    user.tenant_id,
                 )
                 logger.warning("chat.context.compressed: est_before=%d → history=%d, chunks=%d (limit=%d)",
                                est_before, len(history), len(current_chunks), limit_cap)
@@ -412,6 +415,8 @@ async def chat_ask(
                     "kb_ids": [str(kb) for kb in effective_kb_ids],
                     "doc_ids": sorted({c["doc_id"] for c in citations_payload}),
                     "refused": False,
+                    # 口径快照：本条答案由哪个 contract / 模型 / 提示词版本产出（方案二）
+                    "caliber": await snapshot_for_message(user.tenant_id),
                 },
             )
 
@@ -622,7 +627,10 @@ async def _persist_assistant(
             raise RuntimeError(f"assistant 占位消息不存在: {message_id}")
         msg.content = text
         msg.citations = citations
-        msg.meta = {**meta, "refused": refused}
+        # 口径快照（方案二）：记录本条答案由哪个 contract / 模型 / 提示词版本产出。
+        # 在此**单点注入** —— 正常 / 拒答各条落库路径自动带上，无需逐处调用点传参。
+        caliber = await snapshot_for_message(user.tenant_id)
+        msg.meta = {**meta, "refused": refused, "caliber": caliber}
         await session.commit()
 
 
@@ -642,6 +650,7 @@ async def _update_user_memory(
                 assistant_msg,
                 u.memory or {},
                 trace_id=trace.get_trace_id() or "",
+                tenant_id=u.tenant_id,
             )
             u.memory = new_memory
             await session.commit()

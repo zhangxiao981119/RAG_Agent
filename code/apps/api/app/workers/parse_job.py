@@ -20,6 +20,7 @@ from arq.connections import RedisSettings
 from arq.cron import cron
 from sqlalchemy import delete
 
+from app.config.index_profile import current_index_profile
 from app.config.settings import get_settings
 from app.database import SessionLocal
 from app.models import Chunk, Document, ParseJob
@@ -123,6 +124,9 @@ async def run_parse_job(
             delete(Chunk).where(Chunk.document_id == doc_ext["id"])
         )
 
+        # 本次写入的索引口径（模型 / 维度 / 文本公式 / 分块参数）
+        profile = current_index_profile()
+
         for index, (chunk, vec) in enumerate(zip(chunks, vectors, strict=True)):
             session.add(
                 Chunk(
@@ -139,6 +143,9 @@ async def run_parse_job(
                     deny_subjects=doc_ext["deny_subjects"],
                     is_latest=True,
                     embedding=vec,
+                    embedding_model=profile.embedding_model,
+                    embedding_text_version=profile.embedding_text_version,
+                    chunker_version=profile.chunker_version,
                 )
             )
 

@@ -207,6 +207,12 @@ class Chunk(Base):
     deny_subjects: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
     is_latest: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1024))
+    # ── 索引口径（方案一：索引/模型版本）──
+    # 记录本 chunk 的向量由什么口径产出，供检索隔离与「过期重算」判定。
+    # 取值来自 app/config/index_profile.py 的 current_index_profile()，写入时落到行上。
+    embedding_model: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding_text_version: Mapped[str] = mapped_column(Text, nullable=False)
+    chunker_version: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -252,6 +258,13 @@ class Message(Base):
     __table_args__ = (
         CheckConstraint("role IN ('user','assistant')", name="ck_messages_role"),
         Index("idx_msg_conv", "conversation_id", "created_at"),
+        # 口径快照（方案二）反查用：meta @> '{"caliber":{...}}'（jsonb_path_ops 对包含查询最优）
+        Index(
+            "idx_msg_meta_gin",
+            "meta",
+            postgresql_using="gin",
+            postgresql_ops={"meta": "jsonb_path_ops"},
+        ),
     )
 
 
@@ -338,6 +351,40 @@ class EvalCase(Base):
     expected_doc_ids: Mapped[list[uuid.UUID]] = mapped_column(ARRAY(UUID(as_uuid=True)), server_default="{}")
     note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class EvalRun(Base):
+    """评估基线运行记录 —— 手册 §7.3 / M6 G5 门禁的版本化留痕（项2：评估基线版本）。
+
+    每跑一次 scripts/run_eval.py 落一条，记录「这一次评估的指标 + 用例集指纹 + 当时的运行口径」。
+    用途：① 留痕，可回溯「某次发布前评估是什么成绩」；
+         ② 基线对比，--baseline 与最近一次**同用例集**的运行比对，指标回退超过
+            --max-regression 即以非零退出码阻断发布。
+
+    ★ 用例集指纹（case_fingerprint）是**可比性前提**：用例增删改后指标天然会变，
+      与旧基线比毫无意义。指纹不一致时基线对比 MUST 跳过而非强行比对。
+    """
+
+    __tablename__ = "eval_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    # 本次指标：refusal_rate / miss_rate / hit_rate / answerable / unanswerable / judged
+    metrics: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    # 参与评估的用例条数（与 case_fingerprint 一起界定「比的是哪一批」）
+    case_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 用例集指纹 = sha1(排序后的用例身份集合)[:12]，用例增删改即变
+    case_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
+    # 运行口径快照（contract / 模型 / 提示词版本 / 阈值 / 配置指纹），用于解释指标差异来源
+    caliber: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    # 本次是否通过门禁（--assert-* 与 --baseline 全部满足才算 True）
+    passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_eval_runs_tenant_fp_created", "tenant_id", "case_fingerprint", "created_at"),
+    )
 
 
 class FinetuneSample(Base):
@@ -429,6 +476,44 @@ class FeatureFlag(Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "feature_key", "dept_path_pattern", name="uq_feature_flags_tenant_key_pattern"),
         Index("idx_feature_flags_tenant_key", "tenant_id", "feature_key", "enabled"),
+    )
+
+
+class PromptVersion(Base):
+    """提示词版本（DB 存版本，约束段仍锁在代码里，不可在线改）。
+
+    设计要点：
+      · 同一 prompt_key 可存多版本，version 单调递增（0 号保留给代码内置默认，不落库）
+      · status: draft（草稿）/ active（生效）/ archived（归档）
+      · 每个 key 同一时刻只允许一条 active，由部分唯一索引 uq_prompt_versions_active 兜底
+      · content 只放「可编辑区」文本；约束段与拒答文案由 app/config/prompts.py 在 build
+        时拼回，激活前 MUST 通过 build 校验，防止把约束改没了
+    """
+
+    __tablename__ = "prompt_versions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    prompt_key: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'draft'"))
+    note: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "prompt_key", "version", name="uq_prompt_versions_tenant_key_version"),
+        Index("idx_prompt_versions_tenant_key_status", "tenant_id", "prompt_key", "status"),
+        # 每个 key 同一时刻只允许一条 active —— 并发激活时由数据库保证唯一
+        Index(
+            "uq_prompt_versions_active",
+            "tenant_id",
+            "prompt_key",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
     )
 
 
