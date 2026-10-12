@@ -1042,3 +1042,105 @@ export async function updateFeatureFlag(
 export async function deleteFeatureFlag(id: string): Promise<void> {
   await http(`/api/admin/feature-flags/${id}`, { method: 'DELETE' })
 }
+
+// ---------- 提示词版本管理 API ----------
+
+/** 某个提示词 key 的当前状态（列表页）。 */
+export type PromptKeyState = {
+  key: string
+  label: string
+  locked: string
+  default_editable: string
+  active_version: number | null
+  active_version_id: string | null
+  is_customized: boolean
+  version_count: number
+}
+
+/** 提示词版本（列表项，不含 content）。 */
+export type PromptVersion = {
+  id: string
+  prompt_key: string
+  version: number
+  status: 'draft' | 'active' | 'archived'
+  note: string | null
+  created_by: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** 版本详情：含可编辑区 content 与拼装后的完整文本。 */
+export type PromptVersionDetail = PromptVersion & { content: string; built: string }
+
+/** 列出全部提示词 key 的当前状态。 */
+export async function fetchPrompts(): Promise<PromptKeyState[]> {
+  return http<PromptKeyState[]>('/api/admin/prompts')
+}
+
+/** 分页列出某 key 的版本（按版本号倒序）。 */
+export async function fetchPromptVersions(
+  key: string,
+  page = 1,
+  pageSize = 50,
+): Promise<PromptVersion[]> {
+  return http<PromptVersion[]>(
+    `/api/admin/prompts/${encodeURIComponent(key)}/versions?page=${page}&page_size=${pageSize}`,
+  )
+}
+
+/** 版本详情（含可编辑区与拼装后的完整文本）。 */
+export async function fetchPromptVersionDetail(
+  key: string,
+  id: string,
+): Promise<PromptVersionDetail> {
+  return http<PromptVersionDetail>(
+    `/api/admin/prompts/${encodeURIComponent(key)}/versions/${id}`,
+  )
+}
+
+/** 新建草稿版本。 */
+export async function createPromptVersion(
+  key: string,
+  payload: { content: string; note?: string | null },
+): Promise<PromptVersionDetail> {
+  return http<PromptVersionDetail>(
+    `/api/admin/prompts/${encodeURIComponent(key)}/versions`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+  )
+}
+
+/** 激活某版本（立即生效）。 */
+export async function activatePromptVersion(
+  key: string,
+  id: string,
+): Promise<PromptVersionDetail> {
+  return http<PromptVersionDetail>(
+    `/api/admin/prompts/${encodeURIComponent(key)}/versions/${id}/activate`,
+    { method: 'POST' },
+  )
+}
+
+/** 归档某版本。 */
+export async function archivePromptVersion(
+  key: string,
+  id: string,
+): Promise<PromptVersion> {
+  return http<PromptVersion>(
+    `/api/admin/prompts/${encodeURIComponent(key)}/versions/${id}/archive`,
+    { method: 'POST' },
+  )
+}
+
+/** 某版本与内置默认的 unified diff。 */
+export async function fetchPromptDiff(
+  key: string,
+  id: string,
+): Promise<{ key: string; version: number | null; diff: string }> {
+  return http<{ key: string; version: number | null; diff: string }>(
+    `/api/admin/prompts/${encodeURIComponent(key)}/versions/${id}/diff`,
+  )
+}

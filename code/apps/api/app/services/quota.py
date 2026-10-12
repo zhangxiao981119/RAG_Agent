@@ -341,7 +341,7 @@ async def check_and_degrade(
 
     # L3 历史压缩：调 LLM 把更早的历史压缩成 system 摘要
     try:
-        compressed = await compress_history(history, keep_recent=2) if len(history) > 2 else history
+        compressed = await compress_history(history, keep_recent=2, tenant_id=tenant_id) if len(history) > 2 else history
     except Exception:
         logger.warning("L3 历史压缩失败，跳到 L4", exc_info=True)
         compressed = trimmed_history

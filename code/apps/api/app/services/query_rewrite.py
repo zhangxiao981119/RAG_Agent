@@ -17,42 +17,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 
 from app.config import decisions
+from app.config.prompts import render_prompt
 from app.infra import metrics
+from app.services import prompt_registry as prompt_registry_service
 from app.services.llm import LLMError, get_llm_service
 
 logger = logging.getLogger(__name__)
 
-# 评分 + 改写 prompt：一次调用完成评分和可选改写
-# 输出 JSON 包含 score + need_rewrite + (可选) query/intent
-_SCORE_AND_REWRITE_PROMPT = """你是一个检索优化器。请对用户问题进行打分，判断是否需要改写以提升检索效果。
-
-评分标准（百分制，0-100）：
-  90-100 分：问题自包含、实体完整、关键词充分、无歧义（如"飞书知识库支持哪些文件格式？"）
-  70-89 分：有小瑕疵但基本可检索（如"怎么上传文档？"——缺少知识库限定词）
-  50-69 分：需要结合历史才能理解（如"它的核心优势是什么？"——"它"指代不明）
-  0-49 分：口语化严重或过于模糊（如"那个东西怎么弄？"——完全无法独立检索）
-
-打分维度：
-  - 明确度（clarity）：问题是否自包含、实体/领域是否清晰
-  - 检索友好度（retrieval_friendliness）：是否含关键词/术语/实体名
-  - 指代依赖度（reference_dependency）：是否依赖历史上下文才能理解（越高越需改写）
-  综合分 = max(0, clarity + retrieval_friendliness - reference_dependency // 2)，clamp 到 [0, 100]
-
-改写规则（仅 need_rewrite=true 时执行）：
-  1. 补全指代 —— 用历史上下文把"它/那个"替换成完整实体名
-  2. 提取关键词 —— 口语化转领域术语（"怎么弄"→"上传流程"）
-  3. 保留核心意图 —— 改写后 MUST 与原问题等价，MUST NOT 引入新信息
-  4. 简洁聚焦 —— 去掉语气词，让向量语义更明确
-
-输出严格 JSON（不要 Markdown 代码围栏）：
-{{"score": 85, "need_rewrite": true, "query": "改写后的检索友好问题", "intent": "意图标签"}}
-
-对话历史（用于指代消解）：
-{history}
-
-当前问题：{question}"""
+# 评分 + 改写 prompt 已迁到提示词注册表（app/config/prompts.py 的 query_rewrite key），
+# 支持在线切版本；占位符 {history} / {question} 由 render_prompt 单趟替换。
 
 
 def _estimate_tokens(text: str) -> int:
@@ -132,6 +108,7 @@ def _compute_binary_score(question: str, has_history: bool) -> int | None:
 async def rewrite_query(
     question: str,
     history: list[dict] | None = None,
+    tenant_id: uuid.UUID | None = None,
 ) -> tuple[str, str, int]:
     """对用户问题先打分，再决定是否改写。
 
@@ -146,7 +123,8 @@ async def rewrite_query(
 
     history_text = _format_history(history or [])
     has_history = bool(history)
-    prompt = _SCORE_AND_REWRITE_PROMPT.format(history=history_text, question=question)
+    template = await prompt_registry_service.resolve_prompt("query_rewrite", tenant_id)
+    prompt = render_prompt(template, {"history": history_text, "question": question})
 
     try:
         llm = get_llm_service()

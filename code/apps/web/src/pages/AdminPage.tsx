@@ -7,6 +7,7 @@ import { EvalPanel } from './admin/EvalPanel'
 import { FeatureFlagPanel } from './admin/FeatureFlagPanel'
 import { GroupPanel } from './admin/GroupPanel'
 import { MetricsPanel } from './admin/MetricsPanel'
+import { PromptPanel } from './admin/PromptPanel'
 import { QuotaPanel } from './admin/QuotaPanel'
 import { RolePanel } from './admin/RolePanel'
 import { SensitiveWordsPanel } from './admin/SensitiveWordsPanel'
@@ -23,6 +24,7 @@ type AdminTabKey =
   | 'quota'
   | 'sensitive'
   | 'feature_flags'
+  | 'prompts'
 
 // 系统管理：组织架构 / 用户 / 用户组 / 角色 / 审计日志 五个标签页
 // 面板按激活标签懒挂载，切到对应标签时才请求数据
@@ -84,6 +86,11 @@ export function AdminPage() {
             key: 'feature_flags',
             label: '灰度开关',
             children: activeKey === 'feature_flags' ? <FeatureFlagPanel /> : null,
+          },
+          {
+            key: 'prompts',
+            label: '提示词',
+            children: activeKey === 'prompts' ? <PromptPanel /> : null,
           },
         ]}
       />

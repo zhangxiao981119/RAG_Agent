@@ -5,7 +5,9 @@
   2. compress_history — 历史消息过长时，用 LLM 把较早部分压缩成摘要（短期记忆）
   3. build_memory_prompt — 把画像拼成 system prompt 里的记忆段（**读取白名单**）
   4. purge_facts_by_trace_id — 权限变更 / 文档删除时按来源清除记忆项
-  5. build_caliber_snapshot — 永久记忆：口径版本快照
+
+★ 口径快照（原第 5 项）已上提为独立模块 app/services/caliber.py ——
+  同一份口径既用于永久记忆，也写入每条 assistant 消息的 meta。
 
 ★ 不做 fallback：提取/压缩失败静默跳过（不阻塞主流程）。
 
@@ -20,31 +22,17 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
 
 from app.config import decisions
+from app.config.prompts import render_prompt
+from app.services import prompt_registry as prompt_registry_service
 from app.services.llm import LLMError, get_llm_service
 
 logger = logging.getLogger(__name__)
 
-# 提取事实的 prompt（要求输出 JSON）
-_EXTRACT_FACTS_PROMPT = """你是一个信息抽取器。从下面这轮对话中提取对用户画像有价值的关键事实。
-
-只提取稳定的、跨对话有意义的信息（如：用户身份、偏好、常用技术领域、公司背景、关键决策）。
-不要提取临时上下文（如："让我看看文档"、"好的"）。
-★ 不要提取文档正文内容、引用片段、或具体的资料原文 —— 只提炼「偏好」与「背景」。
-★ 单条事实 MUST 简短（不超过 {max_chars} 字）。
-
-输出严格 JSON：{"facts": ["事实1", "事实2", ...]}，数组为空则表示没有新事实。
-
-对话：
-用户：{user}
-助手：{assistant}"""
-
-# 压缩历史的 prompt
-_COMPRESS_PROMPT = """请把下面的对话历史压缩成一段简洁摘要，保留关键信息点和讨论脉络。
-
-摘要："""
+# 事实提取 prompt（memory_extract）与历史压缩 prompt（memory_compress）已迁到
+# 提示词注册表 app/config/prompts.py，支持在线切版本。
+# 提取 prompt 的占位符：{max_chars} / {user} / {assistant_msg}（由 render_prompt 替换）。
 
 
 # ── 记忆项契约（D-21 / 4.20）────────────────────────────
@@ -211,26 +199,6 @@ def purge_facts_by_trace_id(
     return base, removed
 
 
-def build_caliber_snapshot() -> dict:
-    """永久记忆：口径版本快照。
-
-    永久记忆**不含任何用户内容** —— 只记「系统按什么口径运行」，
-    供申诉与问题回溯（「这条答案是哪个阈值/提示词版本产生的」）。
-    """
-    return {
-        "contract_version": decisions.CONTRACT_VERSION,
-        "relevance_threshold_vector": decisions.RELEVANCE_THRESHOLD_VECTOR,
-        "relevance_threshold_rerank": decisions.RELEVANCE_THRESHOLD_RERANK,
-        "rrf_k": decisions.RRF_K,
-        "top_k_recall": decisions.TOP_K_RECALL,
-        "top_k_rerank": decisions.TOP_K_RERANK,
-        "chunk_target_tokens": decisions.CHUNK_TARGET_TOKENS,
-        "cot_mode": decisions.COT_MODE,
-        "grounding_check_enabled": decisions.GROUNDING_CHECK_ENABLED,
-        "snapshot_at": datetime.now(UTC).isoformat(),
-    }
-
-
 def _merge_facts(
     existing: list[MemoryItem], new_facts: list[MemoryItem]
 ) -> list[MemoryItem]:
@@ -305,6 +273,7 @@ async def extract_facts(
     assistant_msg: str,
     existing_memory: dict | None = None,
     trace_id: str = "",
+    tenant_id: uuid.UUID | None = None,
 ) -> dict:
     """从一轮对话提取事实，**经写入过滤器**后返回更新后的 memory dict。
 
@@ -329,10 +298,14 @@ async def extract_facts(
     candidates: list[str] = []
     try:
         llm = get_llm_service()
-        prompt = _EXTRACT_FACTS_PROMPT.format(
-            user=user_msg[:500],
-            assistant_msg=assistant_msg[:1000],
-            max_chars=decisions.MEMORY_MAX_FACT_CHARS,
+        template = await prompt_registry_service.resolve_prompt("memory_extract", tenant_id)
+        prompt = render_prompt(
+            template,
+            {
+                "user": user_msg[:500],
+                "assistant_msg": assistant_msg[:1000],
+                "max_chars": decisions.MEMORY_MAX_FACT_CHARS,
+            },
         )
         raw = await llm.chat(
             [{"role": "user", "content": prompt}],
@@ -388,6 +361,7 @@ async def extract_facts(
 async def compress_history(
     history: list[dict],
     keep_recent: int,
+    tenant_id: uuid.UUID | None = None,
 ) -> list[dict]:
     """把较早的历史压缩成一条 system 摘要，保留最近 keep_recent 条完整消息。
 
@@ -407,12 +381,13 @@ async def compress_history(
 
     try:
         llm = get_llm_service()
+        compress_prompt = await prompt_registry_service.resolve_prompt("memory_compress", tenant_id)
         summary = await llm.chat(
             [
                 {"role": "system", "content": "你是对话摘要器。只输出摘要文本。"},
                 {
                     "role": "user",
-                    "content": f"{_COMPRESS_PROMPT}\n\n历史：\n{dialogue_text}",
+                    "content": f"{compress_prompt}\n\n历史：\n{dialogue_text}",
                 },
             ],
             temperature=0.1,
@@ -498,6 +473,7 @@ async def ensure_context_within_limit(
     chunks_text: str,
     question: str,
     chunks: list,
+    tenant_id: uuid.UUID | None = None,
 ) -> tuple[list[dict], list]:
     """确保 context 在窗口上限内。超限则按 history 压缩 → chunks 裁剪顺序处理。
 
@@ -526,7 +502,7 @@ async def ensure_context_within_limit(
     for keep in (decisions.MAX_HISTORY_TURNS, 4, 2, 0):
         if len(current_history) <= keep:
             break
-        compressed = await compress_history(current_history, keep_recent=keep)
+        compressed = await compress_history(current_history, keep_recent=keep, tenant_id=tenant_id)
         est = estimate_context_tokens(
             system_prompt, memory_prompt, compressed,
             _make_chunks_text(current_chunks), question,
