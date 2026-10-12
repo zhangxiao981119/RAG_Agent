@@ -57,6 +57,7 @@ pdfminer.six==20260107
 pdfplumber==0.11.10
 pgvector==0.5.1
 pillow==12.3.0
+prometheus-client==0.26.0
 propcache==0.5.4
 pyasn1==0.6.4
 pycparser==3.11

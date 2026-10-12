@@ -18,6 +18,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from app.config.settings import get_settings
+from app.infra import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class LLMService:
         """
         settings = get_settings()
         if not settings.llm_base_url:
+            metrics.incr("rag.llm.error", kind="not_configured")
             raise LLMError("LLM_BASE_URL 未配置")
         headers = {"Authorization": f"Bearer {settings.llm_api_key}"} if settings.llm_api_key else {}
         body = {
@@ -64,6 +66,7 @@ class LLMService:
                 ) as response:
                     if response.status_code != 200:
                         text = await response.aread()
+                        metrics.incr("rag.llm.error", kind=f"http_{response.status_code}")
                         raise LLMError(
                             f"LLM 返回 {response.status_code}: {text.decode()[:200]}"
                         )
@@ -88,15 +91,18 @@ class LLMService:
                                 yield delta
                     except (httpx.TimeoutException, asyncio.TimeoutError) as exc:
                         if not first_token_seen:
+                            metrics.incr("rag.llm.first_token_timeout")
                             raise LLMTimeout(f"首 token 超时: {exc}") from exc
                         logger.warning("LLM 中途超时，已输出部分内容: %s", exc)
                         return
         except (httpx.TimeoutException, asyncio.TimeoutError) as exc:
             if not first_token_seen:
+                metrics.incr("rag.llm.first_token_timeout")
                 raise LLMTimeout(f"首 token 超时: {exc}") from exc
             logger.warning("LLM 总超时，已输出部分内容: %s", exc)
             return
         except httpx.HTTPError as exc:
+            metrics.incr("rag.llm.error", kind="transport")
             raise LLMError(f"LLM 调用失败: {exc}") from exc
 
     async def chat(self, messages: list[dict[str, str]], temperature: float) -> str:

@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app.api.auth import router as auth_router
 from app.api.audit import router as audit_router
@@ -278,10 +278,14 @@ async def trace_id_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
         response.headers["X-Trace-Id"] = trace_id
+        # path 标签取**路由模板**（如 /api/documents/{document_id}），不是原始 URL：
+        # 原始 path 带资源 ID，会让时间序列基数随数据量无限膨胀（Prometheus 大忌）。
+        # 未命中任何路由（404）统一归到 __unmatched__，避免把任意路径当标签写进去。
+        _route = request.scope.get("route")
         metrics.observe_ms(
             "http.request.duration",
             (time.perf_counter() - started) * 1000,
-            path=request.url.path,
+            path=getattr(_route, "path", None) or "__unmatched__",
             status=str(response.status_code),
         )
         return response
@@ -312,6 +316,21 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
         content={"detail": "INTERNAL_SERVER_ERROR"},
+    )
+
+
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics() -> PlainTextResponse:
+    """暴露 Prometheus 文本指标，供监控栈抓取（P0-4 可观测性）。
+
+    为什么挂在根路径而非 /api 下：web 的 nginx 只反代 /api/，
+    挂在 /api 外可确保这条内部指标不经唯一对外入口 gateway(Caddy) 暴露。
+    api 本身不发布宿主端口、网关只反代 web:80，故 /metrics 仅容器内网可达，
+    不额外做鉴权（监控抓取亦不便携带凭证）。
+    """
+    return PlainTextResponse(
+        content=metrics.render(),
+        media_type=metrics.CONTENT_TYPE_LATEST,
     )
 
 

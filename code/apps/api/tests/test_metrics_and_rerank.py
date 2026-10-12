@@ -51,18 +51,27 @@ def test_tag_order_does_not_split_series():
     assert metrics.get("x", a="1", b="2") == 2
 
 
-def test_histogram_tracks_count_sum_min_max():
+def test_histogram_tracks_count_sum_avg():
     metrics.observe_ms("rag.retrieve.duration", 100.0)
     metrics.observe_ms("rag.retrieve.duration", 300.0)
     metrics.observe_ms("rag.retrieve.duration", 200.0)
 
     snap = metrics.snapshot()
-    hist = snap["histograms"]["rag.retrieve.duration"]
+    # 暴露名统一补 _seconds 后缀（Prometheus 基准单位为秒），快照再按毫秒还原
+    hist = snap["histograms"]["rag_retrieve_duration_seconds"]
     assert hist["count"] == 3
     assert hist["sum_ms"] == 600.0
     assert hist["avg_ms"] == 200.0
-    assert hist["min_ms"] == 100.0
-    assert hist["max_ms"] == 300.0
+
+
+def test_render_exposes_prometheus_text():
+    """GET /metrics 依赖 render()：必须输出 Prometheus 文本格式的指标。"""
+    metrics.incr("rag.test.render", reason="ok")
+    metrics.observe_ms("rag.test.duration", 50.0)
+
+    text = metrics.render().decode()
+    assert "rag_test_render_total" in text
+    assert "rag_test_duration_seconds_bucket" in text
 
 
 def test_snapshot_shape():
