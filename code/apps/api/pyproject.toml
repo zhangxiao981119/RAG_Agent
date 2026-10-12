@@ -48,3 +48,8 @@ pythonpath = ["."]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+
+[tool.ruff.lint]
+# 显式声明规则集：ruff 新版本扩展了默认集（0.16 起默认远超 E4/E7/E9/F），
+# 不写死会让 CI 的 `ruff check .` 结果随安装版本漂移。此处固定为经典默认集。
+select = ["E4", "E7", "E9", "F"]

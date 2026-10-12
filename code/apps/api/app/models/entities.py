@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     Text,
     UniqueConstraint,
+    event,
     func,
     text,
 )
@@ -529,7 +530,6 @@ class PromptVersion(Base):
 # （上传 API、解析 worker、未来手动标签覆盖）都会走这里。
 # 抛 AclTagError → 转 ValueError（API 层已有 ValueError → 400 的映射）。
 # ─────────────────────────────────────────────────────────────
-from sqlalchemy import event as _sa_event
 
 
 def _validate_and_normalize_acl_tags(target: object) -> None:
@@ -555,21 +555,21 @@ def _validate_and_normalize_acl_tags(target: object) -> None:
         raise ValueError(str(exc)) from exc
 
 
-@_sa_event.listens_for(Document, "before_insert")
+@event.listens_for(Document, "before_insert")
 def _doc_before_insert(mapper, connection, target):
     _validate_and_normalize_acl_tags(target)
 
 
-@_sa_event.listens_for(Document, "before_update")
+@event.listens_for(Document, "before_update")
 def _doc_before_update(mapper, connection, target):
     _validate_and_normalize_acl_tags(target)
 
 
-@_sa_event.listens_for(Chunk, "before_insert")
+@event.listens_for(Chunk, "before_insert")
 def _chunk_before_insert(mapper, connection, target):
     _validate_and_normalize_acl_tags(target)
 
 
-@_sa_event.listens_for(Chunk, "before_update")
+@event.listens_for(Chunk, "before_update")
 def _chunk_before_update(mapper, connection, target):
     _validate_and_normalize_acl_tags(target)

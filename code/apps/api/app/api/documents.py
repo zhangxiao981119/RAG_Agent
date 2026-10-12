@@ -12,13 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.models import Chunk, Document
 from app.schemas.documents import ChunkPreview, DocumentDetail
-from app.services.storage import get_storage
-
-router = APIRouter(tags=["documents"])
-
 # 预览提取服务（所有上传格式统一转纯文本）
 from app.services import audit
 from app.services.preview import PreviewError, extract_preview_text
+from app.services.storage import get_storage
+
+router = APIRouter(tags=["documents"])
 
 
 async def _get_visible_document(
