@@ -57,7 +57,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 
 首次启动自动完成三件事：
 
-1. `migrate` 一次性服务执行数据库迁移（`0001 ~ 0009`），完成后 api/worker 才启动
+1. `migrate` 一次性服务执行数据库迁移（`0001 ~ 0014`），完成后 api/worker 才启动
 2. 初始化默认租户 + admin 角色 + admin 账号 + 公开知识库（幂等）
 3. 下载 bge-m3（约 2GB）与 bge-reranker-v2-m3（约 1GB）到本地缓存
 
@@ -184,6 +184,10 @@ curl -fsSk https://<站点地址>/api/health     # 数据库 / Redis / 模型全
 （Caddy 内置 CA 自动签发与续期），客户端需导入根证书消除告警，见
 [docs/DEPLOY.md §7](docs/DEPLOY.md)。
 
+生产编排共 **12 个服务**：除业务服务外，另有 `migrate`（一次性数据库迁移，
+先于 api/worker 完成，失败则下游不启动）与 `prometheus` + `grafana` 监控栈
+（仅暴露内部端口，经 Caddy 子路径反代访问，内置 7 条核心 SLO 告警与 RAG 看板）。
+
 **详细步骤（手动部署、观察启动、拓扑与安全说明、常见报错）见
 [docs/DEPLOY.md](docs/DEPLOY.md)。**
 
@@ -237,14 +241,19 @@ COMPOSE="docker compose -p kagent -f docker-compose.prod.yml"
 $COMPOSE ps                       # 服务状态
 $COMPOSE logs -f api              # 跟踪 api 日志
 $COMPOSE logs -f worker           # 跟踪文档解析日志
+$COMPOSE logs -f prometheus       # 抓取与告警状态
 $COMPOSE restart api              # 重启单个服务
 $COMPOSE down                     # 停止全部（不删数据卷）
 $COMPOSE up -d                    # 重新启动
 ```
 
 **数据卷**：`kagent_postgres_data`（账号/权限/对话/审计）与 `kagent_minio_data`
-（原始文档）**必须备份**；`kagent_redis_data`、`kagent_hf_cache` 可重建；
-`kagent_caddy_data`（Caddy 内置 CA 与证书）建议备份，丢失后客户端需重新导入根证书。
+（原始文档）**必须备份**；`kagent_redis_data`、`kagent_hf_cache`、`kagent_prometheus_data`
+可重建；`kagent_caddy_data`（Caddy 内置 CA 与证书）建议备份，丢失后客户端需重新导入根证书。
+
+**链路追踪**：前端每条回答旁有「追踪 ID」按钮，复制后可按 trace 串起容器日志与审计
+（`$COMPOSE logs api worker` 里按该 ID 过滤，或查 `audit_logs` 表 `trace_id` 列）。
+详见 [docs/DEPLOY.md §10.5](docs/DEPLOY.md)。
 
 **备份与恢复的完整命令见 [docs/DEPLOY.md §5](docs/DEPLOY.md)。**
 
@@ -261,6 +270,7 @@ $COMPOSE up -d                    # 重新启动
 | LLM 调用返回 400 | **检查 `LLM_MODEL` 是否为现役模型 ID**（模型 ID 会退役） |
 | 登录提示密码错误 | `ADMIN_PASSWORD` 只在首次创建时生效，改值不会重置已有账号 |
 | 上传文档后一直解析中 | `logs worker`；失败自动重试 3 次后进死信队列。也检查格式是否在白名单内 |
+| 需要定位某次问答的完整链路 | 复制该回答的「追踪 ID」，按 trace 过滤 api/worker 日志并查 `audit_logs.trace_id`，见 §10.5 |
 | 端口被占用 | gateway 固定监听 80/443，需停掉占用进程 |
 
 更多排查项见 [docs/DEPLOY.md §8](docs/DEPLOY.md)。

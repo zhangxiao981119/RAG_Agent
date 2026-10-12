@@ -31,7 +31,7 @@
 
 ## 二、演示
 
-| 流式问答 + 引用溯源 | 管理面板（10 个） |
+| 流式问答 + 引用溯源 | 管理面板（11 个） |
 |:---:|:---:|
 | <img src="code/docs/screenshots/demo-chat.gif" width="420" alt="流式问答演示：Token 级打字机输出，引用角标 [1] 可点击回跳原文"/> | <img src="code/docs/screenshots/admin-panels.png" width="420" alt="管理面板：组织/用户/角色/审计/配额/敏感词/灰度开关"/> |
 
@@ -60,11 +60,15 @@
 | 限流与配额 | Redis 令牌桶（单用户 20 次/分钟）+ 用户/租户双层 token 配额 + 四级降级 | [services/quota.py](code/apps/api/app/services/quota.py) |
 | 文档预览 | 6 种格式统一转纯文本供前端预览（md/txt/docx/xlsx/xls/pdf），无文本层给明确提示 | [services/preview.py](code/apps/api/app/services/preview.py) |
 | 评估门禁 | **63 条** eval 用例集（43 可答 + 20 不可答）自动跑检索 + 生成，判定"该答的答了 / 不该答的拒了"，实测可答 95.4% / 拒答 100% | [services/eval_service.py](code/apps/api/app/services/eval_service.py) |
-| 指标可观测 | admin 指标接口聚合 **TTFT（P50/P95/P99）** 与**三路召回 covered/unique 贡献**（量化「去掉任一路会漏多少」），前端面板展示待接入 | [api/audit.py](code/apps/api/app/api/audit.py) |
+| 指标可观测 | `prometheus_client` 标准指标 + `/metrics` 端点（路径标签用路由模板，避免高基数）；admin 指标接口另聚合 **TTFT（P50/P95/P99）** 与**三路召回 covered/unique 贡献**（量化「去掉任一路会漏多少」） | [infra/metrics.py](code/apps/api/app/infra/metrics.py) · [api/audit.py](code/apps/api/app/api/audit.py) |
+| 提示词版本管理 | 锁定区（角色 / 合规约束 / 拒答文案，代码内置不可在线改）+ 可编辑区（落库、可切换版本）；激活前校验 + Redis 60s 缓存、写后失效 | [services/prompt_registry.py](code/apps/api/app/services/prompt_registry.py) · [api/prompts.py](code/apps/api/app/api/prompts.py) |
+| 索引 / 口径版本 | `IndexProfile` 单一真源（embedding_model / dim / text_version / chunker_version），指纹取 SHA1 前 12 位；检索按口径过滤（fail-closed），重算脚本支持 `--check` 检测过期 chunk | [config/index_profile.py](code/apps/api/app/config/index_profile.py) · [scripts/reindex_embeddings.py](code/apps/api/scripts/reindex_embeddings.py) |
+| 答案口径快照 | 每条助手消息落 `meta.caliber` 快照（无 IO 同步构建），可按口径反查；配套 messages.meta GIN 索引 | [services/caliber.py](code/apps/api/app/services/caliber.py) |
+| 链路追踪 | 请求 → 审计 → 异步任务统一透传 `trace_id`，容器 JSON 日志按 trace 串联；前端问答展示可一键复制的「追踪 ID」 | [infra/trace.py](code/apps/api/app/infra/trace.py) |
 | 微调样本闭环 | 用户采纳的问答自动落库，admin 分页查看 + 导出打标（增量取出），为后续微调备好数据资产 | [api/finetune.py](code/apps/api/app/api/finetune.py) |
 | 灰度开关 | 按部门 / 百分比放量，关闭即秒级回滚 | [services/feature_flag.py](code/apps/api/app/services/feature_flag.py) |
 
-**规模**：前端 React 18 + TypeScript（**5 个业务页面 + 10 个管理面板**）；后端 FastAPI（**20 个 REST 路由模块 / 69 个接口 / 9 版 Alembic 迁移**）；Docker Compose 8 服务一键启动。
+**规模**：前端 React 18 + TypeScript（**5 个业务页面 + 11 个管理面板**）；后端 FastAPI（**21 个 REST 路由模块 / 76 个接口 / 14 版 Alembic 迁移**）；Docker Compose 开发 9 服务、生产 12 服务（含迁移 / 网关 / 监控）一键启动。
 
 ---
 
@@ -193,7 +197,8 @@
 | 后端 | FastAPI · Python 3.12 · asyncpg · SQLAlchemy · Alembic |
 | 数据/存储 | PostgreSQL 16 + pgvector 0.7 · Redis 7（缓存 + 令牌桶 + arq 队列）· MinIO |
 | AI | bge-m3（1024 维）· bge-reranker-v2-m3（本地 CPU 推理）· OpenAI 兼容 LLM 接口（默认 deepseek-v4-flash） |
-| 部署 | Docker Compose（开发 8 服务 / 生产 9 服务，多一个 `gateway` 做 TLS 终止；生产 `api` 起 2 个 uvicorn worker 进程）· Nginx（web 静态与反代）· Caddy（生产 TLS 入口，内网自签） |
+| 部署 | Docker Compose（开发 9 服务 / 生产 12 服务：新增 `migrate` 一次性迁移、`gateway` TLS 终止、`prometheus` + `grafana` 监控；生产 `api` 起 2 个 uvicorn worker 进程）· Nginx（web 静态与反代）· Caddy（生产 TLS 入口，内网自签） |
+| 工程 / CI | GitHub Actions（push master 与所有 PR：后端 `ruff + pytest`、前端 `tsc + vite build`）· 依赖锁定（`requirements.lock` / `package-lock.json`）· 基础镜像按 `sha256` digest 固定 |
 
 ---
 
@@ -211,7 +216,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 # 健康  http://localhost:8000/api/health（全绿=正常）
 ```
 
-首次启动自动执行：数据库迁移（0001~0009）→ 初始化默认租户 + admin 账号 + 公开知识库 → 下载 bge-m3 / bge-reranker 到本地缓存。
+首次启动自动执行：数据库迁移（0001~0014）→ 初始化默认租户 + admin 账号 + 公开知识库 → 下载 bge-m3 / bge-reranker 到本地缓存。
 
 | 内置账号 | 密码 | 角色 |
 |------|------|------|
@@ -250,8 +255,12 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 | F23 | 前端体验 | 上传进度、批量删除、列表分页、SSE 断网提示与一键重试（保留已流出文本） |
 | F24 | **三级记忆层** | 短期/长期/永久分层契约 + 11 条写入过滤器 + 来源 trace 反查清除 + 用户可查看/可删除（物理删除） |
 | F25 | **思维链分级** | `COT_MODE`（off/adaptive/full）；adaptive 复用 Query 改写分判断复杂度，仅对难问题开启；推理链不外发、仅落库审计 |
+| F26 | **提示词版本管理** | 5 个提示词的锁定区（角色/合规约束/拒答文案，代码内置不可在线改）与可编辑区（落库、可切换版本）分离；激活前校验 + Redis 60s 缓存、写后失效 |
+| F27 | **索引 / 口径版本管理** | `IndexProfile` 单一真源 + 口径指纹；检索按口径过滤（fail-closed）；`reindex_embeddings --check` 检测过期 chunk 并增量重算 |
+| F28 | **可观测与告警** | `prometheus_client` 指标 + `/metrics` 端点；Prometheus 抓取 + Grafana 看板 + 7 条核心 SLO 告警；日志级别由 `LOG_LEVEL` 控制 |
+| F29 | **链路追踪** | `trace_id` 贯穿请求 → 审计 → 异步任务，前端问答展示可复制「追踪 ID」，可与容器日志、`audit_logs` 串成一条链 |
 
-**管理面板（admin 可见，共 10 个）**：组织架构 / 用户管理 / 用户组 / 角色管理 / 审计日志 / 系统监控（P50/P95/P99 延迟 + 拒答率）/ 评估门禁 / 配额管理 / 敏感词 / 灰度开关。
+**管理面板（admin 可见，共 11 个）**：组织架构 / 用户管理 / 用户组 / 角色管理 / 审计日志 / 系统监控（P50/P95/P99 延迟 + 拒答率）/ 评估门禁 / 配额管理 / 敏感词 / 灰度开关 / 提示词版本。
 
 ---
 
@@ -262,7 +271,7 @@ code/
 ├── apps/
 │   ├── api/                     # 后端
 │   │   ├── app/
-│   │   │   ├── api/             # REST 路由层（20 个模块 / 69 个接口）
+│   │   │   ├── api/             # REST 路由层（21 个模块 / 76 个接口）
 │   │   │   ├── services/        # 业务层（检索/改写/生成/grounding/acl/记忆/注入防护/评估/预览…）
 │   │   │   │   ├── retrieve/    #   三路召回 + RRF 融合
 │   │   │   │   ├── guard/       #   提示注入检测
@@ -270,19 +279,21 @@ code/
 │   │   │   │   └── chunk/       #   分块（粒度优先级 + 表格整表/按行组带表头）
 │   │   │   ├── models/          # SQLAlchemy ORM（PostgreSQL + pgvector）
 │   │   │   ├── schemas/         # Pydantic 请求/响应模型
-│   │   │   ├── infra/           # 指标 / 链路 / Redis 与 arq 连接池
-│   │   │   └── config/          # 配置 + 全局口径常量（decisions.py + 启动自检）
-│   │   ├── alembic/versions/    # 9 版数据库迁移（0001~0009）
+│   │   │   ├── infra/           # 指标（prometheus_client）/ 链路追踪 / Redis 与 arq 连接池
+│   │   │   └── config/          # 配置 + 全局口径常量（decisions.py + index_profile.py + 启动自检）
+│   │   ├── alembic/versions/    # 14 版数据库迁移（0001~0014）
 │   │   └── tests/               # pytest（ACL 判定 / 检索 / 分块 / 记忆 / 注入 / 解析…）
 │   └── web/                     # 前端
 │       ├── src/pages/           # ChatPage / KnowledgeBasesPage / DocumentsPage / AdminPage
-│       ├── src/pages/admin/     # 10 个管理面板
+│       ├── src/pages/admin/     # 11 个管理面板
 │       └── Dockerfile           # 多阶段构建：Vite → Nginx
-├── docker-compose.yml           # 开发环境（8 服务）
-├── docker-compose.prod.yml      # 生产环境（8 服务，api 起 2 worker）
+├── docker-compose.yml           # 开发环境（9 服务）
+├── docker-compose.prod.yml      # 生产环境（12 服务，含 migrate/gateway/prometheus/grafana）
+├── ops/                         # Caddyfile · Prometheus 抓取 · Grafana 看板与告警规则
+├── scripts/                     # init-prod / release / backup 一键脚本
 ├── .env.prod.example            # 生产配置模板
 └── docs/
-    ├── DEPLOY.md                # 生产部署指南（F1-F5 验收 + 回滚决策树）
+    ├── DEPLOY.md                # 生产部署指南（F1-F5 验收 + 回滚决策树 + 日志与链路追踪）
     └── screenshots/             # 演示截图/动图
 ```
 
@@ -331,11 +342,14 @@ code/
 
 其他工程化设计：
 
-- **数据库迁移可进可退**：9 版 Alembic 迁移，支持 downgrade
+- **数据库迁移可进可退**：14 版 Alembic 迁移，支持 downgrade
 - **三层回滚体系**：灰度开关秒级回滚（零停服）→ Alembic 迁移回滚 → 镜像回滚
-- **可观测性**：P50/P95/P99 延迟、拒答率监控面板 + 全链路审计 + 注入命中/记忆契约违反等细粒度计数器；指标接口另聚合 **TTFT（P50/P95/P99）**与**三路召回 covered/unique 贡献**（量化「去掉任一路会漏多少」），前端面板展示待接入
+- **可观测性**：`prometheus_client` 标准指标 + `/metrics` 端点（路径标签用路由模板，避免高基数）；Prometheus 抓取 + Grafana 看板，内置 **7 条核心 SLO 告警**（存活 / 健康 / 5xx 错误率 / 重排降级 / 拒答率 / 首 token 超时 / P95 延迟）；admin 指标接口另聚合 **TTFT（P50/P95/P99）**与**三路召回 covered/unique 贡献**
+- **日志与链路追踪**：JSON 结构化日志（级别由 `LOG_LEVEL` 控制）+ `trace_id` 贯穿请求 → 审计 → 异步任务，`audit_logs.trace_id` 与容器日志可互查同一链路
+- **可复现构建**：后端 `requirements.lock` + 前端 `package-lock.json` 锁定全部传递依赖，基础镜像按 `sha256` digest 固定 —— 同一 commit 可复现出完全一致的镜像
+- **CI 门禁**：GitHub Actions 在 push master 与所有 PR 触发，后端 `ruff + pytest`（带 Redis 服务容器）、前端 `tsc + vite build` 两个独立 job
 - **资源复用**：Redis 与 arq 连接池**进程级共享**（请求级调用点拿到的 `aclose()` 是 no-op）—— 高并发下不会每请求新建/关闭连接
-- **质量门禁**：**63 条** eval 用例集（43 可答 + 20 不可答）自动检查可答/拒答准确率；pytest **218 个用例（17 个测试文件）**覆盖 ACL 判定 / RRF 融合 / 阈值闸门 / 分块 / 记忆过滤 / 注入检测 / 解析 / CoT / Query 改写等核心链路；关键口径被改坏则启动自检拒绝启动（fail-closed）
+- **质量门禁**：**63 条** eval 用例集（43 可答 + 20 不可答）自动检查可答/拒答准确率；pytest **219 个用例（17 个测试文件，1 条按环境跳过）**覆盖 ACL 判定 / RRF 融合 / 阈值闸门 / 分块 / 记忆过滤 / 注入检测 / 解析 / CoT / Query 改写等核心链路；关键口径被改坏则启动自检拒绝启动（fail-closed）
 
 ### 上线前自检发现的真实缺陷（已修复）
 
@@ -380,7 +394,7 @@ code/
 |------|------|------|
 | 本地体验 | `docker compose up -d --build` | 见上文快速启动 |
 | 同局域网演示 | 内网 IP 直访 `:5173` | 放行防火墙 5173/8000 即可 |
-| 外网演示（零成本） | cpolar / ngrok 内网穿透 | 务必换 SECRET_KEY + 无余额 API Key，演示完立即停 |
+| 外网演示（零成本） | cpolar / ngrok 内网穿透 | 务必换 JWT_SECRET + 无余额 API Key，演示完立即停 |
 | 云服务器生产 | 详见 [code/docs/DEPLOY.md](code/docs/DEPLOY.md) | 4 核 8GB 起；嵌入/重排走外部 API 可压到 4-8GB 内存 |
 
 生产验收清单（F1-F5）、升级与回滚决策树见 [code/docs/DEPLOY.md](code/docs/DEPLOY.md)。
@@ -418,6 +432,9 @@ M6 安全加固功能默认关闭，到「灰度开关」面板手动创建规�
 
 **Q: 上传几百页的大 PDF，解析很久或失败？**
 解析与嵌入都在本地 CPU 上跑，大文档按 8 条一批嵌入：283 页 PDF 约 450 个 chunk，需要 10 分钟量级；单任务超时上限 1800s（`PARSE_JOB_TIMEOUT_SECONDS`）。失败会自动重试 3 次，仍失败进死信队列，用 `docker compose logs worker` 看原因。
+
+**Q: 想排查某次问答为什么慢/出错？**
+每条回答旁边有「追踪 ID」按钮，复制后可按 trace 串起容器日志与审计。`docker compose -p kagent -f docker-compose.prod.yml logs api worker` 里按该 ID 过滤，或查 `audit_logs` 表的 `trace_id` 列。详见 [code/docs/DEPLOY.md §10.5](code/docs/DEPLOY.md)。
 
 **Q: 想改管理员密码？**
 `ADMIN_PASSWORD` 仅首次 seed 生效，后续在「用户管理」里重置。
