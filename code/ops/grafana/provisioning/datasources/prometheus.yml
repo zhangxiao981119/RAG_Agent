@@ -1,0 +1,17 @@
+# Grafana 数据源 provisioning：Prometheus 作为唯一数据源
+#
+# uid 固定为 kagent-prometheus —— 看板与告警规则都按这个 uid 引用数据源，
+# 不固定的话 Grafana 每次生成的 uid 不同，引用会全部失配。
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: kagent-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # 与 prometheus.yml 的 scrape_interval 对齐，避免查询步长小于抓取间隔产生空洞
+      timeInterval: 15s

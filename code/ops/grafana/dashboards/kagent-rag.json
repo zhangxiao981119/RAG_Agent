@@ -1,0 +1,207 @@
+{
+  "uid": "kagent-rag",
+  "title": "KAgent RAG 可观测",
+  "tags": ["kagent", "rag"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "API 抓取状态 (up)",
+      "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "up{job=\"kagent-api\"}",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red", "index": 0 } } },
+            { "type": "value", "options": { "1": { "text": "UP", "color": "green", "index": 1 } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "none", "textMode": "auto" }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "请求 QPS（按路由）",
+      "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+      "gridPos": { "h": 8, "w": 10, "x": 4, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "sum by (path) (rate(http_request_duration_seconds_count[5m]))",
+          "legendFormat": "{{path}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "5xx 错误率",
+      "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "sum(rate(http_request_duration_seconds_count{status=~\"5..\"}[5m])) / clamp_min(sum(rate(http_request_duration_seconds_count[5m])), 0.0001)",
+          "legendFormat": "5xx 占比"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "请求延迟 P95 / P50",
+      "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "P95"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "P50"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "fillOpacity": 0, "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "重排降级速率（rerank 不可用即降级）",
+      "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "sum by (reason) (rate(rag_rerank_degraded_total[5m]))",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "L1 闸门拒答率",
+      "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "sum(rate(rag_gate_refused_total[5m])) / clamp_min(sum(rate(rag_gate_refused_total[5m])) + sum(rate(rag_gate_passed_total[5m])), 0.0001)",
+          "legendFormat": "拒答占比"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "LLM 首 token 超时 / 调用错误",
+      "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "sum(rate(rag_llm_first_token_timeout_total[5m]))",
+          "legendFormat": "首 token 超时"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "sum by (kind) (rate(rag_llm_error_total[5m]))",
+          "legendFormat": "错误 {{kind}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 20, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "质量与安全异常计数（CoT 未闭合 / 注入命中 / 契约违约 / FTS 失败）",
+      "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "sum(rate(rag_cot_unclosed_total[5m]))",
+          "legendFormat": "CoT 未闭合"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "sum(rate(rag_injection_hit_total[5m]))",
+          "legendFormat": "注入命中"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "sum(rate(rag_rewrite_contract_violation_total[5m]))",
+          "legendFormat": "改写契约违约"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "sum(rate(rag_keyword_fts_failed_total[5m]))",
+          "legendFormat": "关键字 FTS 失败"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 20, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "API 进程内存 RSS",
+      "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "kagent-prometheus" },
+          "expr": "process_resident_memory_bytes{job=\"kagent-api\"}",
+          "legendFormat": "RSS"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    }
+  ]
+}

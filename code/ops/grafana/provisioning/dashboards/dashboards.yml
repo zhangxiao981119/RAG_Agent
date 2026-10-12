@@ -1,0 +1,17 @@
+# Grafana 看板 provider：从挂载目录加载 JSON 看板
+#
+# 目录 /var/lib/grafana/dashboards 由编排挂载到 ./ops/grafana/dashboards，
+# 看板随 Git 版本化；allowUiUpdates=true 允许在 UI 里临时调整（调整后需回写文件才持久）。
+apiVersion: 1
+
+providers:
+  - name: kagent
+    orgId: 1
+    folder: KAgent
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

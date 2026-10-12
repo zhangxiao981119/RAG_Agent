@@ -1,0 +1,424 @@
+# Grafana 内置告警规则（unified alerting）provisioning
+#
+# 采用 Grafana 11 的文件化 provisioning 格式（apiVersion: 1）：
+#   每个规则由 A(Prometheus 查询) → B(reduce 取 last) → C(threshold 阈值) 三节点组成，
+#   condition 指向 C。规则随 Git 版本化，改完文件重启 Grafana 或走 Admin API 热加载生效。
+#
+# 通知渠道不在此文件：deployment 私有化环境无法预知 SMTP / webhook 地址，
+# 由运维在 Grafana UI 里配置 Contact point 与 Notification policy（见 docs/DEPLOY.md）。
+# 未配置前告警仍在 Grafana 界面可见（Alerting → Alert rules 的 Firing 状态）。
+#
+# 指标名说明：业务名中的点号被规范化为下划线，计数器统一带 _total 后缀。
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: kagent-rag
+    folder: KAgent
+    interval: 1m
+    rules:
+      # ── 1. API 抓取中断 / 实例不可用（最严重，NoData 也视为异常）──
+      - uid: kagent-api-down
+        title: "API 不可用（抓取中断）"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: kagent-prometheus
+            model:
+              editorMode: code
+              expr: 'up{job="kagent-api"} < 1'
+              instant: false
+              intervalMs: 15000
+              legendFormat: __auto
+              maxDataPoints: 43200
+              range: true
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0, 0], type: gt }
+                  operator: { type: and }
+                  query: { params: [B] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              intervalMs: 15000
+              maxDataPoints: 43200
+              reducer: last
+              refId: B
+              settings: { mode: dropNN }
+              type: reduce
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0.5], type: gt }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              intervalMs: 15000
+              maxDataPoints: 43200
+              refId: C
+              settings: { mode: "" }
+              type: threshold
+        noDataState: Alerting
+        execErrState: Error
+        for: 2m
+        annotations:
+          summary: "kagent api 抓取中断或实例不可用（up=0），问答服务可能已中断"
+        labels:
+          severity: critical
+
+      # ── 2. 健康检查返回 503（依赖故障）──
+      - uid: kagent-health-degraded
+        title: "健康检查失败（依赖故障）"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: kagent-prometheus
+            model:
+              editorMode: code
+              expr: 'increase(http_request_duration_seconds_count{path="/api/health",status="503"}[5m])'
+              instant: false
+              intervalMs: 15000
+              legendFormat: __auto
+              maxDataPoints: 43200
+              range: true
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0, 0], type: gt }
+                  operator: { type: and }
+                  query: { params: [B] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              intervalMs: 15000
+              maxDataPoints: 43200
+              reducer: last
+              refId: B
+              settings: { mode: dropNN }
+              type: reduce
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0], type: gt }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              intervalMs: 15000
+              maxDataPoints: 43200
+              refId: C
+              settings: { mode: "" }
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        annotations:
+          summary: "/api/health 返回 503，后端依赖（DB/Redis/向量扩展/LLM/嵌入）存在故障"
+        labels:
+          severity: critical
+
+      # ── 3. 5xx 错误率过高 ──
+      - uid: kagent-5xx-rate
+        title: "HTTP 5xx 错误率过高"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: kagent-prometheus
+            model:
+              editorMode: code
+              expr: 'sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m])) / clamp_min(sum(rate(http_request_duration_seconds_count[5m])), 0.0001)'
+              instant: false
+              intervalMs: 15000
+              legendFormat: __auto
+              maxDataPoints: 43200
+              range: true
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0, 0], type: gt }
+                  operator: { type: and }
+                  query: { params: [B] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              intervalMs: 15000
+              maxDataPoints: 43200
+              reducer: last
+              refId: B
+              settings: { mode: dropNN }
+              type: reduce
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0.05], type: gt }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              intervalMs: 15000
+              maxDataPoints: 43200
+              refId: C
+              settings: { mode: "" }
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: "HTTP 5xx 占比持续超过 5%，接口在报错"
+        labels:
+          severity: warning
+
+      # ── 4. 重排服务持续降级（rerank 不可用会静默改用向量分）──
+      - uid: kagent-rerank-degraded
+        title: "重排服务持续降级"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 900, to: 0 }
+            datasourceUid: kagent-prometheus
+            model:
+              editorMode: code
+              expr: 'sum(increase(rag_rerank_degraded_total[10m]))'
+              instant: false
+              intervalMs: 15000
+              legendFormat: __auto
+              maxDataPoints: 43200
+              range: true
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0, 0], type: gt }
+                  operator: { type: and }
+                  query: { params: [B] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              intervalMs: 15000
+              maxDataPoints: 43200
+              reducer: last
+              refId: B
+              settings: { mode: dropNN }
+              type: reduce
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0], type: gt }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              intervalMs: 15000
+              maxDataPoints: 43200
+              refId: C
+              settings: { mode: "" }
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        annotations:
+          summary: "10 分钟内出现重排降级，检索质量下降（已改用向量余弦分），检查 reranker 服务"
+        labels:
+          severity: warning
+
+      # ── 5. 拒答率异常（阈值/召回口径漂移的信号）──
+      - uid: kagent-refusal-rate
+        title: "L1 闸门拒答率异常"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 1800, to: 0 }
+            datasourceUid: kagent-prometheus
+            model:
+              editorMode: code
+              expr: 'sum(rate(rag_gate_refused_total[10m])) / clamp_min(sum(rate(rag_gate_refused_total[10m])) + sum(rate(rag_gate_passed_total[10m])), 0.0001)'
+              instant: false
+              intervalMs: 15000
+              legendFormat: __auto
+              maxDataPoints: 43200
+              range: true
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0, 0], type: gt }
+                  operator: { type: and }
+                  query: { params: [B] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              intervalMs: 15000
+              maxDataPoints: 43200
+              reducer: last
+              refId: B
+              settings: { mode: dropNN }
+              type: reduce
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0.5], type: gt }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              intervalMs: 15000
+              maxDataPoints: 43200
+              refId: C
+              settings: { mode: "" }
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        annotations:
+          summary: "拒答占比持续超过 50%，检查召回质量、阈值口径是否漂移（重排抖动会引起口径切换）"
+        labels:
+          severity: warning
+
+      # ── 6. LLM 首 token 超时（生成不可用的前兆）──
+      - uid: kagent-llm-first-token-timeout
+        title: "LLM 首 token 超时"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 900, to: 0 }
+            datasourceUid: kagent-prometheus
+            model:
+              editorMode: code
+              expr: 'sum(increase(rag_llm_first_token_timeout_total[10m]))'
+              instant: false
+              intervalMs: 15000
+              legendFormat: __auto
+              maxDataPoints: 43200
+              range: true
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0, 0], type: gt }
+                  operator: { type: and }
+                  query: { params: [B] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              intervalMs: 15000
+              maxDataPoints: 43200
+              reducer: last
+              refId: B
+              settings: { mode: dropNN }
+              type: reduce
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [2], type: gt }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              intervalMs: 15000
+              maxDataPoints: 43200
+              refId: C
+              settings: { mode: "" }
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: "10 分钟内 LLM 首 token 超时超过 2 次，检查 LLM_BASE_URL / 上游大模型可用性"
+        labels:
+          severity: critical
+
+      # ── 7. 请求延迟 P95 过高 ──
+      - uid: kagent-p95-latency
+        title: "请求延迟 P95 过高"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: kagent-prometheus
+            model:
+              editorMode: code
+              expr: 'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))'
+              instant: false
+              intervalMs: 15000
+              legendFormat: __auto
+              maxDataPoints: 43200
+              range: true
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [0, 0], type: gt }
+                  operator: { type: and }
+                  query: { params: [B] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              intervalMs: 15000
+              maxDataPoints: 43200
+              reducer: last
+              refId: B
+              settings: { mode: dropNN }
+              type: reduce
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [10], type: gt }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              intervalMs: 15000
+              maxDataPoints: 43200
+              refId: C
+              settings: { mode: "" }
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        annotations:
+          summary: "请求 P95 延迟持续超过 10s，检索/生成链路变慢"
+        labels:
+          severity: warning

@@ -138,9 +138,12 @@ services:
       dockerfile: apps/api/Dockerfile
     restart: unless-stopped
     # 生产启动：生产种子（仅租户/管理员/公开库）+ API；迁移由 migrate 服务先完成
+    # ★ 固定单 worker（--workers 1）：指标在进程内聚合，多 worker 时 Prometheus 从
+    #   同一端口只会抓到随机一个副本，rate() 随副本切换跳变。单 worker 下 asyncio
+    #   足以承载 I/O 密集的检索/流式生成；进程崩溃由 restart 策略兜底。
     command: >
       sh -c "python -m scripts.seed_prod &&
-             uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2"
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"
     environment:
       APP_ENV: prod
       JWT_SECRET: ${JWT_SECRET:?必须在 .env 设置（建议 openssl rand -hex 32）}
@@ -271,6 +274,62 @@ services:
       timeout: 5s
       retries: 20
 
+  # ── 可观测性（P0-4）────────────────────────────────────
+  # 抓取 api:8000/metrics（Prometheus 文本格式），驱动 Grafana 看板与告警。
+  # 两者均不发布宿主端口：Grafana 经 gateway(Caddy) 的 /grafana 子路径访问，
+  # Prometheus 仅内网（如需直连排障，用 docker compose exec/port-forward）。
+  prometheus:
+    image: docker.m.daocloud.io/prom/prometheus:v3.13.4@sha256:87861b8cf91579109319ebc300f3f1060e6da9c05d6ae8ad15a20c879e84e32e
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 指标留存 30 天，超出自动清理（单机磁盘保护）
+      - --storage.tsdb.retention.time=30d
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      # 只等 api 起来，不强绑 healthy —— 抓取失败会自动重试，无需把启动顺序绑死
+      api:
+        condition: service_started
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  grafana:
+    image: docker.m.daocloud.io/grafana/grafana:11.6.0@sha256:62d2b9d20a19714ebfe48d1bb405086081bc602aa053e28cf6d73c7537640dfb
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?必须在 .env 设置}
+      # 经 gateway 的 /grafana 子路径访问：root_url 与子路径开关必须一致，否则静态资源 404
+      GF_SERVER_ROOT_URL: https://${SITE_ADDRESS}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # 离线私有化：关闭版本检查与匿名使用统计上报
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # 数据源 / 看板 / 告警规则均为文件化 provisioning，随镜像外的 ops 目录版本化
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
 volumes:
   postgres_data:
   redis_data:
@@ -278,3 +337,5 @@ volumes:
   hf_cache:
   caddy_data:
   caddy_config:
+  prometheus_data:
+  grafana_data:

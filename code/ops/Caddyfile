@@ -28,5 +28,14 @@
 		Referrer-Policy "strict-origin-when-cross-origin"
 	}
 
-	reverse_proxy web:80
+	# 运维看板：Grafana 经同一 TLS 入口的 /grafana 子路径访问，不额外开对外端口；
+	# handle 不剥离前缀，配合 Grafana 的 serve_from_sub_path 正常处理静态资源与 API。
+	handle /grafana* {
+		reverse_proxy grafana:3000
+	}
+
+	# 其余流量整体反代到 web（未匹配 handle 的兜底）
+	handle {
+		reverse_proxy web:80
+	}
 }

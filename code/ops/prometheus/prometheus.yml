@@ -1,0 +1,18 @@
+# Prometheus 抓取配置（P0-4 可观测性）
+#
+# 只抓一个目标：api 的 /metrics（容器内网 DNS 名 api:8000，Prometheus 文本格式）。
+# worker 是 arq 常驻进程、无 HTTP 端点，不纳入抓取。
+#
+# 告警不放这里：本项目采用 Grafana 内置告警（unified alerting），
+# 规则以文件化 provisioning 落在 ops/grafana/provisioning/alerting/，
+# 因此 Prometheus 不需要 rule_files，也不需要 Alertmanager。
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: kagent-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]

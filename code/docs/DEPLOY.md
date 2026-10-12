@@ -346,6 +346,47 @@ $COMPOSE logs -f api
 
 ---
 
+## 10. 可观测性与告警（Grafana / Prometheus）
+
+生产编排内置 `prometheus` + `grafana` 两个服务，均为**内网**（不发布宿主机端口）：
+
+- `prometheus` 每 15s 抓取一次 `api:8000/metrics`（Prometheus 文本格式），指标留存 30 天（卷 `kagent_prometheus_data`）。
+- `grafana` 经 gateway 的同一 TLS 入口以子路径访问：**https://&lt;SITE_ADDRESS&gt;/grafana/**，登录账号为 `.env` 的 `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD`（数据落卷 `kagent_grafana_data`）。
+
+### 10.1 指标来源
+
+- `api` 进程暴露 `GET /metrics`（Prometheus 文本）：业务计数器与耗时直方图，另含进程级默认指标（`process_*` / `python_*`）。
+- 业务指标口径：名称中的点号被规范化为下划线，计数器带 `_total` 后缀，耗时直方图带 `_seconds` 后缀。例：`rag_rerank_degraded_total`、`rag_gate_refused_total`、`rag_llm_first_token_timeout_total`、`http_request_duration_seconds_bucket`。
+- `http_request_duration_seconds` 的 `path` 标签取**路由模板**（如 `/api/documents/{document_id}`）而非原始 URL，避免时间序列基数膨胀。
+- api 固定单 worker（`--workers 1`）：指标在进程内聚合，多 worker 会导致同一端口只抓到随机副本、`rate()` 跳变。
+
+### 10.2 内置看板
+
+provisioning 自动加载看板 **KAgent RAG 可观测**（文件夹 `KAgent`），含：API 抓取状态、请求 QPS、5xx 错误率、延迟 P95/P50、重排降级速率、L1 闸门拒答率、LLM 首 token 超时、质量与安全异常计数、进程内存 RSS。
+
+### 10.3 内置告警规则
+
+文件 `ops/grafana/provisioning/alerting/rules.yml` 预置 7 条 Grafana 内置告警（`critical`：API 不可用 / 健康检查 503 / LLM 首 token 超时；`warning`：5xx 错误率、重排持续降级、拒答率异常、P95 延迟过高）。
+
+**通知渠道需自行配置**：私有化环境无法预知 SMTP / webhook 地址，故未预置 Contact point。在 Grafana → Alerting → Contact points 新建通知渠道（如邮件、Webhook 飞书机器人），再到 Notification policies 将默认策略指向该渠道；未配置前告警仍在 Alerting → Alert rules 中可见 Firing 状态。
+
+### 10.4 排障与验证
+
+```bash
+# 容器内直接看指标（确认 /metrics 已输出业务指标）
+docker compose -p kagent -f docker-compose.prod.yml exec api curl -s http://localhost:8000/metrics | head
+
+# 看 Prometheus 抓取目标是否 UP（Prometheus 仅内网，临时映射端口排障后用 Ctrl+C 结束）
+docker compose -p kagent -f docker-compose.prod.yml exec prometheus wget -qO- http://localhost:9090/api/v1/targets | head
+
+# 健康检查（自签证书加 -k）
+curl -k https://<SITE_ADDRESS>/api/health
+```
+
+> ⚠️ 若在 `.env` 中设置了 `TRUSTED_HOSTS`，必须把 `api:8000` 一并列入，否则 Prometheus 以容器名抓取时 Host 不匹配，会被 api 以 400 拒绝、导致抓取中断。
+
+---
+
 ## 附：交付物清单
 
 ```
@@ -353,7 +394,12 @@ code/
 ├── docker-compose.prod.yml     # 生产编排
 ├── .env.prod.example           # 生产配置模板（复制为 .env 使用）
 ├── ops/
-│   └── Caddyfile               # TLS 入口配置（Caddy 自签 + 安全头 + 反代 web）
+│   ├── Caddyfile               # TLS 入口配置（Caddy 自签 + 安全头 + 反代 web + /grafana 子路径）
+│   ├── prometheus/
+│   │   └── prometheus.yml      # 抓取配置（api:8000/metrics）
+│   └── grafana/
+│       ├── provisioning/       # 数据源 / 看板 / 告警规则（文件化 provisioning）
+│       └── dashboards/         # 看板 JSON（KAgent RAG 可观测）
 ├── scripts/
 │   ├── init-prod.sh            # 一键初始化脚本（生成密钥/收集配置/构建启动）
 │   ├── backup.sh               # 备份脚本（PostgreSQL + MinIO → backups/<时间戳>/）
