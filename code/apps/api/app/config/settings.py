@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "dev"
+    # ── 日志 ─────────────────────────────────────────────────
+    # 结构化 JSON 日志级别；DEBUG 可见检索/改写等细节，生产默认 INFO
+    log_level: str = "INFO"
     # ── 密钥/密码：生产 MUST 通过环境变量覆盖，dev 可用空字符串（seed 自动生成） ──
     # 注：登录链路的应用层加密密钥对（RSA-OAEP）由 services/crypto.py 在 Redis 内部
     #     自动生成与持有（key = auth:rsa_private_key），不经环境变量注入。

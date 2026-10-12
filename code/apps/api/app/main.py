@@ -75,7 +75,8 @@ class JsonFormatter(logging.Formatter):
 _json_handler = logging.StreamHandler()
 _json_handler.setFormatter(JsonFormatter())
 logging.root.handlers = [_json_handler]
-logging.root.setLevel(logging.INFO)
+# 级别由配置驱动（.env 的 LOG_LEVEL），生产默认 INFO
+logging.root.setLevel(get_settings().log_level.upper())
 for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
     _logger = logging.getLogger(_name)
     _logger.handlers = [_json_handler]
