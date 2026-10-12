@@ -20,6 +20,7 @@ from sqlalchemy import select
 
 from app.config.settings import get_settings
 from app.database import SessionLocal
+from app.infra import trace
 from app.infra.arq_pool import get_arq_pool
 from app.models import Document, ParseJob, SyncSource
 from app.services.storage import get_storage
@@ -146,8 +147,10 @@ async def _sync_one_file(
         pool = await get_arq_pool()
         # enqueue 失败 → 异常上抛，事务回滚，Document/ParseJob 不入库。
         # MUST NOT 在此关闭池 —— 池是进程级共享资源，关掉会让后续所有入队重新建连
+        # 透传当前 trace_id：手动触发时=请求 trace，cron 触发时=该轮新 trace
         await pool.enqueue_job(
-            "run_parse_job", str(parse_job.id), _queue_name=settings.arq_queue_name
+            "run_parse_job", str(parse_job.id), trace.get_trace_id(),
+            _queue_name=settings.arq_queue_name,
         )
 
         # 全部成功才 commit

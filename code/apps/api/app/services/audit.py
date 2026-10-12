@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import SessionLocal
+from app.infra import trace
 from app.models import AuditLog, User
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,8 @@ async def record(
                     object_id=object_id,
                     detail=detail or {},
                     ip=ip,
+                    # trace_id 从当前上下文读取，调用点无需传参
+                    trace_id=trace.get_trace_id(),
                 )
             )
             await session.commit()
@@ -76,6 +79,8 @@ async def record_with_session(
             object_id=object_id,
             detail=detail or {},
             ip=ip,
+            # 同 record()：trace_id 从当前上下文读取
+            trace_id=trace.get_trace_id(),
         )
     )
 

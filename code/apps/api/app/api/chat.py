@@ -97,6 +97,7 @@ async def chat_ask(
                     "conversation_id": None,
                     "message_id": None,
                     "stage": "blocked",
+                    "trace_id": trace.get_trace_id(),
                 })
                 yield _sse("refused", {
                     "reason": "SENSITIVE_INPUT",
@@ -162,6 +163,7 @@ async def chat_ask(
                 "conversation_id": str(conversation_id),
                 "message_id": str(message_id),
                 "stage": "retrieving",
+                "trace_id": trace.get_trace_id(),
             })
 
             # ── Query 改写（检索前，用历史做指代消解）───────────
@@ -249,6 +251,8 @@ async def chat_ask(
                         "kb_ids": [str(kb) for kb in effective_kb_ids],
                         "doc_ids": [],
                         "refused": True,
+                        # 各阶段耗时快照：便于只看审计就能定位慢在哪一环
+                        "stage_ms": result.stage_ms,
                     },
                 )
                 _total_ms = int((_time.monotonic() - _t0) * 1000)
@@ -415,6 +419,8 @@ async def chat_ask(
                     "kb_ids": [str(kb) for kb in effective_kb_ids],
                     "doc_ids": sorted({c["doc_id"] for c in citations_payload}),
                     "refused": False,
+                    # 各阶段耗时快照：便于只看审计就能定位慢在哪一环
+                    "stage_ms": result.stage_ms,
                     # 口径快照：本条答案由哪个 contract / 模型 / 提示词版本产出（方案二）
                     "caliber": await snapshot_for_message(user.tenant_id),
                 },
@@ -630,7 +636,11 @@ async def _persist_assistant(
         # 口径快照（方案二）：记录本条答案由哪个 contract / 模型 / 提示词版本产出。
         # 在此**单点注入** —— 正常 / 拒答各条落库路径自动带上，无需逐处调用点传参。
         caliber = await snapshot_for_message(user.tenant_id)
-        msg.meta = {**meta, "refused": refused, "caliber": caliber}
+        # trace_id 在此单点注入：正常 / 拒答各条落库路径自动带上，前端历史里可复制
+        msg.meta = {
+            **meta, "refused": refused, "caliber": caliber,
+            "trace_id": trace.get_trace_id(),
+        }
         await session.commit()
 
 

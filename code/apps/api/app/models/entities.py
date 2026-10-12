@@ -297,11 +297,14 @@ class AuditLog(Base):
     object_id: Mapped[str | None] = mapped_column(Text)
     detail: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     ip: Mapped[str | None] = mapped_column(INET)
+    # 链路追踪 ID：与该次请求的日志同值，可按 trace 把审计与容器日志串成一条链
+    trace_id: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         Index("idx_audit_time", "tenant_id", text("created_at DESC")),
         Index("idx_audit_user", "tenant_id", "user_id", text("created_at DESC")),
+        Index("idx_audit_trace", "tenant_id", "trace_id"),
     )
 
 

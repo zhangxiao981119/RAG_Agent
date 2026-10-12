@@ -23,6 +23,7 @@ from sqlalchemy import delete
 from app.config.index_profile import current_index_profile
 from app.config.settings import get_settings
 from app.database import SessionLocal
+from app.infra import trace
 from app.models import Chunk, Document, ParseJob
 from app.services.chunk import chunk_blocks, to_embedding_text
 from app.services.embedding import get_embedding_service
@@ -33,14 +34,18 @@ logger = logging.getLogger(__name__)
 
 
 async def run_parse_job(
-    ctx: dict[str, Any], job_id: str
+    ctx: dict[str, Any], job_id: str, trace_id: str | None = None
 ) -> str:
-    """arq 任务入口。job_id 是 parse_jobs.id 字符串。
+    """arq 任务入口。job_id 是 parse_jobs.id 字符串；trace_id 由入队方透传。
 
     分 3 段 session：锁任务 → 网络调用（无 session）→ 写 chunks。
     网络调用（拉 MinIO 文件 + 调 embedding 服务）可能几十秒，
     放在 session 外避免长时间占用 DB 连接池。
     """
+    # 绑定入队方透传的 trace_id（缺失则新生成），使本任务日志与触发它的请求同链。
+    # arq 每个任务在独立 asyncio Task 中执行（worker.py create_task），
+    # contextvars 随任务隔离，无需显式还原。
+    trace.set_trace_id(trace_id or trace.new_trace_id())
     parse_job_id = uuid.UUID(job_id)
     settings = get_settings()
 
@@ -160,6 +165,8 @@ async def run_parse_job(
 
 async def run_sync_all(ctx: dict[str, Any]) -> int:
     """M6 任务 1：cron job 入口 — 扫描所有 active 同步源并增量同步。"""
+    # cron 无上游请求，生成本轮 trace_id，贯穿本轮所有文件解析入队
+    trace.set_trace_id(trace.new_trace_id())
     from app.services.sync_service import sync_all_active_sources
 
     new_count = await sync_all_active_sources()
@@ -167,8 +174,12 @@ async def run_sync_all(ctx: dict[str, Any]) -> int:
     return new_count
 
 
-async def run_sync_source(ctx: dict[str, Any], source_id: str) -> int:
+async def run_sync_source(
+    ctx: dict[str, Any], source_id: str, trace_id: str | None = None
+) -> int:
     """手动触发单个同步源（HTTP trigger_sync 入队，避免阻塞 API 事件循环）。"""
+    # 绑定入队方透传的 trace_id（缺失则新生成），worker 日志与触发请求同链
+    trace.set_trace_id(trace_id or trace.new_trace_id())
     from app.services.sync_service import sync_source
     from app.models import SyncSource
 

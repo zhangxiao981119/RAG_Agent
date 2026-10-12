@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config.settings import get_settings
+from app.infra import trace
 from app.infra.redis_client import get_redis
 from app.models import Document, KnowledgeBase, KnowledgeBaseMember, ParseJob
 from app.schemas.documents import DocumentOut
@@ -382,8 +383,10 @@ async def upload_document(
     )
 
     # 入队 arq 任务（复用 lifespan 初始化的全局连接池）
+    # 透传 trace_id，让 worker 日志与本次上传请求同链
     await request.app.state.arq_pool.enqueue_job(
-        "run_parse_job", str(parse_job.id), _queue_name=settings.arq_queue_name
+        "run_parse_job", str(parse_job.id), trace.get_trace_id(),
+        _queue_name=settings.arq_queue_name,
     )
 
     return DocumentOut(

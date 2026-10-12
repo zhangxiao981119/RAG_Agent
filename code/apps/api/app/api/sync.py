@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db, require_admin
 from app.config.settings import get_settings
+from app.infra import trace
 from app.models import KnowledgeBase, SyncSource
 from app.schemas.sync import SyncSourceCreate, SyncSourceOut, SyncSourceUpdate, SyncResult
 from app.services import audit
@@ -174,8 +175,10 @@ async def trigger_sync(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
 
     settings = get_settings()
+    # 透传 trace_id，让 worker 日志与本次触发请求同链
     await request.app.state.arq_pool.enqueue_job(
-        "run_sync_source", str(source_id), _queue_name=settings.arq_queue_name
+        "run_sync_source", str(source_id), trace.get_trace_id(),
+        _queue_name=settings.arq_queue_name,
     )
 
     await audit.record(
