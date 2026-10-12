@@ -385,6 +385,24 @@ curl -k https://<SITE_ADDRESS>/api/health
 
 > ⚠️ 若在 `.env` 中设置了 `TRUSTED_HOSTS`，必须把 `api:8000` 一并列入，否则 Prometheus 以容器名抓取时 Host 不匹配，会被 api 以 400 拒绝、导致抓取中断。
 
+### 10.5 日志与链路追踪
+
+- 全部日志为**单行 JSON**（`ts` / `level` / `logger` / `msg` + 结构化字段），每条自带 `trace_id`；日志级别由 `.env` 的 `LOG_LEVEL` 控制（默认 INFO，排障时临时调 DEBUG）。
+- 每次请求由入口中间件生成或透传 `X-Trace-Id` 并回写同名响应头；问答的 SSE `meta` 事件、落库的 `message.meta.trace_id` 均为同一个 trace_id，前端回答下方「追踪 ID」按钮可一键复制。
+- 异步解析 / 同步任务入队时透传 trace_id，worker 日志与触发它的那次请求同链（cron 触发则每轮生成新 trace）。
+- 审计记录 `audit_logs.trace_id` 与日志同值，可按 trace 把「请求日志 + worker 日志 + 审计记录」串成一条链。
+
+```bash
+# <TRACE> = 前端「追踪 ID」复制到的值
+docker compose -p kagent -f docker-compose.prod.yml logs api    | grep <TRACE>
+docker compose -p kagent -f docker-compose.prod.yml logs worker | grep <TRACE>
+
+# 审计反查：这条 trace 产生的全部审计记录
+docker compose -p kagent -f docker-compose.prod.yml exec postgres \
+  psql -U kagent -d kagent -c \
+  "select action, object_id, trace_id, created_at from audit_logs where trace_id = '<TRACE>' order by created_at;"
+```
+
 ---
 
 ## 附：交付物清单
