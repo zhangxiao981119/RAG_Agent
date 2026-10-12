@@ -63,6 +63,8 @@ type Message = {
   suggestions?: string[]
   /** 网络断开导致 SSE 中断：保留已流出的 fullText，提示用户重试 */
   networkError?: boolean
+  /** 本条问答的链路追踪 ID（meta 事件 / 历史 meta 带回），用于按 trace 定位后端日志 */
+  traceId?: string
 }
 
 type Props = { currentUser: User }
@@ -192,6 +194,16 @@ export function ChatPage({ currentUser }: Props) {
     }
   }
 
+  /** 复制追踪 ID：拿该 ID 到后端日志里 grep，即可定位本次问答全链路。 */
+  async function handleCopyTraceId(traceId: string) {
+    try {
+      await navigator.clipboard.writeText(traceId)
+      message.success('已复制追踪 ID')
+    } catch {
+      message.error('复制失败，请手动复制')
+    }
+  }
+
   /** 重试：用原问题重新提问。 */
   function handleRetry(msg: Message) {
     const q = findQuestionOf(msg.id)
@@ -243,6 +255,8 @@ export function ChatPage({ currentUser }: Props) {
           done: true,
           messageId: m.id,
           suggestions: refused ? [] : suggestions,
+          // 历史消息的 trace_id 落在 meta 里（后端 _persist_assistant 单点注入）
+          traceId: typeof meta.trace_id === 'string' ? meta.trace_id : undefined,
         }
       })
       setMessages(
@@ -305,6 +319,7 @@ export function ChatPage({ currentUser }: Props) {
       if (event.event === 'meta') {
         const cid = event.data.conversation_id
         const mid = event.data.message_id
+        const tid = event.data.trace_id
         // 敏感词拦截等分支会回 null id，不能用 null 覆盖已有会话
         if (cid) {
           // 仅首轮（id 从空变非空）时更新并刷新侧边栏，避免每轮重复刷新
@@ -314,9 +329,14 @@ export function ChatPage({ currentUser }: Props) {
             refreshConversations()
           }
         }
-        if (mid) {
+        if (mid || tid) {
           setMessages((prev) =>
-            prev.map((m) => (m.id === assistantMsg.id ? { ...m, messageId: mid } : m)),
+            prev.map((m) =>
+              m.id === assistantMsg.id
+                // 敏感词拦截等分支回 null id，用 ?? 保留已有值不覆盖
+                ? { ...m, messageId: mid ?? m.messageId, traceId: tid ?? m.traceId }
+                : m,
+            ),
           )
         }
       } else if (event.event === 'citations') {
@@ -554,6 +574,7 @@ export function ChatPage({ currentUser }: Props) {
               msg={m}
               onOpenCitation={(c) => setSidebarCitation(c)}
               onCopy={handleCopy}
+              onCopyTraceId={handleCopyTraceId}
               onRetry={handleRetry}
               onSuggestionClick={handleSuggestionClick}
               onFollowUp={handleFollowUp}
@@ -744,6 +765,7 @@ function MessageBubble({
   msg,
   onOpenCitation,
   onCopy,
+  onCopyTraceId,
   onRetry,
   onSuggestionClick,
   onFollowUp,
@@ -752,6 +774,7 @@ function MessageBubble({
   msg: Message
   onOpenCitation: (c: Citation) => void
   onCopy: (m: Message) => void
+  onCopyTraceId: (traceId: string) => void
   onRetry: (m: Message) => void
   onSuggestionClick: (text: string) => void
   onFollowUp: (m: Message) => void
@@ -817,6 +840,8 @@ function MessageBubble({
 
   // networkError 消息只显示断网提示行的重试按钮，隐藏正常操作栏（避免重复）
   const canOperate = !msg.loading && msg.done && !msg.refused && !msg.networkError && !!msg.messageId && !!msg.text
+  // 取为 const，便于在下方闭包中保留类型收窄
+  const traceId = msg.traceId
 
   return (
     <div style={{ marginBottom: 12 }}>
@@ -927,6 +952,18 @@ function MessageBubble({
               追问
             </Button>
           </Tooltip>
+          {traceId && (
+            <Tooltip title="复制本次问答的追踪 ID，按它可在后端日志中定位全链路">
+              <Button
+                type="text"
+                size="small"
+                icon={<CopyOutlined />}
+                onClick={() => onCopyTraceId(traceId)}
+              >
+                追踪 ID
+              </Button>
+            </Tooltip>
+          )}
           {msg.adopted ? (
             <Tooltip title="该问答对已收集为微调样本，微调时由管理员导出">
               <span>

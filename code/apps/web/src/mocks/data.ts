@@ -15,7 +15,7 @@ export type Citation = {
 }
 
 export type ChatEvent =
-  | { event: 'meta'; data: { conversation_id: string | null; message_id: string | null; stage: string } }
+  | { event: 'meta'; data: { conversation_id: string | null; message_id: string | null; stage: string; trace_id: string | null } }
   | { event: 'stage'; data: { stage: string; ms: number } }
   | { event: 'citations'; data: { citations: Citation[] } }
   | { event: 'delta'; data: { text: string } }
@@ -367,7 +367,7 @@ export type ConversationMessage = {
   role: 'user' | 'assistant'
   content: string
   citations: Citation[]
-  meta: { suggestions?: string[]; refused?: boolean }
+  meta: { suggestions?: string[]; refused?: boolean; trace_id?: string }
   created_at: string
 }
 
