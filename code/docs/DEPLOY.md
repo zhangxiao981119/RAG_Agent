@@ -72,15 +72,22 @@ docker compose -p kagent -f docker-compose.prod.yml up -d --build
 
 ### 3.3 观察启动过程
 
+启动顺序由编排保证：**postgres 健康 → migrate 一次性服务执行 `alembic upgrade head` → migrate 成功后 api/worker 才启动**。migrate 失败则下游服务不启动（fail-fast），避免用旧 schema 跑新代码。
+
 ```bash
 # 查看全部服务状态（首次启动 embedding/reranker 需要下载模型，约 10-30 分钟）
 docker compose -p kagent -f docker-compose.prod.yml ps
 
-# 跟踪 api 日志：会依次执行 alembic 迁移 → seed_prod 初始化 → uvicorn 启动
+# 观察迁移（一次性服务）：Exited (0) 表示迁移成功
+docker compose -p kagent -f docker-compose.prod.yml logs migrate
+
+# 跟踪 api 日志：seed_prod 初始化 → uvicorn 启动
 docker compose -p kagent -f docker-compose.prod.yml logs -f api
 ```
 
 `seed_prod` 会创建（均幂等）：默认租户 `default` → `admin` 角色 → 管理员账号 → 唯一公开知识库「公共知识库」。
+
+> 日常发布升级请用 `bash scripts/release.sh`（先备份再 `up -d --build`），不要单独 `restart api` —— 迁移只在编排启动时由 migrate 服务执行。
 
 ### 3.4 验证健康
 
@@ -119,6 +126,18 @@ curl -fsSk https://<站点地址>/api/health
 | `kagent_caddy_data` | Caddy 内置 CA 与站点证书 | 建议（丢失后 CA 重新生成，客户端需重新信任根证书） |
 
 ### 5.1 备份（逻辑备份，推荐）
+
+**推荐：一键备份脚本**（PostgreSQL + MinIO 一起打包到 `backups/<时间戳>/`）：
+
+```bash
+cd code
+bash scripts/backup.sh
+# 可用 BACKUP_DIR=/mnt/backup bash scripts/backup.sh 指定输出目录
+```
+
+`release.sh` 发布前会自动调用该脚本，因此每次发布都留有发布前备份。
+
+如需手工执行：
 
 ```bash
 cd code
@@ -166,20 +185,27 @@ COMPOSE="docker compose -p kagent -f docker-compose.prod.yml"
 
 $COMPOSE ps                      # 查看服务状态
 $COMPOSE logs -f api             # 跟踪 api 日志
-$COMPOSE restart api             # 重启单个服务
+$COMPOSE logs migrate            # 查看最近一次迁移结果（一次性服务）
+$COMPOSE restart api             # 重启单个服务（不触发迁移）
 $COMPOSE down                    # 停止全部服务（不删除数据卷）
-$COMPOSE up -d                   # 重新启动
+$COMPOSE up -d                   # 重新启动（按依赖顺序重跑 migrate → api/worker）
 $COMPOSE pull && $COMPOSE up -d  # 更新基础镜像后重启（应用镜像需重新 build）
 ```
 
-**升级应用代码**：
+**升级应用代码（发布流程）**：
 
 ```bash
-git pull   # 或替换交付包
-$COMPOSE up -d --build api worker web
+# 推荐：走发布脚本（先备份，再构建并启动；migrate 服务会自动执行迁移）
+bash scripts/release.sh
+
+# 等价手工流程：
+git pull                              # 或替换交付包
+bash scripts/backup.sh                # 迁移前先备份（第 5 节）
+$COMPOSE up -d --build                # migrate → api/worker → web/gateway 按顺序拉起
+$COMPOSE logs migrate                 # 确认迁移 Exited (0)
 ```
 
-启动时 `alembic upgrade head` 会自动执行数据库迁移；迁移前请先按第 5 节备份。
+> 迁移只在 `up` 时由 **migrate 一次性服务**执行，`restart api` 不会触发迁移。若需单独执行迁移/回退，见 9.2。
 
 ---
 
@@ -261,14 +287,17 @@ $COMPOSE stop api worker
 $COMPOSE exec -T postgres psql -U kagent -d kagent -c "SELECT version_num FROM alembic_version;"
 
 # 3. 回退一个版本（例如 0007 → 0006）
-$COMPOSE exec -T api alembic downgrade -1
+$COMPOSE run --rm migrate alembic downgrade -1
 
 # 4. 或回退到指定版本
-$COMPOSE exec -T api alembic downgrade 0006
+$COMPOSE run --rm migrate alembic downgrade 0006
 
 # 5. 回退完成后重启应用层
 $COMPOSE up -d api worker
 ```
+
+> 回滚复用编排中的 `migrate` 一次性服务（`run --rm migrate` 等价于临时启动一个迁移容器），
+> 与发布时执行迁移用的是同一镜像与同一 `DATABASE_URL`，避免手工 `exec api` 时依赖 api 容器状态。
 
 > 注意：`downgrade` 会执行迁移文件中的 `downgrade()` 函数，对应 0007 会 `DROP TABLE` 三张表（tenant_quotas / sensitive_words / feature_flags）。如该表已有线上数据且可能复用，请先 `pg_dump` 备份对应表。
 
@@ -280,17 +309,25 @@ $COMPOSE up -d api worker
 cd code
 COMPOSE="docker compose -p kagent -f docker-compose.prod.yml"
 
-# 1. 切换交付包到上一稳定版本（保留 .env 不变）
+# 1. 【仅当本次发布引入了新迁移】先用【当前（新）代码】的 migrate 服务把 schema 退回旧版本。
+#    必须在切换代码之前执行 —— 旧交付包不含新迁移文件，切回去后就无法再 downgrade。
+$COMPOSE stop api worker
+$COMPOSE run --rm migrate alembic downgrade <旧版本，如 0006>
+
+# 2. 切换交付包到上一稳定版本（保留 .env 不变）
 git checkout <上一稳定 tag 或 commit>   # 或解压旧交付包覆盖 code/
 
-# 2. 用旧代码重建并启动（迁移会自动 alembic upgrade head）
-$COMPOSE up -d --build api worker web
+# 3. 用旧代码重建并启动；migrate 服务执行 `alembic upgrade head`，此时 head 即旧版本
+$COMPOSE up -d --build
 
-# 3. 观察日志确认正常
+# 4. 观察日志确认迁移与启动正常
+$COMPOSE logs migrate
 $COMPOSE logs -f api
 ```
 
-如已执行过新版迁移且新版表结构有破坏性变更（如 0007 建表后又在 0008 改了列类型），需先按 9.2 执行 `alembic downgrade <旧版本>` 再启动旧镜像，否则旧代码会因 schema 不匹配报错。
+> - 若本次发布**未引入新迁移**（纯代码回滚），跳过第 1 步，直接切换代码后 `up -d --build` 即可；
+>   旧代码的 `alembic upgrade head` 在 schema 已是该版本时为空操作。
+> - 顺序不可颠倒：`downgrade` 依赖新代码里的迁移文件，先切旧包会导致无迁移可回退。
 
 ### 9.4 回滚决策树
 
@@ -318,7 +355,9 @@ code/
 ├── ops/
 │   └── Caddyfile               # TLS 入口配置（Caddy 自签 + 安全头 + 反代 web）
 ├── scripts/
-│   └── init-prod.sh            # 一键初始化脚本
+│   ├── init-prod.sh            # 一键初始化脚本（生成密钥/收集配置/构建启动）
+│   ├── backup.sh               # 备份脚本（PostgreSQL + MinIO → backups/<时间戳>/）
+│   └── release.sh              # 发布脚本（先备份再 up -d --build，migrate 自动执行迁移）
 ├── docs/
 │   └── DEPLOY.md               # 本文档
 └── apps/api/scripts/

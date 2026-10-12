@@ -57,7 +57,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 
 首次启动自动完成三件事：
 
-1. 执行数据库迁移（`0001 ~ 0009`）
+1. `migrate` 一次性服务执行数据库迁移（`0001 ~ 0009`），完成后 api/worker 才启动
 2. 初始化默认租户 + admin 角色 + admin 账号 + 公开知识库（幂等）
 3. 下载 bge-m3（约 2GB）与 bge-reranker-v2-m3（约 1GB）到本地缓存
 
@@ -194,9 +194,10 @@ curl -fsSk https://<站点地址>/api/health     # 数据库 / Redis / 模型全
 ### 升级
 
 ```bash
-git pull                                    # 或替换交付包
-docker compose -p kagent -f docker-compose.prod.yml up -d --build api worker web
-# 启动时自动执行 alembic upgrade head；迁移前请先备份
+bash scripts/release.sh                     # 推荐：先备份，再构建并启动
+# 等价手工流程：git pull && bash scripts/backup.sh &&
+#   docker compose -p kagent -f docker-compose.prod.yml up -d --build
+# 迁移由 migrate 一次性服务在启动前自动执行（alembic upgrade head）；迁移前请先备份
 ```
 
 ### 回滚（按影响由小到大，优先选小的）
@@ -204,8 +205,10 @@ docker compose -p kagent -f docker-compose.prod.yml up -d --build api worker web
 | 方式 | 操作 | 影响 |
 |------|------|------|
 | **功能回滚**（零停服） | 管理后台 → 灰度开关 → 关闭对应规则 | 秒级生效，最多 60s 缓存过期 |
-| **迁移回滚** | `alembic downgrade -1` | 需停 api + worker |
-| **镜像回滚** | 切回上一稳定版本 → 重新 `--build` | 整版本退回 |
+| **迁移回滚** | `docker compose -p kagent -f docker-compose.prod.yml run --rm migrate alembic downgrade -1` | 需停 api + worker |
+| **镜像回滚** | 先用当前代码 `run --rm migrate alembic downgrade <旧版本>`，再切回上一稳定版本重新 `--build` | 整版本退回 |
+
+详细步骤见 [docs/DEPLOY.md](docs/DEPLOY.md) 第 9 节。
 
 ```
 故障现象

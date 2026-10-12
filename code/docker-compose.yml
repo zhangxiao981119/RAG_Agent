@@ -94,6 +94,19 @@ services:
       retries: 60
       start_period: 10m
 
+  # 数据库迁移（一次性）：先于 api/worker 完成，失败则下游不启动（fail-fast）
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: alembic upgrade head
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-pass}@postgres:5432/${POSTGRES_DB:-kagent}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build:
       context: .
@@ -127,6 +140,8 @@ services:
     volumes:
       - ./sync_data:/data/sync
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       minio:
@@ -171,6 +186,8 @@ services:
     volumes:
       - ./sync_data:/data/sync
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:

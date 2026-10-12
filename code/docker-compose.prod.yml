@@ -118,15 +118,28 @@ services:
       retries: 60
       start_period: 10m
 
+  # 数据库迁移（一次性）：先于 api/worker 完成，失败则下游不启动（fail-fast）
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: alembic upgrade head
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+
   api:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
     restart: unless-stopped
-    # 生产启动：迁移 + 生产种子（仅租户/管理员/公开库）+ API；不跑开发种子与评估用例
+    # 生产启动：生产种子（仅租户/管理员/公开库）+ API；迁移由 migrate 服务先完成
     command: >
-      sh -c "alembic upgrade head &&
-             python -m scripts.seed_prod &&
+      sh -c "python -m scripts.seed_prod &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2"
     environment:
       APP_ENV: prod
@@ -152,6 +165,8 @@ services:
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
       MULTI_TENANT: ${MULTI_TENANT:-false}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -196,6 +211,8 @@ services:
     volumes:
       - ./sync_data:/data/sync
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
