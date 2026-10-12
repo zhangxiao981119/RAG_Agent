@@ -55,7 +55,7 @@ cp .env.prod.example .env
 
 | 变量 | 说明 |
 |------|------|
-| `SECRET_KEY` / `JWT_SECRET` | 各执行一次 `openssl rand -hex 32` 生成（Windows 可用 Git Bash） |
+| `JWT_SECRET` | `openssl rand -hex 32` 生成（Windows 可用 Git Bash） |
 | `ADMIN_PASSWORD` | admin 初始密码，至少 10 位含大小写与数字 |
 | `POSTGRES_PASSWORD` / `REDIS_PASSWORD` / `MINIO_ROOT_PASSWORD` | 基础设施强密码 |
 | `LLM_API_KEY` | DeepSeek（或其他 OpenAI 兼容服务）的 API Key |

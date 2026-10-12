@@ -1,6 +1,9 @@
+# 基础镜像一律锁 digest（可复现构建）：tag 可能被重推指向新镜像，digest 不会。
+# digest 与 registry 绑定 —— 换镜像站/私有仓库时需重新解析后替换：
+#   docker image inspect --format '{{.RepoDigests}}' <ref>
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-kagent}
       POSTGRES_USER: ${POSTGRES_USER:-user}
@@ -14,7 +17,7 @@ services:
       retries: 20
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
@@ -25,7 +28,7 @@ services:
       retries: 20
 
   minio:
-    image: quay.io/minio/minio:latest
+    image: quay.io/minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
@@ -41,7 +44,8 @@ services:
   # M2 本地嵌入服务（OpenAI 兼容 /v1/embeddings）
   # 镜像可替换为其他 OpenAI 兼容服务；若用外部端点，注释掉本服务并改 EMBEDDING_BASE_URL
   embedding:
-    image: ${EMBEDDING_IMAGE:-michaelf34/infinity:latest}
+    # digest 取自 daocloud 镜像站的 cpu 变体；GPU 环境或私有仓库需用自有 registry 的 digest 覆盖
+    image: ${EMBEDDING_IMAGE:-docker.m.daocloud.io/michaelf34/infinity:latest-cpu@sha256:161ef2dd48ba050ad29a413d671270502acb4ad67759d695eb0d325c033a935d}
     # model-id 是 HF 仓库 ID，served-model-name 是 API 模型名，二者不可混用
     # 用 torch 而非 optimum：ONNX 图优化序列化阶段双份模型峰值会撑爆 8GB 内存
     # url-prefix=/v1 对齐 api 的 OpenAI 兼容调用路径
@@ -54,14 +58,19 @@ services:
       - hf_cache:/app/.cache/huggingface
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 120s
+      # ★ 模型服务冷启动实测约 9 分钟（CPU 机器 + 与另一模型服务同时加载，含 infinity 启动基准测试）；
+      #   首次部署还要从 HF_ENDPOINT 下载约 5GB 权重（init-prod.sh 按 30 分钟估）。
+      #   原窗口 start_period 2m + 30×10s = 7min 不够，会在启动过程中被判 unhealthy 并让 /api/health 误报依赖故障。
+      #   现为 start_period 10m + 60×30s ≈ 40min；探针频率从 10s 放宽到 30s ——
+      #   加载期容器已跑满 CPU，每 10s 起一个 python 解释器既抢 CPU 又容易误报。
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      start_period: 10m
 
   # M2 本地重排服务（OpenAI 兼容 /v1/rerank）
   reranker:
-    image: ${RERANKER_IMAGE:-michaelf34/infinity:latest}
+    image: ${RERANKER_IMAGE:-docker.m.daocloud.io/michaelf34/infinity:latest-cpu@sha256:161ef2dd48ba050ad29a413d671270502acb4ad67759d695eb0d325c033a935d}
     # bge-reranker-v2-m3 官方仓库无 ONNX 文件，optimum 引擎会报错，CPU 上用 torch
     # url-prefix=/v1 对齐 api 的 OpenAI 兼容调用路径
     command: v2 --model-id ${RERANKER_MODEL_ID:-BAAI/bge-reranker-v2-m3} --engine torch --url-prefix /v1 --port 8000 --served-model-name ${RERANKER_MODEL:-bge-reranker-v2-m3}
@@ -75,10 +84,15 @@ services:
     mem_limit: 4g
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 120s
+      # ★ 模型服务冷启动实测约 9 分钟（CPU 机器 + 与另一模型服务同时加载，含 infinity 启动基准测试）；
+      #   首次部署还要从 HF_ENDPOINT 下载约 5GB 权重（init-prod.sh 按 30 分钟估）。
+      #   原窗口 start_period 2m + 30×10s = 7min 不够，会在启动过程中被判 unhealthy 并让 /api/health 误报依赖故障。
+      #   现为 start_period 10m + 60×30s ≈ 40min；探针频率从 10s 放宽到 30s ——
+      #   加载期容器已跑满 CPU，每 10s 起一个 python 解释器既抢 CPU 又容易误报。
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      start_period: 10m
 
   api:
     build:
@@ -86,7 +100,6 @@ services:
       dockerfile: apps/api/Dockerfile
     environment:
       APP_ENV: ${APP_ENV:-dev}
-      SECRET_KEY: ${SECRET_KEY:-change-me}
       # ★ 必须显式注入：缺失时 auth._get_jwt_secret() 会按进程随机兜底，
       #   导致多副本/重启后 token 全部失效（静默故障，极难排查）
       JWT_SECRET: ${JWT_SECRET:-}

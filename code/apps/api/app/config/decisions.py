@@ -9,6 +9,7 @@ MUST NOT 在业务文件里写 `from .decisions import X` 那种把值拷进命�
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from enum import Enum
@@ -469,6 +470,36 @@ def self_check() -> None:
             "MEMORY_SOURCE_TRACE_REQUIRED MUST be True —— "
             "无 source_trace_id 则权限变更时无法按文档反查清除记忆。"
         )
+    # ── 提示词锁定区口径（方案 A：约束段代码锁定）──
+    # 拒答文案 MUST 落在 qa_system 的**锁定区**里 ——
+    # 若被移进可编辑区，管理员在线改一下就会"提示词说 A、代码认 B"，
+    # 拒答会被当成正常回答流出（见 services/generate 的 refused 判定）。
+    from app.config.prompts import NO_ANSWER_TEXT, PROMPT_SPECS
+
+    if "qa_system" not in PROMPT_SPECS:
+        raise RuntimeError("PROMPT_SPECS MUST 含 qa_system（问答主提示词）")
+    if NO_ANSWER_TEXT not in PROMPT_SPECS["qa_system"].locked:
+        raise RuntimeError(
+            "拒答文案 MUST 位于 qa_system 的锁定区（locked），"
+            "MUST NOT 放进可编辑区 —— 否则可被在线改掉"
+        )
+
+    # ── 索引口径（方案一：索引/模型版本）──
+    # 维度是 schema 契约：chunks.embedding 是 vector(1024)，改维度必须配套迁移表结构。
+    # 模型 / 文本公式为空则写入侧无法留痕、检索过滤会失配（见 config/index_profile.py）。
+    from app.config.index_profile import current_index_profile
+
+    _profile = current_index_profile()
+    if _profile.embedding_dim != 1024:
+        raise RuntimeError(
+            "embedding_dim MUST be 1024（chunks.embedding 是 vector(1024)）；"
+            f"改维度需先迁移表结构，当前 {_profile.embedding_dim}"
+        )
+    if not _profile.embedding_model.strip() or not _profile.embedding_text_version.strip():
+        raise RuntimeError(
+            "索引口径的 embedding_model / embedding_text_version MUST NOT 为空"
+        )
+
     # ── 注入防护口径（§4.21）──
     if not INJECTION_PATTERNS:
         raise RuntimeError(
@@ -491,6 +522,33 @@ def self_check() -> None:
             raise RuntimeError(
                 f"INJECTION_PATTERNS 正则非法: {_pattern_name} —— {exc}"
             ) from exc
+
+    # ── 运行时配置口径（方案三：配置版本）──
+    # 快照会写进启动日志与每条消息的 caliber，MUST 脱敏 ——
+    # 此处校验它确实不含任何密钥明文（防止日后有人往快照里加回密钥字段）。
+    from app.config.config_profile import (
+        FINGERPRINT_LEN,
+        config_fingerprint,
+        runtime_config_snapshot,
+    )
+    from app.config.settings import get_settings as _get_settings
+
+    _snapshot = runtime_config_snapshot()
+    _flat = json.dumps(_snapshot, ensure_ascii=False)
+    for _secret in (
+        _get_settings().llm_api_key,
+        _get_settings().jwt_secret,
+        _get_settings().s3_secret_key,
+    ):
+        if _secret and _secret in _flat:
+            raise RuntimeError(
+                "运行时配置快照含密钥明文 —— 快照会写入日志与消息 caliber，"
+                "MUST 脱敏（见 config/config_profile.py 的 _redact_url）"
+            )
+    if len(config_fingerprint(_snapshot)) != FINGERPRINT_LEN:
+        raise RuntimeError(
+            f"config_fingerprint MUST 为 {FINGERPRINT_LEN} 位十六进制"
+        )
 
 
 if __name__ == "__main__":

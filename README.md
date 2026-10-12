@@ -59,7 +59,8 @@
 | 密级脱敏 | 4 档密级（公开/内部/机密/绝密），回答中手机号/身份证/银行卡自动打码（引用原文不打码） | [services/mask.py](code/apps/api/app/services/mask.py) |
 | 限流与配额 | Redis 令牌桶（单用户 20 次/分钟）+ 用户/租户双层 token 配额 + 四级降级 | [services/quota.py](code/apps/api/app/services/quota.py) |
 | 文档预览 | 6 种格式统一转纯文本供前端预览（md/txt/docx/xlsx/xls/pdf），无文本层给明确提示 | [services/preview.py](code/apps/api/app/services/preview.py) |
-| 评估门禁 | eval 用例集自动跑检索 + 生成，判定"该答的答了 / 不该答的拒了"，输出准确率报告 | [services/eval_service.py](code/apps/api/app/services/eval_service.py) |
+| 评估门禁 | **63 条** eval 用例集（43 可答 + 20 不可答）自动跑检索 + 生成，判定"该答的答了 / 不该答的拒了"，实测可答 95.4% / 拒答 100% | [services/eval_service.py](code/apps/api/app/services/eval_service.py) |
+| 指标可观测 | admin 指标接口聚合 **TTFT（P50/P95/P99）** 与**三路召回 covered/unique 贡献**（量化「去掉任一路会漏多少」），前端面板展示待接入 | [api/audit.py](code/apps/api/app/api/audit.py) |
 | 微调样本闭环 | 用户采纳的问答自动落库，admin 分页查看 + 导出打标（增量取出），为后续微调备好数据资产 | [api/finetune.py](code/apps/api/app/api/finetune.py) |
 | 灰度开关 | 按部门 / 百分比放量，关闭即秒级回滚 | [services/feature_flag.py](code/apps/api/app/services/feature_flag.py) |
 
@@ -243,7 +244,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 | F17 | 数据同步 | 本地目录 + Git 源，定时增量 + 手动触发 |
 | F18 | 多轮对话 | 会话列表 + 消息历史 + 上下文压缩 |
 | F19 | 文档预览 | `GET /documents/{id}/raw`，6 种格式统一转纯文本；不支持格式返回 415 |
-| F20 | 评估门禁 | eval 用例集自动跑检索 + 生成，检查可答/拒答准确率，出报告 |
+| F20 | 评估门禁 | **63 条**用例集（43 可答 + 20 不可答）自动跑检索 + 生成，检查可答/拒答准确率出报告（实测可答 95.4% / 拒答 100%） |
 | F21 | 微调样本闭环 | 采纳问答落库 → admin 查看 → 导出打标（增量取出） |
 | F22 | 安全加固 | 提示注入检测（8 规则/4 类，命中降权）+ 令牌桶限流（20 次/分钟）+ 配额四级降级 + 敏感词双向拦截 + 按部门灰度开关 |
 | F23 | 前端体验 | 上传进度、批量删除、列表分页、SSE 断网提示与一键重试（保留已流出文本） |
@@ -332,9 +333,9 @@ code/
 
 - **数据库迁移可进可退**：9 版 Alembic 迁移，支持 downgrade
 - **三层回滚体系**：灰度开关秒级回滚（零停服）→ Alembic 迁移回滚 → 镜像回滚
-- **可观测性**：P50/P95/P99 延迟、拒答率监控面板 + 全链路审计 + 注入命中/记忆契约违反等细粒度计数器
+- **可观测性**：P50/P95/P99 延迟、拒答率监控面板 + 全链路审计 + 注入命中/记忆契约违反等细粒度计数器；指标接口另聚合 **TTFT（P50/P95/P99）**与**三路召回 covered/unique 贡献**（量化「去掉任一路会漏多少」），前端面板展示待接入
 - **资源复用**：Redis 与 arq 连接池**进程级共享**（请求级调用点拿到的 `aclose()` 是 no-op）—— 高并发下不会每请求新建/关闭连接
-- **质量门禁**：eval 用例集自动检查可答/拒答准确率；pytest **218 个用例（17 个测试文件）**覆盖 ACL 判定 / RRF 融合 / 阈值闸门 / 分块 / 记忆过滤 / 注入检测 / 解析 / CoT / Query 改写等核心链路；关键口径被改坏则启动自检拒绝启动（fail-closed）
+- **质量门禁**：**63 条** eval 用例集（43 可答 + 20 不可答）自动检查可答/拒答准确率；pytest **218 个用例（17 个测试文件）**覆盖 ACL 判定 / RRF 融合 / 阈值闸门 / 分块 / 记忆过滤 / 注入检测 / 解析 / CoT / Query 改写等核心链路；关键口径被改坏则启动自检拒绝启动（fail-closed）
 
 ### 上线前自检发现的真实缺陷（已修复）
 
@@ -344,6 +345,10 @@ code/
 |------|------|----------|
 | P1 | **越权**：部分详情类接口只做了登录校验，没复用检索链路的权限口径 | 统一 admin 鉴权口径，把权限校验收敛到数据访问层，而不是逐个接口打补丁 |
 | P1 | `trigger_sync` 用了未导入的 `Request` / `get_settings` —— 该端点一调用就 500（`from __future__ import annotations` 让注解不求值，所以 import 阶段与编译检查都不报错） | 补齐导入；由静态检查的 `undefined name` 抓出 |
+| P1 | **评估门禁恒失效**：门禁把检索主体硬编码为 `["role:admin"]`，漏掉 `public`，被检索 SQL 的 ACL 闸门 `acl_tags && user_subjects` 全量过滤 —— 公开库文档一条都召不回，30 条评估集**恒输出「可答 0% / 拒答 100%」且整轮只跑 3.7s**（根本走不到 LLM） | 改为复用真实问答同一份主体解析结果，门禁才第一次给出真实基线 |
+| P1 | **关键词召回静默崩溃**：`to_tsquery` 是标量函数，不给列别名时其输出列名就是函数名，SQL 写成 `FROM to_tsquery(...) q` 再引用 `q.query` 会直接报 `column does not exist`；异常被 `except` 吞掉，但事务已 abort，同一次检索里后续查询连锁失败，整条召回链路崩掉。触发条件是提问含英文/数字（`API` / `OKR` / `F09`），纯中文提问不触发，因此长期潜伏 | 用 psql 对照验证后改为 `AS q(query)`，并补单测钉住 |
+| P1 | **大文档必进死信**：`embedding_batch_size=32` 时单批真实 chunk（avg 517+ token，本地 CPU 约 217 token/s）需 75s+，撞 embedding 客户端 60s 超时 → `ReadTimeout` → 重试 3 次进死信；同时 `parse_job_timeout_seconds` **从未接线到 arq**（实际用 arq 自带默认 300s），配置形同虚设 | 批量降到 8（约 19s，余量充足）+ `WorkerSettings.job_timeout` 接线 1800s |
+| P1 | **NUL 字节致整批写库失败**：283 页 PDF 的文本层抽取出 `\x00`（第 282/283 页），PostgreSQL TEXT 拒收 0x00，报 `invalid byte sequence for encoding "UTF8"` —— 一条 chunk 就让整篇文档的 INSERT 整批失败 | 在解析唯一出口 `parse_bytes` 统一剥离 0x00（只清 0x00，其它 C0 字符合法保留，避免静默篡改内容） |
 | P2 | 前端鉴权链路可绕过（路由守卫、admin 面板入口） | 前端守卫 + 后端二次校验，前后端同口径 |
 | P2 | token rotation 竞态：并发刷新时旧 token 被误判有效 | 刷新链路加原子操作，消除竞态窗口 |
 | P2 | logout 死锁 | 拆掉锁内 await，改造清理时序 |
@@ -410,6 +415,9 @@ code/
 
 **Q: 配额/敏感词/灰度开关不起作用？**
 M6 安全加固功能默认关闭，到「灰度开关」面板手动创建规则启用（`quota` / `sensitive_filter` / `rerank`）。
+
+**Q: 上传几百页的大 PDF，解析很久或失败？**
+解析与嵌入都在本地 CPU 上跑，大文档按 8 条一批嵌入：283 页 PDF 约 450 个 chunk，需要 10 分钟量级；单任务超时上限 1800s（`PARSE_JOB_TIMEOUT_SECONDS`）。失败会自动重试 3 次，仍失败进死信队列，用 `docker compose logs worker` 看原因。
 
 **Q: 想改管理员密码？**
 `ADMIN_PASSWORD` 仅首次 seed 生效，后续在「用户管理」里重置。

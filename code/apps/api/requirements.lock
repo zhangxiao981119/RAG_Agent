@@ -1,0 +1,93 @@
+# Python 依赖锁文件 —— 生产镜像的唯一依赖真源（可复现构建）
+#
+# 为什么需要：pyproject.toml 里只有区间（>=x,<y），pip 每次构建都会解析到当时的最新版本，
+# 于是同一个 commit 在不同时间能构建出不同的镜像。本文件把**含全部传递依赖**的
+# 精确版本冻结下来，Dockerfile 只按本文件安装。
+#
+# 重新生成（改完 pyproject.toml 后执行，Windows PowerShell）：
+#   docker run --rm -v "${PWD}:/w" -w /w/apps/api python:3.12-slim `
+#     sh -c "pip install --no-cache-dir -q -i https://pypi.tuna.tsinghua.edu.cn/simple . && pip freeze" `
+#     | Select-String -NotMatch '^knowledge-agent-api' > requirements.lock
+#
+# 说明：
+#   · 不含项目自身（knowledge-agent-api）—— Dockerfile 用 pip install --no-deps . 单独安装
+#   · 不含 dev 可选依赖（pytest 等）—— 它们不参与生产镜像
+
+aioboto3==13.4.0
+aiobotocore==2.18.0
+aiofiles==25.1.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aioitertools==0.13.0
+aiosignal==1.4.0
+alembic==1.20.0
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+arq==0.28.0
+asyncpg==0.32.0
+attrs==26.1.0
+bcrypt==4.3.0
+boto3==1.36.1
+botocore==1.36.1
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.2
+click==8.5.0
+cryptography==50.0.2
+ecdsa==0.19.2
+et_xmlfile==2.0.0
+fastapi==0.143.0
+frozenlist==1.8.0
+greenlet==3.5.6
+h11==0.16.0
+hiredis==3.4.2
+httpcore==1.0.9
+httptools==0.9.0
+httpx==0.28.1
+idna==3.20
+jmespath==1.1.0
+lxml==6.1.3
+Mako==1.4.3
+MarkupSafe==3.0.4
+multidict==6.9.1
+openpyxl==3.1.5
+opentelemetry-api==1.45.1
+pdfminer.six==20260107
+pdfplumber==0.11.10
+pgvector==0.5.1
+pillow==12.3.0
+propcache==0.5.4
+pyasn1==0.6.4
+pycparser==3.11
+pydantic==2.14.1
+pydantic-settings==2.15.0
+pydantic_core==2.50.1
+PyJWT==2.15.1
+pypdf==5.9.0
+pypdfium2==5.14.0
+python-dateutil==2.9.0.post0
+python-docx==1.2.0
+python-dotenv==1.2.4
+python-jose==3.5.0
+python-multipart==0.0.32
+PyYAML==6.0.3
+redis==5.3.1
+regex==2026.9.29
+requests==2.34.2
+rsa==4.9.1
+s3transfer==0.11.3
+six==1.17.0
+SQLAlchemy==2.1.4
+starlette==1.7.0
+tiktoken==0.14.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.8.0
+uvicorn==0.54.0
+uvloop==0.23.0
+watchfiles==1.3.0
+websockets==17.2
+wrapt==1.17.3
+xlrd==2.0.2
+yarl==1.25.1

@@ -132,7 +132,7 @@ ngrok http 5173
 
 穿透时你的本地服务**直接暴露到公网**。务必做这三件事：
 
-1. 改 `.env` 里的 `SECRET_KEY`（`openssl rand -hex 32` 生成新值）
+1. 改 `.env` 里的 `JWT_SECRET`（`openssl rand -hex 32` 生成新值）
 2. 用一个**没余额**的 LLM API Key（防止盗刷）
 3. 演示完立刻 `Ctrl+C` 停掉穿透进程
 
@@ -160,7 +160,7 @@ cp .env.prod.example .env
 
 | 变量 | 怎么填 |
 |------|--------|
-| `SECRET_KEY` / `JWT_SECRET` | 各执行一次 `openssl rand -hex 32` |
+| `JWT_SECRET` | `openssl rand -hex 32` |
 | `ADMIN_PASSWORD` | admin 初始密码（≥10 位，含大小写与数字） |
 | `LLM_API_KEY` | OpenAI 兼容服务的 Key；同时确认 `LLM_MODEL` 是**现役**模型 ID |
 

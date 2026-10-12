@@ -19,7 +19,8 @@ class Settings(BaseSettings):
 
     app_env: str = "dev"
     # ── 密钥/密码：生产 MUST 通过环境变量覆盖，dev 可用空字符串（seed 自动生成） ──
-    secret_key: str | None = None  # RSA 私钥 PEM 路径或内容；None 时 seed_prod 自动生成
+    # 注：登录链路的应用层加密密钥对（RSA-OAEP）由 services/crypto.py 在 Redis 内部
+    #     自动生成与持有（key = auth:rsa_private_key），不经环境变量注入。
     tenant_code: str = "default"
     # ── M3 JWT 认证 ──────────────────────────────────────────
     jwt_secret: str | None = None  # JWT 签名密钥；生产 MUST 显式注入，dev 自动生成随机值
@@ -101,16 +102,8 @@ class Settings(BaseSettings):
         dev 环境 jwt_secret 允许 None（auth.py 运行时自动生成随机值）。
         prod 环境必须显式注入，否则立即阻止启动。
         """
-        if self.app_env == "prod":
-            missing = []
-            if not self.jwt_secret:
-                missing.append("JWT_SECRET")
-            if not self.secret_key:
-                missing.append("SECRET_KEY")
-            if missing:
-                raise ValueError(
-                    f"生产环境必须显式注入: {', '.join(missing)}（当前值为 None/空）"
-                )
+        if self.app_env == "prod" and not self.jwt_secret:
+            raise ValueError("生产环境必须显式注入: JWT_SECRET（当前值为 None/空）")
 
 
 @lru_cache

@@ -40,14 +40,12 @@ if [ ! -f .env ]; then
   echo "[1/4] 已从 .env.prod.example 创建 .env，开始生成密钥..."
 
   # 自动生成全部基础设施密钥（hex 字符，无 sed 转义问题）
-  SECRET_KEY=$(openssl rand -hex 32)
   JWT_SECRET=$(openssl rand -hex 32)
   DB_PASSWORD=$(openssl rand -hex 16)
   REDIS_PASSWORD=$(openssl rand -hex 16)
   MINIO_PASSWORD=$(openssl rand -hex 16)
 
-  sed -i "s|SECRET_KEY=please-change-me-to-64-hex-chars|SECRET_KEY=${SECRET_KEY}|" .env
-  sed -i "s|JWT_SECRET=please-change-me-to-64-hex-chars-too|JWT_SECRET=${JWT_SECRET}|" .env
+  sed -i "s|JWT_SECRET=please-change-me-to-64-hex-chars|JWT_SECRET=${JWT_SECRET}|" .env
   sed -i "s|POSTGRES_PASSWORD=please-change-this-db-password|POSTGRES_PASSWORD=${DB_PASSWORD}|" .env
   sed -i "s|REDIS_PASSWORD=please-change-this-redis-password|REDIS_PASSWORD=${REDIS_PASSWORD}|" .env
   sed -i "s|MINIO_ROOT_PASSWORD=please-change-this-minio-password|MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}|" .env

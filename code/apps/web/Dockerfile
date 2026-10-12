@@ -2,7 +2,9 @@ FROM node:22-alpine AS build
 WORKDIR /app
 COPY package*.json ./
 # 国内镜像源加速
-RUN npm config set registry https://registry.npmmirror.com && npm install
+# 用 npm ci 而非 npm install：严格按 package-lock.json 安装（可复现构建），
+# npm install 会按 ^ 区间解析到当时的最新版本，同一 commit 可构建出不同产物
+RUN npm config set registry https://registry.npmmirror.com && npm ci
 COPY . .
 RUN npm run build
 
