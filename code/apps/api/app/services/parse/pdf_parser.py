@@ -1,12 +1,17 @@
-"""PDF 解析 —— 文本层提取 + 表格结构识别（手册 §3.3.1 + §8 D-04）。
+"""PDF 解析 —— 文本层提取 + 表格结构识别 + 扫描件视觉改道（手册 §3.3.1 + M7 WU-M-10）。
 
-两条路径，按页独立决策：
+三条路径：
   · 表格页：pdfplumber 识别表格 → 表格块；同页文本用 pdfplumber 的词坐标
     **排除表格区域**后重建，避免同一份数据在blocks 里出现两次
   · 无表格页：pypdf 的 extract_text() + 行首模式匹配标题（pypdf 无 layout）
+  · 纯扫描件（全文文本层总长 < 10）：M7 起改道视觉链路 —— PyMuPDF 逐页渲染
+    PNG → 视觉转录 → 每页一个块并填 page_no（INV-M-05 可回链）；
+    受 settings.ocr_enabled 门控，关闭时维持原 ParseError（fail-closed）。
 
-★ 扫描件 PDF（全文提取文本总长接近 0）→ ParseError，提示不支持 OCR
-  （§1.4 Non-Goals）。**扫描件判定优先于表格识别** —— 扫描件里既没有文本层
+★ 文本层优先原则不变：只要全文文本层总量达标（>= 10），绝不进入视觉链路 ——
+  混合文档中个别无文本的页与改造前一样被跳过，行为逐字节一致。
+
+★ 扫描件判定优先于表格识别 —— 扫描件里既没有文本层
   也没有可识别的表格线，先判扫描件才不会把版面噪声误当表格。
 
 ★ 为什么要引 pdfplumber：pypdf 只吐字符流，表格会被拍平成
@@ -18,6 +23,7 @@
 """
 from __future__ import annotations
 
+import base64
 import io
 import re
 
@@ -200,29 +206,25 @@ def _extract_page_tables(
     return tables, outside
 
 
-def parse_pdf(data: bytes) -> list[ParsedBlock]:
+def _extract_page_texts(data: bytes) -> list[str]:
+    """逐页抽取文本层（pypdf）。返回每页文本列表，页序即 page_no。"""
     try:
         reader = PdfReader(io.BytesIO(data))  # type: ignore[call-arg]
     except Exception as exc:
         raise ParseError(f"PDF 打开失败: {exc}") from exc
 
-    # ── ① 先取全文文本判定扫描件（优先级最高，先于表格识别）──
     page_texts: list[str] = []
-    total_text = 0
     for page in reader.pages:
         try:
             page_text = page.extract_text() or ""
         except Exception:
             page_text = ""
         page_texts.append(page_text)
-        total_text += len(page_text)
+    return page_texts
 
-    if total_text < 10:
-        raise ParseError(
-            "PDF 文本层为空，疑似扫描件。本系统不支持 OCR（见手册 §8 D-04），"
-            "请提供文本层 PDF 或先用 OCR 工具转换。"
-        )
 
+def _text_layer_pipeline(page_texts: list[str], data: bytes) -> list[ParsedBlock]:
+    """文本层主管线：表格识别 + 标题切分（逻辑与 M7 前完全一致，逐字节未改）。"""
     tables_by_page, outside_by_page = _extract_page_tables(data)
 
     blocks: list[ParsedBlock] = []
@@ -265,3 +267,101 @@ def parse_pdf(data: bytes) -> list[ParsedBlock]:
         flush(page_index)
 
     return blocks
+
+
+def parse_pdf(data: bytes) -> list[ParsedBlock]:
+    """同步入口（纯文本层）。扫描件在此仍 ParseError —— 视觉链路是异步的，
+    同步签名承载不了；扫描件请走 parse_pdf_async（worker 统一入口）。"""
+    page_texts = _extract_page_texts(data)
+
+    # ── ① 先取全文文本判定扫描件（优先级最高，先于表格识别）──
+    if sum(len(t) for t in page_texts) < 10:
+        raise ParseError(
+            "PDF 文本层为空，疑似扫描件。本系统不支持 OCR（见手册 §8 D-04），"
+            "请提供文本层 PDF 或先用 OCR 工具转换。"
+        )
+
+    return _text_layer_pipeline(page_texts, data)
+
+
+# 扫描件页渲染 DPI：150 是可读性与体积的常规平衡点（72 太低字糊，300 体积翻倍）
+_SCAN_RENDER_DPI: int = 150
+
+
+async def _parse_scanned_pdf(data: bytes, page_count: int) -> list[ParsedBlock]:
+    """纯扫描件 → 逐页渲染 PNG → 视觉转录 → 每页一块（M7 WU-M-10 / INV-M-05）。
+
+    ★ 延迟导入 vision 与 settings：与 image_parser 同理，避免包初始化期环链。
+    ★ 异常不降级（INV-M-04）：任一页视觉失败 / 无可读内容 → ParseError（带页码），
+      整份进 job last_error；不静默跳页 —— 跳过等于把缺页知识当完整知识入库。
+    """
+    from app.config.settings import get_settings
+    from app.schemas.chat import ImageRef
+    from app.services.multimodal.vision import VisionError, extract_text_from_image
+
+    if not get_settings().ocr_enabled:
+        raise ParseError(
+            "PDF 文本层为空，疑似扫描件。本系统不支持 OCR（见手册 §8 D-04），"
+            "请提供文本层 PDF 或先用 OCR 工具转换。"
+        )
+
+    try:
+        import pymupdf
+    except ImportError as exc:  # pragma: no cover - 依赖必装（requirements.lock）
+        raise ParseError(f"扫描件渲染依赖 PyMuPDF 不可用: {exc}") from exc
+
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as exc:
+        raise ParseError(f"扫描件 PDF 打开失败: {exc}") from exc
+
+    blocks: list[ParsedBlock] = []
+    current_heading = ""
+    with doc:
+        for page_index in range(1, page_count + 1):
+            page = doc[page_index - 1]
+            png = page.get_pixmap(dpi=_SCAN_RENDER_DPI).tobytes("png")
+            image_ref = ImageRef(
+                data_url="data:image/png;base64," + base64.b64encode(png).decode("ascii")
+            )
+            try:
+                block = await extract_text_from_image(image_ref)
+            except VisionError as exc:
+                raise ParseError(f"扫描件第 {page_index} 页视觉抽取失败：{exc}") from exc
+
+            # 页内行级标题识别：与文本层管线同一套 _is_heading，保证
+            # heading_path 口径一致；非标题行按页聚合为一个块
+            content_lines: list[str] = []
+            for line in block.text.split("\n"):
+                if _is_heading(line):
+                    if content_lines:
+                        blocks.append(
+                            ParsedBlock(
+                                text="\n".join(content_lines).strip(),
+                                heading_path=current_heading,
+                                page_no=page_index,
+                            )
+                        )
+                        content_lines = []
+                    current_heading = line.strip()
+                else:
+                    content_lines.append(line)
+            if content_lines:
+                blocks.append(
+                    ParsedBlock(
+                        text="\n".join(content_lines).strip(),
+                        heading_path=current_heading,
+                        page_no=page_index,
+                    )
+                )
+    return blocks
+
+
+async def parse_pdf_async(data: bytes) -> list[ParsedBlock]:
+    """异步入口 —— 文本层优先，纯扫描件改道视觉链路（M7 WU-M-10）。"""
+    page_texts = _extract_page_texts(data)
+
+    if sum(len(t) for t in page_texts) >= 10:
+        return _text_layer_pipeline(page_texts, data)
+
+    return await _parse_scanned_pdf(data, page_count=len(page_texts))

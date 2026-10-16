@@ -40,7 +40,7 @@ class ParseError(Exception):
 # 具体解析器在数据类定义之后再导入：
 # 各 parser 反向 import ParsedBlock，放顶部会构成循环导入
 from app.services.parse.markdown_parser import parse_markdown  # noqa: E402
-from app.services.parse.pdf_parser import parse_pdf  # noqa: E402
+from app.services.parse.pdf_parser import parse_pdf, parse_pdf_async  # noqa: E402
 from app.services.parse.text_parser import parse_text  # noqa: E402
 from app.services.parse.xlsx_parser import parse_xlsx  # noqa: E402
 from app.services.parse.xls_parser import parse_xls  # noqa: E402
@@ -84,13 +84,16 @@ def parse_bytes(ext: str, data: bytes) -> list[ParsedBlock]:
 
 
 async def parse_bytes_async(ext: str, data: bytes) -> list[ParsedBlock]:
-    """异步分派入口 —— worker 的统一调用点（M7 WU-M-09）。
+    """异步分派入口 —— worker 的统一调用点（M7 WU-M-09 / WU-M-10）。
 
-    图片扩展名走视觉链路（异步 LLM 调用），其余走既有同步 parse_bytes；
-    NUL 清洗对两条路径同样收口（同一唯一出口的口径不变）。
-    ★ ocr_enabled=false 时图片在此处 ParseError（fail-closed，见 parse_image）。
+    图片扩展名走视觉链路（异步 LLM 调用）；pdf 走 parse_pdf_async
+    （文本层优先，纯扫描件改道视觉链路）；其余走既有同步 parse_bytes；
+    NUL 清洗对全部分支同样收口（同一唯一出口的口径不变）。
+    ★ ocr_enabled=false 时图片 / 扫描件在此处 ParseError（fail-closed）。
     """
     ext_l = ext.lower()
     if ext_l in IMAGE_EXTS:
         return _strip_nul(await parse_image(data, ext_l))
+    if ext_l == "pdf":
+        return _strip_nul(await parse_pdf_async(data))
     return parse_bytes(ext_l, data)

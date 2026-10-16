@@ -17,8 +17,8 @@ fitz = pytest.importorskip("pymupdf")
 
 from app.config import decisions  # noqa: E402
 from app.services.chunk import chunk_blocks  # noqa: E402
-from app.services.parse.base import ParseError  # noqa: E402
-from app.services.parse.pdf_parser import parse_pdf  # noqa: E402
+from app.services.parse.base import ParsedBlock, ParseError  # noqa: E402
+from app.services.parse.pdf_parser import parse_pdf, parse_pdf_async  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -273,4 +273,134 @@ class TestScanRejection:
         data = doc.tobytes()
         doc.close()
         with pytest.raises(ParseError):
+            parse_pdf(data)
+
+
+# ── WU-M-10：扫描件改道视觉链路 ─────────────────────────────────
+
+
+def _make_scanned_pdf(pages_text: list[str]) -> bytes:
+    """生成真·扫描件固件：文字先渲染成图片再嵌回 PDF —— 页面无文本层。
+
+    ★ 不能直接 insert_text：那会留下文本层，扫描判定（total_text < 10）不成立。
+      正确做法是渲染成 pixmap 后 insert_image，视觉上看得到字、文本层为空。
+    """
+    src = fitz.open()
+    out = fitz.open()
+    for text in pages_text:
+        page = src.new_page()
+        y = 60
+        for line in text.split("\n"):
+            page.insert_text((60, y), line, fontsize=12)
+            y += 24
+        pix = page.get_pixmap(dpi=150)
+        new_page = out.new_page(width=page.rect.width, height=page.rect.height)
+        new_page.insert_image(new_page.rect, pixmap=pix)
+    data = out.tobytes()
+    src.close()
+    out.close()
+    return data
+
+
+def _set_ocr(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+    """get_settings 是 lru_cache 单例，直接改实例属性，monkeypatch 负责还原。"""
+    from app.config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "ocr_enabled", enabled)
+
+
+def _patch_vision(
+    monkeypatch: pytest.MonkeyPatch,
+    returns: list[str],
+    exc_on: dict[int, Exception] | None = None,
+) -> list:
+    """打桩视觉抽取：按调用序返回各页文本；返回调用记录容器。
+
+    ★ 桩打在 vision 模块属性上 —— _parse_scanned_pdf 每次调用时才做
+      from-import，读到的是打桩后的属性（与 test_image_parser 同一模式）。
+    """
+    from app.services.multimodal import vision as vision_mod
+    calls: list = []
+
+    async def _fake(image_ref):
+        idx = len(calls)
+        calls.append(image_ref)
+        if exc_on and idx in exc_on:
+            raise exc_on[idx]
+        return ParsedBlock(text=returns[idx])
+
+    monkeypatch.setattr(vision_mod, "extract_text_from_image", _fake)
+    return calls
+
+
+class TestScannedPdfVisionPath:
+    """WU-M-10：纯扫描件改道视觉链路；文本层优先原则不变。"""
+
+    @pytest.mark.asyncio
+    async def test_scanned_pdf_goes_to_vision_and_fills_page_no(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """纯扫描件 + OCR 开 → 逐页视觉转录，每页块 MUST 带 page_no（INV-M-05）。"""
+        _set_ocr(monkeypatch, True)
+        calls = _patch_vision(monkeypatch, ["page one content", "page two content"])
+        data = _make_scanned_pdf(["page one content", "page two content"])
+
+        blocks = await parse_pdf_async(data)
+
+        assert len(calls) == 2, "每页 MUST 各发起一次视觉调用"
+        assert [b.page_no for b in blocks] == [1, 2]
+        assert blocks[0].text == "page one content"
+        assert blocks[1].text == "page two content"
+        assert all(calls[i].data_url.startswith("data:image/png;base64,") for i in range(2))
+
+    @pytest.mark.asyncio
+    async def test_scanned_pdf_rejected_when_ocr_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """OCR 关 → 维持原 ParseError（fail-closed，M7 D6）。"""
+        _set_ocr(monkeypatch, False)
+        data = _make_scanned_pdf(["any content"])
+        with pytest.raises(ParseError, match="疑似扫描件"):
+            await parse_pdf_async(data)
+
+    @pytest.mark.asyncio
+    async def test_vision_failure_carries_page_no(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """某页视觉失败 → ParseError 且带页码（INV-M-04：不静默跳页）。"""
+        from app.services.multimodal import VisionNoContentError
+
+        _set_ocr(monkeypatch, True)
+        _patch_vision(
+            monkeypatch,
+            ["page one content", ""],
+            exc_on={1: VisionNoContentError("图中未识别到可读内容")},
+        )
+        data = _make_scanned_pdf(["page one content", "page two content"])
+        with pytest.raises(ParseError, match="第 2 页"):
+            await parse_pdf_async(data)
+
+    @pytest.mark.asyncio
+    async def test_text_layer_pdf_never_calls_vision(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """文本层优先：即使 OCR 开，文本层 PDF MUST NOT 触达视觉链路。"""
+        _set_ocr(monkeypatch, True)
+
+        async def _forbidden(image_ref):  # pragma: no cover - 被调用即失败
+            raise AssertionError("文本层 PDF 不应进入视觉链路")
+
+        from app.services.multimodal import vision as vision_mod
+        monkeypatch.setattr(vision_mod, "extract_text_from_image", _forbidden)
+
+        blocks = await parse_pdf_async(_make_pdf(SMALL))
+        assert any(b.is_table for b in blocks), "文本层管线的表格识别结果不变"
+
+    @pytest.mark.asyncio
+    async def test_sync_entry_still_rejects_scanned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """同步入口 parse_pdf 无异步承载能力，扫描件在此仍 ParseError（口径见 docstring）。"""
+        _set_ocr(monkeypatch, True)
+        data = _make_scanned_pdf(["any content"])
+        with pytest.raises(ParseError, match="疑似扫描件"):
             parse_pdf(data)
