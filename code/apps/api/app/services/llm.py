@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 
@@ -21,6 +22,15 @@ from app.config.settings import get_settings
 from app.infra import metrics
 
 logger = logging.getLogger(__name__)
+
+ChatMessage = dict[str, Any]
+"""OpenAI 兼容对话消息（M7 WU-M-05 放宽类型）。
+
+`content` 允许两种形态，均按 OpenAI 兼容规范原样透传：
+  · 纯文本：str
+  · 多模态：list[{"type": "text", "text": ...},
+                 {"type": "image_url", "image_url": {"url": ...}}]
+MUST NOT 引入厂商私有参数（项目定位为"任意 OpenAI 兼容接口"）。"""
 
 
 class LLMTimeout(Exception):
@@ -33,11 +43,12 @@ class LLMError(Exception):
 
 class LLMService:
     async def stream_chat(
-        self, messages: list[dict[str, str]], temperature: float
+        self, messages: list[ChatMessage], temperature: float
     ) -> AsyncIterator[str]:
         """流式生成。yield 每个 delta 文本片段。
 
         首 token 超时 → LLMTimeout；中途报错 → LLMError。
+        messages 支持纯文本与多模态 content 数组（WU-M-05），请求体原样透传。
         """
         settings = get_settings()
         if not settings.llm_base_url:
@@ -105,7 +116,7 @@ class LLMService:
             metrics.incr("rag.llm.error", kind="transport")
             raise LLMError(f"LLM 调用失败: {exc}") from exc
 
-    async def chat(self, messages: list[dict[str, str]], temperature: float) -> str:
+    async def chat(self, messages: list[ChatMessage], temperature: float) -> str:
         """非流式调用（用于 L3 grounding 等需要完整输出的场景）。"""
         result: list[str] = []
         async for delta in self.stream_chat(messages, temperature):
