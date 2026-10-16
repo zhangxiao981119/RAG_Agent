@@ -270,14 +270,17 @@ export async function fetchDocument(docId: string): Promise<Document | undefined
   }
 }
 
-/** 拉取文档原文（预览用）。调用方按 ext 决定读文本还是 blob。 */
-export async function fetchDocumentRaw(docId: string): Promise<Response> {
-  let resp = await fetch(`/api/documents/${docId}/raw`, withAuth())
+/** 拉取文档原文（预览用）。调用方按 ext 决定读文本还是 blob。
+ *  page 可选：PDF 逐页回链（后端渲染该页 PNG，M7 WU-M-19）。
+ */
+export async function fetchDocumentRaw(docId: string, page?: number): Promise<Response> {
+  const suffix = page != null ? `?page=${page}` : ''
+  let resp = await fetch(`/api/documents/${docId}/raw${suffix}`, withAuth())
   // 401 先 refresh + 重试一次
   if (resp.status === 401) {
     const newToken = await refreshAccessToken()
     if (newToken) {
-      resp = await fetch(`/api/documents/${docId}/raw`, {
+      resp = await fetch(`/api/documents/${docId}/raw${suffix}`, {
         headers: { Authorization: `Bearer ${newToken}` },
       })
     }
@@ -292,6 +295,35 @@ export async function fetchDocumentRaw(docId: string): Promise<Response> {
 
 export async function deleteDocument(docId: string): Promise<void> {
   await http<void>(`/api/documents/${docId}`, { method: 'DELETE' })
+}
+
+// ── 解析预览（M7 WU-M-20 / INV-M-17：原图 + 文本化结果同屏）────────
+
+/** 解析预览来源：raw_url 为相对路径（后端鉴权端点，前端直接 <img src> / 拼请求） */
+export interface ParsePreviewSource {
+  raw_url: string
+  page_count: number
+  page_raw_urls: string[]
+}
+
+/** 逐块文本化结果（chunks 表真实入库内容，供人工核对） */
+export interface ParsePreviewBlock {
+  index: number
+  page_no: number | null
+  is_table: boolean
+  text: string
+}
+
+export interface ParsePreview {
+  document_id: string
+  modality: 'image' | 'text'
+  source: ParsePreviewSource
+  blocks: ParsePreviewBlock[]
+}
+
+/** 拉取解析预览（原图/原文件 + 逐块文本化结果）。 */
+export async function fetchParsePreview(docId: string): Promise<ParsePreview> {
+  return http<ParsePreview>(`/api/documents/${docId}/parse-preview`)
 }
 
 /** 带上传进度的文件上传。fetch 标准不支持 upload progress，必须用 XMLHttpRequest。

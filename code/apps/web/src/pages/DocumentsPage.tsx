@@ -29,7 +29,9 @@ import {
   fetchDocuments,
   fetchDocumentRaw,
   fetchKbs,
+  fetchParsePreview,
   KnowledgeBase,
+  ParsePreview,
   uploadDocument,
 } from '../mocks/data'
 
@@ -321,27 +323,67 @@ export function DocumentsPage() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 文档原文预览 Modal
+// 文档预览 Modal
 //
-// 后端 raw 接口已把所有上传格式统一提取为纯文本（md/txt 原文；
-// docx/xlsx/xls/pdf 由后端提取），前端统一按文本展示。
+// 两种模式（M7 WU-M-20 / INV-M-17）：
+//   · 图片 / PDF → 解析预览：左侧原图（raw 接口 blob 流），右侧逐块文本化
+//     结果（chunks 表真实入库内容），同屏供人工核对
+//   · 其余文本系 → 现行纯文本预览（raw 接口统一提取文本）
 // Modal body 高度由全局 CSS 限制在可视区内并内部滚动。
 // ─────────────────────────────────────────────────────────────
+/** 视觉链路支持的图片扩展（与后端 IMAGE_EXTS 同源口径，前端小写比较） */
+const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']
+
 function PreviewModal({ doc, onClose }: { doc: Document | null; onClose: () => void }) {
   const { message } = App.useApp()
   const [loading, setLoading] = useState(false)
   const [textContent, setTextContent] = useState('')
+  // 解析预览态（图片 / PDF）：预览结构 + 原图页 blob URL 列表
+  const [preview, setPreview] = useState<ParsePreview | null>(null)
+  const [pageUrls, setPageUrls] = useState<string[]>([])
 
   useEffect(() => {
     if (!doc) return
+    const isVisual = doc.ext === 'pdf' || IMAGE_EXTS.includes(doc.ext.toLowerCase())
+    if (!isVisual) {
+      // 文本系：现行提取文本路径
+      setLoading(true)
+      setTextContent('')
+      fetchDocumentRaw(doc.id)
+        .then((r) => r.text())
+        .then(setTextContent)
+        .catch((e) => message.error(e instanceof Error ? e.message : String(e)))
+        .finally(() => setLoading(false))
+      return
+    }
+
+    // 图片 / PDF：解析预览同屏（左原图右文本）
+    // <img> 无法带 Authorization 头，原图经 fetch raw → blob → objectURL
+    const created: string[] = []
     setLoading(true)
-    setTextContent('')
-    fetchDocumentRaw(doc.id)
-      .then((r) => r.text())
-      .then(setTextContent)
+    setPreview(null)
+    setPageUrls([])
+    fetchParsePreview(doc.id)
+      .then(async (pv) => {
+        setPreview(pv)
+        const urls: string[] = []
+        // page_raw_urls 顺序即页码 1..N，逐页 fetch raw（带 401 刷新）
+        for (let i = 0; i < pv.source.page_raw_urls.length; i++) {
+          const resp = await fetchDocumentRaw(doc.id, i + 1)
+          urls.push(URL.createObjectURL(await resp.blob()))
+        }
+        created.push(...urls)
+        setPageUrls(urls)
+      })
       .catch((e) => message.error(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false))
+
+    return () => {
+      for (const url of created) URL.revokeObjectURL(url)
+    }
   }, [doc, message])
+
+  const isVisual = doc != null && (doc.ext === 'pdf' || IMAGE_EXTS.includes(doc.ext.toLowerCase()))
 
   return (
     <Modal
@@ -349,30 +391,76 @@ function PreviewModal({ doc, onClose }: { doc: Document | null; onClose: () => v
       open={doc != null}
       onCancel={onClose}
       footer={null}
-      width={860}
+      width={960}
     >
       <Spin spinning={loading}>
-        {textContent ? (
-          doc?.ext === 'md' ? (
-            <div className="md-body" style={{ fontSize: 13 }}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{textContent}</ReactMarkdown>
+        {isVisual && preview ? (
+          // 解析预览：左原图 / 右文本化结果并排（INV-M-17）
+          <div style={{ display: 'flex', gap: 16, maxHeight: '62vh' }}>
+            <div style={{ flex: 1, overflow: 'auto', border: '1px solid #f0f0f0', borderRadius: 8, padding: 8 }}>
+              {pageUrls.map((url, i) => (
+                <div key={url} style={{ marginBottom: 8 }}>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    第 {i + 1} 页
+                  </Typography.Text>
+                  <img src={url} alt={`第 ${i + 1} 页`} style={{ width: '100%', display: 'block', borderRadius: 4 }} />
+                </div>
+              ))}
+              {pageUrls.length === 0 && !loading && <Empty description="原图不可用" />}
             </div>
-          ) : (
-            <pre
-              style={{
-                margin: 0,
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-word',
-                fontFamily: 'inherit',
-                fontSize: 13,
-                lineHeight: 1.7,
-              }}
-            >
-              {textContent}
-            </pre>
-          )
+            <div style={{ flex: 1, overflow: 'auto' }}>
+              {preview.blocks.length === 0 ? (
+                <Empty description="尚未解析出文本（解析中或解析失败）" />
+              ) : (
+                preview.blocks.map((b) => (
+                  <div key={b.index} style={{ marginBottom: 12 }}>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      块 {b.index}
+                      {b.page_no != null ? ` · 第 ${b.page_no} 页` : ''}
+                      {b.is_table ? ' · 表格' : ''}
+                    </Typography.Text>
+                    <pre
+                      style={{
+                        margin: '4px 0 0',
+                        padding: 8,
+                        background: '#fafafa',
+                        borderRadius: 6,
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                        fontSize: 12,
+                        lineHeight: 1.6,
+                      }}
+                    >
+                      {b.text}
+                    </pre>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
         ) : (
-          !loading && <Empty description="暂无内容" />
+          textContent ? (
+            doc?.ext === 'md' ? (
+              <div className="md-body" style={{ fontSize: 13 }}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{textContent}</ReactMarkdown>
+              </div>
+            ) : (
+              <pre
+                style={{
+                  margin: 0,
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  fontFamily: 'inherit',
+                  fontSize: 13,
+                  lineHeight: 1.7,
+                }}
+              >
+                {textContent}
+              </pre>
+            )
+          ) : (
+            !loading && <Empty description="暂无内容" />
+          )
         )}
       </Spin>
     </Modal>

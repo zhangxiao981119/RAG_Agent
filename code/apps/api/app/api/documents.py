@@ -12,7 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.models import Chunk, Document
-from app.schemas.documents import ChunkPreview, DocumentDetail
+from app.schemas.documents import (
+    ChunkPreview,
+    DocumentDetail,
+    ParsePreviewBlock,
+    ParsePreviewResponse,
+    ParsePreviewSource,
+)
 # 预览提取服务（所有上传格式统一转纯文本）
 from app.services import audit
 from app.services.parse.image_parser import IMAGE_EXTS
@@ -160,6 +166,69 @@ async def get_document_raw(
         content=text,
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": _content_disposition(doc.filename)},
+    )
+
+
+@router.get("/documents/{doc_id}/parse-preview")
+async def get_document_parse_preview(
+    doc_id: uuid.UUID,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> ParsePreviewResponse:
+    """解析预览：原图/原文件 + 文本化结果同屏（M7 WU-M-20 / INV-M-17）。
+
+    ★ blocks 从 chunks 表读 —— 人工核对的对象是**真实入库被检索的**
+      文本化结果，不是解析器的"此刻重放"（重放对图片/扫描件会再烧一次
+      视觉调用，且与库内结果可能因口径漂移不一致）。
+    ★ raw_url 一律相对路径（INV-M-16），多页扫描件逐页给 page_raw_urls。
+    """
+    doc = await _get_visible_document(doc_id, user, session)
+
+    rows = (
+        (await session.execute(
+            select(Chunk)
+            .where(
+                Chunk.document_id == doc.id,
+                Chunk.tenant_id == doc.tenant_id,
+            )
+            .order_by(Chunk.chunk_index)
+        ))
+        .scalars()
+        .all()
+    )
+
+    blocks = [
+        ParsePreviewBlock(
+            index=idx,
+            page_no=chunk.page_no,
+            # chunks 表未落 is_table（解析链路内存信号）；按扩展名推断仅作
+            # 预览样式提示 —— xlsx/xls 整文档皆为表格块，图片/扫描件的视觉
+            # 转录与 pdf/docx 混合文档的内嵌表格不标（注释即边界承诺）
+            is_table=doc.ext.lower() in ("xls", "xlsx"),
+            text=chunk.content,
+        )
+        for idx, chunk in enumerate(rows)
+    ]
+
+    raw_url = f"/api/documents/{doc.id}/raw"
+    if doc.ext.lower() == "pdf":
+        # 扫描件每页至少一块（页级转录失败会整份 ParseError），文本层 PDF
+        # 同理有页级 page_no —— max(page_no) 即有效页数
+        page_count = max((c.page_no or 1) for c in rows) if rows else 1
+        page_raw_urls = [f"{raw_url}?page={n}" for n in range(1, page_count + 1)]
+    else:
+        page_count = 1
+        page_raw_urls = [raw_url]
+
+    return ParsePreviewResponse(
+        document_id=doc.id,
+        modality="image" if doc.ext.lower() in IMAGE_EXTS else "text",
+        source=ParsePreviewSource(
+            raw_url=raw_url,
+            page_count=page_count,
+            page_raw_urls=page_raw_urls,
+        ),
+        blocks=blocks,
     )
 
 
