@@ -323,8 +323,14 @@ MAX_UPLOAD_MB: Final[int] = 100
 #   曾经这里有一份同名的 decisions.ALLOWED_EXT，但全项目**无人引用**、且值里漏了 docx
 #   —— 两个"真源"比一个都没有更危险：改了不生效，看着却像改了；照它读还会得出
 #   "不支持 docx"的错误结论。既然它是**部署可变项**而不是冻结口径，就不该放在本文件。
-OCR_ENABLED: Final[bool] = False
-"""扫描件 OCR 明确不做（§1.4 Non-Goals）。带 OCR 需求的文件 MUST 在解析层显式拒绝并提示用户。"""
+# ★ 这里**故意没有** OCR_ENABLED（M7 D6 口径变更）。
+#   原值是冻结常量 False（"扫描件 OCR 明确不做"）。M7 起改由**配置驱动**：
+#   真源是 `settings.ocr_enabled`（环境变量 OCR_ENABLED，默认 false）。
+#   默认 false 保持既有语义「仅支持文本层 PDF」；置 true 时扫描件 PDF / 图片
+#   改由多模态视觉链路抽取文本入库（见 services/multimodal/）。
+#   与 ALLOWED_EXT 同理：它是**部署可变项**而非冻结口径，真源统一在 settings，
+#   本模块不再持有一份会与 settings 打架的副本。
+# M7-OVERRIDE: 手册 §1.4 / §8 D-04
 
 
 # ── 合规与保留（§8 D-15）─────────────────────────────────
@@ -420,10 +426,13 @@ def self_check() -> None:
         raise RuntimeError("ACL_LEVEL_TAGS_ALLOWED MUST be False（§3.2.4）")
     if PUBLIC_KB_MAX_COUNT != 1:
         raise RuntimeError("PUBLIC_KB_MAX_COUNT MUST be 1")
-    if OCR_ENABLED:
-        raise RuntimeError(
-            "OCR_ENABLED MUST be False —— 扫描件 OCR 是明确不做项（§1.4 / §8 D-04）。"
-            "要打开它，先改手册并重估 M2 排期。"
+    # ── 扫描件 OCR（M7 D6：由冻结口径改为配置驱动）──
+    # 关闭是默认态，此处只做提示、**不再 fail-closed 阻断启动**。
+    from app.config.settings import get_settings as _get_settings
+    if not _get_settings().ocr_enabled:
+        logger.warning(
+            "OCR_ENABLED=false（默认）：扫描件 PDF 与图片不进入解析，仅支持文本层 PDF。"
+            "如需支持，将 OCR_ENABLED 置 true（M7 D6；手册 §1.4 已同步修订）。"
         )
     if MAX_UPLOAD_MB <= 0:
         raise RuntimeError("MAX_UPLOAD_MB MUST > 0")
@@ -531,10 +540,10 @@ def self_check() -> None:
         config_fingerprint,
         runtime_config_snapshot,
     )
-    from app.config.settings import get_settings as _get_settings
 
     _snapshot = runtime_config_snapshot()
     _flat = json.dumps(_snapshot, ensure_ascii=False)
+    # 注：_get_settings 已在函数前段（扫描件 OCR 分支）导入，此处复用
     for _secret in (
         _get_settings().llm_api_key,
         _get_settings().jwt_secret,
