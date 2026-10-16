@@ -82,6 +82,35 @@ class StorageService:
             else:
                 yield body.read()
 
+    async def open_object(self, key: str) -> tuple[AsyncIterator[bytes], str]:
+        """打开对象做真流式读取（M7 WU-M-19），返回 (字节流, Content-Type)。
+
+        ★ 与 get_object（一次性读全量，预览/解析用）不同：这里把
+          aioboto3 的 client 生命周期挂到生成器上 —— 字节块在消费时
+          才逐段拉取，/raw 转发大图片不会在 worker 内存里堆整份副本。
+        ★ Content-Type 取对象存储记录值（上传时写入的浏览器 MIME），
+          不在存储层做扩展名猜测 —— 显式信号单点（INV-M-01 同源口径）。
+        """
+        session = self._session()
+        client = await session.__aenter__()
+        try:
+            response = await client.get_object(Bucket=self._settings.s3_bucket, Key=key)
+        except BaseException:
+            await session.__aexit__(None, None, None)
+            raise
+
+        body = response["Body"]
+        content_type = response.get("ContentType") or "application/octet-stream"
+
+        async def _iter() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in body.iter_chunks():
+                    yield chunk
+            finally:
+                await session.__aexit__(None, None, None)
+
+        return _iter(), content_type
+
     async def delete_object(self, key: str) -> None:
         async with self._session().client("s3", **self._client_kwargs()) as client:
             await client.delete_object(Bucket=self._settings.s3_bucket, Key=key)

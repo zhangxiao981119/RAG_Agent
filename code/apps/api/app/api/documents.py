@@ -1,11 +1,12 @@
-"""文档详情 + 删除 API（手册 §5.1 M2）。"""
+"""文档详情 + 原文回链 + 删除 API（手册 §5.1 M2 + M7 WU-M-19）。"""
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +15,7 @@ from app.models import Chunk, Document
 from app.schemas.documents import ChunkPreview, DocumentDetail
 # 预览提取服务（所有上传格式统一转纯文本）
 from app.services import audit
+from app.services.parse.image_parser import IMAGE_EXTS
 from app.services.preview import PreviewError, extract_preview_text
 from app.services.storage import get_storage
 
@@ -78,14 +80,73 @@ async def get_document(
     )
 
 
+def _content_disposition(filename: str, disposition: str = "inline") -> str:
+    """RFC 6266：非 ASCII 文件名必须用 filename*=UTF-8''urlencoded 形式，
+    直接把中文塞 filename= 会导致 httpx/uvicorn latin-1 编码炸掉。"""
+    ascii_fallback = filename.encode("ascii", "replace").decode("ascii")
+    utf8_encoded = quote(filename)
+    return f"{disposition}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{utf8_encoded}"
+
+
 @router.get("/documents/{doc_id}/raw")
 async def get_document_raw(
     doc_id: uuid.UUID,
+    page: int | None = Query(default=None, ge=1),
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> Response:
-    """文档原文预览：所有上传格式统一提取为纯文本（md/txt 原文，docx/xlsx/xls/pdf 提取），提取失败 415。"""
+    """文档原文回链（M7 WU-M-19 / INV-M-16）。
+
+    按文档形态分流（显式信号 = doc.ext，INV-M-01 同源口径）：
+      · 图片扩展 → 流式转发对象原始字节，Content-Type 用对象存储记录值
+        （前端 <img>/引用回链直接消费相对路径）
+      · PDF 带 ?page=N → pymupdf 渲染该页为 PNG（扫描件逐页回链，INV-M-05）
+      · 其余（含不带 page 的 PDF）→ 维持提取纯文本（文档列表预览的现行行为）
+    ★ 响应只含对象字节 / 渲染结果，不出现 S3_ENDPOINT / 签名串 ——
+      MinIO 直连地址与 presigned URL 一律不出网（INV-M-16 红线）。
+    """
     doc = await _get_visible_document(doc_id, user, session)
+
+    # ── ① 图片：流式转发原始字节 ──────────────────────────────
+    if doc.ext.lower() in IMAGE_EXTS:
+        storage = await get_storage()
+        byte_stream, content_type = await storage.open_object(doc.storage_key)
+        return StreamingResponse(
+            byte_stream,
+            media_type=content_type,
+            headers={"Content-Disposition": _content_disposition(doc.filename)},
+        )
+
+    # ── ② PDF 指定页：渲染该页 PNG（扫描件/文本层 PDF 同样支持逐页回链）──
+    if doc.ext.lower() == "pdf" and page is not None:
+        storage = await get_storage()
+        data = await storage.get_object(doc.storage_key)
+        try:
+            import pymupdf
+
+            with pymupdf.open(stream=data, filetype="pdf") as pdf:
+                if page > pdf.page_count:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="PAGE_OUT_OF_RANGE",
+                    )
+                png = pdf[page - 1].get_pixmap(dpi=150).tobytes("png")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail=f"PDF 打开失败: {exc}",
+            ) from exc
+        return Response(
+            content=png,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": _content_disposition(doc.filename, "inline")
+            },
+        )
+
+    # ── ③ 文本系（及不带 page 的 PDF）：提取纯文本（列表预览现行行为）──
     storage = await get_storage()
     data = await storage.get_object(doc.storage_key)
     try:
@@ -95,15 +156,10 @@ async def get_document_raw(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail=str(exc),
         )
-    # RFC 6266：非 ASCII 文件名必须用 filename*=UTF-8''urlencoded 形式，
-    # 直接把中文塞 filename= 会导致 httpx/uvicorn latin-1 编码炸掉
-    ascii_fallback = doc.filename.encode("ascii", "replace").decode("ascii")
-    utf8_encoded = quote(doc.filename)
-    cd = f"inline; filename=\"{ascii_fallback}\"; filename*=UTF-8''{utf8_encoded}"
     return Response(
         content=text,
         media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": cd},
+        headers={"Content-Disposition": _content_disposition(doc.filename)},
     )
 
 
