@@ -9,6 +9,8 @@
   · .txt   → 按空行切段
   · .xlsx  → openpyxl，按 sheet 整表输出（chunk 服务整表不切）
   · .docx  → python-docx，按标题/段落/表格切分
+  · .png/.jpg/.jpeg/.gif/.webp/.bmp → 视觉链路文本化（异步，见 parse_bytes_async；
+    受 settings.ocr_enabled 门控，M7 WU-M-09）
 
 ★ PDF 标题识别：pypdf 不带 layout，这里用行首模式匹配
   （"第 X 章/X.Y 标题/数字. 序号"），识别不到则退化为"第 N 页"。
@@ -43,6 +45,7 @@ from app.services.parse.text_parser import parse_text  # noqa: E402
 from app.services.parse.xlsx_parser import parse_xlsx  # noqa: E402
 from app.services.parse.xls_parser import parse_xls  # noqa: E402
 from app.services.parse.docx_parser import parse_docx  # noqa: E402
+from app.services.parse.image_parser import IMAGE_EXTS, parse_image  # noqa: E402
 
 
 _DISPATCH = {
@@ -55,8 +58,16 @@ _DISPATCH = {
 }
 
 
+def _strip_nul(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
+    """NUL 字节清洗的共用实现（见 parse_bytes docstring 的口径说明）。"""
+    for block in blocks:
+        if "\x00" in block.text:
+            block.text = block.text.replace("\x00", "")
+    return blocks
+
+
 def parse_bytes(ext: str, data: bytes) -> list[ParsedBlock]:
-    """按扩展名分派。未知扩展名 / 扫描件 → ParseError。
+    """同步分派入口（纯文本系解析器）。未知扩展名 / 扫描件 → ParseError。
 
     ★ 出口统一清掉 NUL 字节（0x00）：PDF 文本层抽取会把字形噪声抽成 NUL
       （实测某 283 页 PDF 的第 282/283 页就有 `\\x001\\x002...` 这种序列），
@@ -64,13 +75,22 @@ def parse_bytes(ext: str, data: bytes) -> list[ParsedBlock]:
       一条 chunk 就能让整篇文档的 INSERT 整批失败。收口在这里而不是各 parser 内部，
       因为这是所有解析结果的唯一出口。
       ★ 只清 0x00：TEXT 接受其它 C0 控制字符（\\x01、\\x0b 等都能存），
-      多删就是对解析内容做静默篡改。
+        多删就是对解析内容做静默篡改。
     """
     handler = _DISPATCH.get(ext.lower())
     if handler is None:
         raise ParseError(f"不支持的文件类型: {ext}")
-    blocks = handler(data)
-    for block in blocks:
-        if "\x00" in block.text:
-            block.text = block.text.replace("\x00", "")
-    return blocks
+    return _strip_nul(handler(data))
+
+
+async def parse_bytes_async(ext: str, data: bytes) -> list[ParsedBlock]:
+    """异步分派入口 —— worker 的统一调用点（M7 WU-M-09）。
+
+    图片扩展名走视觉链路（异步 LLM 调用），其余走既有同步 parse_bytes；
+    NUL 清洗对两条路径同样收口（同一唯一出口的口径不变）。
+    ★ ocr_enabled=false 时图片在此处 ParseError（fail-closed，见 parse_image）。
+    """
+    ext_l = ext.lower()
+    if ext_l in IMAGE_EXTS:
+        return _strip_nul(await parse_image(data, ext_l))
+    return parse_bytes(ext_l, data)

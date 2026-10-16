@@ -27,7 +27,7 @@ from app.infra import trace
 from app.models import Chunk, Document, ParseJob
 from app.services.chunk import chunk_blocks, to_embedding_text
 from app.services.embedding import get_embedding_service
-from app.services.parse import ParseError, parse_bytes
+from app.services.parse import ParseError, parse_bytes_async
 from app.services.storage import get_storage
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,9 @@ async def run_parse_job(
         storage = await get_storage()
         data = await storage.get_object(doc_ext["storage_key"])
 
-        blocks = parse_bytes(doc_ext["ext"], data)
+        # ★ 统一走异步分派入口：图片扩展名转视觉链路（WU-M-09），
+        #   其余扩展名行为与原 parse_bytes 完全一致
+        blocks = await parse_bytes_async(doc_ext["ext"], data)
         if not blocks:
             raise ParseError("解析结果为空（无文本内容）")
 
