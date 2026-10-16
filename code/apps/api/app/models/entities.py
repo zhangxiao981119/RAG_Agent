@@ -236,6 +236,9 @@ class Chunk(Base):
     embedding_model: Mapped[str] = mapped_column(Text, nullable=False)
     embedding_text_version: Mapped[str] = mapped_column(Text, nullable=False)
     chunker_version: Mapped[str] = mapped_column(Text, nullable=False)
+    # M7 治理加权（迁移 0017）：在 rerank 之后叠加，MUST NOT 进入 RRF（INV-M-13）。
+    # 落列缓存避免检索期每次 join documents。
+    governance_weight: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -356,14 +359,18 @@ class AuditLog(Base):
 
 
 class SyncSource(Base):
-    """M6 任务 1：知识源同步 — 配置表（§8 D-07）。
+    """M6 任务 1：知识源同步 — 配置表（§8 D-07）；M7 WU-M-04 增补 web 源。
 
-    支持两种源类型：
+    支持三种源类型：
     - local：扫描宿主机挂载目录
     - git：定时 git pull 后扫描工作目录
+    - web：内部网址抓取（鉴权 → 发现页面 → 清洗 → 切片 → 增量）
 
     增量指纹存在 synced_files（JSONB），格式：
     { "relative/path.md": {"mtime": float, "size": int, "doc_id": "uuid"} }
+
+    web 源的凭据 MUST 经 app/services/crypto.py 加密后存 auth_payload（INV-M-07），
+    MUST NOT 明文落库 / 写日志。
     """
 
     __tablename__ = "sync_sources"
@@ -372,7 +379,7 @@ class SyncSource(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
     kb_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
-    source_type: Mapped[str] = mapped_column(Text, nullable=False)  # local | git
+    source_type: Mapped[str] = mapped_column(Text, nullable=False)  # local | git | web
     path: Mapped[str] = mapped_column(Text, nullable=False)  # 本地目录 或 Git URL
     branch: Mapped[str | None] = mapped_column(Text)  # Git 分支，仅 git 类型
     file_patterns: Mapped[str] = mapped_column(Text, nullable=False, server_default="*.md,*.pdf,*.txt,*.docx")
@@ -382,11 +389,16 @@ class SyncSource(Base):
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_sync_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     last_error: Mapped[str | None] = mapped_column(Text)
+    # ── M7 web 源字段（迁移 0017）──
+    auth_type: Mapped[str] = mapped_column(Text, nullable=False, server_default="none")  # none | basic | bearer | cookie
+    auth_payload: Mapped[str | None] = mapped_column(Text)  # crypto 加密后的凭据密文
+    entry_urls: Mapped[list[str]] = mapped_column(JSONB, nullable=False, server_default="[]")
+    scope_rules: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        CheckConstraint("source_type IN ('local','git')", name="ck_sync_sources_type"),
+        CheckConstraint("source_type IN ('local','git','web')", name="ck_sync_sources_type"),
         CheckConstraint("status IN ('active','paused')", name="ck_sync_sources_status"),
     )
 
