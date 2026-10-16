@@ -183,11 +183,33 @@ class Document(Base):
     uploaded_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # ── M7 知识治理（四维审查结论 + 治理元数据，迁移 0015）──
+    # 四维分数 NULL = 未审查；审查结论只写这些字段与 governance_report，
+    # MUST NOT 改写 filename/content 等原文（INV-M-11）。
+    freshness_score: Mapped[int | None] = mapped_column(Integer)
+    authority_score: Mapped[int | None] = mapped_column(Integer)
+    consistency_score: Mapped[int | None] = mapped_column(Integer)
+    completeness_score: Mapped[int | None] = mapped_column(Integer)
+    governance_status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    governance_report: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    source_kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="upload")
+    effective_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    content_hash: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         CheckConstraint("status IN ('pending','parsing','indexed','failed')", name="ck_documents_status"),
+        CheckConstraint(
+            "governance_status IN ('pending','running','done','failed')",
+            name="ck_documents_governance_status",
+        ),
+        CheckConstraint(
+            "source_kind IN ('upload','sync_local','sync_git','sync_web')",
+            name="ck_documents_source_kind",
+        ),
         Index("idx_doc_kb", "tenant_id", "kb_id", "is_latest"),
         Index("idx_doc_grp", "doc_group_id", text("version DESC")),
+        Index("idx_doc_governance", "tenant_id", "kb_id", "governance_status"),
     )
 
 
@@ -284,6 +306,31 @@ class ParseJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (CheckConstraint("status IN ('queued','running','succeeded','failed','dead')", name="ck_parse_jobs_status"),)
+
+
+class GovernanceJob(Base):
+    """M7 WU-M-03：四维审查异步任务（与 ParseJob 同构，迁移 0016）。
+
+    审查 MUST 独立于文档解析主路径（INV-M-10）；失败降级为"未审查"，
+    知识 MUST 仍可被检索（INV-M-12）。
+    """
+
+    __tablename__ = "governance_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="3")
+    last_error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('queued','running','succeeded','failed','dead')", name="ck_governance_jobs_status"),
+    )
 
 
 class AuditLog(Base):
