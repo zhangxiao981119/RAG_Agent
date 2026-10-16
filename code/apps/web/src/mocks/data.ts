@@ -15,7 +15,8 @@ export type Citation = {
 }
 
 export type ChatEvent =
-  | { event: 'meta'; data: { conversation_id: string | null; message_id: string | null; stage: string; trace_id: string | null } }
+  // M7 起 meta 增补 modality（text|image），与后端 SSE 契约一致
+  | { event: 'meta'; data: { conversation_id: string | null; message_id: string | null; stage: string; trace_id: string | null; modality?: 'text' | 'image' } }
   | { event: 'stage'; data: { stage: string; ms: number } }
   | { event: 'citations'; data: { citations: Citation[] } }
   | { event: 'delta'; data: { text: string } }
@@ -367,7 +368,8 @@ export type ConversationMessage = {
   role: 'user' | 'assistant'
   content: string
   citations: Citation[]
-  meta: { suggestions?: string[]; refused?: boolean; trace_id?: string }
+  // meta 增补 reason（拒答原因，如 IMAGE_NO_CONTENT / VISION_UNAVAILABLE）与 modality（M7 形态）
+  meta: { suggestions?: string[]; refused?: boolean; trace_id?: string; reason?: string; modality?: string }
   created_at: string
 }
 
@@ -396,8 +398,15 @@ export async function askChat(
   conversationId: string | null,
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
+  /** M7 带图提问：data URL 数组（ImageRef.data_url 契约）；缺省/空数组 = 纯文本形态 */
+  images?: string[],
 ): Promise<void> {
-  const body = JSON.stringify({ question, kb_ids: kbIds, conversation_id: conversationId })
+  const body = JSON.stringify({
+    question,
+    kb_ids: kbIds,
+    conversation_id: conversationId,
+    images: (images ?? []).map((data_url) => ({ data_url })),
+  })
   let response = await fetch('/api/chat/ask', withAuth({
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

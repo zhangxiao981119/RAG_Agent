@@ -18,10 +18,12 @@ import {
 } from 'antd'
 import {
   CheckOutlined,
+  CloseOutlined,
   CopyOutlined,
   DeleteOutlined,
   LikeOutlined,
   MessageOutlined,
+  PictureOutlined,
   PlusOutlined,
   RedoOutlined,
   SendOutlined,
@@ -45,12 +47,26 @@ import {
 
 const { Text } = Typography
 
+// ── M7 带图提问：与后端同口径的入参上限（chat.py MAX_IMAGES_PER_ASK / settings.max_upload_mb）──
+// 超限前端即拦（规范 §3.2：MUST NOT 静默截断），后端 400 只作为兜底
+const MAX_IMAGES_PER_ASK = 3
+const MAX_IMAGE_BYTES = 100 * 1024 * 1024
+
+/** 待发送的图片附件（FileReader 读出的 data URL，随请求按 ImageRef.data_url 提交）。 */
+type AttachedImage = {
+  id: string
+  dataUrl: string
+  name: string
+}
+
 type Message = {
   id: string
   role: 'user' | 'assistant'
   text: string
   citations?: Citation[]
   refused?: boolean
+  /** 拒答原因（后端 refused 事件的 reason），用于区分图片类拒答文案 */
+  refusedReason?: string
   refusedMessage?: string
   loading?: boolean
   /** 流式打字完成（终态落定后为 true，操作栏仅在完成后可用） */
@@ -65,6 +81,10 @@ type Message = {
   networkError?: boolean
   /** 本条问答的链路追踪 ID（meta 事件 / 历史 meta 带回），用于按 trace 定位后端日志 */
   traceId?: string
+  /** user 消息随附的图片（data URL，仅当前会话展示；历史不落图，INV-M-03） */
+  images?: string[]
+  /** assistant 消息形态（meta 事件带回），image 时回答区展示「图片提问」标 */
+  modality?: 'text' | 'image'
 }
 
 type Props = { currentUser: User }
@@ -90,6 +110,55 @@ export function ChatPage({ currentUser }: Props) {
   const [followUpContext, setFollowUpContext] = useState<{
     assistantText: string
   } | null>(null)
+
+  /** 待发送的图片附件（预览条数据源），发送成功后清空 */
+  const [pendingImages, setPendingImages] = useState<AttachedImage[]>([])
+  /** 拖拽文件悬停在输入区上方：高亮提示可松手 */
+  const [dragOver, setDragOver] = useState(false)
+  /** 隐藏 file input 的引用（上传按钮触发） */
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  /**
+   * 粘贴 / 上传 / 拖拽统一入口（M7）：
+   * 过滤非图片文件 → 数量 / 单图大小前端即拦（与后端同口径）→ FileReader 读 data URL 入预览条。
+   * 超限显式 warning 告知忽略数量，不静默截断。
+   */
+  function addImages(files: (File | null)[]) {
+    const imageFiles = files.filter((f): f is File => !!f && f.type.startsWith('image/'))
+    if (imageFiles.length === 0) return
+    const remain = MAX_IMAGES_PER_ASK - pendingImages.length
+    if (remain <= 0) {
+      message.warning(`单轮最多 ${MAX_IMAGES_PER_ASK} 张图片`)
+      return
+    }
+    const accepted: File[] = []
+    let oversize = 0
+    for (const f of imageFiles) {
+      if (accepted.length >= remain) break
+      // 后端按 base64 解码字节数卡大小，file.size 即解码后字节数，口径一致
+      if (f.size > MAX_IMAGE_BYTES) {
+        oversize += 1
+        continue
+      }
+      accepted.push(f)
+    }
+    if (oversize > 0) message.warning(`${oversize} 张图片超过 100MB 上限，已忽略`)
+    const overflow = imageFiles.length - accepted.length - oversize
+    if (overflow > 0) message.warning(`单轮最多 ${MAX_IMAGES_PER_ASK} 张，已忽略超出的 ${overflow} 张`)
+    for (const f of accepted) {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const dataUrl = reader.result as string
+        // FileReader 异步回调内再卡一次上限，防快速连续添加越过 3 张
+        setPendingImages((prev) =>
+          prev.length >= MAX_IMAGES_PER_ASK
+            ? prev
+            : [...prev, { id: crypto.randomUUID(), dataUrl, name: f.name || '粘贴的图片' }],
+        )
+      }
+      reader.readAsDataURL(f)
+    }
+  }
 
   // 会话列表（左侧侧边栏）
   const [conversations, setConversations] = useState<Conversation[]>([])
@@ -160,10 +229,10 @@ export function ChatPage({ currentUser }: Props) {
   }, [messages])
 
   /** 找某条 assistant 消息对应的提问（向前最近一条 user 消息）。 */
-  function findQuestionOf(assistantMsgId: string): string | null {
+  function findQuestionOf(assistantMsgId: string): Message | null {
     const idx = messages.findIndex((m) => m.id === assistantMsgId)
     for (let i = idx - 1; i >= 0; i--) {
-      if (messages[i].role === 'user') return messages[i].text
+      if (messages[i].role === 'user') return messages[i]
     }
     return null
   }
@@ -204,10 +273,10 @@ export function ChatPage({ currentUser }: Props) {
     }
   }
 
-  /** 重试：用原问题重新提问。 */
+  /** 重试：用原问题（含原图，M7）重新提问。 */
   function handleRetry(msg: Message) {
     const q = findQuestionOf(msg.id)
-    if (q) void askQuestion(q)
+    if (q && (q.text || (q.images && q.images.length > 0))) void askQuestion(q.text, q.images)
     else message.warning('未找到原始问题')
   }
 
@@ -226,6 +295,7 @@ export function ChatPage({ currentUser }: Props) {
       },
     ])
     setInput('')
+    setPendingImages([])
     setSidebarCitation(null)
     setContextWarning(null)  // 新开对话重置上下文告警
   }
@@ -240,6 +310,7 @@ export function ChatPage({ currentUser }: Props) {
       const msgs = await fetchConversationMessages(conv.id)
       setConversationId(conv.id)
       setSidebarCitation(null)
+      setPendingImages([])
       // 后端消息 → 前端 Message 结构
       const mapped: Message[] = msgs.map((m) => {
         const meta = m.meta || {}
@@ -251,12 +322,15 @@ export function ChatPage({ currentUser }: Props) {
           text: m.content,
           citations: Array.isArray(m.citations) ? m.citations : [],
           refused,
+          refusedReason: refused && typeof meta.reason === 'string' ? meta.reason : undefined,
           refusedMessage: refused ? '知识库中未找到相关内容' : undefined,
           done: true,
           messageId: m.id,
           suggestions: refused ? [] : suggestions,
           // 历史消息的 trace_id 落在 meta 里（后端 _persist_assistant 单点注入）
           traceId: typeof meta.trace_id === 'string' ? meta.trace_id : undefined,
+          // 历史形态（M7）：image 时回答区同样展示「图片提问」标
+          modality: meta.modality === 'image' ? 'image' : undefined,
         }
       })
       setMessages(
@@ -285,10 +359,16 @@ export function ChatPage({ currentUser }: Props) {
     }
   }
 
-  async function askQuestion(question: string) {
-    if (!question || streaming) return
+  async function askQuestion(question: string, images: string[] = []) {
+    if ((!question && images.length === 0) || streaming) return
 
-    const userMsg: Message = { id: `u_${Date.now()}`, role: 'user', text: question }
+    const userMsg: Message = {
+      id: `u_${Date.now()}`,
+      role: 'user',
+      text: question,
+      // 带图提问：缩略图随气泡展示（仅当前会话内存，不落库，INV-M-03）
+      images: images.length > 0 ? images : undefined,
+    }
     const assistantMsg: Message = { id: `a_${Date.now()}`, role: 'assistant', text: '', loading: true }
     setMessages((prev) => [...prev, userMsg, assistantMsg])
     setInput('')
@@ -302,8 +382,10 @@ export function ChatPage({ currentUser }: Props) {
     let fullText = ''
     let citations: Citation[] | undefined
     let refused = false
+    let refusedReason: string | undefined
     let refusedMessage: string | undefined
     let suggestions: string[] = []
+    let modality: 'text' | 'image' | undefined
 
     // delta 直接渲染（真流式透传，不再用打字机缓冲）
     const appendDelta = (chunk: string) => {
@@ -320,6 +402,8 @@ export function ChatPage({ currentUser }: Props) {
         const cid = event.data.conversation_id
         const mid = event.data.message_id
         const tid = event.data.trace_id
+        // M7：meta 增补 modality，image 时回答区展示「图片提问」标
+        modality = event.data.modality
         // 敏感词拦截等分支会回 null id，不能用 null 覆盖已有会话
         if (cid) {
           // 仅首轮（id 从空变非空）时更新并刷新侧边栏，避免每轮重复刷新
@@ -345,6 +429,7 @@ export function ChatPage({ currentUser }: Props) {
         appendDelta(event.data.text)
       } else if (event.event === 'refused') {
         refused = true
+        refusedReason = event.data.reason
         refusedMessage = event.data.message
       } else if (event.event === 'done') {
         suggestions = event.data.suggestions ?? []
@@ -360,7 +445,7 @@ export function ChatPage({ currentUser }: Props) {
     }
 
     try {
-      await mockAsk(question, selectedKbs, conversationIdRef.current, handler, controller.signal)
+      await mockAsk(question, selectedKbs, conversationIdRef.current, handler, controller.signal, images)
       // 正常结束（含 refused）：统一收尾
       setMessages((prev) =>
         prev.map((m) => {
@@ -371,10 +456,12 @@ export function ChatPage({ currentUser }: Props) {
                 loading: false,
                 done: true,
                 refused: true,
+                refusedReason,
                 refusedMessage: refusedMessage ?? '知识库中未找到相关内容',
                 text: '',
+                modality,
               }
-            : { ...m, loading: false, done: true, text: fullText || '(空)', citations, suggestions }
+            : { ...m, loading: false, done: true, text: fullText || '(空)', citations, suggestions, modality }
         }),
       )
     } catch (e) {
@@ -408,10 +495,14 @@ export function ChatPage({ currentUser }: Props) {
 
   async function handleAsk() {
     const q = input.trim()
-    if (!q) return
+    // M7：有图时可不发文字（后端允许空 question，转录文本会拼接进链路）
+    if (!q && pendingImages.length === 0) return
+    const images = pendingImages.map((p) => p.dataUrl)
     // 发送成功后清除追问上下文
     clearFollowUpContext()
-    await askQuestion(q)
+    // 图片随本次请求发出即清空预览条，不滞留到下一轮
+    setPendingImages([])
+    await askQuestion(q, images)
   }
 
   function handleStop() {
@@ -584,8 +675,32 @@ export function ChatPage({ currentUser }: Props) {
           <div ref={messagesEndRef} />
         </div>
 
-        {/* 输入区 */}
-        <div ref={inputAreaRef} style={{ borderTop: '1px solid #f0f0f0', padding: 12, flexShrink: 0 }}>
+        {/* 输入区（M7：支持拖拽图片到此区域） */}
+        <div
+          ref={inputAreaRef}
+          style={{
+            borderTop: '1px solid #f0f0f0',
+            padding: 12,
+            flexShrink: 0,
+            // 拖拽文件悬停时高亮提示可松手
+            outline: dragOver ? '2px dashed #1677ff' : 'none',
+            outlineOffset: -2,
+            background: dragOver ? '#e6f4ff' : undefined,
+          }}
+          onDragOver={(e) => {
+            if (e.dataTransfer.types.includes('Files')) {
+              e.preventDefault()
+              setDragOver(true)
+            }
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault()
+            setDragOver(false)
+            if (streaming) return
+            addImages(Array.from(e.dataTransfer.files ?? []))
+          }}
+        >
           {/* 追问上下文灰色展示行 */}
           {followUpContext && (
             <div
@@ -624,7 +739,69 @@ export function ChatPage({ currentUser }: Props) {
               </Button>
             </div>
           )}
+          {/* 待发送图片预览条（M7）：每张可单独移除 */}
+          {pendingImages.length > 0 && (
+            <div style={{ display: 'flex', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
+              {pendingImages.map((img) => (
+                <div key={img.id} style={{ position: 'relative', width: 48, height: 48 }}>
+                  <img
+                    src={img.dataUrl}
+                    alt={img.name}
+                    title={img.name}
+                    style={{
+                      width: 48,
+                      height: 48,
+                      objectFit: 'cover',
+                      borderRadius: 6,
+                      border: '1px solid #f0f0f0',
+                      display: 'block',
+                    }}
+                  />
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<CloseOutlined />}
+                    onClick={() => setPendingImages((prev) => prev.filter((p) => p.id !== img.id))}
+                    style={{
+                      position: 'absolute',
+                      top: -7,
+                      right: -7,
+                      width: 18,
+                      height: 18,
+                      minWidth: 18,
+                      padding: 0,
+                      borderRadius: '50%',
+                      background: 'rgba(0,0,0,0.55)',
+                      color: '#fff',
+                      fontSize: 10,
+                    }}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
           <Space.Compact style={{ width: '100%' }}>
+            {/* 隐藏 file input：由左侧图片按钮触发（上传入口之一） */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                addImages(Array.from(e.target.files ?? []))
+                // 清空 value 允许重复选择同一文件
+                e.target.value = ''
+              }}
+            />
+            <Tooltip title="添加图片（也可直接粘贴或拖拽到输入区，单轮最多 3 张）">
+              <Button
+                icon={<PictureOutlined />}
+                onClick={() => fileInputRef.current?.click()}
+                disabled={streaming}
+                style={{ height: 'auto' }}
+              />
+            </Tooltip>
             <Input.TextArea
               ref={inputRef}
               value={input}
@@ -637,7 +814,18 @@ export function ChatPage({ currentUser }: Props) {
                   void handleAsk()
                 }
               }}
-              placeholder="输入你的问题，Enter 发送，Shift+Enter 换行"
+              onPaste={(e) => {
+                // 粘贴图片：从 clipboardData.items 取文件，拦截默认行为避免文件名进文本框
+                const items = Array.from(e.clipboardData?.items ?? [])
+                const files = items
+                  .filter((it) => it.kind === 'file' && it.type.startsWith('image/'))
+                  .map((it) => it.getAsFile())
+                if (files.some(Boolean)) {
+                  e.preventDefault()
+                  addImages(files)
+                }
+              }}
+              placeholder="输入你的问题，Enter 发送，Shift+Enter 换行；支持粘贴 / 拖拽图片"
               autoSize={{ minRows: 1, maxRows: 4 }}
               disabled={streaming}
             />
@@ -650,7 +838,7 @@ export function ChatPage({ currentUser }: Props) {
                 type="primary"
                 icon={<SendOutlined />}
                 onClick={() => void handleAsk()}
-                disabled={!input.trim()}
+                disabled={!input.trim() && pendingImages.length === 0}
                 style={{ height: 'auto' }}
               >
                 提问
@@ -795,6 +983,26 @@ function MessageBubble({
             whiteSpace: 'pre-wrap',
           }}
         >
+          {/* 随问题提交的图片缩略图（M7，仅当前会话展示，历史不落图） */}
+          {msg.images && msg.images.length > 0 && (
+            <div
+              style={{
+                display: 'flex',
+                gap: 6,
+                flexWrap: 'wrap',
+                marginBottom: msg.text ? 6 : 0,
+              }}
+            >
+              {msg.images.map((src, i) => (
+                <img
+                  key={i}
+                  src={src}
+                  alt={`图片 ${i + 1}`}
+                  style={{ width: 72, height: 72, objectFit: 'cover', borderRadius: 6 }}
+                />
+              ))}
+            </div>
+          )}
           {msg.text}
         </div>
       </div>
@@ -802,14 +1010,21 @@ function MessageBubble({
   }
 
   if (msg.refused) {
+    // M7 图片类拒答：直接展示后端 message（文案与拒答原因一一对应），不套知识库拒答模板
+    const imageRefused =
+      msg.refusedReason === 'IMAGE_NO_CONTENT' || msg.refusedReason === 'VISION_UNAVAILABLE'
     return (
       <div style={{ display: 'flex', marginBottom: 12 }}>
         <Alert
           type="warning"
           showIcon
           style={{ maxWidth: '80%' }}
-          message="知识库中未找到相关内容"
-          description={msg.refusedMessage || '换个问题试试？或者检查知识库选择是否正确。'}
+          message={imageRefused ? msg.refusedMessage : '知识库中未找到相关内容'}
+          description={
+            imageRefused
+              ? undefined
+              : msg.refusedMessage || '换个问题试试？或者检查知识库选择是否正确。'
+          }
         />
       </div>
     )
@@ -845,6 +1060,14 @@ function MessageBubble({
 
   return (
     <div style={{ marginBottom: 12 }}>
+      {/* M7：带图提问的回答区展示形态标（DoD：回答区展示 modality） */}
+      {msg.modality === 'image' && (
+        <div style={{ marginBottom: 4, marginLeft: 4 }}>
+          <Tag icon={<PictureOutlined />} color="geekblue" style={{ marginInlineEnd: 0 }}>
+            图片提问
+          </Tag>
+        </div>
+      )}
       <div style={{ display: 'flex' }}>
         <div
           style={{
