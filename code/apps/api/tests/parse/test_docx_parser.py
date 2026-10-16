@@ -188,6 +188,72 @@ def test_table_without_heading_has_empty_path():
     assert tables[0].heading_path == ""
 
 
+def test_vertical_merge_fills_down():
+    """纵向合并：延续格 text 为空，MUST 沿用正上方值（fill-down）。
+
+    Word 里"部门"列跨 3 行合并 —— 不展开的话第 2/3 行整列空，
+    检索期"该行属于哪个部门"语义丢失。
+    """
+    from docx import Document
+
+    doc = Document()
+    table = doc.add_table(rows=3, cols=2)
+    merged = table.cell(0, 0).merge(table.cell(2, 0))  # 纵向合并 3 行
+    merged.text = "研发部"
+    table.cell(0, 1).text = "张三"
+    table.cell(1, 1).text = "李四"
+    table.cell(2, 1).text = "王五"
+    buf = BytesIO()
+    doc.save(buf)
+
+    tables = [b for b in parse_docx(buf.getvalue()) if b.is_table]
+    assert len(tables) == 1
+    lines = tables[0].text.split("\n")
+    assert lines[0] == "研发部\t张三"
+    assert lines[1] == "研发部\t李四", "延续行 MUST 填充合并值"
+    assert lines[2] == "研发部\t王五", "延续行 MUST 填充合并值"
+
+
+def test_horizontal_merge_naturally_expanded():
+    """横向合并：python-docx 返回同一 tc 的重复引用，text 天然展开（探针钉住行为）。"""
+    from docx import Document
+
+    doc = Document()
+    table = doc.add_table(rows=2, cols=3)
+    merged = table.cell(0, 0).merge(table.cell(0, 1))
+    merged.text = "费用"
+    table.cell(0, 2).text = "金额"
+    table.cell(1, 0).text = "a"
+    table.cell(1, 1).text = "b"
+    table.cell(1, 2).text = "c"
+    buf = BytesIO()
+    doc.save(buf)
+
+    tables = [b for b in parse_docx(buf.getvalue()) if b.is_table]
+    lines = tables[0].text.split("\n")
+    assert lines[0] == "费用\t费用\t金额", "合并区每格展开为同值"
+    assert tables[0].table_header == ["费用", "费用", "金额"]
+
+
+def test_cell_tab_and_newline_sanitized():
+    """单元格内的 \\t / \\n 会破坏 TSV 列结构，MUST 在序列化前消毒。"""
+    from docx import Document
+
+    doc = Document()
+    table = doc.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "名称"
+    table.cell(0, 1).text = "值"
+    table.cell(1, 0).text = "伪\t列"      # 制表符：会制造伪列
+    table.cell(1, 1).text = "多\n行"      # 换行：会把一行劈成两行
+    buf = BytesIO()
+    doc.save(buf)
+
+    tables = [b for b in parse_docx(buf.getvalue()) if b.is_table]
+    lines = tables[0].text.split("\n")
+    assert len(lines) == 2, "换行消毒后不产生额外行"
+    assert lines[1].split("\t") == ["伪 列", "多 行"], "每行恰好两列"
+
+
 # ── 非法输入 ──────────────────────────────────────────────────────
 
 

@@ -27,7 +27,7 @@ import base64
 import io
 import re
 
-from app.services.parse.base import ParsedBlock, ParseError
+from app.services.parse.base import ParsedBlock, ParseError, cell_to_text
 
 # 标题模式：行首匹配
 #   · "第 X 章" / "第 X 节"
@@ -70,14 +70,22 @@ def _is_heading(line: str) -> bool:
 
 
 def _row_to_tsv(row: list[object]) -> str:
-    return "\t".join("" if v is None else str(v) for v in row)
+    # 输入是 _normalize_table 已清洗的字符串矩阵；仍走 cell_to_text 保持单点口径
+    return "\t".join(cell_to_text(v) for v in row)
 
 
 def _normalize_table(raw: list[list[object]]) -> list[list[str]] | None:
-    """pdfplumber 原始单元格 → 规整字符串矩阵。None = 不可信，当普通文本处理。"""
+    """pdfplumber 原始单元格 → 规整字符串矩阵。None = 不可信，当普通文本处理。
+
+    ★ 合并单元格不展开（与 xlsx/xls/docx 不同）：PDF 是渲染产物，
+      pdfplumber 没有合并模型 —— 合并区的文本只落进左上格，被覆盖的
+      格子是 None，而 None 同时也是"真空格"的取值。任何填充都是在
+      区分不了的两种语义之间赌博（稀疏表会把空格填成错误数据），
+      宁可保守留空 —— 消除猜测，不做启发式。
+    """
     rows: list[list[str]] = []
     for raw_row in raw:
-        cells = ["" if c is None else str(c).replace("\n", " ").strip() for c in raw_row]
+        cells = [cell_to_text(c) for c in raw_row]
         if any(cells):  # 跳过全空行
             rows.append(cells)
     if len(rows) < _MIN_TABLE_ROWS:

@@ -37,6 +37,19 @@ class ParseError(Exception):
     """解析失败。worker 捕获后写 last_error 并重试。"""
 
 
+def cell_to_text(v: object) -> str:
+    """表格单元格 → 安全文本（各表格 parser 共用，口径单点）。
+
+    ★ MUST 在进 TSV 序列化前调用：单元格内的 \\t / \\n / \\r 会破坏
+      "一行一条记录、\\t 分列"的结构约定 —— 制表符静默制造伪列、
+      换行把一格内容劈成两行，下游"按行组切分带表头"会把错位行
+      当成数据行 embedding 入库（错误知识，检索期才暴露）。
+    """
+    if v is None:
+        return ""
+    return str(v).replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+
+
 # 具体解析器在数据类定义之后再导入：
 # 各 parser 反向 import ParsedBlock，放顶部会构成循环导入
 from app.services.parse.markdown_parser import parse_markdown  # noqa: E402

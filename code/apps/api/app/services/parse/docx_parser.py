@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from io import BytesIO
 
-from app.services.parse.base import ParsedBlock, ParseError
+from docx.oxml.ns import qn  # type: ignore[import-untyped]
+
+from app.services.parse.base import ParsedBlock, ParseError, cell_to_text
 
 try:
     from docx import Document  # type: ignore[import-untyped]
@@ -21,11 +23,42 @@ except ImportError:  # pragma: no cover
     raise
 
 
+def _vmerge_is_continue(cell) -> bool:
+    """判断单元格是否为纵向合并的延续格（w:vMerge 无 val 或 val="continue"）。
+
+    Word 纵向合并：起始格 val="restart"（或省略 val 但有内容），延续格的
+    text 恒为空 —— 直接序列化会整列丢语义（INV-M-05 之外的结构保真缺口）。
+    """
+    tcPr = cell._tc.tcPr
+    if tcPr is None:
+        return False
+    vm = tcPr.find(qn("w:vMerge"))
+    if vm is None:
+        return False
+    return vm.get(qn("w:val")) in (None, "continue")
+
+
 def _table_to_block(table, heading_path: str) -> ParsedBlock:
-    """将 python-docx Table 转为 ParsedBlock（整表）。"""
+    """将 python-docx Table 转为 ParsedBlock（整表）。
+
+    ★ 横向合并无需处理：python-docx 的 row.cells 对 gridSpan 合并
+      返回同一 tc 的重复引用，text 天然重复展开（探针实测 ['M','M']）。
+    ★ 纵向合并：延续格 text 为空，按列跟踪上一行已序列化文本做
+      fill-down（与 xlsx/xls 的左上值展开同一语义）。
+    """
     rows_data: list[list[str]] = []
     for row in table.rows:
-        rows_data.append([cell.text.strip() for cell in row.cells])
+        cells = [cell_to_text(c.text) for c in row.cells]
+        prev = rows_data[-1] if rows_data else None
+        for idx, text in enumerate(cells):
+            if (
+                prev is not None
+                and idx < len(prev)
+                and text == ""
+                and _vmerge_is_continue(row.cells[idx])
+            ):
+                cells[idx] = prev[idx]  # 纵向合并延续格：沿用正上方已序列化文本
+        rows_data.append(cells)
     if not rows_data:
         return ParsedBlock(text="", heading_path=heading_path, is_table=True)
 
