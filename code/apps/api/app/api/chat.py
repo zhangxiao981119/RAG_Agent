@@ -25,10 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.api.rate_limit import check_chat_rate_limit
 from app.config import decisions
+from app.config.settings import get_settings
 from app.database import SessionLocal
 from app.infra import trace
 from app.models import Conversation, KnowledgeBase, Message, User
-from app.schemas.chat import ChatAskRequest
+from app.schemas.chat import ChatAskRequest, ImageRef
 from app.services import audit
 from app.services import feature_flag as flag_service
 from app.services import quota as quota_service
@@ -43,11 +44,46 @@ from app.services.memory import (
     estimate_context_tokens,
     extract_facts,
 )
+from app.services.multimodal import (
+    VisionError,
+    VisionNoContentError,
+    extract_text_from_image,
+)
 from app.services.query_rewrite import rewrite_query
 from app.services.retrieve import get_retrieval_service
+from app.services.router.modality import Modality, detect
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
+
+# 单轮提问允许携带的图片上限（M7 规范 §3.2：超限直接 400，MUST NOT 静默截断）
+MAX_IMAGES_PER_ASK = 3
+
+
+def _validate_images(images: list[ImageRef]) -> None:
+    """带图提问的入参校验（数量 + 单图大小），超限抛 400。
+
+    ★ 放在端点层而非 pydantic：规范 §3.2 要求超限返 400，pydantic 校验失败是 422。
+    ★ storage_key 不重复卡大小：bucket 对象必经既有上传链路落库，
+      kbs.py 上传时已按同一 max_upload_mb 上限拦截过。
+    """
+    if len(images) > MAX_IMAGES_PER_ASK:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"TOO_MANY_IMAGES: 单轮最多 {MAX_IMAGES_PER_ASK} 张",
+        )
+    limit_bytes = get_settings().max_upload_mb * 1024 * 1024
+    for ref in images:
+        if not ref.data_url:
+            continue
+        # data URL 形如 data:<mime>;base64,<payload>，按 base64 解码后字节数估算
+        payload_part = ref.data_url.partition(",")[2]
+        estimated = len(payload_part) * 3 // 4
+        if estimated > limit_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"IMAGE_TOO_LARGE: 单图上限 {get_settings().max_upload_mb}MB",
+            )
 
 
 def _sse(event: str, data: dict) -> str:
@@ -62,6 +98,12 @@ async def chat_ask(
     session: AsyncSession = Depends(get_db),
     _: None = Depends(check_chat_rate_limit),
 ) -> StreamingResponse:
+    # ── M7 带图提问：形态判定 + 入参校验（StreamingResponse 之前，可 400）──
+    # 图片路径过全仓唯一形态判定点（记 rag.router.decision 指标，INV-M-01）；
+    # 纯文本是聊天缺省形态，直接用枚举，不调 detect（无显式信号会抛 UnknownModalityError）
+    modality = detect(has_images=True) if payload.images else Modality.TEXT
+    _validate_images(payload.images)
+
     # admin 豁免 G2 库级授权校验；普通用户求交集（手册 §3.2.7 G2）
     if user.clearance >= 40:
         effective_kb_ids = list(payload.kb_ids)
@@ -98,6 +140,7 @@ async def chat_ask(
                     "message_id": None,
                     "stage": "blocked",
                     "trace_id": trace.get_trace_id(),
+                    "modality": modality.value,
                 })
                 yield _sse("refused", {
                     "reason": "SENSITIVE_INPUT",
@@ -158,13 +201,83 @@ async def chat_ask(
         _t0 = _time.monotonic()
         try:
 
-            # meta 事件
+            # meta 事件（M7 起增补 modality，事件顺序不变：meta→stage→citations→delta...→done/refused）
             yield _sse("meta", {
                 "conversation_id": str(conversation_id),
                 "message_id": str(message_id),
                 "stage": "retrieving",
                 "trace_id": trace.get_trace_id(),
+                "modality": modality.value,
             })
+
+            # ── M7 带图提问：视觉抽取 → 与原 question 拼接后进既有链路 ─────
+            # ★ 不落库（INV-M-03）：转录文本只存在于本轮内存，不调 upload_document、
+            #   不建 Document / ParseJob；user 消息 content 仍是用户原始问题。
+            # ★ 异常直抛后映射 refused（INV-M-04）：MUST NOT 退回"只看文本凭先验作答"。
+            question_for_pipeline = payload.question
+            if modality is Modality.IMAGE:
+                try:
+                    # ≤3 张并行抽取（gather 保序，首个异常直抛）
+                    image_blocks = await asyncio.gather(
+                        *(extract_text_from_image(ref) for ref in payload.images)
+                    )
+                except VisionNoContentError:
+                    logger.info("chat.vision: 图中无可读内容，拒答")
+                    yield _sse("refused", {
+                        "reason": "IMAGE_NO_CONTENT",
+                        "message": "图片中未识别到可读内容",
+                    })
+                    await _persist_assistant(
+                        conversation_id, user, message_id,
+                        text="", refused=True, citations=[],
+                        meta={"refused": True, "reason": "IMAGE_NO_CONTENT",
+                              "modality": modality.value},
+                    )
+                    await audit.record(
+                        user.tenant_id, user.user_id, "chat.ask",
+                        object_type="conversation", object_id=str(conversation_id),
+                        detail={
+                            "question": payload.question,
+                            "kb_ids": [str(kb) for kb in effective_kb_ids],
+                            "doc_ids": [],
+                            "refused": True,
+                            "refuse_reason": "IMAGE_NO_CONTENT",
+                            "image_count": len(payload.images),
+                        },
+                    )
+                    return
+                except VisionError as exc:
+                    logger.warning("chat.vision: 视觉链路不可用: %s", exc)
+                    yield _sse("refused", {
+                        "reason": "VISION_UNAVAILABLE",
+                        "message": "图片理解服务暂时不可用，请稍后重试",
+                    })
+                    await _persist_assistant(
+                        conversation_id, user, message_id,
+                        text="", refused=True, citations=[],
+                        meta={"refused": True, "reason": "VISION_UNAVAILABLE",
+                              "modality": modality.value},
+                    )
+                    await audit.record(
+                        user.tenant_id, user.user_id, "chat.ask",
+                        object_type="conversation", object_id=str(conversation_id),
+                        detail={
+                            "question": payload.question,
+                            "kb_ids": [str(kb) for kb in effective_kb_ids],
+                            "doc_ids": [],
+                            "refused": True,
+                            "refuse_reason": "VISION_UNAVAILABLE",
+                            "image_count": len(payload.images),
+                        },
+                    )
+                    return
+                transcripts = "\n\n".join(
+                    f"[图片{i + 1}转录]\n{block.text}"
+                    for i, block in enumerate(image_blocks)
+                )
+                question_for_pipeline = f"{payload.question}\n\n{transcripts}"
+                logger.info("chat.vision: %d 张图转录完成，拼接后进既有链路",
+                            len(image_blocks))
 
             # ── Query 改写（检索前，用历史做指代消解）───────────
             # 提前读历史消息（用于改写指代消解 + 后续生成复用，避免读两次 DB）
@@ -187,8 +300,9 @@ async def chat_ask(
                     rewrite_history.append({"role": m.role, "content": m.content})
 
             # 评分 + 改写（一次 LLM 调用完成，score >= 90 直接跳过）
+            # 带图时用拼接后的问题（含转录文本），改写模型才能消解对图片内容的指代
             retrieve_query, rewrite_status, rewrite_score = await rewrite_query(
-                payload.question, rewrite_history, user.tenant_id,
+                question_for_pipeline, rewrite_history, user.tenant_id,
             )
             if rewrite_status == "rewritten":
                 logger.info("chat.rewrite: score=%d, '%s' → '%s'",
@@ -312,12 +426,12 @@ async def chat_ask(
             )
             est_before = estimate_context_tokens(
                 system_for_estimate, memory_prompt, history,
-                chunks_text_for_est, payload.question,
+                chunks_text_for_est, question_for_pipeline,
             )
             if est_before > limit_cap:
                 history, current_chunks = await ensure_context_within_limit(
                     system_for_estimate, memory_prompt, history,
-                    chunks_text_for_est, payload.question, current_chunks,
+                    chunks_text_for_est, question_for_pipeline, current_chunks,
                     user.tenant_id,
                 )
                 logger.warning("chat.context.compressed: est_before=%d → history=%d, chunks=%d (limit=%d)",
@@ -350,7 +464,7 @@ async def chat_ask(
             if quota_enabled:
                 plan = await quota_service.check_and_degrade(
                     user.tenant_id, user.user_id,
-                    payload.question, history, memory_prompt, effective_chunks,
+                    question_for_pipeline, history, memory_prompt, effective_chunks,
                 )
                 if plan.refused:
                     yield _sse("refused", {
@@ -419,6 +533,8 @@ async def chat_ask(
                     "kb_ids": [str(kb) for kb in effective_kb_ids],
                     "doc_ids": sorted({c["doc_id"] for c in citations_payload}),
                     "refused": False,
+                    # 带图提问留痕（图片本体与转录文本不落库，只记张数）
+                    "image_count": len(payload.images),
                     # 各阶段耗时快照：便于只看审计就能定位慢在哪一环
                     "stage_ms": result.stage_ms,
                     # 口径快照：本条答案由哪个 contract / 模型 / 提示词版本产出（方案二）
@@ -444,7 +560,7 @@ async def chat_ask(
                 yield _sse("stage", {"stage": "reasoning"})
 
             async for stream_evt in generation.stream_generate(
-                payload.question, effective_chunks,
+                question_for_pipeline, effective_chunks,
                 history=history,
                 memory_prompt=memory_prompt,
                 tenant_id=user.tenant_id,
