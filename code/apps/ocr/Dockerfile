@@ -2,8 +2,7 @@
 FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    HF_HOME=/app/.cache/huggingface \
-    PYTHONPATH=/app/GOT-OCR2.0
+    HF_HOME=/app/.cache/huggingface
 
 WORKDIR /app
 
@@ -22,6 +21,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 #   docker compose build ocr --build-arg HTTPS_PROXY=http://host.docker.internal:7897
 #   （Docker 内建代理 ARG 对 RUN 的 git clone 自动生效）
 RUN git clone --depth 1 https://github.com/Ucas-HaoranWei/GOT-OCR2.0.git /app/GOT-OCR2.0
+
+# ★ 官方仓库把推理代码放在 GOT-OCR-2.0-master 子目录（仓库根没有 GOT/ 包），
+#   PYTHONPATH 须指向该子目录才能 from GOT import ...；
+#   放在 clone 层之后，避免改 ENV 使 pip 安装层缓存全部失效
+ENV PYTHONPATH=/app/GOT-OCR2.0/GOT-OCR-2.0-master
 
 COPY apps/ocr/main.py ./
 

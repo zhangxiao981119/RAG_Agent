@@ -98,7 +98,9 @@ def load_model() -> None:
     if GOT_REPO_DIR not in sys.path:
         sys.path.insert(0, GOT_REPO_DIR)
     try:
-        from GOT import GOTQwenForCausalLM  # type: ignore[import-not-found]
+        # GOTQwenForCausalLM 定义在 GOT/model/GOT_ocr_2_0.py，经 model 包 __init__ 导出；
+        # GOT/__init__.py 为空，不能直接从 GOT 顶层导入
+        from GOT.model import GOTQwenForCausalLM  # type: ignore[import-not-found]
         from transformers import AutoTokenizer
 
         logger.info("开始加载 OCR 模型 %s（CPU 推理）", MODEL_ID)

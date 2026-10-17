@@ -7,6 +7,10 @@
 torch @ https://mirrors.aliyun.com/pytorch-wheels/cpu/torch-2.1.2%2Bcpu-cp310-cp310-linux_x86_64.whl#sha256=bf3ca897f8c7c218dd6c4b1cc5eec57b4f4e71106b0b8120e92f5fdaf4acf6cd
 # GOT-OCR2.0 官方锁定 transformers 4.37.0（自定义架构 API 兼容边界）
 transformers==4.37.0
+# torch 2.1.2 编译于 NumPy 1.x ABI，NumPy 2.x 会触发 _ARRAY_API 不兼容
+numpy<2
+# GOT 推理链（GOT/model 包 import 链）唯一额外依赖；headless 版无 GUI 依赖
+opencv-python-headless
 sentencepiece
 accelerate
 safetensors
