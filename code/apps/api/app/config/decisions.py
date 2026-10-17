@@ -556,6 +556,14 @@ def self_check() -> None:
                 "（INV-M-15：不得臆造 / 不得改写原文 / 仅依据给定内容）"
             )
 
+    # ── 冲突披露（M8-P3a）──
+    # qa_system 默认文案的披露要求钉住：误删会让多文档矛盾被静默择一或混写
+    if "冲突披露要求" not in PROMPT_SPECS["qa_system"].default_editable:
+        raise RuntimeError(
+            "qa_system 可编辑默认文案 MUST 含「冲突披露要求」"
+            "（M8-P3a：多文档矛盾时显式披露，MUST NOT 静默择一）"
+        )
+
     # ── 知识治理口径（M7 B7-4）──
     if abs(sum(GOVERNANCE_DIM_WEIGHTS.values()) - 1.0) > 1e-9:
         raise RuntimeError(
