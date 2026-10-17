@@ -46,9 +46,11 @@ _WHERE_BASE = """WHERE c.tenant_id = :tenant_id
 #   被判为不同构而**排除**——宁可在重算前查不到，也不能把不同构向量混进来算相似度
 #   （那是"静默劣化"：不报错，只是答不准）。
 #   ★ 该过滤**只加在向量路径**：关键词路（ILIKE / tsquery）与向量空间无关，加会误伤。
+# 治理权重（M7 WU-M-17）：COALESCE 按 0 —— INV-M-12 治理失败/未审查不参与过滤
 _VECTOR_SQL_TEMPLATE = f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
        c.level_rank, c.acl_tags,
+       COALESCE(c.governance_weight, 0) AS governance_weight,
        1 - (c.embedding <=> '{{query_vec}}'::vector) AS vector_score
 FROM chunks c
 {_WHERE_BASE}
@@ -63,7 +65,8 @@ LIMIT :limit
 # ESCAPE '\' 让 pattern 中的 \% \_ 当字面量，避免用户输入的 %/_ 被当 SQL 通配符
 _KEYWORD_SQL = text(f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
-       c.level_rank, c.acl_tags
+       c.level_rank, c.acl_tags,
+       COALESCE(c.governance_weight, 0) AS governance_weight
 FROM chunks c
 {_WHERE_BASE}
   AND (c.content ILIKE :pattern ESCAPE '\\' OR c.heading_path ILIKE :pattern ESCAPE '\\')
@@ -78,6 +81,7 @@ LIMIT :limit
 _KEYWORD_FTS_SQL = text(f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
        c.level_rank, c.acl_tags,
+       COALESCE(c.governance_weight, 0) AS governance_weight,
        ts_rank(to_tsvector('simple', c.content), q.query) AS keyword_score
 FROM chunks c, to_tsquery('simple', :tsquery) AS q(query)
 {_WHERE_BASE}
@@ -292,12 +296,19 @@ class RetrievalService:
         # ⑤ 构造 RetrievedChunk
         #    rerank 在线：候选集 = rerank 返回项，顺序即重排顺序，final=绝对 rerank 分
         #    rerank 降级：候选集 = 全部召回，final=向量余弦分，按分排序取 TOP_K
+        #    ★ 治理加权（INV-M-13）：位于 rerank 之后叠加，MUST NOT 进 RRF ——
+        #      否则已标定的 RELEVANCE_THRESHOLD_* 阈值口径与 eval 基线同时失效。
+        #      偏移 = weight * GOVERNANCE_WEIGHT_SCALE（weight ∈ [-50,+50]，
+        #      0 = 未审查/中性 —— INV-M-12：治理失败不使知识不可检索）。
         retrieved: list[RetrievedChunk] = []
 
         def _build_chunk(cid: uuid.UUID) -> RetrievedChunk:
             row = all_chunks[cid]
             vec_score = float(row.get("vector_score") or 0.0)
             r_score = rerank_scores.get(cid)
+            base_score = r_score if r_score is not None else vec_score
+            # COALESCE 在 SQL 层兜 NULL，这里再按缺省 0 兜底（INV-M-12 双保险）
+            weight = float(row.get("governance_weight") or 0)
             return RetrievedChunk(
                 chunk_id=cid,
                 document_id=row["document_id"],
@@ -311,7 +322,7 @@ class RetrievalService:
                 keyword_score=1.0 if cid in keyword_ranks else None,
                 rrf_score=rrf_scores[cid],
                 rerank_score=r_score,
-                final_score=r_score if r_score is not None else vec_score,
+                final_score=base_score + weight * decisions.GOVERNANCE_WEIGHT_SCALE,
             )
 
         if use_rerank:
