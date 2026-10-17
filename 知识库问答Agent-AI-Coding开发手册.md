@@ -119,15 +119,22 @@
 | F15 | 知识库数据源同步（定时/增量）· 首个源 = **本地目录 + Git**（§8 D-07） | M6 |
 | F16 | 多轮对话与上下文治理 | M6 |
 | F17 | 安全加固（提示注入、限流、配额） | M6 |
+| F18 | **图片/扫描件知识接入**（视觉抽取转文本后进同一向量空间；`OCR_ENABLED` 开关，默认关闭，§8 D-17/D-22） | M7 |
+| F19 | **图片提问**（多模态聊天：单轮 ≤3 张图，SSE `meta` 增补 `modality`，§8 D-18） | M7 |
+| F20 | **内部网址接入**（Web 源同步：会话式抓取 + 双重域名白名单 + 三级指纹增量） | M7 |
+| F21 | **解析预览同屏核对**（左原图｜右文本化结果，逐块对应） | M7 |
+| F22 | **图片对象存储与鉴权溯源回链**（字节存 MinIO，后端鉴权代理端点回链，§8 D-23） | M7 |
+| F23 | **四维知识治理审查**（时效/权威/一致/完整 → 治理权重作用于检索排序；admin 治理面板） | M7 |
+| F24 | **批量上传**（同格式约束：前端拦截 + 后端复校验） | M7 |
 
 **P2 · 以后再说**
 
 | # | 功能 |
 |---|---|
-| F18 | Agent 工具化（让模型调用外部工具） |
-| F19 | 多端适配（移动端 / 嵌入 SDK） |
-| F20 | 可观测面板 + 评估门禁接入 CI |
-| F21 | 计费与授权 |
+| F25 | Agent 工具化（让模型调用外部工具） |
+| F26 | 多端适配（移动端 / 嵌入 SDK） |
+| F27 | 可观测面板 + 评估门禁接入 CI |
+| F28 | 计费与授权 |
 
 ### 1.4 明确不做（Non-Goals）
 
@@ -870,12 +877,28 @@ CREATE TABLE documents (
     acl_tags      TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
     deny_subjects TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
     uploaded_by   UUID REFERENCES users(id),
+    -- ↓↓ M7 增补（迁移 0015 / 0017）↓↓
+    source_kind   TEXT NOT NULL DEFAULT 'upload'
+                  CHECK (source_kind IN ('upload','sync_local','sync_git','sync_web')),
+    effective_at  TIMESTAMPTZ,                   -- 生效时间（时效性输入）
+    expire_at     TIMESTAMPTZ,                   -- 失效时间（时效性输入）
+    content_hash  TEXT,                          -- 内容指纹（web 增量判定）
+    freshness_score    INTEGER,                  -- 四维审查：时效性 0-100，NULL = 未审查
+    authority_score    INTEGER,                  -- 权威性 0-100
+    consistency_score  INTEGER,                  -- 一致性 0-100
+    completeness_score INTEGER,                  -- 完整度 0-100
+    governance_status  TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (governance_status IN ('pending','running','done','failed')),
+    governance_report  JSONB NOT NULL DEFAULT '{}'::JSONB,   -- 四维判定依据（可审计）
+    -- ↑↑
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at    TIMESTAMPTZ
 );
 
 CREATE INDEX idx_doc_kb  ON documents(tenant_id, kb_id, is_latest);
 CREATE INDEX idx_doc_grp ON documents(doc_group_id, version DESC);
+-- M7：治理审查扫描与面板筛选
+CREATE INDEX idx_doc_governance ON documents(tenant_id, kb_id, governance_status);
 ```
 
 #### 4.2.8 `chunks` ★（权限与检索的最终载体）
@@ -900,6 +923,7 @@ CREATE TABLE chunks (
     is_latest     BOOLEAN NOT NULL DEFAULT true,
     -- ↑↑
     embedding     vector(1024),          -- 维度 MUST 与 embedding 模型一致（见 §8 D-05）
+    governance_weight INTEGER NOT NULL DEFAULT 0,  -- M7：检索期治理加权（冗余自 documents，避免 JOIN）
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -996,6 +1020,51 @@ CREATE TABLE eval_cases (
 > `eval_cases` 是 **M2 的门禁**：没有它，`RELEVANCE_THRESHOLD` 就只能拍脑袋，
 > 而阈值是"该拒答时拒答"的唯一控制点。
 
+#### 4.2.11 `sync_sources` / `governance_jobs`（M6 同步 / M7 治理 · 迁移 0016 / 0017）
+
+```sql
+-- 数据源同步配置（M6：local/git；M7 增补 web 与鉴权字段 0017）
+CREATE TABLE sync_sources (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id    UUID NOT NULL REFERENCES tenants(id),
+    kb_id        UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    source_type  TEXT NOT NULL DEFAULT 'local'
+                 CHECK (source_type IN ('local','git','web')),   -- 0017 扩展 'web'
+    config       JSONB NOT NULL DEFAULT '{}'::JSONB,
+    schedule     TEXT,                        -- cron 表达式，NULL = 仅手动
+    enabled      BOOLEAN NOT NULL DEFAULT true,
+    last_synced_at TIMESTAMPTZ,
+    last_error   TEXT,
+    -- ↓↓ M7 0017 增补（web 源）↓↓
+    auth_type    TEXT NOT NULL DEFAULT 'none' CHECK (auth_type IN ('none','basic','bearer','cookie')),
+    auth_payload TEXT,                        -- crypto 加密后的凭据，MUST NOT 明文落库/进日志
+    entry_urls   JSONB NOT NULL DEFAULT '[]'::JSONB,   -- 入口 URL 列表（域名白名单唯一真源）
+    scope_rules  JSONB NOT NULL DEFAULT '{}'::JSONB,   -- 页面发现范围（前缀/正则/深度）
+    -- ↑↑
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 四维治理审查任务（M7 0016，与 parse_jobs 同构）
+CREATE TABLE governance_jobs (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id    UUID NOT NULL REFERENCES tenants(id),
+    document_id  UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    status       TEXT NOT NULL DEFAULT 'queued'
+                 CHECK (status IN ('queued','running','succeeded','failed','dead')),
+    attempts     INT NOT NULL DEFAULT 0,
+    max_attempts INT NOT NULL DEFAULT 3,
+    last_error   TEXT,
+    started_at   TIMESTAMPTZ,
+    finished_at  TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+> **web 源两条红线**（M7）：凭据必须 Fernet 加密落库（`auth_payload`），审计与响应输出
+> MUST NOT 含任何凭据内容；抓取 MUST 双重校验域名白名单（仅 `entry_urls` 对应主机名）。
+> **治理任务**：arq cron 每 10 分钟扫描 `pending` 文档入队，重试耗尽转 `dead` 且文档
+> `governance_status='failed'`——治理失败 MUST NOT 阻断检索（`COALESCE(governance_weight, 0)`）。
+
 ### 4.3 迁移要点
 
 ```bash
@@ -1044,6 +1113,14 @@ alembic upgrade head
 | `POST` | `/api/admin/users` | 建用户 | M5 |
 | `GET` | `/api/admin/audit-logs` | 审计日志 | M5 |
 | `GET` | `/api/health` | 健康检查（含各依赖） | M0 |
+| `POST` | `/api/chat/ask` | 提问（增补 `images` 多模态入参，SSE `meta` 增补 `modality`） | M7 |
+| `GET` | `/api/documents/{doc_id}/governance` | 四维审查结论 + 依据报告 | M7 |
+| `POST` | `/api/documents/{doc_id}/governance/rerun` | 手动重跑治理审查（admin） | M7 |
+| `POST` | `/api/sync/sources` | 创建同步源（`source_type` 支持 `web` + 鉴权/入口字段） | M6/M7 |
+| `POST` | `/api/sync/sources/{id}/probe` | Web 源鉴权联通探活（admin） | M7 |
+| `GET` | `/api/documents/{doc_id}/raw` | 原文件/原图流式回链（鉴权代理，禁止直出 MinIO） | M7 |
+| `GET` | `/api/documents/{doc_id}/parse-preview` | 解析预览：原图链接 + 逐块文本化结果 | M7 |
+| `POST` | `/api/kbs/{kb_id}/documents/batch` | 批量上传（仅同格式，前端拦截 + 后端复校验） | M7 |
 
 ### 5.2 关键接口
 
@@ -1055,9 +1132,14 @@ alembic upgrade head
 {
   "kb_ids": ["uuid1", "uuid2"],
   "question": "报销流程是什么？",
-  "conversation_id": "uuid-or-null"
+  "conversation_id": "uuid-or-null",
+  "images": [ { "storage_key": "..." } ]
 }
 ```
+
+> **M7 多模态**：`images` 默认 `[]`，单轮 ≤ 3 张、单图 ≤ `MAX_UPLOAD_MB`，超限直接 400
+> （MUST NOT 静默截断）。SSE `meta` 事件增补 `modality`（`text|image`），事件顺序不变；
+> `Citation` 结构不变（图片知识同样按 `chunk_id/doc_id` 溯源）。
 
 **响应（`text/event-stream`，逐个事件推送）**
 
@@ -1156,8 +1238,9 @@ M3 账号与组织     1 周    ── 能多人登录，有部门树
 M4 权限与隔离    2–3 周   ── 权限全口径落地  ★ 第二重要
 M5 产品化与交付  2–3 周   ── 能打包卖给客户
 M6 增量与上线    3–4 周   ── 能长期运行
+M7 多模态+治理   增量     ── 图片/扫描件/Web 源接入 + 四维知识治理（《实施规范 M7》）
 ────────────────────────────
-单人全职合计    12–18 周
+单人全职合计    12–18 周（不含 M7 增量）
 单人业余合计     6–9 个月（按每周 10–15 小时）
 ```
 
@@ -1416,6 +1499,32 @@ M6 增量与上线    3–4 周   ── 能长期运行
 
 ---
 
+### M7 · 多模态与知识治理（增量，详见《实施规范 M7》）
+
+**目标**：知识库支持图片/扫描件与内部网址接入，且对已入库知识具备四维治理能力。
+
+**做什么**（四个能力域，21 个工作单元 / 6 个批次）
+
+| # | 任务 | 关键口径 |
+|---|---|---|
+| 1 | **图片/扫描件接入 + 图片提问** | 视觉抽取转文本进同一向量空间（1024 维不变）；`OCR_ENABLED` 默认关闭；单轮 ≤3 张图 |
+| 2 | **图片对象存储与溯源** | 字节存既有 MinIO；后端鉴权代理回链，禁止直出 MinIO/presigned URL |
+| 3 | **内部网址接入（Web 源）** | 会话式抓取 + 双重域名白名单；凭据 Fernet 加密落库；ETag→Last-Modified→content_hash 三级指纹增量 |
+| 4 | **四维治理审查 + 检索加权** | 时效（纯规则）/权威/一致/完整（一次 LLM 调用）；加权 = 四维加权均值 − 50 ∈ [-50,+50]，在 rerank 之后叠加，不进 RRF |
+
+**验收（GATE-M-0~M-5 摘要）**
+
+| # | 测试 | 期望 |
+|---|---|---|
+| H1 | 上传图片并向图片提问 | 回答仅依据图片内容，`meta.modality=image`，引用可点开原图 |
+| H2 | 扫描件 PDF 入库（OCR 开/关两态） | 开 = 视觉抽取成功；关 = 明确报错，MUST NOT 静默降级 |
+| H3 | 配置 Web 源并同步 | 白名单外域名被拒；凭据在日志/响应中零出现；页面未变更不重入 |
+| H4 | 治理审查全链路 | cron 扫描入队 → 四维结论落库 → chunks.governance_weight 生效；治理失败不阻断检索 |
+| H5 | eval 基线对比 | 拒答正确率 / 漏答率 / 命中率 相对基线不回退（--max-regression 0.02） |
+| H6 | 批量上传混合格式 | 前端拦截 + 后端 400，不产生半批成功 |
+
+---
+
 ## 7. 验收与测试
 
 ### 7.1 每个里程碑的"完成"定义
@@ -1534,7 +1643,7 @@ python -c "from app.config.decisions import self_check; self_check()"
 
 ## 8. 决策清单（已定稿 · 2026-09-16）
 
-> **16 条全部已定（2026-09-16），取值即正文口径。** 张枭批复：全部按推荐值执行。
+> **D-01~D-16 已定（2026-09-16），D-17~D-25 为 M7 增量（已定/已批准），取值即正文口径。** 张枭批复：全部按推荐值执行。
 > 表格里的「已定值」列就是最终口径，正文各节已按本表更新；AI MUST 按此实现。
 >
 > **状态**：✅ **已定** = 可直接开工；⏳ 到点可调 = 到该里程碑前再确认一次（调了不影响 M0）。
@@ -1547,7 +1656,7 @@ python -c "from app.config.decisions import self_check; self_check()"
 | **D-01** | 交付形态：私有化 / SaaS / 都要 | **私有化优先 + 代码支持多租户** | ✅ **已定** |
 | **D-02** | 首个目标客户画像 | **中小企业（50–500 人）** | ✅ **已定** |
 | **D-03** | 是否收费、如何授权 | 暂不考虑，M6 前再定 | ⏳ 到 M6 前可调 |
-| **D-04** | 是否支持扫描件 PDF（要 OCR） | **不支持**，只支持文本层 PDF | ✅ **已定** |
+| **D-04** | 是否支持扫描件 PDF（要 OCR） | ~~不支持~~ → **M7 起由多模态视觉链路承接**（仅限静态图片与扫描件 PDF 的文本抽取，见 **D-22**） | ✅ 已修订（M7） |
 | **D-05** | Embedding 模型与向量维度 | **本地 `bge-m3`，1024 维** | ✅ **已定** |
 | **D-06** | 中文全文检索扩展 | **先降级 `ILIKE`**，M2 评估后再决定 | ✅ 已定 |
 | **D-07** | 知识源同步先做哪个 | **本地目录 + Git** | ⏳ 到 M6 前可调 |
@@ -1559,7 +1668,16 @@ python -c "from app.config.decisions import self_check; self_check()"
 | **D-13** | deny 的运维责任人（交付后） | **客户系统管理员**，写进交付文档 | ✅ 已定 |
 | **D-14** | 部署环境资源预算 | 开发用云 API；交付给**两套配置**（全云 / 全本地） | ✅ 已定 |
 | **D-15** | 审计日志保留期 | **1 年 + 定期归档** | ✅ 已定 |
-| **D-16** | 上传大小上限与类型白名单 | **100 MB**；`pdf/md/txt/xls/xlsx/docx` | ✅ 已定 |
+| **D-16** | 上传大小上限与类型白名单 | **100 MB**；`pdf/md/txt/xls/xlsx/docx`（图片扩展名随 `OCR_ENABLED=true` 开启，见 D-22） | ✅ 已修订（M7） |
+| **D-17** ★ | 图片内容如何进入检索体系 | **文本化后进同一向量空间**（复用 1024 维 embedding，与 RRF/rerank 天然兼容） | ✅ 已定（M7，92 分） |
+| **D-18** | 视觉理解模型选型 | **复用现有 LLM 视觉能力**（OpenAI 兼容 `image_url`，无新容器） | ✅ 已定（M7，91 分） |
+| **D-19** | 内部网址抓取方式 | **会话式 HTTP + 站点地图/链接发现**（httpx 维持会话，保守限速） | ✅ 已定（M7，93 分） |
+| **D-20** | 四维审查计算时机 | **入库后异步治理 + 落库 + 检索加权**（不阻塞解析，结论可审计） | ✅ 已定（M7，93 分） |
+| **D-21** | 治理加权的作用位置 | **rerank 之后叠加**（不进 RRF，已标定阈值与 eval 基线可比） | ✅ 已定（M7，92 分） |
+| **D-22** | `OCR_ENABLED` 口径变更 | **由冻结改为配置开关**（默认 false；开启后 `ALLOWED_EXT` 增补图片扩展名） | ✅ 已批准（M7） |
+| **D-23** | 图片存储与溯源链接方式 | **字节存既有 MinIO + 后端鉴权代理端点回链**（禁止 presigned URL 直出） | ✅ 已定（M7，92 分） |
+| **D-24** | 文本化核对的前端形态 | **文档详情/上传结果页并排（左原图｜右文本块）** | ✅ 已定（M7，92 分） |
+| **D-25** | 批量上传的同格式约束 | **前端提交前拦截 + 后端复校验**（双重防线） | ✅ 已定（M7，93 分） |
 
 ### 8.2 已定决策的展开说明
 
