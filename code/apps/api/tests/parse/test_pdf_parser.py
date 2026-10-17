@@ -302,55 +302,58 @@ def _make_scanned_pdf(pages_text: list[str]) -> bytes:
     return data
 
 
-def _set_ocr(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+def _set_ocr(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, base_url: str = "http://ocr:8000"
+) -> None:
     """get_settings 是 lru_cache 单例，直接改实例属性，monkeypatch 负责还原。"""
     from app.config.settings import get_settings
     monkeypatch.setattr(get_settings(), "ocr_enabled", enabled)
+    monkeypatch.setattr(get_settings(), "ocr_base_url", base_url)
 
 
-def _patch_vision(
+def _patch_ocr(
     monkeypatch: pytest.MonkeyPatch,
     returns: list[str],
     exc_on: dict[int, Exception] | None = None,
 ) -> list:
-    """打桩视觉抽取：按调用序返回各页文本；返回调用记录容器。
+    """打桩 OCR 客户端：按调用序返回各页文本；返回调用记录容器。
 
-    ★ 桩打在 vision 模块属性上 —— _parse_scanned_pdf 每次调用时才做
+    ★ 桩打在 ocr 模块属性上 —— _parse_scanned_pdf 每次调用时才做
       from-import，读到的是打桩后的属性（与 test_image_parser 同一模式）。
     """
-    from app.services.multimodal import vision as vision_mod
+    from app.services import ocr as ocr_mod
     calls: list = []
 
-    async def _fake(image_ref):
+    async def _fake(data: bytes, mime: str = "image/png"):
         idx = len(calls)
-        calls.append(image_ref)
+        calls.append((data, mime))
         if exc_on and idx in exc_on:
             raise exc_on[idx]
         return ParsedBlock(text=returns[idx])
 
-    monkeypatch.setattr(vision_mod, "extract_text_from_image", _fake)
+    monkeypatch.setattr(ocr_mod, "ocr_image", _fake)
     return calls
 
 
-class TestScannedPdfVisionPath:
-    """WU-M-10：纯扫描件改道视觉链路；文本层优先原则不变。"""
+class TestScannedPdfOcrPath:
+    """WU-M-10 + B'：纯扫描件改道本地 OCR；文本层优先原则不变。"""
 
     @pytest.mark.asyncio
-    async def test_scanned_pdf_goes_to_vision_and_fills_page_no(
+    async def test_scanned_pdf_goes_to_ocr_and_fills_page_no(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """纯扫描件 + OCR 开 → 逐页视觉转录，每页块 MUST 带 page_no（INV-M-05）。"""
+        """纯扫描件 + OCR 开 → 逐页 OCR 转录，每页块 MUST 带 page_no（INV-M-05）。"""
         _set_ocr(monkeypatch, True)
-        calls = _patch_vision(monkeypatch, ["page one content", "page two content"])
+        calls = _patch_ocr(monkeypatch, ["page one content", "page two content"])
         data = _make_scanned_pdf(["page one content", "page two content"])
 
         blocks = await parse_pdf_async(data)
 
-        assert len(calls) == 2, "每页 MUST 各发起一次视觉调用"
+        assert len(calls) == 2, "每页 MUST 各发起一次 OCR 调用"
         assert [b.page_no for b in blocks] == [1, 2]
         assert blocks[0].text == "page one content"
         assert blocks[1].text == "page two content"
-        assert all(calls[i].data_url.startswith("data:image/png;base64,") for i in range(2))
+        assert all(c[1] == "image/png" for c in calls), "渲染页以 PNG 字节直传"
 
     @pytest.mark.asyncio
     async def test_scanned_pdf_rejected_when_ocr_disabled(
@@ -363,34 +366,59 @@ class TestScannedPdfVisionPath:
             await parse_pdf_async(data)
 
     @pytest.mark.asyncio
-    async def test_vision_failure_carries_page_no(
+    async def test_scanned_pdf_rejected_when_base_url_missing(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """某页视觉失败 → ParseError 且带页码（INV-M-04：不静默跳页）。"""
-        from app.services.multimodal import VisionNoContentError
+        """B'：开关已开但服务地址未配置 → ParseError（fail-closed，不降级）。"""
+        _set_ocr(monkeypatch, True, base_url="")
+        data = _make_scanned_pdf(["any content"])
+        with pytest.raises(ParseError, match="OCR_BASE_URL"):
+            await parse_pdf_async(data)
+
+    @pytest.mark.asyncio
+    async def test_scanned_pdf_rejected_over_max_pages(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """B'：页数超过 OCR_MAX_SCAN_PAGES → ParseError，且不发起任何 OCR 调用。"""
+        from app.config import decisions as decisions_mod
 
         _set_ocr(monkeypatch, True)
-        _patch_vision(
+        calls = _patch_ocr(monkeypatch, ["x"])
+        monkeypatch.setattr(decisions_mod, "OCR_MAX_SCAN_PAGES", 1)
+        data = _make_scanned_pdf(["p1", "p2"])
+        with pytest.raises(ParseError, match="超过单份 OCR 上限"):
+            await parse_pdf_async(data)
+        assert calls == [], "超限 MUST 在渲染前拒绝，不发起任何 OCR 调用"
+
+    @pytest.mark.asyncio
+    async def test_ocr_failure_carries_page_no(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """某页 OCR 失败 → ParseError 且带页码（INV-M-04：不静默跳页）。"""
+        from app.services.ocr import OcrNoContentError
+
+        _set_ocr(monkeypatch, True)
+        _patch_ocr(
             monkeypatch,
             ["page one content", ""],
-            exc_on={1: VisionNoContentError("图中未识别到可读内容")},
+            exc_on={1: OcrNoContentError("图中未识别到可读内容")},
         )
         data = _make_scanned_pdf(["page one content", "page two content"])
         with pytest.raises(ParseError, match="第 2 页"):
             await parse_pdf_async(data)
 
     @pytest.mark.asyncio
-    async def test_text_layer_pdf_never_calls_vision(
+    async def test_text_layer_pdf_never_calls_ocr(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """文本层优先：即使 OCR 开，文本层 PDF MUST NOT 触达视觉链路。"""
+        """文本层优先：即使 OCR 开，文本层 PDF MUST NOT 触达 OCR 链路。"""
         _set_ocr(monkeypatch, True)
 
-        async def _forbidden(image_ref):  # pragma: no cover - 被调用即失败
-            raise AssertionError("文本层 PDF 不应进入视觉链路")
+        async def _forbidden(data, mime="image/png"):  # pragma: no cover - 被调用即失败
+            raise AssertionError("文本层 PDF 不应进入 OCR 链路")
 
-        from app.services.multimodal import vision as vision_mod
-        monkeypatch.setattr(vision_mod, "extract_text_from_image", _forbidden)
+        from app.services import ocr as ocr_mod
+        monkeypatch.setattr(ocr_mod, "ocr_image", _forbidden)
 
         blocks = await parse_pdf_async(_make_pdf(SMALL))
         assert any(b.is_table for b in blocks), "文本层管线的表格识别结果不变"

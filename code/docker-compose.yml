@@ -94,6 +94,35 @@ services:
       retries: 60
       start_period: 10m
 
+  # B' 本地 OCR 服务（GOT-OCR2.0 CPU 推理）：扫描件 PDF / 图片入库转录，数据不出域
+  ocr:
+    build:
+      context: .
+      dockerfile: apps/ocr/Dockerfile
+      args:
+        # GitHub clone 官方推理代码须走代理；Clash 开启时构建：
+        #   OCR_BUILD_PROXY=http://host.docker.internal:7897 docker compose build ocr
+        HTTPS_PROXY: ${OCR_BUILD_PROXY:-}
+        HTTP_PROXY: ${OCR_BUILD_PROXY:-}
+    restart: unless-stopped
+    environment:
+      # huggingface.co 不可达，模型权重走国内镜像站
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      OCR_MODEL_ID: ${OCR_MODEL_ID:-stepfun-ai/GOT-OCR2_0}
+    volumes:
+      # 权重缓存与 embedding/reranker 共用 volume（GOT-OCR2_0 约 1.3GB，一次下载长期复用）
+      - hf_cache:/app/.cache/huggingface
+    # 权重 fp32 驻留约 2.3GB + 推理峰值；低于 3g 加载期会 OOM(137)，与 reranker 同档
+    mem_limit: 4g
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      # 模型 CPU 加载约 1~3 分钟，首次部署含权重下载；口径对齐 embedding/reranker
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      start_period: 10m
+    # ★ 不 ports：仅容器网络内可达，对外唯一入口是 Caddy 反代的 api/web
+
   # 数据库迁移（一次性）：先于 api/worker 完成，失败则下游不启动（fail-fast）
   migrate:
     build:
@@ -131,6 +160,9 @@ services:
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
       RERANK_BASE_URL: ${RERANK_BASE_URL:-http://reranker:8000/v1}
       RERANK_MODEL: ${RERANKER_MODEL:-bge-reranker-v2-m3}
+      # B' 扫描件 OCR：与 worker 同源注入（api 自身不走 OCR，保持 settings 口径一致）
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+      OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:8000}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-100}
       ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx}
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
@@ -186,6 +218,9 @@ services:
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://embedding:8000/v1}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      # B' 扫描件 OCR：解析任务在 worker 内调用本地 ocr 服务（fail-closed，未启用时不触达）
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+      OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:8000}
       ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx}
     volumes:
       - ./sync_data:/data/sync
@@ -197,6 +232,8 @@ services:
       redis:
         condition: service_healthy
       embedding:
+        condition: service_started
+      ocr:
         condition: service_started
 
   web:

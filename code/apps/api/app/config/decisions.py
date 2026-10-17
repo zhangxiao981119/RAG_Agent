@@ -333,6 +333,24 @@ MAX_UPLOAD_MB: Final[int] = 100
 # M7-OVERRIDE: 手册 §1.4 / §8 D-04
 
 
+# ── 扫描件 OCR · 本地引擎（B'：GOT-OCR2.0 单引擎 fail-closed）──
+# 引擎真源是 apps/ocr 服务（本地 HTTP 服务，数据不出域）；
+# 此处只冻结调用侧的资源护栏口径，MUST NOT 引入第二引擎兜底。
+OCR_MAX_SCAN_PAGES: Final[int] = 50
+"""单份扫描件 PDF 允许 OCR 的最大页数，超限 ParseError。
+防单任务占用 OCR 服务过久（CPU 推理约 3~8s/页，50 页 ≈ 3~7 分钟，
+远在 parse_job_timeout 1800s 内）；超大扫描件应先拆分再上传。"""
+
+OCR_TIMEOUT_S: Final[float] = 30.0
+"""OCR 客户端单页调用超时（秒）。超时即该页失败 → 整份 ParseError，
+任务走 arq 重试 → 死信 → 恢复后重跑（显式失败，MUST NOT 静默跳页或换引擎）。"""
+
+OCR_LOW_CONF: Final[float] = 0.60
+"""单页置信度告警阈值：低于此值仅打 warning 进审计日志，仍正常入库。
+GOT 为生成式模型，置信度 = 解码 token 平均概率的代理（见 apps/ocr 服务）；
+warning 不改变主流程 —— 数据不出域约束下禁止升级外部 LLM 重转录。"""
+
+
 # ── 合规与保留（§8 D-15）─────────────────────────────────
 AUDIT_RETENTION_DAYS: Final[int] = 365
 
@@ -474,16 +492,30 @@ def self_check() -> None:
         raise RuntimeError("ACL_LEVEL_TAGS_ALLOWED MUST be False（§3.2.4）")
     if PUBLIC_KB_MAX_COUNT != 1:
         raise RuntimeError("PUBLIC_KB_MAX_COUNT MUST be 1")
-    # ── 扫描件 OCR（M7 D6：由冻结口径改为配置驱动）──
-    # 关闭是默认态，此处只做提示、**不再 fail-closed 阻断启动**。
+    # ── 扫描件 OCR（M7 D6：由冻结口径改为配置驱动；B'：本地引擎）──
+    # 关闭是默认态，此处只做提示、**不再 fail-closed 阻断启动**；
+    # 开启但未配置服务地址也不在此阻断 —— 解析层 fail-closed 兜底（ParseError），
+    # 让运维可以先开开关再部署 ocr 服务，错误发生在使用处而非启动处。
     from app.config.settings import get_settings as _get_settings
     if not _get_settings().ocr_enabled:
         logger.warning(
             "OCR_ENABLED=false（默认）：扫描件 PDF 与图片不进入解析，仅支持文本层 PDF。"
-            "如需支持，将 OCR_ENABLED 置 true（M7 D6；手册 §1.4 已同步修订）。"
+            "如需支持，置 OCR_ENABLED=true 并注入 OCR_BASE_URL（本地 apps/ocr 服务）。"
+        )
+    elif not _get_settings().ocr_base_url:
+        logger.warning(
+            "OCR_ENABLED=true 但 OCR_BASE_URL 为空：解析层将 fail-closed"
+            "（ParseError）。请部署 apps/ocr 服务并注入 OCR_BASE_URL=http://ocr:8000。"
         )
     if MAX_UPLOAD_MB <= 0:
         raise RuntimeError("MAX_UPLOAD_MB MUST > 0")
+    # ── OCR 资源护栏口径（B'）──
+    if OCR_MAX_SCAN_PAGES <= 0:
+        raise RuntimeError("OCR_MAX_SCAN_PAGES MUST > 0")
+    if OCR_TIMEOUT_S <= 0:
+        raise RuntimeError("OCR_TIMEOUT_S MUST > 0")
+    if not (0.0 < OCR_LOW_CONF < 1.0):
+        raise RuntimeError(f"OCR_LOW_CONF MUST ∈ (0, 1)，当前 {OCR_LOW_CONF}")
     if level_rank(Level.SECRET) != LEVEL_RANK_SECRET:
         raise RuntimeError("level_rank 与 LEVEL_RANK_* 常量不一致")
     if level_rank(Level.PUBLIC) != LEVEL_RANK_PUBLIC:

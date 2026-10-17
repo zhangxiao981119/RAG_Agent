@@ -71,9 +71,13 @@ class Settings(BaseSettings):
     )
     # ── M7 多模态：扫描件 OCR / 视觉抽取 ─────────────────────
     # ★ 默认 false：保持既有语义「仅支持文本层 PDF」，扫描件 PDF 与图片在解析层被拒绝。
-    #   置 true 后，扫描件 PDF 与图片改由多模态视觉链路抽取文本入库。
+    #   置 true 后，扫描件 PDF 与图片改道本地 OCR 服务（apps/ocr，GOT-OCR2.0）转录入库。
     #   真源即此处；decisions.py **不再**持有 OCR_ENABLED（M7 D6）。
     ocr_enabled: bool = False
+    # ── B'：本地 OCR 服务地址（fail-closed）────────────────────
+    # ocr_enabled=true 时必须显式注入（compose 内为 http://ocr:8000）；
+    # 留空且开关开启 → 解析层直接 ParseError，不做任何降级（无双引擎兼容）。
+    ocr_base_url: str = ""
     audit_retention_days: int = 365
     multi_tenant: bool = False
     # ── M5 生产初始化 ────────────────────────────────────────

@@ -4,9 +4,10 @@
   · 表格页：pdfplumber 识别表格 → 表格块；同页文本用 pdfplumber 的词坐标
     **排除表格区域**后重建，避免同一份数据在blocks 里出现两次
   · 无表格页：pypdf 的 extract_text() + 行首模式匹配标题（pypdf 无 layout）
-  · 纯扫描件（全文文本层总长 < 10）：M7 起改道视觉链路 —— PyMuPDF 逐页渲染
-    PNG → 视觉转录 → 每页一个块并填 page_no（INV-M-05 可回链）；
-    受 settings.ocr_enabled 门控，关闭时维持原 ParseError（fail-closed）。
+  · 纯扫描件（全文文本层总长 < 10）：B' 起改道本地 OCR 服务（apps/ocr，
+    GOT-OCR2.0）—— PyMuPDF 逐页渲染 PNG → OCR 转录 → 每页一个块并填
+    page_no（INV-M-05 可回链）；受 settings.ocr_enabled + ocr_base_url 双门控，
+    任一未就绪均维持 ParseError（fail-closed，无双引擎兜底）。
 
 ★ 文本层优先原则不变：只要全文文本层总量达标（>= 10），绝不进入视觉链路 ——
   混合文档中个别无文本的页与改造前一样被跳过，行为逐字节一致。
@@ -23,7 +24,6 @@
 """
 from __future__ import annotations
 
-import base64
 import io
 import re
 
@@ -278,15 +278,15 @@ def _text_layer_pipeline(page_texts: list[str], data: bytes) -> list[ParsedBlock
 
 
 def parse_pdf(data: bytes) -> list[ParsedBlock]:
-    """同步入口（纯文本层）。扫描件在此仍 ParseError —— 视觉链路是异步的，
+    """同步入口（纯文本层）。扫描件在此仍 ParseError —— OCR 链路是异步的，
     同步签名承载不了；扫描件请走 parse_pdf_async（worker 统一入口）。"""
     page_texts = _extract_page_texts(data)
 
     # ── ① 先取全文文本判定扫描件（优先级最高，先于表格识别）──
     if sum(len(t) for t in page_texts) < 10:
         raise ParseError(
-            "PDF 文本层为空，疑似扫描件。本系统不支持 OCR（见手册 §8 D-04），"
-            "请提供文本层 PDF 或先用 OCR 工具转换。"
+            "PDF 文本层为空，疑似扫描件。本系统未启用 OCR（见手册 §8 D-04/D-06），"
+            "请提供文本层 PDF 或置 OCR_ENABLED=true 并部署本地 OCR 服务。"
         )
 
     return _text_layer_pipeline(page_texts, data)
@@ -297,20 +297,32 @@ _SCAN_RENDER_DPI: int = 150
 
 
 async def _parse_scanned_pdf(data: bytes, page_count: int) -> list[ParsedBlock]:
-    """纯扫描件 → 逐页渲染 PNG → 视觉转录 → 每页一块（M7 WU-M-10 / INV-M-05）。
+    """纯扫描件 → 逐页渲染 PNG → 本地 OCR 转录 → 每页一块（M7 WU-M-10 / INV-M-05 / B'）。
 
-    ★ 延迟导入 vision 与 settings：与 image_parser 同理，避免包初始化期环链。
-    ★ 异常不降级（INV-M-04）：任一页视觉失败 / 无可读内容 → ParseError（带页码），
-      整份进 job last_error；不静默跳页 —— 跳过等于把缺页知识当完整知识入库。
+    ★ 延迟导入 ocr client 与 settings：与 image_parser 同理，避免包初始化期环链。
+    ★ 单引擎 fail-closed（B'）：服务未配置 / 任一页 OCR 失败 / 无可读内容
+      → ParseError（带页码），整份进 job last_error，走 arq 重试 → 死信 → 重跑；
+      不静默跳页 —— 跳过等于把缺页知识当完整知识入库，也不换引擎兜底。
     """
+    from app.config import decisions
     from app.config.settings import get_settings
-    from app.schemas.chat import ImageRef
-    from app.services.multimodal.vision import VisionError, extract_text_from_image
+    from app.services.ocr import OcrError, ocr_image
 
-    if not get_settings().ocr_enabled:
+    settings = get_settings()
+    if not settings.ocr_enabled:
         raise ParseError(
-            "PDF 文本层为空，疑似扫描件。本系统不支持 OCR（见手册 §8 D-04），"
-            "请提供文本层 PDF 或先用 OCR 工具转换。"
+            "PDF 文本层为空，疑似扫描件。本系统未启用 OCR（见手册 §8 D-04/D-06），"
+            "请提供文本层 PDF 或置 OCR_ENABLED=true 并部署本地 OCR 服务。"
+        )
+    if not settings.ocr_base_url:
+        raise ParseError(
+            "扫描件 OCR 已启用但未配置 OCR_BASE_URL（fail-closed）。"
+            "请部署 apps/ocr 服务并注入 OCR_BASE_URL。"
+        )
+    if page_count > decisions.OCR_MAX_SCAN_PAGES:
+        raise ParseError(
+            f"扫描件共 {page_count} 页，超过单份 OCR 上限 "
+            f"{decisions.OCR_MAX_SCAN_PAGES} 页，请拆分后上传。"
         )
 
     try:
@@ -329,13 +341,12 @@ async def _parse_scanned_pdf(data: bytes, page_count: int) -> list[ParsedBlock]:
         for page_index in range(1, page_count + 1):
             page = doc[page_index - 1]
             png = page.get_pixmap(dpi=_SCAN_RENDER_DPI).tobytes("png")
-            image_ref = ImageRef(
-                data_url="data:image/png;base64," + base64.b64encode(png).decode("ascii")
-            )
             try:
-                block = await extract_text_from_image(image_ref)
-            except VisionError as exc:
-                raise ParseError(f"扫描件第 {page_index} 页视觉抽取失败：{exc}") from exc
+                block = await ocr_image(png, "image/png")
+            except OcrError as exc:
+                raise ParseError(
+                    f"扫描件第 {page_index} 页 OCR 转录失败：{exc}"
+                ) from exc
 
             # 页内行级标题识别：与文本层管线同一套 _is_heading，保证
             # heading_path 口径一致；非标题行按页聚合为一个块
@@ -366,7 +377,7 @@ async def _parse_scanned_pdf(data: bytes, page_count: int) -> list[ParsedBlock]:
 
 
 async def parse_pdf_async(data: bytes) -> list[ParsedBlock]:
-    """异步入口 —— 文本层优先，纯扫描件改道视觉链路（M7 WU-M-10）。"""
+    """异步入口 —— 文本层优先，纯扫描件改道本地 OCR 链路（M7 WU-M-10 / B'）。"""
     page_texts = _extract_page_texts(data)
 
     if sum(len(t) for t in page_texts) >= 10:

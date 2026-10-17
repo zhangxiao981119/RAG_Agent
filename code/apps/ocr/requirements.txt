@@ -1,0 +1,20 @@
+# PyPI 走清华镜像（构建环境国内网络）；torch 走 CPU 专用源
+-i https://pypi.tuna.tsinghua.edu.cn/simple
+--extra-index-url https://download.pytorch.org/whl/cpu
+# torch 走 CPU 专用源（CUDA 版体积 ~3GB 且容器无 GPU 无意义）
+torch==2.1.2
+# GOT-OCR2.0 官方锁定 transformers 4.37.0（自定义架构 API 兼容边界）
+transformers==4.37.0
+sentencepiece
+accelerate
+safetensors
+pillow
+# GOT 官方推理代码（GOT/ 包）的 import 依赖
+bitarray
+easydict
+einops
+timm
+tiktoken
+# 服务框架
+fastapi
+uvicorn[standard]
