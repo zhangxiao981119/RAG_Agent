@@ -11,6 +11,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
+from app.config.settings import get_settings
 from app.infra import trace
 from app.models import Chunk, Document, GovernanceJob
 from app.schemas.documents import (
@@ -157,6 +158,8 @@ async def rerun_document_governance(
     # 复用 app lifespan 建好的 arq 池（口径同 upload/sync 入队）
     await request.app.state.arq_pool.enqueue_job(
         "execute_governance_job", str(job.id), trace.get_trace_id(),
+        # 队列名必须与 WorkerSettings.queue_name 同源（arq 默认队列是 arq:queue）
+        _queue_name=get_settings().arq_queue_name,
     )
     await session.commit()
 

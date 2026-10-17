@@ -28,6 +28,7 @@ from sqlalchemy import select, update
 
 from app.config import decisions
 from app.config.prompts import NO_ANSWER_TEXT, render_prompt
+from app.config.settings import get_settings
 from app.database import SessionLocal
 from app.infra import metrics, trace
 from app.infra.arq_pool import get_arq_pool
@@ -242,7 +243,9 @@ async def scan_and_enqueue(ctx: dict[str, Any]) -> int:
         pool = await get_arq_pool()
         for job in jobs:
             await pool.enqueue_job(
-                "execute_governance_job", str(job.id), trace.get_trace_id()
+                "execute_governance_job", str(job.id), trace.get_trace_id(),
+                # 队列名必须与 WorkerSettings.queue_name 同源（arq 默认队列是 arq:queue）
+                _queue_name=get_settings().arq_queue_name,
             )
         await session.commit()
 

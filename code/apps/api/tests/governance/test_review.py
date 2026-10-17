@@ -140,8 +140,8 @@ class FakePool:
     def __init__(self, h: "Harness") -> None:
         self._h = h
 
-    async def enqueue_job(self, *args) -> None:  # noqa: ANN002
-        self._h.enqueued.append(args)
+    async def enqueue_job(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        self._h.enqueued.append((args, kwargs))
         self._h.events.append("enqueue")
 
 
@@ -350,8 +350,12 @@ async def test_scan_enqueues_pending_docs(harness: Harness) -> None:
     job = harness.added[0]
     assert isinstance(job, GovernanceJob)
     assert job.document_id == doc.id
-    # 入队参数与 flush 后的 job.id 一致，且 enqueue 先于 commit（无 zombie）
-    assert harness.enqueued == [("execute_governance_job", str(job.id), harness.enqueued[0][2])]
+    # 入队参数与 flush 后的 job.id 一致（第 3 位是透传的 trace_id），且 enqueue 先于 commit（无 zombie）
+    args, kwargs = harness.enqueued[0]
+    assert args[:2] == ("execute_governance_job", str(job.id))
+    assert len(args) == 3
+    # 队列名必须与 WorkerSettings.queue_name 同源，否则任务进默认队列无人消费
+    assert kwargs == {"_queue_name": "arq:parse"}
     assert harness.events.index("enqueue") < harness.events.index("commit")
 
 

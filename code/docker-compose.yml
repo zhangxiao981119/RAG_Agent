@@ -173,6 +173,10 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       TENANT_CODE: ${TENANT_CODE:-default}
+      # M7 WU-M-15：治理审查任务在 worker 内调 LLM，必须与 api 段同源注入
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-pass}@postgres:5432/${POSTGRES_DB:-kagent}
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT: http://minio:9000

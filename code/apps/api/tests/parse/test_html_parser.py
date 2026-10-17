@@ -1,4 +1,4 @@
-﻿"""WU-M-13 html 解析清洗器测试。
+"""WU-M-13 html 解析清洗器测试。
 
 钉住六件事：
   1. 噪声剔除：script/style/nav/footer/header 内容不进正文
