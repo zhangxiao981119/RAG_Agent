@@ -7,9 +7,9 @@
      xlsx/xls/docx 的合并展开口径一致）→ cell_to_text 消毒 → TSV 序列化，
      保证 chunk 层"整表不切 / 行组切分带表头"契约原样适用
 
-调用方：sync_service web 分支（WU-M-14）直调 parse_html；
-不注册进 parse_bytes 的 _DISPATCH —— html 不在 ALLOWED_EXT 内，
-网页抓取产物不走上传统一入口（显式信号，不混路径）。
+调用方：worker 的 parse_bytes 分派（WU-M-14 注册 ext=html）—— web 抓取产物
+存 MinIO 后走标准 ParseJob 链路（重试/状态机/审计全部复用）；
+上传端点的 ALLOWED_EXT 不含 html，用户直接上传 .html 仍被拒（边界不变）。
 """
 from __future__ import annotations
 

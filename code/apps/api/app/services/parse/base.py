@@ -58,6 +58,7 @@ from app.services.parse.text_parser import parse_text  # noqa: E402
 from app.services.parse.xlsx_parser import parse_xlsx  # noqa: E402
 from app.services.parse.xls_parser import parse_xls  # noqa: E402
 from app.services.parse.docx_parser import parse_docx  # noqa: E402
+from app.services.parse.html_parser import parse_html  # noqa: E402
 from app.services.parse.image_parser import IMAGE_EXTS, parse_image  # noqa: E402
 
 
@@ -68,6 +69,10 @@ _DISPATCH = {
     "xlsx": parse_xlsx,
     "xls": parse_xls,
     "docx": parse_docx,
+    # M7 WU-M-14：web 同步源的抓取产物（ext=html）走标准 ParseJob 链路
+    # （重试/状态机/审计复用）。html 只来自同步抓取 —— 上传端点的 ALLOWED_EXT
+    # 仍不含 html，用户直接上传 .html 依然被拒（边界不变）
+    "html": parse_html,
 }
 
 
