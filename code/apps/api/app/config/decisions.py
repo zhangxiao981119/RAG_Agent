@@ -337,6 +337,45 @@ MAX_UPLOAD_MB: Final[int] = 100
 AUDIT_RETENTION_DAYS: Final[int] = 365
 
 
+# ── 知识治理 · 四维审查（M7 B7-4 / WU-M-15~17）────────────
+GOVERNANCE_DIM_WEIGHTS: Final[dict[str, float]] = {
+    "freshness": 0.35,
+    "authority": 0.30,
+    "consistency": 0.20,
+    "completeness": 0.15,
+}
+"""governance_weight 合成系数：四维加权均值（0-100）减 50 → 映射到 [-50, +50]。
+0 = 中性（未审查的 chunk 列 default 就是 0）；正 = 治理优秀提升排序；负 = 治理差降权。
+★ 合计 MUST 为 1.0（self_check 校验）。"""
+
+GOVERNANCE_WEIGHT_SCALE: Final[float] = 0.001
+"""检索期治理加权缩放（INV-M-13）：final_score += weight * SCALE（rerank 之后）。
+weight ∈ [-50, +50] → 最大偏移 ±0.05：能改变同分文档的排序，
+但不至于把不相关内容（余弦 ~0.3）推过 0.50 的 L1 阈值。MUST > 0 且 <= 0.002。"""
+
+GOVERNANCE_FRESHNESS_TIERS: Final[tuple[tuple[int, int], ...]] = (
+    (90, 90), (180, 75), (365, 55), (730, 35),
+)
+"""时效性分档（规则判定，不花 LLM token）：`(天数上限, 分数)` 升序，
+created_at 距今 <= 天数取对应分数；超过最后一档取 GOVERNANCE_FRESHNESS_STALE_SCORE。
+expire_at 已过期一律 0 分（废止）；effective_at 未到一律 GOVERNANCE_FRESHNESS_FUTURE_SCORE。"""
+
+GOVERNANCE_FRESHNESS_STALE_SCORE: Final[int] = 15
+"""超过最后分档（730 天）的老文档时效分。"""
+GOVERNANCE_FRESHNESS_FUTURE_SCORE: Final[int] = 10
+"""effective_at 在未来的未生效文档时效分。"""
+
+GOVERNANCE_SCAN_BATCH: Final[int] = 50
+"""cron 扫描每轮最多建多少个治理任务 —— 首轮全库积压时限流，避免 LLM 被打爆。"""
+
+GOVERNANCE_SCAN_CRON_MINUTES: Final[int] = 10
+"""cron 扫描周期（分钟）。治理不要求实时，10 分钟内可见即可。"""
+
+GOVERNANCE_PROMPT_MAX_CHARS: Final[int] = 12_000
+"""送审文档拼接文本上限（字符），超出从尾部截断。
+审查看整体形态，头部内容足够代表；不截断则超长文档会打出 LLM 超时重试风暴。"""
+
+
 # ── 脱敏（M5 任务 2）──────────────────────────────────
 MASK_PII_ENABLED: Final[bool] = True
 """输出层 PII 脱敏。命中手机号/身份证/银行卡的片段打码。
@@ -491,6 +530,35 @@ def self_check() -> None:
         raise RuntimeError(
             "拒答文案 MUST 位于 qa_system 的锁定区（locked），"
             "MUST NOT 放进可编辑区 —— 否则可被在线改掉"
+        )
+
+    # ── 治理审查提示词锁定区（INV-M-15）──
+    # 三类禁止约束（不得臆造 / 不得改写原文 / 仅依据给定内容）MUST 落在锁定区 ——
+    # 若可在线改掉，审查结论可被臆造，治理加权（WU-M-17）就成了没有依据的分数。
+    # 与 qa_system 拒答文案同源风险，同款 fail-closed 校验。
+    _gov_required = ("仅依据给定文档内容判定", "MUST NOT 臆造", "MUST NOT 改写原文")
+    if "governance_review" not in PROMPT_SPECS:
+        raise RuntimeError("PROMPT_SPECS MUST 含 governance_review（知识治理审查提示词）")
+    _gov_locked = PROMPT_SPECS["governance_review"].locked
+    for _frag in _gov_required:
+        if _frag not in _gov_locked:
+            raise RuntimeError(
+                f"governance_review 锁定区 MUST 含约束片段「{_frag}」"
+                "（INV-M-15：不得臆造 / 不得改写原文 / 仅依据给定内容）"
+            )
+
+    # ── 知识治理口径（M7 B7-4）──
+    if abs(sum(GOVERNANCE_DIM_WEIGHTS.values()) - 1.0) > 1e-9:
+        raise RuntimeError(
+            f"GOVERNANCE_DIM_WEIGHTS 合计 MUST 为 1.0，"
+            f"当前为 {sum(GOVERNANCE_DIM_WEIGHTS.values())}"
+        )
+    if set(GOVERNANCE_DIM_WEIGHTS) != {"freshness", "authority", "consistency", "completeness"}:
+        raise RuntimeError("GOVERNANCE_DIM_WEIGHTS 的维度键 MUST 与四维审查维度一一对应")
+    if not 0 < GOVERNANCE_WEIGHT_SCALE <= 0.002:
+        raise RuntimeError(
+            "GOVERNANCE_WEIGHT_SCALE MUST 在 (0, 0.002] 内 —— "
+            "过大会把治理偏移变成对 L1 阈值口径的冲击"
         )
 
     # ── 索引口径（方案一：索引/模型版本）──

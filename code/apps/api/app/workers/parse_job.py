@@ -20,6 +20,7 @@ from arq.connections import RedisSettings
 from arq.cron import cron
 from sqlalchemy import delete
 
+from app.config import decisions
 from app.config.index_profile import current_index_profile
 from app.config.settings import get_settings
 from app.database import SessionLocal
@@ -27,6 +28,7 @@ from app.infra import trace
 from app.models import Chunk, Document, ParseJob
 from app.services.chunk import chunk_blocks, to_embedding_text
 from app.services.embedding import get_embedding_service
+from app.services.governance import execute_governance_job, scan_and_enqueue
 from app.services.parse import ParseError, parse_bytes_async
 from app.services.storage import get_storage
 
@@ -204,7 +206,9 @@ async def run_sync_source(
 
 class WorkerSettings:
     """arq Worker 配置。"""
-    functions = [run_parse_job, run_sync_all, run_sync_source]
+    # 治理任务（INV-M-10）：execute_governance_job / scan_and_enqueue 独立注册，
+    # 逻辑全在 services/governance，run_parse_job 主路径零治理调用
+    functions = [run_parse_job, run_sync_all, run_sync_source, execute_governance_job, scan_and_enqueue]
     queue_name = get_settings().arq_queue_name
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     max_tries = get_settings().arq_max_attempts
@@ -213,4 +217,10 @@ class WorkerSettings:
     # M6 任务 1：每 30 分钟扫描所有 active 同步源
     cron_jobs = [
         cron(run_sync_all, minute={0, 30}),
+        # M7 WU-M-15：治理审查 cron 扫描（INV-M-10 —— 审查是独立任务，
+        # run_parse_job 主路径零治理调用；此处仅调度注册，逻辑全在 services/governance）
+        cron(
+            scan_and_enqueue,
+            minute=set(range(0, 60, decisions.GOVERNANCE_SCAN_CRON_MINUTES)),
+        ),
     ]
