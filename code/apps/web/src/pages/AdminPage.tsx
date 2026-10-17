@@ -5,6 +5,7 @@ import { DeptPanel } from './admin/DeptPanel'
 import { AuditPanel } from './admin/AuditPanel'
 import { EvalPanel } from './admin/EvalPanel'
 import { FeatureFlagPanel } from './admin/FeatureFlagPanel'
+import { GovernancePanel } from './admin/GovernancePanel'
 import { GroupPanel } from './admin/GroupPanel'
 import { MetricsPanel } from './admin/MetricsPanel'
 import { PromptPanel } from './admin/PromptPanel'
@@ -21,6 +22,7 @@ type AdminTabKey =
   | 'audit'
   | 'metrics'
   | 'eval'
+  | 'governance'
   | 'quota'
   | 'sensitive'
   | 'feature_flags'
@@ -71,6 +73,11 @@ export function AdminPage() {
             key: 'eval',
             label: '评估门禁',
             children: activeKey === 'eval' ? <EvalPanel /> : null,
+          },
+          {
+            key: 'governance',
+            label: '知识治理',
+            children: activeKey === 'governance' ? <GovernancePanel /> : null,
           },
           {
             key: 'quota',

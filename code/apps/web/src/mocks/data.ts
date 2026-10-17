@@ -42,6 +42,26 @@ export type Document = {
   version: number
   level_rank: number
   uploaded_at: string
+  // M7 知识治理（WU-M-18）：四维分数 null = 未审查，weight ∈ [-50, +50]
+  governance_status: 'pending' | 'running' | 'done' | 'failed'
+  freshness_score: number | null
+  authority_score: number | null
+  consistency_score: number | null
+  completeness_score: number | null
+  governance_report: GovernanceReport
+  effective_at: string | null
+  expire_at: string | null
+}
+
+// 四维审查报告（后端 governance_report JSONB）
+export type GovernanceReport = {
+  dims?: Record<
+    string,
+    { score: number; basis: string }
+  >
+  governance_weight?: number
+  reviewed_at?: string
+  content_chars?: number
 }
 
 export type Job = {
@@ -260,6 +280,14 @@ export async function setKbMembers(
 
 export async function fetchDocuments(kbId: string): Promise<Document[]> {
   return http<Document[]>(`/api/kbs/${kbId}/documents`)
+}
+
+/** 手动重跑四维审查（M7 WU-M-18，仅 admin，202 受理） */
+export async function rerunGovernance(docId: string): Promise<{ document_id: string; job_id: string }> {
+  return http<{ document_id: string; job_id: string }>(
+    `/api/documents/${docId}/governance/rerun`,
+    { method: 'POST' },
+  )
 }
 
 export async function fetchDocument(docId: string): Promise<Document | undefined> {

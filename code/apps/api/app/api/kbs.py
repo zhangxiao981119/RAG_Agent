@@ -282,6 +282,15 @@ async def list_documents(
             version=d.version,
             level_rank=d.level_rank,
             uploaded_at=d.created_at,
+            # M7 WU-M-18：治理面板数据源（四维分数 NULL = 未审查）
+            governance_status=d.governance_status,
+            freshness_score=d.freshness_score,
+            authority_score=d.authority_score,
+            consistency_score=d.consistency_score,
+            completeness_score=d.completeness_score,
+            governance_report=d.governance_report,
+            effective_at=d.effective_at,
+            expire_at=d.expire_at,
         )
         for d in rows
     ]

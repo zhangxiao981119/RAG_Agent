@@ -16,6 +16,15 @@ class DocumentOut(BaseModel):
     version: int
     level_rank: int
     uploaded_at: datetime
+    # ── M7 知识治理（WU-M-18）：四维分数 NULL = 未审查，weight ∈ [-50, +50] ──
+    governance_status: str = "pending"
+    freshness_score: int | None = None
+    authority_score: int | None = None
+    consistency_score: int | None = None
+    completeness_score: int | None = None
+    governance_report: dict = {}
+    effective_at: datetime | None = None
+    expire_at: datetime | None = None
 
 
 class ChunkPreview(BaseModel):
@@ -71,3 +80,29 @@ class BatchUploadFailure(BaseModel):
 class BatchUploadResponse(BaseModel):
     succeeded: list[DocumentOut] = []
     failed: list[BatchUploadFailure] = []
+
+
+# ── 知识治理端点（M7 REST 清单：四维结论 + 手动重跑）────────────────
+
+
+class GovernanceDetail(BaseModel):
+    """单文档四维审查结论（GET /documents/{id}/governance）。"""
+
+    document_id: uuid.UUID
+    governance_status: str
+    freshness_score: int | None
+    authority_score: int | None
+    consistency_score: int | None
+    completeness_score: int | None
+    # 含 dims.{freshness,authority,consistency,completeness}.basis 依据 +
+    # governance_weight / reviewed_at / content_chars
+    governance_report: dict = {}
+    effective_at: datetime | None
+    expire_at: datetime | None
+
+
+class GovernanceRerunResponse(BaseModel):
+    """手动重跑审查受理结果（POST /documents/{id}/governance/rerun）。"""
+
+    document_id: uuid.UUID
+    job_id: uuid.UUID

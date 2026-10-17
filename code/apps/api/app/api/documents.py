@@ -5,16 +5,19 @@ import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
-from app.models import Chunk, Document
+from app.infra import trace
+from app.models import Chunk, Document, GovernanceJob
 from app.schemas.documents import (
     ChunkPreview,
     DocumentDetail,
+    GovernanceDetail,
+    GovernanceRerunResponse,
     ParsePreviewBlock,
     ParsePreviewResponse,
     ParsePreviewSource,
@@ -72,6 +75,15 @@ async def get_document(
         version=doc.version,
         level_rank=doc.level_rank,
         uploaded_at=doc.created_at,
+        # M7 WU-M-18：治理结论随详情带出（四维分数 NULL = 未审查）
+        governance_status=doc.governance_status,
+        freshness_score=doc.freshness_score,
+        authority_score=doc.authority_score,
+        consistency_score=doc.consistency_score,
+        completeness_score=doc.completeness_score,
+        governance_report=doc.governance_report,
+        effective_at=doc.effective_at,
+        expire_at=doc.expire_at,
         chunks=[
             ChunkPreview(
                 id=c.id,
@@ -84,6 +96,76 @@ async def get_document(
             for c in chunks
         ],
     )
+
+
+@router.get("/documents/{doc_id}/governance", response_model=GovernanceDetail)
+async def get_document_governance(
+    doc_id: uuid.UUID,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> GovernanceDetail:
+    """单文档四维审查结论（M7 REST 清单：可见该文档即可读）。"""
+    doc = await _get_visible_document(doc_id, user, session)
+    return GovernanceDetail(
+        document_id=doc.id,
+        governance_status=doc.governance_status,
+        freshness_score=doc.freshness_score,
+        authority_score=doc.authority_score,
+        consistency_score=doc.consistency_score,
+        completeness_score=doc.completeness_score,
+        governance_report=doc.governance_report,
+        effective_at=doc.effective_at,
+        expire_at=doc.expire_at,
+    )
+
+
+@router.post(
+    "/documents/{doc_id}/governance/rerun",
+    response_model=GovernanceRerunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def rerun_document_governance(
+    doc_id: uuid.UUID,
+    request: Request,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> GovernanceRerunResponse:
+    """手动重跑四维审查（M7 REST 清单：仅 admin）。
+
+    前置：文档已解析完成（indexed）且不在审查进行中（pending/running 拒绝，
+    防重复入队）。动作：治理状态重置 pending + 建 GovernanceJob + 入队；
+    enqueue 先于 commit（任一入队失败整体回滚，口径同 scan_and_enqueue）。
+    """
+    if user.clearance < 40:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
+    doc = await _get_visible_document(doc_id, user, session)
+    if doc.status != "indexed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="NOT_INDEXED: 文档尚未解析完成，无法审查",
+        )
+    if doc.governance_status in ("pending", "running"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="REVIEW_IN_PROGRESS: 审查已排队或进行中",
+        )
+
+    doc.governance_status = "pending"
+    job = GovernanceJob(tenant_id=user.tenant_id, document_id=doc.id)
+    session.add(job)
+    await session.flush()
+    # 复用 app lifespan 建好的 arq 池（口径同 upload/sync 入队）
+    await request.app.state.arq_pool.enqueue_job(
+        "execute_governance_job", str(job.id), trace.get_trace_id(),
+    )
+    await session.commit()
+
+    await audit.record(
+        user.tenant_id, user.user_id, "governance.rerun",
+        object_type="document", object_id=str(doc_id),
+        detail={"job_id": str(job.id), "filename": doc.filename},
+    )
+    return GovernanceRerunResponse(document_id=doc.id, job_id=job.id)
 
 
 def _content_disposition(filename: str, disposition: str = "inline") -> str:
