@@ -12,7 +12,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # torch 走 CPU 专用源；transformers 等走 PyPI
-COPY requirements.txt ./
+# ★ compose 的 build context 是仓库根（code/），COPY 源路径须写 apps/ocr/ 全路径
+COPY apps/ocr/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # GOT-OCR2.0 官方推理代码（GOT/ 包）vendored 进镜像；
@@ -22,7 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 #   （Docker 内建代理 ARG 对 RUN 的 git clone 自动生效）
 RUN git clone --depth 1 https://github.com/Ucas-HaoranWei/GOT-OCR2.0.git /app/GOT-OCR2.0
 
-COPY main.py ./
+COPY apps/ocr/main.py ./
 
 EXPOSE 8000
 
