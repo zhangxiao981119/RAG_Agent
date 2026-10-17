@@ -51,8 +51,9 @@ services:
     # url-prefix=/v1 对齐 api 的 OpenAI 兼容调用路径
     command: v2 --model-id ${EMBEDDING_MODEL_ID:-BAAI/bge-m3} --engine torch --url-prefix /v1 --port 8000 --served-model-name ${EMBEDDING_MODEL:-bge-m3}
     environment:
-      # huggingface.co 不可达，模型权重走国内镜像站
-      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      # 模型权重下载源；hf-mirror.com 已失效（对所有仓库 308 重定向到 huggingface.co，
+      # huggingface_hub 拒绝跟随跨域重定向），改由环境网络出口直连 huggingface.co
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
     volumes:
       # 镜像内 HF_HOME=/app/.cache/huggingface，挂载路径必须与之匹配
       - hf_cache:/app/.cache/huggingface
@@ -75,8 +76,9 @@ services:
     # url-prefix=/v1 对齐 api 的 OpenAI 兼容调用路径
     command: v2 --model-id ${RERANKER_MODEL_ID:-BAAI/bge-reranker-v2-m3} --engine torch --url-prefix /v1 --port 8000 --served-model-name ${RERANKER_MODEL:-bge-reranker-v2-m3}
     environment:
-      # huggingface.co 不可达，模型权重走国内镜像站
-      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      # 模型权重下载源；hf-mirror.com 已失效（对所有仓库 308 重定向到 huggingface.co，
+      # huggingface_hub 拒绝跟随跨域重定向），改由环境网络出口直连 huggingface.co
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
     volumes:
       # 镜像内 HF_HOME=/app/.cache/huggingface，挂载路径必须与之匹配
       - hf_cache:/app/.cache/huggingface
@@ -106,8 +108,12 @@ services:
         HTTP_PROXY: ${OCR_BUILD_PROXY:-}
     restart: unless-stopped
     environment:
-      # huggingface.co 不可达，模型权重走国内镜像站
-      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      # 模型权重下载源；hf-mirror.com 已失效（对所有仓库 308 重定向到 huggingface.co，
+      # huggingface_hub 拒绝跟随跨域重定向），改由环境网络出口直连 huggingface.co
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+      # huggingface_hub 0.36 默认走 Xet 后端（cas-bridge.xethub.hf.co），该域名不可达会卡在 0 字节；
+      # 关闭后回退经典 LFS（cdn-lfs.huggingface.co）下载
+      HF_HUB_DISABLE_XET: "1"
       OCR_MODEL_ID: ${OCR_MODEL_ID:-stepfun-ai/GOT-OCR2_0}
     volumes:
       # 权重缓存与 embedding/reranker 共用 volume（GOT-OCR2_0 约 1.3GB，一次下载长期复用）
