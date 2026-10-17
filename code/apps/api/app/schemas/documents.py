@@ -16,6 +16,15 @@ class DocumentOut(BaseModel):
     version: int
     level_rank: int
     uploaded_at: datetime
+    # ── 上传溯源（P-e）：来源类型 + 上传人展示名 ──
+    # source_kind: upload=手动上传 / sync_local=目录同步 / sync_git=Git 同步 /
+    # sync_web=Web 源抓取；同步/Web 来源无个人上传者，uploader_name 为 None
+    source_kind: str | None = None
+    uploader_name: str | None = None
+    # ── 前端操作标志（P-c/P-d）：判定在后端，前端只做展示渲染 ──
+    # can_delete = admin 或 库 owner 或 上传者本人；can_upload = admin 或 库 owner
+    can_delete: bool = False
+    can_upload: bool = False
     # ── M7 知识治理（WU-M-18）：四维分数 NULL = 未审查，weight ∈ [-50, +50] ──
     governance_status: str = "pending"
     freshness_score: int | None = None

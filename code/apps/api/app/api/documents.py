@@ -7,13 +7,13 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config.settings import get_settings
 from app.infra import trace
-from app.models import Chunk, Document, GovernanceJob
+from app.models import Chunk, Document, GovernanceJob, KnowledgeBase, User
 from app.schemas.documents import (
     ChunkPreview,
     DocumentDetail,
@@ -50,6 +50,94 @@ async def _get_visible_document(
     return doc
 
 
+# ── 知识链路权限收紧（P-a ~ P-f）────────────────────────────────
+# chunk 级三闸门（P-a）：与检索下推 PUSHDOWN_WHERE_SQL 的 G1/G3/G4 同口径
+# （G2 库级与 G0 租户已由 _get_visible_document 在文档级覆盖）。
+# admin（clearance >= 40）豁免 —— 与 kbs.py 的 admin 豁免模式一致。
+
+
+def _chunk_gate(user: CurrentUser) -> list[object]:
+    """返回 chunk 级 G1/G3/G4 的 ORM 条件；admin 返回空列表（全量可见）。"""
+    if user.clearance >= 40:
+        return []
+    return [
+        Chunk.level_rank <= user.clearance,                      # G1 密级
+        ~Chunk.deny_subjects.overlap(list(user.subjects)),       # G3 显式拒绝
+        Chunk.acl_tags.overlap(list(user.subjects)),             # G4 标签匹配
+    ]
+
+
+async def _ensure_doc_fully_visible(
+    doc_id: uuid.UUID,
+    user: CurrentUser,
+    session: AsyncSession,
+) -> None:
+    """整份原文下载需「文档全可见」（P-b）：任一 is_latest chunk 对用户
+    不可见即 403 —— 能下载整份 = 整份都该你看。admin 豁免。"""
+    if user.clearance >= 40:
+        return
+    denied = (
+        select(Chunk.id).where(
+            Chunk.document_id == doc_id,
+            Chunk.is_latest.is_(True),
+            or_(
+                Chunk.level_rank > user.clearance,
+                Chunk.deny_subjects.overlap(list(user.subjects)),
+                ~Chunk.acl_tags.overlap(list(user.subjects)),
+            ),
+        )
+    )
+    has_denied = (await session.execute(denied.exists().select())).scalar()
+    if has_denied:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="PARTIAL_DENIED",
+        )
+
+
+def _can_manage_kb(user: CurrentUser, kb: KnowledgeBase) -> bool:
+    """KB 级管理权（P-c/P-d 口径唯一真源）：admin 或 库 owner。"""
+    return user.clearance >= 40 or kb.owner_id == user.user_id
+
+
+async def _ensure_doc_manageable(
+    doc: Document,
+    user: CurrentUser,
+    session: AsyncSession,
+) -> None:
+    """删除权限（P-c）：admin 或 库 owner 或 上传者本人，否则 403。"""
+    if user.clearance >= 40 or doc.uploaded_by == user.user_id:
+        return
+    kb = await session.get(KnowledgeBase, doc.kb_id)
+    if kb is not None and kb.owner_id == user.user_id:
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
+
+
+async def _doc_provenance(
+    doc: Document,
+    user: CurrentUser,
+    session: AsyncSession,
+) -> dict[str, object]:
+    """溯源 + 操作标志（P-e/P-f）：上传人展示名 / 来源类型 / can_delete / can_upload。"""
+    can_upload = False
+    kb = await session.get(KnowledgeBase, doc.kb_id)
+    if kb is not None:
+        can_upload = _can_manage_kb(user, kb)
+    can_delete = can_upload or doc.uploaded_by == user.user_id
+    uploader_name: str | None = None
+    if doc.uploaded_by is not None:
+        uploader = await session.get(User, doc.uploaded_by)
+        if uploader is not None:
+            uploader_name = uploader.display_name
+    return {
+        "source_kind": doc.source_kind,
+        "uploader_name": uploader_name,
+        "can_delete": can_delete,
+        "can_upload": can_upload,
+    }
+
+
 @router.get("/documents/{doc_id}", response_model=DocumentDetail)
 async def get_document(
     doc_id: uuid.UUID,
@@ -58,14 +146,20 @@ async def get_document(
 ) -> DocumentDetail:
     doc = await _get_visible_document(doc_id, user, session)
 
-    # chunk 预览（前 20 条）
+    # chunk 预览（前 20 条）—— P-a：chunk 级 G1/G3/G4 过滤（admin 豁免），
+    # 只回有权片段；is_latest 限定最新版本
     stmt = (
         select(Chunk)
-        .where(Chunk.document_id == doc_id)
+        .where(
+            Chunk.document_id == doc_id,
+            Chunk.is_latest.is_(True),
+            *_chunk_gate(user),
+        )
         .order_by(Chunk.chunk_index)
         .limit(20)
     )
     chunks = (await session.execute(stmt)).scalars().all()
+    provenance = await _doc_provenance(doc, user, session)
     return DocumentDetail(
         id=doc.id,
         kb_id=doc.kb_id,
@@ -76,6 +170,7 @@ async def get_document(
         version=doc.version,
         level_rank=doc.level_rank,
         uploaded_at=doc.created_at,
+        **provenance,
         # M7 WU-M-18：治理结论随详情带出（四维分数 NULL = 未审查）
         governance_status=doc.governance_status,
         freshness_score=doc.freshness_score,
@@ -197,6 +292,9 @@ async def get_document_raw(
       MinIO 直连地址与 presigned URL 一律不出网（INV-M-16 红线）。
     """
     doc = await _get_visible_document(doc_id, user, session)
+    # P-b：整份原文（字节/逐页渲染/提取文本）需文档全可见 —— 任一片段
+    # 对用户不可见即拒绝，防止「引用可见片段 + 下载整份泄露无权片段」
+    await _ensure_doc_fully_visible(doc_id, user, session)
 
     # ── ① 图片：流式转发原始字节 ──────────────────────────────
     if doc.ext.lower() in IMAGE_EXTS:
@@ -269,12 +367,15 @@ async def get_document_parse_preview(
     """
     doc = await _get_visible_document(doc_id, user, session)
 
+    # P-a 同口径：解析预览是 chunk 内容出口，同样只回有权片段（admin 豁免）
     rows = (
         (await session.execute(
             select(Chunk)
             .where(
                 Chunk.document_id == doc.id,
                 Chunk.tenant_id == doc.tenant_id,
+                Chunk.is_latest.is_(True),
+                *_chunk_gate(user),
             )
             .order_by(Chunk.chunk_index)
         ))
@@ -323,8 +424,10 @@ async def delete_document(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> None:
-    # G1/G2/属主三重校验，与 GET /documents/{id} 一致（避免 IDOR 越权删他人文档）
+    # G1/G2/租户校验 + 管理权判定（P-c）：可见 ≠ 可删 —— 仅 admin /
+    # 库 owner / 上传者本人可删，普通只读成员 403
     doc = await _get_visible_document(doc_id, user, session)
+    await _ensure_doc_manageable(doc, user, session)
 
     # 软删 document
     doc.deleted_at = datetime.now(timezone.utc)

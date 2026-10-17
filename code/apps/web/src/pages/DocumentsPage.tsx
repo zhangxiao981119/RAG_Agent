@@ -48,6 +48,14 @@ const STATUS_TAG: Record<Document['status'], { text: string; color: string }> = 
 
 const LEVEL_LABEL: Record<number, string> = { 10: '公开', 20: '内部', 30: '机密', 40: '绝密' }
 
+// 上传来源（P-e 溯源）：手动上传 / 目录同步 / Git 同步 / Web 源抓取
+const SOURCE_TAG: Record<string, { text: string; color: string }> = {
+  upload: { text: '手动上传', color: 'default' },
+  sync_local: { text: '目录同步', color: 'blue' },
+  sync_git: { text: 'Git 同步', color: 'purple' },
+  sync_web: { text: 'Web 源', color: 'cyan' },
+}
+
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
@@ -165,6 +173,9 @@ export function DocumentsPage() {
     return d.filename.toLowerCase().includes(q)
   })
 
+  // P-d：当前选中库的上传权（admin 或 库 owner），后端判定，前端只做渲染
+  const selectedKbCanUpload = kbs.find((k) => k.id === selectedKb)?.can_upload ?? false
+
   const columns: ColumnsType<Document> = [
     { title: '文件名', dataIndex: 'filename', key: 'filename', ellipsis: true },
     {
@@ -203,6 +214,24 @@ export function DocumentsPage() {
       render: (v: string) => (v ? dayjs(v).format('YYYY-MM-DD HH:mm') : '—'),
     },
     {
+      title: '上传人',
+      key: 'uploader',
+      width: 150,
+      render: (_, record) => (
+        <Space size={4}>
+          {/* P-e 溯源：同步/Web 来源无个人上传者，仅显示来源标识 */}
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {record.uploader_name ?? '—'}
+          </Typography.Text>
+          {record.source_kind && SOURCE_TAG[record.source_kind] && (
+            <Tag color={SOURCE_TAG[record.source_kind].color} style={{ marginInlineEnd: 0 }}>
+              {SOURCE_TAG[record.source_kind].text}
+            </Tag>
+          )}
+        </Space>
+      ),
+    },
+    {
       title: '操作',
       key: 'actions',
       width: 160,
@@ -216,18 +245,21 @@ export function DocumentsPage() {
           >
             预览
           </Button>
-          <Popconfirm
-            title={`确定删除文档「${record.filename}」吗？`}
-            description="删除后不可恢复。"
-            okText="删除"
-            okButtonProps={{ danger: true }}
-            cancelText="取消"
-            onConfirm={() => handleDelete(record)}
-          >
-            <Button type="link" size="small" danger icon={<DeleteOutlined />}>
-              删除
-            </Button>
-          </Popconfirm>
+          {/* P-c：可见 ≠ 可删 —— 仅 admin / 库 owner / 上传者本人显示删除 */}
+          {record.can_delete && (
+            <Popconfirm
+              title={`确定删除文档「${record.filename}」吗？`}
+              description="删除后不可恢复。"
+              okText="删除"
+              okButtonProps={{ danger: true }}
+              cancelText="取消"
+              onConfirm={() => handleDelete(record)}
+            >
+              <Button type="link" size="small" danger icon={<DeleteOutlined />}>
+                删除
+              </Button>
+            </Popconfirm>
+          )}
         </Space>
       ),
     },
@@ -253,11 +285,12 @@ export function DocumentsPage() {
         />
       </div>
 
-      <Dragger
-        accept=".pdf,.md,.txt,.xls,.xlsx,.docx"
-        multiple
-        showUploadList={false}
-        disabled={uploading || !selectedKb}
+      {selectedKbCanUpload ? (
+        <Dragger
+          accept=".pdf,.md,.txt,.xls,.xlsx,.docx"
+          multiple
+          showUploadList={false}
+          disabled={uploading || !selectedKb}
         beforeUpload={(file, fileList) => {
           // INV-M-18：批量提交前校验同格式 —— antd 的 fileList 是当次拖入/
           // 选择的整批文件；混合格式整批拦截（提示只发一次），逐文件判断
@@ -280,7 +313,24 @@ export function DocumentsPage() {
         </p>
         <p className="ant-upload-text">{uploading ? '正在上传...' : '点击或拖放文件到此处上传'}</p>
         <p className="ant-upload-hint">支持 PDF / Markdown / TXT / XLS / XLSX / DOCX，单文件不超过 100 MB</p>
-      </Dragger>
+        </Dragger>
+      ) : (
+        // P-d：无上传权（非 admin 且非库 owner）—— 仅提示，不渲染上传区
+        <div
+          style={{
+            marginBottom: 16,
+            padding: '20px 12px',
+            background: '#fafafa',
+            border: '1px dashed #e0e0e0',
+            borderRadius: 8,
+            textAlign: 'center',
+          }}
+        >
+          <Typography.Text type="secondary">
+            当前知识库仅库管理员可上传文档，如需上传请联系知识库管理员
+          </Typography.Text>
+        </div>
+      )}
 
       {uploading && uploadProgress != null && (
         <div style={{ marginBottom: 16, padding: '8px 12px', background: '#f5f5f5', borderRadius: 6 }}>
@@ -323,6 +373,8 @@ export function DocumentsPage() {
           rowSelection={{
             selectedRowKeys,
             onChange: (keys: React.Key[]) => setSelectedRowKeys(keys),
+            // P-c：不可删行禁用勾选（批量删除仅覆盖有权行）
+            getCheckboxProps: (record: Document) => ({ disabled: !record.can_delete }),
           }}
           locale={{ emptyText: <Empty description={selectedKb ? (search.trim() ? '未匹配到文档' : '该知识库暂无文档') : '请先选择知识库'} /> }}
         />
@@ -363,7 +415,14 @@ function PreviewModal({ doc, onClose }: { doc: Document | null; onClose: () => v
       fetchDocumentRaw(doc.id)
         .then((r) => r.text())
         .then(setTextContent)
-        .catch((e) => message.error(e instanceof Error ? e.message : String(e)))
+        .catch((e) => {
+          // P-b：部分片段无权时禁止下载整份原文，给出明确提示
+          if (e instanceof Error && e.message.includes('PARTIAL_DENIED')) {
+            message.error('该文档包含您无权查看的内容，禁止预览原文')
+          } else {
+            message.error(e instanceof Error ? e.message : String(e))
+          }
+        })
         .finally(() => setLoading(false))
       return
     }

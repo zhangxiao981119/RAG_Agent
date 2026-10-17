@@ -19,7 +19,7 @@ from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config.settings import get_settings
 from app.infra import trace
 from app.infra.redis_client import get_redis
-from app.models import Document, KnowledgeBase, KnowledgeBaseMember, ParseJob
+from app.models import Document, KnowledgeBase, KnowledgeBaseMember, ParseJob, User
 from app.schemas.documents import BatchUploadFailure, BatchUploadResponse, DocumentOut
 from app.schemas.kbs import (
     KnowledgeBaseCreate,
@@ -72,6 +72,8 @@ async def list_kbs(
                 description=kb.description,
                 is_public=kb.is_public,
                 doc_count=doc_count,
+                # P-d：库管理权标志（admin 或 owner），前端按此渲染上传区
+                can_upload=user.clearance >= 40 or kb.owner_id == user.user_id,
             )
         )
     return result
@@ -127,6 +129,7 @@ async def create_kb(
             description=kb.description,
             is_public=kb.is_public,
             doc_count=0,
+            can_upload=True,  # 创建者即 owner（P-d）
         )
     finally:
         await redis.aclose()
@@ -271,6 +274,22 @@ async def list_documents(
         .order_by(Document.created_at.desc())
     )
     rows = (await session.execute(stmt)).scalars().all()
+
+    # P-c/P-d：库管理权（同 KB 一次判定）+ 上传人姓名批量查询（P-e）
+    kb = await session.get(KnowledgeBase, kb_id)
+    can_upload = kb is not None and (
+        user.clearance >= 40 or kb.owner_id == user.user_id
+    )
+    uploader_ids = {d.uploaded_by for d in rows if d.uploaded_by is not None}
+    uploader_names: dict[uuid.UUID, str] = {}
+    if uploader_ids:
+        user_rows = (
+            await session.execute(
+                select(User.id, User.display_name).where(User.id.in_(uploader_ids))
+            )
+        ).all()
+        uploader_names = {u.id: u.display_name for u in user_rows}
+
     return [
         DocumentOut(
             id=d.id,
@@ -282,6 +301,14 @@ async def list_documents(
             version=d.version,
             level_rank=d.level_rank,
             uploaded_at=d.created_at,
+            # P-e 溯源：来源类型 + 上传人展示名（同步/Web 来源为 None）
+            source_kind=d.source_kind,
+            uploader_name=(
+                uploader_names.get(d.uploaded_by) if d.uploaded_by is not None else None
+            ),
+            # P-c/P-f 操作标志：判定在后端，前端只做展示渲染
+            can_delete=can_upload or d.uploaded_by == user.user_id,
+            can_upload=can_upload,
             # M7 WU-M-18：治理面板数据源（四维分数 NULL = 未审查）
             governance_status=d.governance_status,
             freshness_score=d.freshness_score,
@@ -409,11 +436,18 @@ async def _load_kb_for_upload(
     user: CurrentUser,
     session: AsyncSession,
 ) -> KnowledgeBase:
-    """上传端点共用的 KB 校验：存在性 + G2 库级授权（admin 豁免）。"""
+    """上传端点共用的 KB 校验（P-d U1）：存在性 + G2 库级授权 + 管理权。
+
+    上传是库级内容管理动作：仅 admin 或 库 owner 可传（与删除口径对称），
+    普通授权成员只读 + 问答。
+    """
     kb = await session.get(KnowledgeBase, kb_id)
     if kb is None or kb.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
     if user.clearance < 40 and kb_id not in user.authorized_kb_ids:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
+    # P-d：admin / 库 owner 之外禁止上传（G2 通过 ≠ 可传）
+    if user.clearance < 40 and kb.owner_id != user.user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
     return kb
 

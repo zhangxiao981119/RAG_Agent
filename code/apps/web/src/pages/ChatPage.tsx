@@ -884,7 +884,12 @@ function CitationPanel({ citation }: { citation: Citation | null }) {
       a.click()
       URL.revokeObjectURL(url)
     } catch (e) {
-      message.error(e instanceof Error ? e.message : String(e))
+      // P-b：部分片段无权时整份原文禁止下载，给出明确提示
+      if (e instanceof Error && e.message.includes('PARTIAL_DENIED')) {
+        message.error('该文档包含您无权查看的内容，禁止下载原文')
+      } else {
+        message.error(e instanceof Error ? e.message : String(e))
+      }
     }
   }
   if (!citation) {

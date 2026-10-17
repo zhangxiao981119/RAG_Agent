@@ -12,6 +12,8 @@ class KnowledgeBaseOut(BaseModel):
     description: str | None = None
     is_public: bool
     doc_count: int = 0
+    # P-d：当前用户对该库是否可上传（admin 或 库 owner），前端按此渲染上传区
+    can_upload: bool = False
 
 
 class KnowledgeBaseCreate(BaseModel):

@@ -32,6 +32,8 @@ export type KnowledgeBase = {
   description: string
   is_public: boolean
   doc_count: number
+  // P-d：当前用户对该库是否可上传（admin 或 库 owner），前端按此渲染上传区
+  can_upload: boolean
 }
 
 export type Document = {
@@ -53,6 +55,12 @@ export type Document = {
   governance_report: GovernanceReport
   effective_at: string | null
   expire_at: string | null
+  // 上传溯源（P-e）：来源类型 + 上传人展示名（同步/Web 来源为 null）
+  source_kind: 'upload' | 'sync_local' | 'sync_git' | 'sync_web' | null
+  uploader_name: string | null
+  // 前端操作标志（P-c/P-d）：判定在后端，前端只做展示渲染
+  can_delete: boolean
+  can_upload: boolean
 }
 
 // 四维审查报告（后端 governance_report JSONB）
