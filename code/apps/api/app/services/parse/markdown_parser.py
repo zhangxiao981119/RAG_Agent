@@ -7,6 +7,13 @@
     序列化 + table_header —— chunk 层「整表不切 / 行组切分带表头」原样适用；
   · 可信度不足（无表体行 / 表头全空，与 html 可信度阈值同口径）→
     整组行原样回退普通文本，不产空表块。
+
+M8-P1（verbatim 信号）增补：围栏代码块与列表聚合。
+  · 围栏（``` / ~~~）代码块 → 独立 verbatim 块，内容逐行保真（围栏内的
+    # 不是标题、缩进不是续行）；未闭合围栏 → 整组行回退普通文本；
+  · 连续列表行（- / * / + / 1.）连同缩进续行聚合为一个 verbatim 块 ——
+    列表项与编号不再被句子切分拆散；
+  · chunk 层对 verbatim 块只按行边界切分（代码行/列表项是原子）。
 """
 from __future__ import annotations
 
@@ -22,6 +29,13 @@ _PIPE_ROW_RE = re.compile(r"^\s*\|(.+)\|\s*$")
 _SEP_ROW_RE = re.compile(r"^\s*\|(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
 # 单元格内转义竖线（\|）的拆分占位符：拆列时不当边界，还原时恢复原文
 _ESC_PIPE = "\x01"
+# 围栏代码块：开栏（记录字符与长度用于配对）；缩进 0-3 空格内合法，
+# 4+ 空格缩进的 ``` 是代码内容（不 match，被当作围栏体吸收）——GFM 口径
+_FENCE_RE = re.compile(r"^\s{0,3}(```+|~~~+)\s*([\w+-]*)\s*$")
+# 列表行：无序（- / * / +）或有序（1. / 1)），序号限 3 位防止误吞「1970. 年代」类年份文本
+_LIST_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+")
+# 列表项的缩进续行（聚合时归属前一项，保持列表语义完整）
+_INDENT_RE = re.compile(r"^\s+\S")
 
 
 def _split_pipe_row(line: str) -> list[str]:
@@ -66,6 +80,52 @@ def parse_markdown(data: bytes) -> list[ParsedBlock]:
                 stack.pop()
             stack.append((level, title))
             i += 1
+            continue
+        # 围栏代码块（M8-P1）：开栏配对收集，内容逐行保真
+        fence_match = _FENCE_RE.match(line)
+        if fence_match:
+            fence_mark = fence_match.group(1)
+            # 收集围栏体：直到配对闭栏（同字符、长度不小于开栏）或 EOF
+            j = i + 1
+            closed = False
+            while j < n:
+                m2 = _FENCE_RE.match(lines[j])
+                if m2 and m2.group(1)[0] == fence_mark[0] and len(m2.group(1)) >= len(fence_mark):
+                    closed = True
+                    break
+                j += 1
+            if closed:
+                flush()  # 围栏前的普通文本先落块，保证块序
+                body = "\n".join(lines[i + 1 : j]).strip("\n")
+                if body.strip():
+                    blocks.append(
+                        ParsedBlock(
+                            text=body,
+                            heading_path=" > ".join(title for _, title in stack),
+                            verbatim=True,
+                        )
+                    )
+                i = j + 1  # 跳过闭栏
+                continue
+            # 未闭合围栏 → 整组行回退普通文本（原文保真，不产半截代码块）
+            buffer.extend(lines[i:n])
+            i = n
+            continue
+        # 列表聚合（M8-P1）：连续列表行 + 缩进续行 → 一个 verbatim 块。
+        # 聚合块可能超限，chunk 层按行边界切分兜底（列表项是原子）。
+        if _LIST_RE.match(line):
+            j = i + 1
+            while j < n and (_LIST_RE.match(lines[j]) or _INDENT_RE.match(lines[j])):
+                j += 1
+            flush()  # 列表前的普通文本先落块，保证块序
+            blocks.append(
+                ParsedBlock(
+                    text="\n".join(lines[i:j]),
+                    heading_path=" > ".join(title for _, title in stack),
+                    verbatim=True,
+                )
+            )
+            i = j
             continue
         # 标准管道表：表头行 + 紧随分隔行 才构成表格起点（窄口判定）
         if _PIPE_ROW_RE.match(line) and i + 1 < n and _SEP_ROW_RE.match(lines[i + 1]):

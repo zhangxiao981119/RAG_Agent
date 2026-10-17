@@ -23,8 +23,10 @@ _NOISE_TAGS = ("script", "style", "nav", "footer", "header", "noscript", "iframe
 # 标题标签 → 层级（与 markdown_parser 的 # 计数、docx_parser 的 Heading N 同口径）
 _HEADING_LEVELS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
 
-# 承担正文的块级文本标签
-_TEXT_TAGS = ("p", "li", "blockquote", "pre")
+# 承担正文的块级文本标签。
+# <pre> 不在此列：M8-P1 要求代码块逐行保真（get_text(" ") 会把换行压成空格，
+# 代码结构全丢），单独走 verbatim 分支
+_TEXT_TAGS = ("p", "li", "blockquote")
 
 
 def _expand_table(table: Tag) -> list[list[str]]:
@@ -108,10 +110,10 @@ def parse_html(data: bytes) -> list[ParsedBlock]:
         if text:
             blocks.append(ParsedBlock(text=text, heading_path="/".join(heading_stack)))
 
-    for el in root.find_all([*_HEADING_LEVELS.keys(), *_TEXT_TAGS, "table"]):
-        # 嵌套表格的 cell 内文本标签（td 里的 p）不参与顶层遍历，
+    for el in root.find_all([*_HEADING_LEVELS.keys(), *_TEXT_TAGS, "pre", "table"]):
+        # 嵌套表格的 cell 内文本标签（td 里的 p / pre）不参与顶层遍历，
         # 否则同一段文本既进表格又进正文（重复入库）
-        if el.name in _TEXT_TAGS and el.find_parent("table") is not None:
+        if el.name in (*_TEXT_TAGS, "pre") and el.find_parent("table") is not None:
             continue
         level = _HEADING_LEVELS.get(el.name)
         if level is not None:
@@ -126,6 +128,18 @@ def parse_html(data: bytes) -> list[ParsedBlock]:
             block = _table_block(el, "/".join(heading_stack))
             if block is not None:
                 blocks.append(block)
+        elif el.name == "pre":
+            # M8-P1：代码块逐行保真（get_text() 默认不压平，保留 \n 与缩进）；
+            # chunk 层 verbatim 块按行边界切分，代码行不会被句子切分拦腰截断
+            pre_text = el.get_text().strip("\n")
+            if pre_text.strip():
+                blocks.append(
+                    ParsedBlock(
+                        text=pre_text,
+                        heading_path="/".join(heading_stack),
+                        verbatim=True,
+                    )
+                )
         else:
             _flush_text(el.get_text(" ", strip=True))
 

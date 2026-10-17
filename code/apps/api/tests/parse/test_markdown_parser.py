@@ -121,3 +121,98 @@ def test_table_uses_current_heading_stack():
     tables = _tables(blocks)
     assert tables[0].heading_path == "一级"
     assert tables[1].heading_path == "一级 > 二级"
+
+
+# ── M8-P1：围栏代码块 ────────────────────────────────────────────────
+
+
+def test_fence_code_block_verbatim():
+    md = (
+        "# 用法\n\n"
+        "```python\n"
+        "def f(x):\n"
+        "    # 不是标题\n"
+        "    return x.5\n"
+        "```\n"
+    ).encode()
+    blocks = parse_markdown(md)
+    assert len(blocks) == 1  # 标题只入栈不产块 → 全文只有代码块
+    code = blocks[0]
+    assert code.verbatim is True
+    assert code.text.splitlines() == ["def f(x):", "    # 不是标题", "    return x.5"]
+    assert code.heading_path == "用法"
+
+
+def test_fence_unclosed_falls_back_to_text():
+    md = "```python\ndef f(x):\n    return x\n".encode()
+    blocks = parse_markdown(md)
+    assert not any(b.verbatim for b in blocks)
+    assert "def f(x):" in blocks[0].text
+
+
+def test_tilde_fence_and_longer_close():
+    md = "~~~~\ncode line\n~~~~~~\nafter\n".encode()
+    blocks = parse_markdown(md)
+    code = [b for b in blocks if b.verbatim]
+    assert len(code) == 1
+    assert code[0].text == "code line"
+    assert blocks[-1].text == "after"
+
+
+def test_fence_after_text_keeps_block_order():
+    md = ("前置段落\n```\ncode\n```\n后置段落\n").encode()
+    blocks = parse_markdown(md)
+    assert [b.verbatim for b in blocks] == [False, True, False]
+    assert blocks[0].text == "前置段落"
+    assert blocks[2].text == "后置段落"
+
+
+def test_indented_fence_is_fence_body():
+    """4+ 空格缩进的 ``` 是代码内容，不是闭栏（GFM 口径）。"""
+    md = "```\nline1\n    ```\nline2\n```\n".encode()
+    blocks = parse_markdown(md)
+    code = [b for b in blocks if b.verbatim]
+    assert len(code) == 1
+    assert "    ```" in code[0].text
+    assert "line2" in code[0].text
+
+
+# ── M8-P1：列表聚合 ──────────────────────────────────────────────────
+
+
+def test_list_aggregated_into_one_verbatim_block():
+    md = "配置步骤：\n- 第一步\n- 第二步\n- 第三步\n结尾段落\n".encode()
+    blocks = parse_markdown(md)
+    assert [b.verbatim for b in blocks] == [False, True, False]
+    lst = blocks[1]
+    assert lst.text.splitlines() == ["- 第一步", "- 第二步", "- 第三步"]
+
+
+def test_list_with_indent_continuation():
+    md = ("- 项一\n  续行内容\n- 项二\n普通段落\n").encode()
+    blocks = parse_markdown(md)
+    lst = blocks[0]
+    assert lst.verbatim is True
+    assert "  续行内容" in lst.text
+    assert blocks[1].text == "普通段落"
+
+
+def test_ordered_list_aggregated():
+    md = "1. 安装\n2. 配置\n3. 启动\n".encode()
+    blocks = parse_markdown(md)
+    assert len(blocks) == 1
+    assert blocks[0].verbatim is True
+    assert len(blocks[0].text.splitlines()) == 3
+
+
+def test_year_like_line_not_list():
+    """「1970. 年代」不是有序列表（序号限 3 位防误吞年份文本）。"""
+    md = "1970. 年代发生了大事\n后续正文\n".encode()
+    blocks = parse_markdown(md)
+    assert not any(b.verbatim for b in blocks)
+
+
+def test_list_inside_heading_uses_stack():
+    md = ("## 步骤\n\n- a\n- b\n").encode()
+    blocks = parse_markdown(md)
+    assert blocks[-1].heading_path == "步骤"

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 
 import tiktoken
 
@@ -63,17 +64,24 @@ def _hard_split(text: str, max_tokens: int) -> list[str]:
     return pieces
 
 
-def _block_to_units(block: ParsedBlock) -> list[tuple[str, str, int | None]]:
-    """把 ParsedBlock 展开为原子单元 (text, heading_path, page_no)。
+def _block_to_units(
+    block: ParsedBlock,
+) -> list[tuple[str, str, int | None, str | None]]:
+    """把 ParsedBlock 展开为原子单元 (text, heading_path, page_no, table_group_id)。
 
     表格块：整表作为一个单元（除非超 MAX，按行组切并保留表头）。
-    文本块：段落 → 句子 → 硬切，逐级降级。
+      ★ 仅「超限行组切分」的表格块生成 table_group_id（同一次切分的全部分片共享），
+        检索命中任一分片时可回捞同组其余分片（表格决策 A1'）；整表不切的单片
+        无回捞意义，不生成。表格决策 B1'：md 标准管道表也产出 is_table 块，
+        超限时走同一行组切分路径，天然获得打组能力。
+    文本块：段落 → 句子 → 硬切，逐级降级，table_group_id 恒为 None。
     """
     if block.is_table:
         # 表格：先看整表是否超 MAX
         if _count_tokens(block.text) <= decisions.CHUNK_MAX_TOKENS:
-            return [(block.text, block.heading_path, block.page_no)]
-        # 超限：按行组切，每组带表头
+            return [(block.text, block.heading_path, block.page_no, None)]
+        # 超限：按行组切，每组带表头；全部分片打同一组 id 供检索期回捞
+        group_id = uuid.uuid4().hex
         lines = block.text.split("\n")
         if not lines:
             return []
@@ -104,7 +112,7 @@ def _block_to_units(block: ParsedBlock) -> list[tuple[str, str, int | None]]:
         # 宁可不给列定义，也不给"半个表头"（半个表头比没表头更有误导性）。
         header_fits = header_tokens <= decisions.CHUNK_MAX_TOKENS
 
-        units: list[tuple[str, str, int | None]] = []
+        units: list[tuple[str, str, int | None, str | None]] = []
         buffer_lines: list[str] = []
         buffer_tokens = 0
         for piece in flat_pieces:
@@ -119,7 +127,7 @@ def _block_to_units(block: ParsedBlock) -> list[tuple[str, str, int | None]]:
                 not buffer_lines and piece_tokens > decisions.CHUNK_MAX_TOKENS
             ):
                 # 装满一组：吐出，下一组重新尝试带表头
-                units.append(("\n".join(buffer_lines), block.heading_path, block.page_no))
+                units.append(("\n".join(buffer_lines), block.heading_path, block.page_no, group_id))
                 buffer_lines, buffer_tokens = [], 0
             if not buffer_lines and header_fits and header_tokens + piece_tokens <= decisions.CHUNK_MAX_TOKENS:
                 buffer_lines.append(raw_header)
@@ -127,30 +135,60 @@ def _block_to_units(block: ParsedBlock) -> list[tuple[str, str, int | None]]:
             buffer_lines.append(piece)
             buffer_tokens += piece_tokens
         if buffer_lines:
-            units.append(("\n".join(buffer_lines), block.heading_path, block.page_no))
+            units.append(("\n".join(buffer_lines), block.heading_path, block.page_no, group_id))
+        return units
+
+    if block.verbatim:
+        # M8-P1：代码块 / 列表聚合块 —— 只按行边界切分。
+        # 代码行与列表项是原子：句子切分（(?<=[.!?]) 空格）会把 `a = 1. b = 2`
+        # 这类代码拦腰截断、token 硬切会把缩进结构毁掉。行内不切，
+        # 仅单行自身超 MAX 时才对该行硬切（极端长行的兜底，与表格行组同口径）。
+        # 首尾空行剥掉（与围栏 body strip 口径一致），中间空行原样保留。
+        units = []
+        buf: list[str] = []
+        buf_tokens = 0
+        for ln in block.text.strip("\n").split("\n"):
+            ln_tokens = _count_tokens(ln)
+            if ln_tokens > decisions.CHUNK_MAX_TOKENS:
+                # 单行超限：先落已累积的 buf，再对该行硬切
+                if buf:
+                    units.append(("\n".join(buf), block.heading_path, block.page_no, None))
+                    buf, buf_tokens = [], 0
+                for piece in _hard_split(ln, decisions.CHUNK_MAX_TOKENS):
+                    units.append((piece, block.heading_path, block.page_no, None))
+                continue
+            if buf and buf_tokens + ln_tokens > decisions.CHUNK_MAX_TOKENS:
+                units.append(("\n".join(buf), block.heading_path, block.page_no, None))
+                buf, buf_tokens = [], 0
+            buf.append(ln)
+            buf_tokens += ln_tokens
+        if buf:
+            units.append(("\n".join(buf), block.heading_path, block.page_no, None))
         return units
 
     # 文本块：段落 → 句子 → 硬切
-    units: list[tuple[str, str, int | None]] = []
+    units: list[tuple[str, str, int | None, str | None]] = []
     for para in _split_paragraphs(block.text):
         para_tokens = _count_tokens(para)
         if para_tokens <= decisions.CHUNK_MAX_TOKENS:
-            units.append((para, block.heading_path, block.page_no))
+            units.append((para, block.heading_path, block.page_no, None))
             continue
         # 段超限：按句子切
         sentences = _split_sentences(para)
         for sent in sentences:
             sent_tokens = _count_tokens(sent)
             if sent_tokens <= decisions.CHUNK_MAX_TOKENS:
-                units.append((sent, block.heading_path, block.page_no))
+                units.append((sent, block.heading_path, block.page_no, None))
                 continue
             # 句子仍超限：硬切
             for piece in _hard_split(sent, decisions.CHUNK_MAX_TOKENS):
-                units.append((piece, block.heading_path, block.page_no))
+                units.append((piece, block.heading_path, block.page_no, None))
     return units
 
 
-def _accumulate(units: list[tuple[str, str, int | None]]) -> list[ChunkData]:
+def _accumulate(
+    units: list[tuple[str, str, int | None, str | None]],
+) -> list[ChunkData]:
     """贪心累积 + 重叠。
 
     累积到 TARGET 时切；超过 MAX 时立刻切。
@@ -158,7 +196,7 @@ def _accumulate(units: list[tuple[str, str, int | None]]) -> list[ChunkData]:
     """
     chunks: list[ChunkData] = []
     index = 0
-    overlap_units: list[tuple[str, str, int | None]] = []
+    overlap_units: list[tuple[str, str, int | None, str | None]] = []
 
     while index < len(units):
         current = list(overlap_units)
@@ -205,12 +243,22 @@ def _accumulate(units: list[tuple[str, str, int | None]]) -> list[ChunkData]:
         #   而引用溯源（generate/__init__.py）直接把这个 heading_path 展示给用户。
         heading_path = current[0][1] or current[-1][1]
         page_no = next((u[2] for u in current if u[2] is not None), None)
+        # 表格组判定（A1'）：块内所有单元来自同一表格组的行组切分才打组标 ——
+        # 混合块（表格分片 + 其他文本混装，贪心累积的固有行为）打标会让回捞
+        # 把无关文本卷进表格上下文，一律视为无组。
+        chunk_group_ids = {u[3] for u in current}
+        chunk_group = (
+            next(iter(chunk_group_ids))
+            if len(chunk_group_ids) == 1 and None not in chunk_group_ids
+            else None
+        )
         chunks.append(
             ChunkData(
                 content=text,
                 token_count=_count_tokens(text),
                 heading_path=heading_path,
                 page_no=page_no,
+                table_group_id=chunk_group,
             )
         )
 
@@ -250,7 +298,7 @@ def to_embedding_text(chunk: ChunkData) -> str:
 
 def chunk_blocks(blocks: list[ParsedBlock]) -> list[ChunkData]:
     """对解析后的 blocks 做分块。空 block 会被跳过。"""
-    units: list[tuple[str, str, int | None]] = []
+    units: list[tuple[str, str, int | None, str | None]] = []
     for block in blocks:
         if not block.text.strip():
             continue

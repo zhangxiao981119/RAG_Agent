@@ -31,6 +31,11 @@ class ParsedBlock:
     is_table: bool = False
     # 表格块的列头（整表不切时 chunk 服务会带表头）
     table_header: list[str] = field(default_factory=list)
+    # M8-P1：逐行保真信号（代码围栏块 / 列表聚合块 / html <pre>）。
+    # verbatim 块在 chunk 层禁用句子/词级切分 —— 代码行与列表项是原子，
+    # 只按行边界切（整块 <=800 直接成片；超限按行累积，单行超限才硬切）。
+    # 普通文本走既有 段落→句子→硬切 逐级降级，语义不变。
+    verbatim: bool = False
 
 
 class ParseError(Exception):

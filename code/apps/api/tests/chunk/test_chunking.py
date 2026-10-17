@@ -214,3 +214,56 @@ def test_no_infinite_loop_when_units_are_large():
 
 def test_empty_blocks_skip():
     assert chunk_blocks([ParsedBlock("   ", heading_path="H")]) == []
+
+
+# ── M8-P1：verbatim 块按行边界切分 ───────────────────────────────────
+
+
+def _code_lines(n: int) -> str:
+    """n 行代码，每行约 30~40 token（英文长行，确保 token 数可预测地超限）。"""
+    return "\n".join(f"value_{i} = compute('arg-{i}', config={'x' * 60})" for i in range(n))
+
+
+def test_verbatim_code_never_midline_split():
+    """代码行是原子：任何 chunk 的行内容必须完整（不含被拦腰截断的行）。"""
+    code = _code_lines(60)  # 约 2000+ token → 必然多片
+    chunks = chunk_blocks([ParsedBlock(code, heading_path="示例", verbatim=True)])
+    assert len(chunks) >= 2
+    for c in chunks:
+        assert c.token_count <= D.CHUNK_MAX_TOKENS
+        for line in c.content.split("\n"):
+            # 行完整：以 value_ 开头且以右括号收尾（行内不切）
+            assert line.startswith("value_")
+            assert line.endswith(")")
+
+
+def test_verbatim_small_block_whole():
+    """≤ MAX 的代码块整块成片，不切。"""
+    code = "def f(x):\n    return x"
+    chunks = chunk_blocks([ParsedBlock(code, heading_path="H", verbatim=True)])
+    assert len(chunks) == 1
+    assert chunks[0].content == code
+    assert chunks[0].table_group_id is None
+
+
+def test_verbatim_single_overlong_line_hard_split():
+    """单行超 MAX：对该行硬切兜底（与表格行组同口径），其余行不受影响。"""
+    long_line = "a" * 4000
+    code = "head_line\n" + long_line + "\ntail_line"
+    chunks = chunk_blocks([ParsedBlock(code, heading_path="H", verbatim=True)])
+    assert chunks
+    for c in chunks:
+        assert c.token_count <= D.CHUNK_MAX_TOKENS
+    joined = "\n".join(c.content for c in chunks)
+    assert "head_line" in joined
+    assert "tail_line" in joined
+    assert "a" * 100 in joined  # 长行内容未丢失
+
+
+def test_verbatim_list_lines_not_merged_by_sentence_split():
+    """列表聚合块走 verbatim 后：列表项与缩进续行的行结构原样保留。"""
+    lst = "- 配置数据库连接\n  默认端口 5432\n- 启动服务\n  等待健康检查通过\n- 验证结果\n"
+    chunks = chunk_blocks([ParsedBlock(lst, heading_path="步骤", verbatim=True)])
+    assert len(chunks) == 1
+    assert chunks[0].content.split("\n") == lst.rstrip("\n").split("\n")
+

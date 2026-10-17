@@ -132,3 +132,37 @@ def test_cell_tab_and_newline_sanitized():
 def test_empty_document_raises_parse_error():
     with pytest.raises(ParseError, match="未提取到可检索内容"):
         parse_html("<html><body><nav>只有导航</nav><script>1</script></body></html>".encode("utf-8"))
+
+
+# ── M8-P1：<pre> 代码块逐行保真 ──────────────────────────────────────
+
+
+def test_pre_block_verbatim_keeps_newlines():
+    html = (
+        "<html><body><h2>示例</h2>"
+        "<pre>def f(x):\n    return x + 1\n</pre>"
+        "<p>正文段落</p>"
+        "</body></html>"
+    ).encode("utf-8")
+    blocks = parse_html(html)
+    pre = [b for b in blocks if b.verbatim]
+    assert len(pre) == 1
+    # get_text() 不压平：换行与缩进保留（此前 get_text(" ") 会把三行压成一行）
+    assert pre[0].text.splitlines() == ["def f(x):", "    return x + 1"]
+    assert pre[0].heading_path == "示例"
+    # h2 只入栈不产块 → blocks = [pre, p]
+    assert [b.verbatim for b in blocks] == [True, False]
+
+
+def test_pre_inside_table_not_duplicated():
+    """td 里的 <pre> 归表格块，不重复进正文。"""
+    html = (
+        "<html><body><table>"
+        "<tr><th>说明</th></tr>"
+        "<tr><td><pre>code\nhere</pre></td></tr>"
+        "</table></body></html>"
+    ).encode("utf-8")
+    blocks = parse_html(html)
+    assert not any(b.verbatim for b in blocks)
+    assert len(blocks) == 1  # 只有表格块
+    assert "code" in blocks[0].text
