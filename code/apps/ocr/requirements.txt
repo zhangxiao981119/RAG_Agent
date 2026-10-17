@@ -1,8 +1,10 @@
-# PyPI 走清华镜像（构建环境国内网络）；torch 走 CPU 专用源
+# PyPI 走清华镜像（构建环境国内网络）
 -i https://pypi.tuna.tsinghua.edu.cn/simple
---extra-index-url https://download.pytorch.org/whl/cpu
-# torch 走 CPU 专用源（CUDA 版体积 ~3GB 且容器无 GPU 无意义）
-torch==2.1.2
+# torch 走 CPU 专用源（CUDA 版体积 ~3GB 且容器无 GPU 无意义）。
+# ★ 不走 download.pytorch.org：大 wheel 经 Clash 代理传输曾在 106MB 处中断，
+#   pip 拿到残缺文件报 hash 不匹配。改阿里云 pytorch-wheels 镜像国内直连，
+#   并锁定 sha256（与 pytorch 官方 index 元数据核对一致）。
+torch @ https://mirrors.aliyun.com/pytorch-wheels/cpu/torch-2.1.2%2Bcpu-cp310-cp310-linux_x86_64.whl#sha256=bf3ca897f8c7c218dd6c4b1cc5eec57b4f4e71106b0b8120e92f5fdaf4acf6cd
 # GOT-OCR2.0 官方锁定 transformers 4.37.0（自定义架构 API 兼容边界）
 transformers==4.37.0
 sentencepiece
