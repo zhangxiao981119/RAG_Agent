@@ -21,6 +21,7 @@ import {
   CloseOutlined,
   CopyOutlined,
   DeleteOutlined,
+  DownloadOutlined,
   LikeOutlined,
   MessageOutlined,
   PictureOutlined,
@@ -39,6 +40,7 @@ import {
   deleteConversation,
   fetchConversationMessages,
   fetchConversations,
+  fetchDocumentRaw,
   fetchKbs,
   KnowledgeBase,
   mockAsk,
@@ -866,6 +868,25 @@ export function ChatPage({ currentUser }: Props) {
 
 // 引用内容面板（右侧常驻栏）
 function CitationPanel({ citation }: { citation: Citation | null }) {
+  const { message } = App.useApp()
+  // M8-P3b 附件下载：<a href> 无法带 Authorization 头，经 fetchDocumentRaw
+  // （带 token 与 401 刷新）取 blob 后触发浏览器保存，复用 DocumentsPage 同款模式
+  const handleDownloadRaw = async () => {
+    if (!citation?.raw_url) return
+    try {
+      const resp = await fetchDocumentRaw(citation.doc_id)
+      if (!resp.ok) throw new Error(`下载失败（${resp.status}）`)
+      const blob = await resp.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = citation.filename
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e))
+    }
+  }
   if (!citation) {
     return (
       <Empty
@@ -878,7 +899,19 @@ function CitationPanel({ citation }: { citation: Citation | null }) {
   return (
     <div>
       <div style={{ background: '#e6f4ff', borderRadius: 8, padding: 12 }}>
-        <div style={{ fontWeight: 600, color: '#0958d9' }}>{citation.filename}</div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+          <div style={{ fontWeight: 600, color: '#0958d9', wordBreak: 'break-all' }}>{citation.filename}</div>
+          {citation.raw_url && (
+            <Tooltip title="下载原始文件">
+              <Button
+                type="text"
+                size="small"
+                icon={<DownloadOutlined />}
+                onClick={handleDownloadRaw}
+              />
+            </Tooltip>
+          )}
+        </div>
         {citation.heading_path && (
           <div style={{ marginTop: 4, color: '#1677ff', fontSize: 13 }}>{citation.heading_path}</div>
         )}

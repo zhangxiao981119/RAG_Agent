@@ -12,6 +12,8 @@ export type Citation = {
   page_no: number
   score: number
   snippet?: string
+  // M8-P3b 附件：原始文件下载链接（后端鉴权代理端点，相对路径）
+  raw_url?: string
 }
 
 export type ChatEvent =

@@ -521,6 +521,9 @@ async def chat_ask(
                     "page_no": c.page_no,
                     "score": c.display_score,
                     "snippet": c.content[:200],
+                    # M8-P3b 附件：原始文件下载链接（WU-M-19 鉴权代理端点，
+                    # 相对路径满足 INV-M-16 —— 禁止直出 MinIO 地址）
+                    "raw_url": f"/api/documents/{c.document_id}/raw",
                 }
                 for i, c in enumerate(effective_chunks)
             ]
