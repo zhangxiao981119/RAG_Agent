@@ -216,3 +216,52 @@ def test_list_inside_heading_uses_stack():
     md = ("## 步骤\n\n- a\n- b\n").encode()
     blocks = parse_markdown(md)
     assert blocks[-1].heading_path == "步骤"
+
+
+# ── M8-P2：块级公式 + mermaid 钉住 ───────────────────────────────────
+
+
+def test_formula_block_verbatim():
+    md = (
+        "# 推导\n\n"
+        "$$\n"
+        "E = mc^2 with 3.14 radius\n"
+        "\\int_0^1 x^2 dx\n"
+        "$$\n"
+    ).encode()
+    blocks = parse_markdown(md)
+    assert len(blocks) == 1
+    f = blocks[0]
+    assert f.verbatim is True
+    # 公式行的 3.14 不构成句子切分断点：整体一个 verbatim 块
+    assert f.text.splitlines() == ["E = mc^2 with 3.14 radius", "\\int_0^1 x^2 dx"]
+    assert f.heading_path == "推导"
+
+
+def test_formula_unclosed_falls_back():
+    md = "$$\nE = mc^2\n".encode()
+    blocks = parse_markdown(md)
+    assert not any(b.verbatim for b in blocks)
+    assert "E = mc^2" in blocks[0].text
+
+
+def test_single_line_dollar_dollar_not_formula():
+    """单行 $$..$$ 不识别（窄口防误判）。"""
+    md = "价格是 $$100 起步\n正文\n".encode()
+    blocks = parse_markdown(md)
+    assert not any(b.verbatim for b in blocks)
+
+
+def test_mermaid_fence_is_verbatim():
+    """mermaid 图是 ``` 围栏，钉住其走 M8-P1 verbatim 保真路径。"""
+    md = (
+        "# 流程\n\n"
+        "```mermaid\n"
+        "graph TD\n"
+        "    A[开始] --> B{判断}\n"
+        "```\n"
+    ).encode()
+    blocks = parse_markdown(md)
+    assert len(blocks) == 1
+    assert blocks[0].verbatim is True
+    assert "graph TD" in blocks[0].text

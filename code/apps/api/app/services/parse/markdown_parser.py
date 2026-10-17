@@ -14,6 +14,9 @@ M8-P1（verbatim 信号）增补：围栏代码块与列表聚合。
   · 连续列表行（- / * / + / 1.）连同缩进续行聚合为一个 verbatim 块 ——
     列表项与编号不再被句子切分拆散；
   · chunk 层对 verbatim 块只按行边界切分（代码行/列表项是原子）。
+
+M8-P2（公式）增补：独立行 $$ 定界的块级公式 → verbatim 块。mermaid 图
+  本身是 ``` 围栏，已由 M8-P1 覆盖保真；行内 $..$ 不处理（切分不涉及）。
 """
 from __future__ import annotations
 
@@ -36,6 +39,9 @@ _FENCE_RE = re.compile(r"^\s{0,3}(```+|~~~+)\s*([\w+-]*)\s*$")
 _LIST_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+")
 # 列表项的缩进续行（聚合时归属前一项，保持列表语义完整）
 _INDENT_RE = re.compile(r"^\s+\S")
+# M8-P2 块级公式：独立行的 $$ 定界（开栏/闭栏同形）。单行 $$..$$ 不识别
+# （窄口防误判：行内公式/金额文本碰巧含 $$ 的场景远多于单行公式块）
+_FORMULA_DELIM_RE = re.compile(r"^\s*\$\$\s*$")
 
 
 def _split_pipe_row(line: str) -> list[str]:
@@ -108,6 +114,30 @@ def parse_markdown(data: bytes) -> list[ParsedBlock]:
                 i = j + 1  # 跳过闭栏
                 continue
             # 未闭合围栏 → 整组行回退普通文本（原文保真，不产半截代码块）
+            buffer.extend(lines[i:n])
+            i = n
+            continue
+        # 块级公式（M8-P2）：独立行 $$ 定界，内容逐行保真。
+        # 公式内的 3.14 / e.g. / x! 会成为句子切分的错误断点，verbatim 块
+        # 只按行边界切分（复用 M8-P1 分支），公式行保持原子
+        if _FORMULA_DELIM_RE.match(line):
+            j = i + 1
+            while j < n and not _FORMULA_DELIM_RE.match(lines[j]):
+                j += 1
+            if j < n:  # 找到闭栏
+                flush()  # 公式前的普通文本先落块，保证块序
+                body = "\n".join(lines[i + 1 : j]).strip("\n")
+                if body.strip():
+                    blocks.append(
+                        ParsedBlock(
+                            text=body,
+                            heading_path=" > ".join(title for _, title in stack),
+                            verbatim=True,
+                        )
+                    )
+                i = j + 1  # 跳过闭栏
+                continue
+            # 未闭合 → 整组行回退普通文本
             buffer.extend(lines[i:n])
             i = n
             continue
