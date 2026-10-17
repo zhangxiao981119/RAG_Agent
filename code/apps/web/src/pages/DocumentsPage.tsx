@@ -255,9 +255,20 @@ export function DocumentsPage() {
 
       <Dragger
         accept=".pdf,.md,.txt,.xls,.xlsx,.docx"
+        multiple
         showUploadList={false}
         disabled={uploading || !selectedKb}
-        beforeUpload={(file) => {
+        beforeUpload={(file, fileList) => {
+          // INV-M-18：批量提交前校验同格式 —— antd 的 fileList 是当次拖入/
+          // 选择的整批文件；混合格式整批拦截（提示只发一次），逐文件判断
+          // 相同集合保证每个文件都被拦下
+          const exts = new Set(fileList.map((f) => f.name.split('.').pop()?.toLowerCase() ?? ''))
+          if (exts.size > 1) {
+            if (fileList[0] === file) {
+              message.error(`批量上传只接受同一格式，检测到 ${[...exts].join('、')}`)
+            }
+            return false
+          }
           void handleUpload(file)
           // 返回 false 阻止 antd Upload 自动发请求，上传逻辑由 uploadDocument 接管
           return false

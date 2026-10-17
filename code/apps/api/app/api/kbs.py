@@ -20,7 +20,7 @@ from app.config.settings import get_settings
 from app.infra import trace
 from app.infra.redis_client import get_redis
 from app.models import Document, KnowledgeBase, KnowledgeBaseMember, ParseJob
-from app.schemas.documents import DocumentOut
+from app.schemas.documents import BatchUploadFailure, BatchUploadResponse, DocumentOut
 from app.schemas.kbs import (
     KnowledgeBaseCreate,
     KnowledgeBaseDetail,
@@ -287,28 +287,21 @@ async def list_documents(
     ]
 
 
-@router.post(
-    "/kbs/{kb_id}/documents",
-    response_model=DocumentOut,
-    status_code=status.HTTP_201_CREATED,
-)
-async def upload_document(
-    kb_id: uuid.UUID,
+async def _upload_single(
     request: Request,
-    file: UploadFile = File(...),
-    user: CurrentUser = Depends(get_current_user),
-    session: AsyncSession = Depends(get_db),
+    kb: KnowledgeBase,
+    file: UploadFile,
+    user: CurrentUser,
+    session: AsyncSession,
 ) -> DocumentOut:
-    settings = get_settings()
+    """单文件上传全流程（WU-M-21 抽取，单文件端点与 batch 端点共用唯一实现）。
 
-    # 校验 KB 存在
-    kb = await session.get(KnowledgeBase, kb_id)
-    if kb is None or kb.tenant_id != user.tenant_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
-    # G2：库级授权（kb_id ∈ authorized_kb_ids），admin 豁免
-    # 与 list_documents 一致，避免普通用户向任意库上传文档
-    if user.clearance < 40 and kb_id not in user.authorized_kb_ids:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
+    ★ KB 存在性 / G2 授权校验在端点层完成（两端点同一套），本函数只管
+      "文件 → 对象存储 → Document → ParseJob → 审计 → 入队" 主链；
+    ★ 每个文件独立 commit + 入队：batch 部分成功时不被后续失败拖累，
+      失败文件返回逐文件原因（INV-M-18 验收口径）。
+    """
+    settings = get_settings()
 
     # 读文件内容（限制大小，避免 OOM）
     data = await file.read()
@@ -330,7 +323,7 @@ async def upload_document(
 
     # 落对象存储
     doc_group_id = uuid.uuid4()
-    storage_key = f"{user.tenant_id}/{kb_id}/{doc_group_id}/v1/{filename}"
+    storage_key = f"{user.tenant_id}/{kb.id}/{doc_group_id}/v1/{filename}"
     storage = await get_storage()
     await storage.put_object(storage_key, data, file.content_type or "application/octet-stream")
 
@@ -344,7 +337,7 @@ async def upload_document(
     # 建 document
     document = Document(
         tenant_id=user.tenant_id,
-        kb_id=kb_id,
+        kb_id=kb.id,
         doc_group_id=doc_group_id,
         version=1,
         is_latest=True,
@@ -379,7 +372,7 @@ async def upload_document(
     await audit.record(
         user.tenant_id, user.user_id, "doc.upload",
         object_type="document", object_id=str(document.id),
-        detail={"kb_id": str(kb_id), "filename": filename, "size_bytes": size_bytes, "level_rank": 20},
+        detail={"kb_id": str(kb.id), "filename": filename, "size_bytes": size_bytes, "level_rank": 20},
     )
 
     # 入队 arq 任务（复用 lifespan 初始化的全局连接池）
@@ -400,3 +393,83 @@ async def upload_document(
         level_rank=document.level_rank,
         uploaded_at=document.created_at,
     )
+
+
+async def _load_kb_for_upload(
+    kb_id: uuid.UUID,
+    user: CurrentUser,
+    session: AsyncSession,
+) -> KnowledgeBase:
+    """上传端点共用的 KB 校验：存在性 + G2 库级授权（admin 豁免）。"""
+    kb = await session.get(KnowledgeBase, kb_id)
+    if kb is None or kb.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+    if user.clearance < 40 and kb_id not in user.authorized_kb_ids:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
+    return kb
+
+
+@router.post(
+    "/kbs/{kb_id}/documents",
+    response_model=DocumentOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_document(
+    kb_id: uuid.UUID,
+    request: Request,
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> DocumentOut:
+    kb = await _load_kb_for_upload(kb_id, user, session)
+    return await _upload_single(request, kb, file, user, session)
+
+
+def _file_ext(filename: str | None) -> str:
+    return (filename.rsplit(".", 1)[-1].lower() if filename and "." in filename else "")
+
+
+@router.post(
+    "/kbs/{kb_id}/documents/batch",
+    response_model=BatchUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_documents_batch(
+    kb_id: uuid.UUID,
+    request: Request,
+    files: list[UploadFile] = File(...),
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> BatchUploadResponse:
+    """批量上传（M7 WU-M-21 / INV-M-18）：只接受同一扩展名的文件集合。
+
+    ★ 混合格式直接 400 —— 混合集合共用一次提交会让解析分派、失败归因、
+      部分成功/失败状态机同时复杂化，问题难定位（规范 §4.2 WU-M-21）。
+    ★ 逐文件复用 _upload_single（MUST NOT 另写一套上传逻辑），
+      返回逐文件成功/失败与原因，便于定位。
+    """
+    kb = await _load_kb_for_upload(kb_id, user, session)
+
+    # INV-M-18：扩展名集合基数 == 1，混合即 400
+    exts = {_file_ext(f.filename) for f in files}
+    if len(exts) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"MIXED_FILE_TYPES: 批量上传只接受同一格式，检测到 {', '.join(sorted(exts))}",
+        )
+
+    succeeded: list[DocumentOut] = []
+    failed: list[BatchUploadFailure] = []
+    for file in files:
+        try:
+            succeeded.append(await _upload_single(request, kb, file, user, session))
+        except HTTPException as exc:
+            # 单文件失败不影响其他文件（各自已独立 commit / 入队）
+            failed.append(
+                BatchUploadFailure(
+                    filename=file.filename or "unnamed",
+                    detail=str(exc.detail),
+                )
+            )
+
+    return BatchUploadResponse(succeeded=succeeded, failed=failed)

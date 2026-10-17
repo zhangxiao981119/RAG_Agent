@@ -56,3 +56,18 @@ class ParsePreviewResponse(BaseModel):
     modality: str
     source: ParsePreviewSource
     blocks: list[ParsePreviewBlock] = []
+
+
+# ── 批量上传（M7 WU-M-21 / INV-M-18）────────────────────────────────
+
+
+class BatchUploadFailure(BaseModel):
+    """逐文件失败结果：文件名 + 原因（便于定位是哪个文件、为何失败）。"""
+
+    filename: str
+    detail: str
+
+
+class BatchUploadResponse(BaseModel):
+    succeeded: list[DocumentOut] = []
+    failed: list[BatchUploadFailure] = []
