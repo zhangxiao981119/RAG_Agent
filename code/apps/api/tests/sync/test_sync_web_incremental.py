@@ -218,6 +218,8 @@ async def test_unchanged_etag_skips_reindex(harness: Harness):
     count = await sync_service.sync_source(source)  # 同 ETag 再同步
 
     assert count == 0
+    # DoD（WU-M-14）：二次同步未变更页面 last_sync_count == 0
+    assert source.last_sync_count == 0
     assert len(harness.docs()) == docs_after_first
     assert len(harness.sink["enqueued"]) == enq_after_first
 
