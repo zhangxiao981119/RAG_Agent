@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     #   "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     # dev 留空 = 内置开发密钥；prod MUST 显式注入独立密钥（见 model_post_init）
     credential_encryption_key: str | None = None
+    # ── M7 WU-M-12 web 抓取限速与并发（INV-M-08，默认保守）────
+    web_fetch_timeout_s: int = 15  # 单请求超时
+    web_fetch_interval_ms: int = 1000  # 同步循环相邻请求最小间隔（毫秒）
+    web_fetch_concurrency: int = 2  # 抓取并发上限（semaphore，同步任务不打垮内网站点）
+    web_max_pages_per_sync: int = 200  # 单次同步最多抓取页面数（防失控膨胀）
     # ── M3 登录安全策略 ──────────────────────────────────────
     bcrypt_rounds: int = 12  # bcrypt 哈希轮数，越大越慢越安全
     login_max_failures: int = 5  # 连续失败多少次后锁定账户
