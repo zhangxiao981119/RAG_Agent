@@ -49,7 +49,7 @@ _WHERE_BASE = """WHERE c.tenant_id = :tenant_id
 # 治理权重（M7 WU-M-17）：COALESCE 按 0 —— INV-M-12 治理失败/未审查不参与过滤
 _VECTOR_SQL_TEMPLATE = f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
-       c.level_rank, c.acl_tags,
+       c.level_rank, c.acl_tags, c.table_group_id,
        COALESCE(c.governance_weight, 0) AS governance_weight,
        1 - (c.embedding <=> '{{query_vec}}'::vector) AS vector_score
 FROM chunks c
@@ -65,7 +65,7 @@ LIMIT :limit
 # ESCAPE '\' 让 pattern 中的 \% \_ 当字面量，避免用户输入的 %/_ 被当 SQL 通配符
 _KEYWORD_SQL = text(f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
-       c.level_rank, c.acl_tags,
+       c.level_rank, c.acl_tags, c.table_group_id,
        COALESCE(c.governance_weight, 0) AS governance_weight
 FROM chunks c
 {_WHERE_BASE}
@@ -80,7 +80,7 @@ LIMIT :limit
 #     名是函数名本身，`q.query` 会直接报 column does not exist。
 _KEYWORD_FTS_SQL = text(f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
-       c.level_rank, c.acl_tags,
+       c.level_rank, c.acl_tags, c.table_group_id,
        COALESCE(c.governance_weight, 0) AS governance_weight,
        ts_rank(to_tsvector('simple', c.content), q.query) AS keyword_score
 FROM chunks c, to_tsquery('simple', :tsquery) AS q(query)
@@ -94,6 +94,20 @@ LIMIT :limit
 # 过滤 deleted_at IS NULL，避免已软删除文档的 filename 仍被带进引用展示
 _FILENAME_SQL = text("""
 SELECT id, filename FROM documents WHERE id = ANY(:doc_ids) AND deleted_at IS NULL
+""")
+
+# 大表分片回捞（表格决策 A1'）：按组取同组全部分片，ACL 四闸门与主召回同款下推。
+# 已入选片 / 上限 / token 预算在 Python 侧过滤 —— 组内分片数小（= 表 tokens / 800），
+# LIMIT 取上限 + 50 余量已足够；排除条件用 Python 过滤避免 asyncpg 空数组类型推断问题。
+# ORDER BY chunk_index 保证回捞片按表内顺序拼接（跨片行对比需要行序连贯）。
+_TABLE_RECALL_SQL = text(f"""
+SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
+       c.level_rank, c.token_count
+FROM chunks c
+{_WHERE_BASE}
+  AND c.table_group_id = :group_id
+ORDER BY c.chunk_index
+LIMIT :recall_limit
 """)
 
 # 从查询中提取可安全用于 tsquery 的词元：仅 ASCII 字母/数字/下划线，长度 >= 2。
@@ -360,7 +374,70 @@ class RetrievalService:
 
         metrics.incr("rag.gate.passed", source="rerank" if use_rerank else "vector")
 
-        # ⑥ 三路召回贡献打点
+        # ⑥ 大表分片回捞（表格决策 A1'）：命中纯表格分片时补捞同组其余分片。
+        #    回捞片仅作上下文补充 —— 单独存放，不进排序 / 阈值 / 三路贡献统计；
+        #    调用方（chat）把它追加进上下文拼装序列，编号与 citations 沿用既有机制。
+        #    限流双保险：每组最多 TABLE_RECALL_MAX_CHUNKS 片、累计 token 不得超过
+        #    TABLE_RECALL_TOKEN_BUDGET（超预算即停，保行序完整，不跳片拼残表）。
+        recall_chunks: list[RetrievedChunk] = []
+        hit_group_ids = {
+            g
+            for g in (
+                all_chunks[c.chunk_id].get("table_group_id") for c in retrieved
+            )
+            if g
+        }
+        if hit_group_ids:
+            t_recall = time.perf_counter()
+            final_id_set = {c.chunk_id for c in retrieved}
+            for gid in hit_group_ids:
+                recall_result = await session.execute(
+                    _TABLE_RECALL_SQL,
+                    {
+                        **pushdown,
+                        "group_id": gid,
+                        "recall_limit": decisions.TABLE_RECALL_MAX_CHUNKS + 50,
+                    },
+                )
+                picked = 0
+                picked_tokens = 0
+                for row in recall_result.fetchall():
+                    if row.id in final_id_set:
+                        continue
+                    if picked >= decisions.TABLE_RECALL_MAX_CHUNKS:
+                        break
+                    row_tokens = int(row.token_count or 0)
+                    if picked_tokens + row_tokens > decisions.TABLE_RECALL_TOKEN_BUDGET:
+                        break
+                    recall_chunks.append(
+                        RetrievedChunk(
+                            chunk_id=row.id,
+                            document_id=row.document_id,
+                            kb_id=row.kb_id,
+                            filename=filenames.get(row.document_id, ""),
+                            content=row.content,
+                            heading_path=row.heading_path or "",
+                            page_no=row.page_no,
+                            level_rank=row.level_rank,
+                            vector_score=0.0,
+                            keyword_score=None,
+                            rrf_score=0.0,
+                            rerank_score=None,
+                            final_score=0.0,
+                            is_table_recall=True,
+                        )
+                    )
+                    picked += 1
+                    picked_tokens += row_tokens
+            if recall_chunks:
+                metrics.incr(
+                    "rag.table_recall.hit",
+                    chunks=len(recall_chunks),
+                    groups=len(hit_group_ids),
+                )
+            stages["table_recall"] = int((time.perf_counter() - t_recall) * 1000)
+
+        # ⑦ 三路召回贡献打点
         #    covered = 最终 top-K 中该路召回到的条数（多路可重叠）
         #    unique  = 最终 top-K 中**只有**该路能召回到的条数
         #    口径以最终 top-K 为准，而不是各路原始候选数 —— 后者只说明"捞了多少"，
@@ -387,6 +464,7 @@ class RetrievalService:
             score_source="rerank" if use_rerank else "vector",
             use_rerank=use_rerank,
             path_stats=path_stats,
+            table_recall_chunks=recall_chunks,
         )
 
 

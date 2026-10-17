@@ -375,6 +375,15 @@ GOVERNANCE_PROMPT_MAX_CHARS: Final[int] = 12_000
 """送审文档拼接文本上限（字符），超出从尾部截断。
 审查看整体形态，头部内容足够代表；不截断则超长文档会打出 LLM 超时重试风暴。"""
 
+# ── 大表分片回捞（表格决策 A1' 限流版）──────────────────────
+TABLE_RECALL_MAX_CHUNKS: Final[int] = 3
+"""单个表格组最多回捞的分片数（不含命中片本身）。
+无上限的回捞会把整张大表塞进上下文，挤占 32K 窗口、挤掉其他正常命中片段。"""
+
+TABLE_RECALL_TOKEN_BUDGET: Final[int] = 2_048
+"""单个表格组回捞分片的 token 预算上限（按 chunks.token_count 累计）。
+与限流双保险：即便分片很小，也不允许无限捞。"""
+
 
 # ── 脱敏（M5 任务 2）──────────────────────────────────
 MASK_PII_ENABLED: Final[bool] = True
@@ -560,6 +569,8 @@ def self_check() -> None:
             "GOVERNANCE_WEIGHT_SCALE MUST 在 (0, 0.002] 内 —— "
             "过大会把治理偏移变成对 L1 阈值口径的冲击"
         )
+    if TABLE_RECALL_MAX_CHUNKS <= 0 or TABLE_RECALL_TOKEN_BUDGET <= 0:
+        raise RuntimeError("TABLE_RECALL_* MUST 为正数 —— 回捞限流常量失守会让大表淹没上下文")
 
     # ── 索引口径（方案一：索引/模型版本）──
     # 维度是 schema 契约：chunks.embedding 是 vector(1024)，改维度必须配套迁移表结构。

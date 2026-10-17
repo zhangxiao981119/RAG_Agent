@@ -151,6 +151,7 @@ async def run_parse_job(
                     acl_tags=doc_ext["acl_tags"],
                     deny_subjects=doc_ext["deny_subjects"],
                     is_latest=True,
+                    table_group_id=chunk.table_group_id,
                     embedding=vec,
                     embedding_model=profile.embedding_model,
                     embedding_text_version=profile.embedding_text_version,

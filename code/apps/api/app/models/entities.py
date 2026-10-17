@@ -239,6 +239,9 @@ class Chunk(Base):
     # M7 治理加权（迁移 0017）：在 rerank 之后叠加，MUST NOT 进入 RRF（INV-M-13）。
     # 落列缓存避免检索期每次 join documents。
     governance_weight: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # 表格决策 A1'（迁移 0018）：超大表行组切分的组 id，同组分片可被检索期回捞。
+    # 仅纯表格分片非空；整表单片 / 混合块为 NULL。
+    table_group_id: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -253,6 +256,12 @@ class Chunk(Base):
             "embedding",
             postgresql_using="hnsw",
             postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+        # 组回捞查询走部分索引：仅组 id 非空的行参与（组数远小于 chunk 总数）
+        Index(
+            "idx_chunk_table_group",
+            "table_group_id",
+            postgresql_where=text("table_group_id IS NOT NULL"),
         ),
     )
 
