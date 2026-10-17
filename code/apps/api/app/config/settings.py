@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     jwt_secret: str | None = None  # JWT 签名密钥；生产 MUST 显式注入，dev 自动生成随机值
     jwt_expire_minutes: int = 1440  # access token 默认 24 小时
     jwt_refresh_expire_days: int = 7  # refresh token 默认 7 天
+    # ── M7 WU-M-11 同步源凭据存储态加密（INV-M-07）────────────
+    # Fernet 密钥（urlsafe base64，32 字节）。生成：python -c
+    #   "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # dev 留空 = 内置开发密钥；prod MUST 显式注入独立密钥（见 model_post_init）
+    credential_encryption_key: str | None = None
     # ── M3 登录安全策略 ──────────────────────────────────────
     bcrypt_rounds: int = 12  # bcrypt 哈希轮数，越大越慢越安全
     login_max_failures: int = 5  # 连续失败多少次后锁定账户
@@ -112,6 +117,14 @@ class Settings(BaseSettings):
         """
         if self.app_env == "prod" and not self.jwt_secret:
             raise ValueError("生产环境必须显式注入: JWT_SECRET（当前值为 None/空）")
+        # WU-M-11：凭据存储态加密密钥 —— dev 留空时落到内置开发密钥；
+        # prod 必须显式注入独立密钥（禁止开发默认值上线）
+        if not self.credential_encryption_key:
+            self.credential_encryption_key = (
+                "Zz3xQ9wV7tK2pL8mN5jH4bF6dS0aR1eY3uI7oP9gX2k="  # 仅 dev
+            )
+        elif self.app_env == "prod" and self.credential_encryption_key == "Zz3xQ9wV7tK2pL8mN5jH4bF6dS0aR1eY3uI7oP9gX2k=":
+            raise ValueError("生产环境必须显式注入: CREDENTIAL_ENCRYPTION_KEY（禁止使用开发默认值）")
 
 
 @lru_cache

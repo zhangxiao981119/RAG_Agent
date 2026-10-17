@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -20,6 +21,7 @@ from app.infra import trace
 from app.models import KnowledgeBase, SyncSource
 from app.schemas.sync import SyncSourceCreate, SyncSourceOut, SyncSourceUpdate, SyncResult
 from app.services import audit
+from app.services.crypto import encrypt_credential
 
 router = APIRouter(tags=["sync-sources"])
 
@@ -41,6 +43,11 @@ def _to_out(source: SyncSource) -> SyncSourceOut:
         synced_file_count=len(source.synced_files or {}),
         created_at=source.created_at,
         updated_at=source.updated_at,
+        auth_type=source.auth_type,
+        # INV-M-07：凭据（明文/密文）都不出接口，只给"是否已配置"
+        has_auth=bool(source.auth_payload),
+        entry_urls=list(source.entry_urls or []),
+        scope_rules=dict(source.scope_rules or {}),
     )
 
 
@@ -60,6 +67,11 @@ async def create_sync_source(
     if kb is None or kb.tenant_id != user.tenant_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
 
+    # INV-M-07：凭据只在创建时进一次、加密落库；audit 只记 auth_type 不记内容
+    auth_payload_ciphertext: str | None = None
+    if body.source_type == "web" and body.auth:
+        auth_payload_ciphertext = encrypt_credential(json.dumps(body.auth, ensure_ascii=False))
+
     source = SyncSource(
         tenant_id=user.tenant_id,
         kb_id=kb_id,
@@ -71,6 +83,10 @@ async def create_sync_source(
         level_rank=body.level_rank,
         status="active",
         synced_files={},
+        auth_type=body.auth_type if body.source_type == "web" else "none",
+        auth_payload=auth_payload_ciphertext,
+        entry_urls=list(body.entry_urls) if body.source_type == "web" else [],
+        scope_rules=dict(body.scope_rules) if body.source_type == "web" else {},
     )
     session.add(source)
     await session.commit()
@@ -79,7 +95,9 @@ async def create_sync_source(
     await audit.record(
         user.tenant_id, user.user_id, "sync_source.create",
         object_type="sync_source", object_id=str(source.id),
-        detail={"kb_id": str(kb_id), "name": body.name, "source_type": body.source_type},
+        # 凭据明文/密文 MUST NOT 进日志（INV-M-07），只记类型
+        detail={"kb_id": str(kb_id), "name": body.name, "source_type": body.source_type,
+                "auth_type": source.auth_type, "has_auth": bool(auth_payload_ciphertext)},
     )
     return _to_out(source)
 
@@ -126,13 +144,33 @@ async def update_sync_source(
     if body.status is not None:
         source.status = body.status
 
+    # ── web 源字段（M7 WU-M-11）──
+    if body.auth_type is not None:
+        source.auth_type = body.auth_type
+    if body.entry_urls is not None:
+        source.entry_urls = list(body.entry_urls)
+    if body.scope_rules is not None:
+        source.scope_rules = dict(body.scope_rules)
+    # 凭据更新语义（schemas.sync.SyncSourceUpdate 注释）：None=不动；clear_auth=显式清除
+    if body.clear_auth:
+        source.auth_payload = None
+        if body.auth_type is None:
+            source.auth_type = "none"
+    elif body.auth is not None:
+        # INV-M-07：新凭据加密落库（全量替换，非合并）
+        source.auth_payload = encrypt_credential(json.dumps(body.auth, ensure_ascii=False))
+        if source.auth_type == "none":
+            source.auth_type = "basic"
+
     await session.commit()
     await session.refresh(source)
 
     await audit.record(
         user.tenant_id, user.user_id, "sync_source.update",
         object_type="sync_source", object_id=str(source_id),
-        detail=body.model_dump(exclude_none=True),
+        # 凭据内容 MUST NOT 进日志（INV-M-07）
+        detail={"fields": [k for k in body.model_dump(exclude_none=True) if k != "auth"],
+                "auth_changed": body.auth is not None or body.clear_auth},
     )
     return _to_out(source)
 

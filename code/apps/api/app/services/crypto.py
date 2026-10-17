@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from redis import Redis
@@ -119,4 +120,42 @@ __all__: list[str] = [
     "decrypt_password",
     "clear_key_cache",
     "warm_up",
+    "encrypt_credential",
+    "decrypt_credential",
 ]
+
+
+# ── M7 WU-M-11：同步源凭据存储态加密（INV-M-07）──────────────────────
+#
+# 与上面的 RSA 登录传输加密是两回事：
+#   - RSA 段：前端 → 后端的传输态加密（每次密文不同，长度受限）
+#   - Fernet 段：后端 → 数据库的存储态加密（auth_payload 列），确定性可逆，
+#     worker 需要还原明文凭据去访问内部站点
+# 密钥从 settings.credential_encryption_key 注入，生产 MUST 独立生成
+# （settings.model_post_init 已拦截开发默认值上线）。
+
+_fernet: Fernet | None = None
+
+
+def _get_fernet() -> Fernet:
+    global _fernet
+    if _fernet is None:
+        _fernet = Fernet(get_settings().credential_encryption_key.encode("ascii"))
+    return _fernet
+
+
+def encrypt_credential(plaintext: str) -> str:
+    """凭据明文（JSON 序列化后的 dict 或原始串）加密为密文，供 auth_payload 落库。"""
+    return _get_fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def decrypt_credential(ciphertext: str) -> str:
+    """auth_payload 密文还原为明文；密文损坏或密钥不匹配时直接抛错（fail-closed）。
+
+    MUST NOT 返回空串或占位值 —— 凭据还原失败说明配置漂移，
+    调用方（web fetcher）应将源置为错误状态而不是带着假凭据打站点。
+    """
+    try:
+        return _get_fernet().decrypt(ciphertext.encode("ascii")).decode("utf-8")
+    except InvalidToken as exc:
+        raise ValueError("凭据密文解密失败：密钥不匹配或密文损坏") from exc
