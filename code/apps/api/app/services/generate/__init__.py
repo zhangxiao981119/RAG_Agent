@@ -42,6 +42,95 @@ logger = logging.getLogger(__name__)
 #   代价是遵循度不如原生 thinking —— 所以生成层**必须**对"标签没闭合"兜底，
 #   不能假设模型一定听话（见 StreamGenerationService 里的 in_reasoning 处理）。
 
+# ── 拒答识别：归一化匹配 ─────────────────────────────────────────────
+# 早期实现是 `text.strip().strip('"') == NO_ANSWER_TEXT` 的**严格等值**比较，
+# 只要模型给契约句加一层 markdown 或补一句解释就判不出来：
+#   · 「知识库中未找到相关内容（现有资料仅含 Java 版）」
+#   · 「知识库中未找到 **XYZ-2000 整机保修期** 的相关内容」
+#   · 「**知识库中未找到杭州仓的库存清单。** 唯一的库存类文档是……」
+# 漏判有两层代价：
+#   产品层——不发 refused 事件，前端把「没找到 + 8 条不相关引用」当正常回答渲染；
+#   度量层——拒答率被系统性低估（实测 87/96 vs 真实 95/96）。
+# 因此改为「归一化 → 首句语义匹配」：只认首句，避免把
+# 「知识库中收录了员工手册，其中规定……」这类正常回答误判为拒答。
+_MARKUP_RE = re.compile(r"[*_`#>~|]")
+_CITE_RE = re.compile(r"\[\d+\]")
+_ZW_RE = re.compile(r"[\u200b-\u200f\ufeff]")
+
+# 首句拒答语义：知识库(中/里) + 否定词 + （≤20 字修饰）+ 拒答动词
+# 覆盖三类真实写法：
+#   「知识库中没有直接规定……」（中间插"直接"）
+#   「知识库中没有关于"策略模式适用场景"的正文说明」（中间插一整个定语）
+#   「知识库中未找到 **XYZ-2000** 的相关内容」
+_REFUSAL_HEAD_RE = re.compile(
+    r"^(?:抱歉[，,]?|对不起[，,]?|不好意思[，,]?)?"
+    r"知识库(?:中|里|内)?"
+    r"(?:未|没有|无法|没能|尚未|暂未)"
+    r"[^。！？\n]{0,20}?"
+    r"(?:找到|检索到|收录|包含|涵盖|提及|说明|规定|提供)"
+)
+
+
+def _normalize_for_refusal(text: str) -> str:
+    """去掉 markdown 标记、引用编号、零宽字符与全部空白，便于做前缀/首句匹配。"""
+    t = _MARKUP_RE.sub("", text)
+    t = _CITE_RE.sub("", t)
+    t = _ZW_RE.sub("", t)
+    t = t.replace("\u3000", "")
+    return re.sub(r"\s+", "", t)
+
+
+def is_no_answer_output(text: str) -> bool:
+    """生成结果是否为拒答。命中任一条件即判拒答：
+
+    1. 归一化后以 NO_ANSWER_TEXT 开头（契约原句，允许尾随补充说明）
+    2. 首句呈现「知识库中未找到/没有…」的拒答语义（覆盖加粗、插入主语、
+       换说法、给替代信息等变体）
+    """
+    if not text or not text.strip():
+        return False
+    normalized = _normalize_for_refusal(text)
+    if normalized.startswith(NO_ANSWER_TEXT):
+        return True
+    head = re.split(r"[。！？；]", normalized, maxsplit=1)[0]
+    return bool(_REFUSAL_HEAD_RE.match(head))
+
+
+def is_unattributed_output(text: str, citation_count: int) -> bool:
+    """检索到了内容，但答案里一条有效引用都没有 —— 判为脱离检索结果作答。
+
+    提示词契约要求结论后标 `[n]`。零引用意味着模型在凭先验自由发挥，
+    而不是在概括 <context>。真实案例：问「帮我写一段快速排序的 Python 代码」，
+    语料只有 Java 版，模型却直接吐了一份 Python 实现（`#### 结论` 开头，
+    全程无引用），既绕过了引用校验（无引用的行一律保留），也绕过了拒答契约。
+
+    兜底放在生成层出口而不是提示词：温度再低也有跑偏的时候，
+    「有没有引用」是当前上下文里唯一一个不依赖模型自觉的硬信号。
+    """
+    if citation_count <= 0:
+        return False
+    return not _CITE_RE.search(text)
+
+
+# 「绕道作答」的典型形态：模型不敢直接说"没找到"，改用一个小标题把
+# 「知识库中的相关信息」包装成答案交出去。两条真实样本：
+#   「#### 知识库中关于上下文切换的说明」→ 正文讲的是定义，没答"有哪些开销"
+#   「#### 知识库中的相关信息」→ 正文讲的是别的制度的餐补
+# 这类输出带引用、也够"礼貌"，前面的规则一条都拦不住，只能认形态。
+# 注意动词表刻意不含「规定」：`#### 知识库中的相关规定` 通常是真的在答（如考勤制度）。
+_REFUSAL_TITLE_RE = re.compile(
+    r"^#{1,6}\s*(?:知识库|资料库?)(?:中|里)?(?:关于|的)?"
+    r"[^\n]{0,30}?"
+    r"(?:说明|信息|内容|记录|资料)(?![库])"
+)
+
+
+def is_offtopic_fallback(text: str) -> bool:
+    """识别「以『知识库中的相关信息』这类标题开头、用相关性内容替代答案」的输出。"""
+    if not text or not text.strip():
+        return False
+    return bool(_REFUSAL_TITLE_RE.match(text.lstrip()))
+
 
 async def build_system_prompt(
     memory_prompt: str,
@@ -307,20 +396,29 @@ class GenerationService:
             formatted = mask_pii(formatted)
 
         # ★ 提示词契约闭环：LLM 只输出拒答文案 ⇒ 判定为拒答，而不是正常回答。
-        #   否则用户会看到"回答：知识库中未找到相关内容"，且下面挂着 8 条不相关引用。
-        _is_no_answer = formatted.strip().strip('"').strip("“").strip("”") == NO_ANSWER_TEXT
+        #   覆盖模型对契约句的常见变体（加粗/插主语/补一句解释），见 is_no_answer_output。
+        _is_no_answer = is_no_answer_output(formatted)
+        # ★ 有上下文却零引用 ⇒ 模型脱离检索结果自由发挥（幻觉），同样按拒答处理。
+        _unattributed = is_unattributed_output(formatted, len(citations))
+        # ★ 用「知识库中的相关信息」当标题绕道作答 ⇒ 没答问题，按拒答处理。
+        _offtopic = is_offtopic_fallback(formatted)
+        _refused = _is_no_answer or _unattributed or _offtopic
 
         return GenerationResult(
-            text="" if _is_no_answer else formatted,
+            text="" if _refused else formatted,
             raw_text=raw_text,
             stripped_sentences=grounding_result.stripped_sentences,
-            refused=_is_no_answer,
-            refuse_reason="NO_RELEVANT_CONTENT" if _is_no_answer else "",
+            refused=_refused,
+            refuse_reason=(
+                "NO_RELEVANT_CONTENT" if _is_no_answer
+                else "UNGROUNDED" if (_unattributed or _offtopic)
+                else ""
+            ),
             # 拒答时不返回引用：这些 chunk 已被判定不足以支撑回答，
             # 挂上去只会误导（用户点开引用看到的是不相关内容）
-            citations=[] if _is_no_answer else citations,
+            citations=[] if _refused else citations,
             usage={"prompt_tokens": 0, "completion_tokens": len(raw_text)},
-            suggestions=[] if _is_no_answer else suggestions,
+            suggestions=[] if _refused else suggestions,
             reasoning=reasoning,
         )
 
@@ -582,9 +680,22 @@ class StreamGenerationService(GenerationService):
         # ★ 提示词契约闭环（流式）：LLM 只输出拒答文案 ⇒ 发 refused，而不是 done。
         #   注意此时 delta 已随流发出，前端收到 refused 后应清空正文与引用，
         #   展示统一的拒答态——内容相同，但状态正确、且不再挂 8 条误导引用。
-        if full_text.strip().strip('"').strip("“").strip("”") == NO_ANSWER_TEXT:
+        if is_no_answer_output(full_text):
             yield StreamDelta(
                 type="refused", refused=True, refuse_reason="NO_RELEVANT_CONTENT",
+                stripped_sentences=stripped, full_text="",
+            )
+            return
+
+        # ★ 有上下文却零引用 ⇒ 模型脱离检索结果自由发挥（幻觉）。
+        #   流式下 delta 已经发出，前端收到 refused 后清空正文与引用。
+        if is_unattributed_output(full_text, len(citations)) or is_offtopic_fallback(full_text):
+            logger.warning(
+                "UNGROUNDED: 检索到 %d 条上下文但答案零引用/绕道作答，按拒答处理",
+                len(citations),
+            )
+            yield StreamDelta(
+                type="refused", refused=True, refuse_reason="UNGROUNDED",
                 stripped_sentences=stripped, full_text="",
             )
             return

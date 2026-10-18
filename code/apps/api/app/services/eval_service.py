@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import EvalCase, EvalRun
+from app.models import EvalCase, EvalRun, KnowledgeBase
 from app.services.generate import get_generation_service
 from app.services.retrieve import RetrievalService
 
@@ -92,7 +92,21 @@ async def run_eval(
     refuse_passed = 0
 
     for case in rows:
-        kb_ids = [case.kb_id] if case.kb_id else []
+        # kb_id 为空 = 跨库用例，检索用租户下全部知识库。
+        # ★ 与 scripts/run_eval.py「全租户 kb 列表」的口径保持一致：
+        #   两套调用方（门禁服务 / CLI 评测）必须检索同一个范围，否则同一批
+        #   用例在两边跑出不同分数。此前 case.kb_id 全指向空库 p1-restricted，
+        #   导致本服务只检索 0 个库、而 CLI 检索全库，分数无法对齐。
+        if case.kb_id:
+            kb_ids: list[uuid.UUID] = [case.kb_id]
+        else:
+            kb_ids = list(
+                (
+                    await session.scalars(
+                        select(KnowledgeBase.id).where(KnowledgeBase.tenant_id == tenant_id)
+                    )
+                ).all()
+            )
         case_t0 = time.monotonic()
 
         # 检索

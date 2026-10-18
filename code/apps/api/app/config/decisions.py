@@ -58,7 +58,10 @@ KEYWORD_TSQUERY_ENABLED: Final[bool] = True
 PostgreSQL 的 'simple' 配置不做中文分词，中文仍走 ILIKE 子串匹配。
 两路结果共同进入 RRF，互不替代。"""
 
-GENERATION_TEMPERATURE: Final[float] = 0.1      # L2
+GENERATION_TEMPERATURE: Final[float] = 0.0      # L2
+# 生成温度固定 0：RAG 问答要的是"同一份上下文给出同一个答案"，评测门禁与线上
+# 回答必须可复现。0.1 下实测同一问题两次跑会一次拒答、一次自编 Python 实现，
+# 导致评估结果无法复算，也无法用基线做回归比对。
 GROUNDING_CHECK_ENABLED: Final[bool] = True     # L3；MUST NOT 置 False
 TOP_K_RECALL: Final[int] = 50                   # 每路召回条数
 TOP_K_RERANK: Final[int] = 8                    # 重排后取用条数

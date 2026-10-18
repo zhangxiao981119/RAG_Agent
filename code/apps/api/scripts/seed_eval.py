@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.config.settings import get_settings
 from app.database import SessionLocal
@@ -121,6 +121,20 @@ async def seed_eval() -> None:
         )
         if tenant is None:
             raise RuntimeError("租户未初始化，先跑 scripts/seed.py")
+
+        # ★ 表非空即整体跳过，而不是逐条去重补录。
+        #   entrypoint 每次启动都会跑本脚本，逐条补录的后果是：只要有人
+        #   清理过下面的内置用例（评测集换成经预检筛过的版本时必然发生），
+        #   下一次容器重启就会把它们全部插回去，评测集构成被悄悄改变，
+        #   上一轮基线直接失去可比性。
+        #   现在的口径：本脚本只负责「空库初始化」，评测集的增删改一律走
+        #   scripts/import_eval_cases.py（带备份 + 预检）。
+        existing_total = await session.scalar(
+            select(func.count()).select_from(EvalCase).where(EvalCase.tenant_id == tenant.id)
+        )
+        if existing_total:
+            print(f"eval_cases 已有 {existing_total} 条，跳过种子（评测集以已导入版本为准）")
+            return
 
         # 取第一个知识库作为默认 kb_id（用户可后续调整）
         kb = await session.scalar(
