@@ -56,11 +56,18 @@ def build_caliber_snapshot() -> dict:
     }
 
 
-async def snapshot_for_message(tenant_id: uuid.UUID | None) -> dict:
-    """消息级口径快照 = 代码口径 + 该租户当前生效的提示词版本号。
+async def snapshot_for_message(
+    tenant_id: uuid.UUID | None, chain_mode: str | None = None
+) -> dict:
+    """消息级口径快照 = 代码口径 + 该租户当前生效的提示词版本号 + 本次检索模式。
 
     tenant_id 为 None（无租户上下文）时，提示词版本退回内置默认（version 0）。
+    chain_mode 是**本次请求**的检索侧链式推理模式（off / single / multi:N）——
+    它随问题复杂度信号变化，故不能像 cot_mode 那样进代码级静态快照，
+    改由调用方（聊天持久化单点）传入；未知（未跑检索的路径）时为 None。
     """
     snapshot = build_caliber_snapshot()
     snapshot["prompt_versions"] = await prompt_registry.resolve_versions(tenant_id)
+    if chain_mode is not None:
+        snapshot["chain_mode"] = chain_mode
     return snapshot

@@ -134,6 +134,13 @@ class _FakeRetrieval:
             path_stats={},
         )
 
+    async def retrieve_chain(self, session, query, tenant_id, kb_ids, clearance, subjects,
+                             rewrite_score=None):  # noqa: ANN001
+        # 单趟语义替身：本 WU 关注模态行为，链式编排由 tests/retrieve/test_chain.py 覆盖
+        result = await self.retrieve(session, query, tenant_id, kb_ids, clearance, subjects)
+        result.chain_mode = "single"
+        return result
+
 
 class _FakeGeneration:
     def __init__(self) -> None:
@@ -195,12 +202,12 @@ def harness(monkeypatch):
 
     monkeypatch.setattr(chat_mod, "build_system_prompt", _fake_system_prompt)
 
-    async def _fake_caliber(tenant_id):  # noqa: ANN001
+    async def _fake_caliber(tenant_id, chain_mode=None):  # noqa: ANN001
         return {}
 
     monkeypatch.setattr(chat_mod, "snapshot_for_message", _fake_caliber)
 
-    async def _fake_persist(conversation_id, user, message_id, text, refused, citations, meta):  # noqa: ANN001
+    async def _fake_persist(conversation_id, user, message_id, text, refused, citations, meta, chain_mode=None):  # noqa: ANN001
         h.persisted.append({"text": text, "refused": refused, "meta": meta})
 
     monkeypatch.setattr(chat_mod, "_persist_assistant", _fake_persist)

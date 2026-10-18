@@ -25,6 +25,11 @@ from app.infra import metrics, trace
 from app.services.acl.visibility import pushdown_params  # noqa: F401  (外部引用，保留导出)
 from app.services.embedding import get_embedding_service
 from app.services.retrieve.base import RetrievalResult, RetrievedChunk
+from app.services.retrieve.chain import (
+    ChainDecomposeError,
+    decompose_question,
+    merge_rounds,
+)
 from app.services.rerank import RerankTimeout, get_rerank_service
 
 logger = logging.getLogger(__name__)
@@ -466,6 +471,84 @@ class RetrievalService:
             path_stats=path_stats,
             table_recall_chunks=recall_chunks,
         )
+
+    async def retrieve_chain(
+        self,
+        session: AsyncSession,
+        query: str,
+        tenant_id: uuid.UUID,
+        authorized_kb_ids: list[uuid.UUID],
+        clearance: int,
+        user_subjects: list[str],
+        rewrite_score: int | None = None,
+    ) -> RetrievalResult:
+        """链式检索：按复杂度信号决定是否拆解 → 多轮检索 → 证据合并。
+
+        · 不拆解（信号不满足 / 开关关闭）→ 直接单趟 retrieve()，chain_mode=single/off
+        · 拆解失败（ChainDecomposeError）→ 降级单趟并打点，不阻断主流程
+        · 拆解后仍只有一个子问题 → 等价单趟，不发多轮（省成本）
+        · 多轮 MUST **串行**复用同一 session（AsyncSession 非并发安全）
+
+        参数是 pushdown_params 的直接展开（与 retrieve 同口径），额外接收
+        rewrite_score 作为「问题复杂度」信号。
+        """
+        t0 = time.perf_counter()
+
+        async def _single(chain_mode: str, chain_ms: int | None = None) -> RetrievalResult:
+            # 单趟路径统一出口：复用既有 retrieve()，只补 chain_mode 与拆解耗时
+            result = await self.retrieve(
+                session, query, tenant_id, authorized_kb_ids, clearance, user_subjects,
+            )
+            result.chain_mode = chain_mode
+            if chain_ms is not None:
+                result.stage_ms["chain_decompose"] = chain_ms
+            return result
+
+        if not decisions.should_use_chain(rewrite_score):
+            # 开关关闭 → "off"；信号不满足（分数够高 / 拿不到分数）→ "single"
+            return await _single("single" if decisions.CHAIN_RETRIEVAL_ENABLED else "off")
+
+        try:
+            subquestions = await decompose_question(query, tenant_id)
+        except ChainDecomposeError as exc:
+            # 拆解不可用 → 降级单趟 + 打点（拆解是增强项，不得阻断问答主链路）
+            metrics.incr("rag.chain.degraded", reason="decompose_error")
+            logger.info(
+                "检索链式推理: 拆解不可用，降级单趟 (%s)", exc,
+                extra={"trace_id": trace.get_trace_id()},
+            )
+            return await _single("single")
+
+        decompose_ms = int((time.perf_counter() - t0) * 1000)
+
+        if len(subquestions) <= 1:
+            # 拆解判定问题已足够聚焦 → 单趟即可，多轮是纯浪费
+            metrics.incr("rag.chain.single")
+            return await _single("single", decompose_ms)
+
+        # 多轮 MUST 串行复用同一 session：AsyncSession 非并发安全 —— 同 session 并发
+        # 会让连接被多协程交叉使用（await 点交错），结果不可预期。
+        rounds: list[RetrievalResult] = []
+        for sq in subquestions:
+            rounds.append(await self.retrieve(
+                session, sq, tenant_id, authorized_kb_ids, clearance, user_subjects,
+            ))
+
+        merged = merge_rounds(rounds)
+        merged.chain_mode = f"multi:{len(subquestions)}"
+        merged.subquestions = subquestions
+        merged.stage_ms["chain_decompose"] = decompose_ms
+
+        metrics.incr("rag.chain.enabled")
+        metrics.incr("rag.chain.subquestions", len(subquestions))
+        metrics.incr("rag.chain.rounds", len(rounds))
+        metrics.incr("rag.chain.merged", len(merged.chunks))
+        logger.info(
+            "检索链式推理: %d 个子问题 / %d 轮 / 合并 %d 条 / 拒答=%s",
+            len(subquestions), len(rounds), len(merged.chunks), merged.refused,
+            extra={"trace_id": trace.get_trace_id()},
+        )
+        return merged
 
 
 def get_retrieval_service() -> RetrievalService:

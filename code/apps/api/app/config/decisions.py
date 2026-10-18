@@ -205,6 +205,41 @@ def should_enable_cot(rewrite_score: int | None) -> bool:
         return False
     return rewrite_score < QUERY_REWRITE_SCORE_THRESHOLD
 
+# ── 检索侧链式推理（Chain Retrieval）────────────────────
+CHAIN_RETRIEVAL_ENABLED: Final[bool] = True
+"""启用检索侧链式推理（问题拆解 → 多轮检索 → 证据合并）。默认开启。
+置 False 退回单趟检索 —— 用于 A/B 对照与故障隔离。"""
+
+CHAIN_MAX_SUBQUESTIONS: Final[int] = 3
+"""一次拆解最多保留的子问题数（原始问题恒占首位，故上限含原始问题）。
+★ 3 的依据：每轮检索 = 向量召回 + 关键词双路 + 一次 rerank，轮数线性放大
+  检索延迟与成本；3 覆盖常见多跳问题的拆解粒度，再多收益递减。"""
+
+CHAIN_SUBQUESTION_MAX_CHARS: Final[int] = 120
+"""单个**拆解产出的**子问题字符上限，超限丢弃。
+★ 只约束拆解产物，不约束原始问题 —— 原始问题（含带图转录拼接）可能远超此值，
+  它是既定输入，截断会改变用户语义，故不受此限。"""
+
+CHAIN_DECOMPOSE_TIMEOUT_SECONDS: Final[float] = 5.0
+"""拆解 LLM 调用超时。超时 / 异常 / JSON 非法 → 降级单趟检索并打点（不阻断主流程）。"""
+
+
+def should_use_chain(rewrite_score: int | None) -> bool:
+    """按复杂度信号决定本次是否走链式检索。
+
+    ★ 复用 Query 改写分作为复杂度信号（与 should_enable_cot 同款、同源）：
+      分数低 = 问题模糊 / 强依赖上下文 / 需要多步推理 → 值得拆解；
+      分数高 = 自包含的简单问题，单趟检索即可 —— 省掉多轮检索的延迟与成本。
+    ★ rewrite_score 为 None（跳过了改写流程）→ 不走链：拿不到复杂度信号时
+      不做无差别多轮检索（与 should_enable_cot 的 None 语义一致）。
+    """
+    if not CHAIN_RETRIEVAL_ENABLED:
+        return False
+    if rewrite_score is None:
+        return False
+    return rewrite_score < QUERY_REWRITE_SCORE_THRESHOLD
+
+
 # ── 上下文窗口上限（单次请求 prompt 总 token 数）────────
 CONTEXT_WINDOW_LIMIT_TOKENS: Final[int] = 32_000
 """单次请求 context（system + memory + history + chunks + question）token 上限。
@@ -581,6 +616,13 @@ def self_check() -> None:
             "COT_REASONING_EXPOSED MUST be False —— "
             "推理链含内部规则与试探表述，不得对外输出。"
         )
+    # ── 检索侧链式推理口径 ──
+    if CHAIN_MAX_SUBQUESTIONS < 1:
+        raise RuntimeError("CHAIN_MAX_SUBQUESTIONS MUST >= 1（至少保留原始问题那一路）")
+    if CHAIN_SUBQUESTION_MAX_CHARS < 1:
+        raise RuntimeError("CHAIN_SUBQUESTION_MAX_CHARS MUST >= 1")
+    if CHAIN_DECOMPOSE_TIMEOUT_SECONDS <= 0:
+        raise RuntimeError("CHAIN_DECOMPOSE_TIMEOUT_SECONDS MUST > 0")
     # ── 记忆层口径（D-21 / 4.20）──
     if "fact" in MEMORY_LONG_TERM_KINDS:
         raise RuntimeError(

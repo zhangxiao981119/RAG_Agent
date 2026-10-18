@@ -312,11 +312,13 @@ async def chat_ask(
                             rewrite_score, rewrite_status)
 
             # 检索（用改写后的 query，原始 question 留给 generation）
+            # ★ 走链式检索入口：按 rewrite_score 复杂度信号决定是否拆解为多轮检索，
+            #   拆解不可用时内部降级单趟 —— 对下游是同一个 RetrievalResult 契约
             _t_retrieve = _time.monotonic()
             async with SessionLocal() as retrieve_session:
                 retrieval = get_retrieval_service()
                 try:
-                    result = await retrieval.retrieve(
+                    result = await retrieval.retrieve_chain(
                         retrieve_session,
                         retrieve_query,  # 改写后的 query 只用于检索
                         user.tenant_id,
@@ -326,6 +328,7 @@ async def chat_ask(
                         effective_kb_ids,
                         user.clearance,
                         user.subjects,
+                        rewrite_score=rewrite_score,  # 复杂度信号（复用改写分）
                     )
                 except Exception:
                     logger.exception("检索失败")
@@ -335,6 +338,10 @@ async def chat_ask(
                     })
                     return
 
+            # 链式检索：多轮时补一个 stage 事件（前端 SSE switch 无 stage 分支，
+            # 未知 stage 会被忽略，新增取值安全）—— 先于 retrieving 告知走了多轮
+            if result.chain_mode.startswith("multi"):
+                yield _sse("stage", {"stage": "chain", "mode": result.chain_mode})
             yield _sse("stage", {"stage": "retrieving", "ms": result.stage_ms.get("retrieving", 0)})
 
             _retrieve_ms = int((_time.monotonic() - _t_retrieve) * 1000)
@@ -343,6 +350,7 @@ async def chat_ask(
                 "retrieve_ms": _retrieve_ms,
                 "chunks_found": len(result.chunks),
                 "refused": result.refused,
+                "chain_mode": result.chain_mode,
             })
 
             if result.refused:
@@ -355,6 +363,7 @@ async def chat_ask(
                     conversation_id, user, message_id,
                     text="", refused=True, citations=[],
                     meta={"stage_ms": result.stage_ms, "refused": True},
+                    chain_mode=result.chain_mode,
                 )
                 # 审计：拒答也记录（refused=True 无引用）
                 await audit.record(
@@ -481,6 +490,7 @@ async def chat_ask(
                             "refused": True,
                             "reason": plan.refuse_reason,
                         },
+                        chain_mode=result.chain_mode,
                     )
                     await audit.record(
                         user.tenant_id, user.user_id, "chat.quota.exceeded",
@@ -543,7 +553,8 @@ async def chat_ask(
                     # 各阶段耗时快照：便于只看审计就能定位慢在哪一环
                     "stage_ms": result.stage_ms,
                     # 口径快照：本条答案由哪个 contract / 模型 / 提示词版本产出（方案二）
-                    "caliber": await snapshot_for_message(user.tenant_id),
+                    # chain_mode 为本次检索侧链式推理模式（off / single / multi:N）
+                    "caliber": await snapshot_for_message(user.tenant_id, result.chain_mode),
                 },
             )
 
@@ -606,6 +617,7 @@ async def chat_ask(
                         "reason": reason,
                         "grounding_stripped": gen_result.stripped_sentences,
                     },
+                    chain_mode=result.chain_mode,
                 )
                 _total_ms = int((_time.monotonic() - _t0) * 1000)
                 logger.info("chat.ask.complete", extra={
@@ -698,6 +710,7 @@ async def chat_ask(
                     # 那里面可能带手机号/身份证（正文走 mask_pii，推理链不经过那条路）。
                     "reasoning": mask_pii(final_reasoning) if final_reasoning else "",
                 },
+                chain_mode=result.chain_mode,
             )
 
             # 后台更新用户画像（不阻塞流式响应）
@@ -741,11 +754,13 @@ async def _persist_assistant(
     refused: bool,
     citations: list[dict],
     meta: dict,
+    chain_mode: str | None = None,
 ) -> None:
     """更新流开始前占位的 assistant message（citations 存快照，手册 §4.2.9）。
 
     占位行已在 chat_ask 中与 user message 同事务提交，此处按 message_id 定位更新；
     meta 去掉 generating 标记并写入 refused 等最终状态。
+    chain_mode 为本次检索侧链式推理模式（本请求可变），并入口径快照。
     """
     async with SessionLocal() as session:
         msg = await session.get(Message, message_id)
@@ -756,7 +771,7 @@ async def _persist_assistant(
         msg.citations = citations
         # 口径快照（方案二）：记录本条答案由哪个 contract / 模型 / 提示词版本产出。
         # 在此**单点注入** —— 正常 / 拒答各条落库路径自动带上，无需逐处调用点传参。
-        caliber = await snapshot_for_message(user.tenant_id)
+        caliber = await snapshot_for_message(user.tenant_id, chain_mode)
         # trace_id 在此单点注入：正常 / 拒答各条落库路径自动带上，前端历史里可复制
         msg.meta = {
             **meta, "refused": refused, "caliber": caliber,

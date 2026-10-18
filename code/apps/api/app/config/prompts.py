@@ -210,6 +210,25 @@ _GOVERNANCE_EDITABLE_DEFAULT = """对下面三个维度分别输出 0-100 分与
 {content}"""
 
 
+# ── qa_decompose：检索问题拆解提示词 ─────────────────────
+# 一次 LLM 调用把问题拆成至多 {max} 个可独立检索的子问题（检索侧链式推理）。
+# 无锁定区：拆解不涉及拒答文案 / 合规底线，纯检索增强，可在线切版本。
+# 占位符：{question} {max} {max_chars}
+_DECOMPOSE_EDITABLE_DEFAULT = """你是一个检索问题拆解器。判断用户问题是否由多个可独立检索的部分组成，并据此拆解。
+
+拆解规则：
+  1. 问题本身已足够聚焦（单一检索目标）时，MUST 原样返回该问题，subquestions 只含这一条
+  2. 仅在问题包含多个不同检索目标、多步推理、或需要跨主题对比时才拆解
+  3. 每个子问题 MUST 可独立检索：自包含、含明确实体与关键词，MUST NOT 出现"它/那个/上述"等指代
+  4. 子问题之间 MUST NOT 重复；合并后 MUST 覆盖原问题的全部意图，MUST NOT 引入原问题之外的新信息
+  5. 每个子问题不超过 {max_chars} 字；子问题总数不超过 {max} 条
+
+输出严格 JSON（不要 Markdown 代码围栏）：
+{"subquestions": ["子问题1", "子问题2"]}
+
+用户问题：{question}"""
+
+
 PROMPT_SPECS: Final[dict[str, PromptSpec]] = {
     "qa_system": PromptSpec(
         key="qa_system",
@@ -259,6 +278,13 @@ PROMPT_SPECS: Final[dict[str, PromptSpec]] = {
         default_editable=_GOVERNANCE_EDITABLE_DEFAULT,
         required_placeholders=("content",),
         require_no_answer_text=True,
+    ),
+    "qa_decompose": PromptSpec(
+        key="qa_decompose",
+        label="检索问题拆解提示词",
+        locked="",
+        default_editable=_DECOMPOSE_EDITABLE_DEFAULT,
+        required_placeholders=("question", "max", "max_chars"),
     ),
 }
 

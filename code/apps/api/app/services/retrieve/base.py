@@ -57,3 +57,9 @@ class RetrievalResult:
     # 预算 TABLE_RECALL_TOKEN_BUDGET）。调用方把它追加进上下文拼装序列即可 ——
     # 编号 / citations / 配额裁剪沿用既有机制，不设特殊分支。
     table_recall_chunks: list[RetrievedChunk] = field(default_factory=list)
+    # 检索侧链式推理：本次走的是哪种模式。
+    # "off"（开关关闭）/ "single"（信号不满足或拆解降级）/ "multi:N"（N 个子问题）。
+    # 仅作审计与口径留痕，不参与任何判定。
+    chain_mode: str = ""
+    # multi 模式下实际检索用的子问题列表（原始问题恒在首位）；供审计与打点。
+    subquestions: list[str] = field(default_factory=list)
