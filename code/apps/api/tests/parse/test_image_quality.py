@@ -103,15 +103,44 @@ def test_skew_detected_and_corrected() -> None:
 
 
 def test_watermark_detected_but_pixels_untouched() -> None:
-    """浅灰平铺水印：识别得到，且不因此触发像素级清洗。"""
+    """稀疏平铺水印：识别得到，且不因此触发像素级清洗。
+
+    ★ 条纹间距必须显著大于分块高度（块高 = 页高/6）：水印是**条带**，块与块
+      之间深浅必须有差异。等距密排（间距≈块高）会被块间离散度判成「均匀网纹」，
+      那是摩尔纹的特征，不是水印 —— 见 test_uniform_texture_is_not_watermark。
+    """
     img = _text_page()
     draw = ImageDraw.Draw(img)
-    for y in range(20, img.size[1], 40):
-        draw.rectangle([20, y, img.size[0] - 20, y + 6], fill=220)
+    for y in range(15, img.size[1], 260):
+        draw.rectangle([20, y, img.size[0] - 20, y + 16], fill=220)
     report = analyze(_png(img))
-    assert report.watermark_detected is True
+    assert report.watermark_detected is True, report.reasons
     assert report.watermark_coverage >= decisions.IMAGE_WATERMARK_MIN_BLOCK_COVERAGE
     assert any("水印" in r for r in report.reasons)
+
+
+def test_uniform_texture_is_not_watermark() -> None:
+    """整页均匀浅灰纹理（摩尔纹 / 网纹）：不许报成水印，只提示重扫。"""
+    img = _text_page()
+    draw = ImageDraw.Draw(img)
+    rnd = random.Random(5)
+    w, h = img.size
+    for _ in range(int(w * h * 0.2)):  # 20% 均匀散点，无条带
+        draw.point((rnd.randrange(w), rnd.randrange(h)), fill=220)
+    report = analyze(_png(img))
+    assert report.watermark_detected is False, report.reasons
+    assert any("网纹" in r or "摩尔纹" in r for r in report.reasons), report.reasons
+
+
+def test_gray_background_triggers_enhance() -> None:
+    """灰底复印件：既不判水印也不能放过 —— 必须走增强（拉伸 + 二值化）。"""
+    page = _text_page()
+    gray_bg = Image.new("L", page.size, 212)
+    ink = page.point(lambda p: 45 if p < 128 else 212)
+    report = analyze(_png(Image.composite(ink, gray_bg, page.point(lambda p: 255 if p < 128 else 0))))
+    assert report.verdict == VERDICT_ENHANCE, report.reasons
+    assert report.watermark_detected is False
+    assert any("底色偏灰" in r for r in report.reasons)
 
 
 def test_small_image_rejected() -> None:
@@ -157,6 +186,29 @@ def test_strip_watermark_line() -> None:
     assert report.removed_lines == 1
 
 
+def test_strip_long_watermark_line_without_image_evidence() -> None:
+    """真实水印行带公司名与编号（归一化后 40+ 字），图像侧漏检时也必须删掉。
+
+    ★ 这是实测暴露的核心缺陷：行长上限 30 会把「西安博信云创科技有限公司
+      内部资料 严禁外传 编号 BXYC-2026-0917」当正文保留，同时短语规则要求
+      图像侧双证据 —— 两条一叠加，水印行 100% 进入 chunk。
+    """
+    line = "西安博信云创科技有限公司 内部资料 严禁外传 编号 BXYC-2026-0917"
+    text = "\n".join([line, BODY, "差旅标准按职级执行，住宿上限为每晚六百元。"])
+    cleaned, report = strip_watermark_text(text, watermark_detected=False)
+    assert "严禁外传" not in cleaned, cleaned
+    assert BODY in cleaned
+    assert report.removed_lines == 1
+
+
+def test_strip_keeps_short_secret_heading() -> None:
+    """「机密」这类 2 字小节标题不是水印 —— 行长下限必须挡住它。"""
+    text = "\n".join(["机密", BODY])
+    cleaned, report = strip_watermark_text(text, watermark_detected=False)
+    assert cleaned == text
+    assert report.applied is False
+
+
 def test_strip_keeps_long_sentence_with_secret_word() -> None:
     """正文里的密级词汇不能碰：带句读、超长行一律保留。"""
     line = "公司商业秘密管理办法适用于全体在职员工，具体范围见附件一。"
@@ -173,13 +225,34 @@ def test_strip_repeated_short_lines_even_without_image_evidence() -> None:
     assert report.removed_lines == 3
 
 
-def test_strip_reverts_when_ratio_too_high() -> None:
-    """删得太多 → 判定误伤正文，回退原文。"""
-    text = "\n".join([WM] * 8 + ["短正文"])
-    cleaned, report = strip_watermark_text(text, watermark_detected=True)
+def test_strip_reverts_when_mass_deleting_non_phrase_lines() -> None:
+    """表格页的大量重复短单元格：无密级短语却要删掉 39% → 判误伤，回退原文。
+
+    ★ 回退判据不是「比例超限」而是「比例超限 **且被删行不含密级短语**」。
+      平铺水印能占全文 40%，按纯比例判会把该删的水印退回去 —— 见下一个用例。
+    """
+    text = "\n".join(["是"] * 20 + ["否"] * 5 + [BODY])
+    cleaned, report = strip_watermark_text(text, watermark_detected=False)
     assert cleaned == text
     assert report.reverted is True
     assert report.applied is False
+
+
+def test_tiled_watermark_high_ratio_still_cleaned() -> None:
+    """平铺水印：6 行全部命中密级短语，占全文 40% 也必须删，不许回退。
+
+    这是实测暴露的缺陷：合成画像真水印页 OCR 出 6 行水印（含多种错字变体），
+    占 39.8%，被旧的纯比例规则整页回退，水印 100% 留在 chunk 里。
+    """
+    lines = [
+        f"西安博信云创科技有限公司 内部资料 严禁外传 编号 BXYC-2026-{i:04d}"
+        for i in range(6)
+    ] + [BODY, "差旅标准按职级执行，住宿上限为每晚六百元。"]
+    cleaned, report = strip_watermark_text("\n".join(lines), watermark_detected=True)
+    assert "严禁外传" not in cleaned
+    assert BODY in cleaned
+    assert report.reverted is False
+    assert report.removed_lines == 6
 
 
 def test_strip_repeated_page_lines_across_pages() -> None:

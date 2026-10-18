@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 import httpx
 
@@ -22,6 +23,40 @@ from app.config.settings import get_settings
 from app.services.parse import ParsedBlock
 
 logger = logging.getLogger(__name__)
+
+# GOT-OCR 会按文档结构输出 LaTeX 风格标记：单行的 `\title{` / `}`，
+# 以及少量转义符号（`\(2026-0917\)`）。这些 token 会原样进入 chunk 与 embedding，
+# 在引用里显示成 `\title{`，但没有任何语义 —— 入库前统一剥掉。
+_STRUCT_ONLY_RE = re.compile(
+    r"^\s*\\?(?:title|chapter|section|subsection|subsubsection|paragraph"
+    r"|subparagraph|figure|table)\s*\{?\s*$",
+    re.IGNORECASE,
+)
+_BRACE_ONLY_RE = re.compile(r"^\s*[{}]\s*$")
+_STRUCT_WRAP_RE = re.compile(
+    r"\\(?:title|chapter|section|subsection|subsubsection|paragraph)\{([^{}]*)\}"
+)
+_TEX_ESCAPE_RE = re.compile(r"\\([()\[\]%_&$#])")
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+
+
+def normalize_ocr_text(text: str) -> str:
+    """剥离 OCR 引擎的结构标记与转义符，只留下正文（逐字保真，不改语义）。
+
+    ★ 只处理**已知的标记 token**，不做任何「纠错 / 补全 / 改写」——
+      OCR 的错字是事实，改它就等于伪造原文，与「答案可回溯」冲突。
+    """
+    if not text:
+        return ""
+    out = _STRUCT_WRAP_RE.sub(r"\1", text)  # 单行包好的 \title{X} → X
+    lines = []
+    for line in out.split("\n"):
+        if _STRUCT_ONLY_RE.match(line) or _BRACE_ONLY_RE.match(line):
+            continue
+        lines.append(line)
+    out = "\n".join(lines)
+    out = _TEX_ESCAPE_RE.sub(r"\1", out)  # \( → ( ，\_ → _
+    return _BLANK_RUN_RE.sub("\n\n", out).strip()
 
 
 class OcrError(Exception):
@@ -65,6 +100,9 @@ async def ocr_image(data: bytes, mime: str = "image/png") -> ParsedBlock:
 
     text = str(payload.get("text") or "").strip()
     confidence = float(payload.get("confidence") or 0.0)
+    # 结构标记（`\title{`、裸 `}`、`\(` 转义）先剥掉：空文本判定也据此复核，
+    # 否则一整页只有标记时会被当成「有内容」送进 chunk。
+    text = normalize_ocr_text(text)
     if not text:
         logger.info("OCR：服务判定图中无可读内容")
         raise OcrNoContentError("图中未识别到可读内容")

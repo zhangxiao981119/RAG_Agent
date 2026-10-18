@@ -96,6 +96,31 @@ async def test_success_returns_parsed_block(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
+async def test_structure_markup_is_stripped(monkeypatch: pytest.MonkeyPatch):
+    """GOT 的结构标记（`\\title{` / 裸 `}` / `\\(`）不得进入 chunk。
+
+    ★ 实测输出长这样：`\\title{` + 标题 + `}`，转义还会出现在编号里
+      （`BXYC- \\(2026-0917\\)`）。不剥就会在引用里露出反斜杠脚手架。
+    """
+    _set_base_url(monkeypatch, _OCR_URL)
+    raw = "\\title{\n员工报销管理办法\n}\n第一条 见 BXYC- \\(2026-0917\\) 号文。"
+    _install(monkeypatch, _http_response(200, {"text": raw, "confidence": 0.9}))
+    block = await ocr_image(b"png-bytes")
+    assert "\\title" not in block.text
+    assert block.text.splitlines()[0] == "员工报销管理办法"
+    assert "BXYC- (2026-0917) 号文" in block.text
+
+
+@pytest.mark.asyncio
+async def test_markup_only_text_maps_to_no_content(monkeypatch: pytest.MonkeyPatch):
+    """整页只有结构标记 → 剥完是空文本 → OcrNoContentError，不落库空块。"""
+    _set_base_url(monkeypatch, _OCR_URL)
+    _install(monkeypatch, _http_response(200, {"text": "\\title{\n}", "confidence": 0.9}))
+    with pytest.raises(OcrNoContentError):
+        await ocr_image(b"png-bytes")
+
+
+@pytest.mark.asyncio
 async def test_empty_text_maps_to_no_content(monkeypatch: pytest.MonkeyPatch):
     """服务判定图中无可读内容（空文本）→ OcrNoContentError。"""
     _set_base_url(monkeypatch, _OCR_URL)

@@ -50,8 +50,13 @@ _SKEW_FINE_STEP: float = 0.25
 _SKEW_MAX_ABS: float = 4.0
 # 水印分块：6×6 网格，块内浅灰占比 >= IMAGE_WATERMARK_BLOCK_LIGHT_RATIO 记命中块
 _WM_GRID: int = 6
+# 块间离散度的分母下限：避免 min=0 时除零，同时保留「空块 = 强条带证据」的语义
+_SHARE_EPS: float = 1e-4
 # 暗区（污渍候选）二值化阈值：低于此灰度算暗
-_DARK_THRESHOLD: int = 90
+# ★ 90 太低：污渍/墨块经高斯模糊后边缘灰度升到 100–150，整块算出 0%，
+#   三个明显黑斑的合成页 stain_ratio = 0.0000（实测）。128 是「白底 255 与
+#   正文 0」的中点，正文笔画 3px 在 5×5 腐蚀下仍会被抹掉，不会误判。
+_DARK_THRESHOLD: int = 128
 
 VERDICT_PASS = "pass"
 VERDICT_ENHANCE = "enhance"
@@ -74,6 +79,7 @@ class ImageQualityReport:
     light_gray_ratio: float
     red_stamp_ratio: float
     high_freq_score: float
+    bg_level: int = 0
     reasons: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -158,11 +164,18 @@ def _estimate_skew(gray: Image.Image, dark_ratio: float) -> float:
 
 def _watermark(
     gray: Image.Image, total: int
-) -> tuple[bool, float, float]:
-    """水印识别：浅灰窄峰占比 + 分块覆盖率。
+) -> tuple[bool, float, float, float]:
+    """水印识别：浅灰窄峰占比 + 分块覆盖率 + 块间离散度。
+
+    三个条件同时成立才算水印：
+      ① 全局浅灰占比落在 IMAGE_WATERMARK_MIN/MAX_RATIO 之间（局部而非整页）
+      ② 命中块覆盖率达到 IMAGE_WATERMARK_MIN_BLOCK_COVERAGE
+      ③ 块间离散度（max/min）达到 IMAGE_WATERMARK_MIN_BLOCK_SPREAD
 
     ★ 只认「局部」浅灰：整页均匀偏灰是底色 / 对比度问题（走 enhance），
       不是水印 —— 所以给 upper 上限，超过就判成灰底而不是 watermark。
+    ★ ③ 是为了排除「整页均匀网纹」：摩尔纹 / 灰底的块间几乎无差异（实测 1.08 /
+      1.15），而水印是条带（实测 7.0 / 5.5）。没有这条会输出「水印覆盖 100%」。
     """
     lo, hi = decisions.IMAGE_WATERMARK_LIGHT_RANGE
     light = sum(gray.histogram()[lo:hi]) / total if total else 0.0
@@ -170,6 +183,7 @@ def _watermark(
     w, h = gray.size
     bw, bh = max(1, w // _WM_GRID), max(1, h // _WM_GRID)
     blocks = 0
+    shares: list[float] = []
     for by in range(_WM_GRID):
         for bx in range(_WM_GRID):
             box = (bx * bw, by * bh, min(w, (bx + 1) * bw), min(h, (by + 1) * bh))
@@ -179,17 +193,43 @@ def _watermark(
             if area <= 0:
                 continue
             share = sum(gray.crop(box).histogram()[lo:hi]) / area
+            shares.append(share)
             if share >= decisions.IMAGE_WATERMARK_BLOCK_LIGHT_RATIO:
                 blocks += 1
     coverage = blocks / (_WM_GRID * _WM_GRID)
+    # 离散度：最小块为 0（块内完全没有浅灰）时按「极大」处理 —— 那是最强的条带证据。
+    # ★ 不能写成 `if min > 0 else 0.0`：稀疏水印的空块占比就是 0，那样会把
+    #   最典型的水印判成「块间无差异」，正好和这条判据想干的事相反。
+    spread = (
+        max(shares) / max(min(shares), _SHARE_EPS)
+        if shares and max(shares) > 0
+        else 0.0
+    )
 
     detected = (
         decisions.IMAGE_WATERMARK_MIN_RATIO
         <= light
         <= decisions.IMAGE_WATERMARK_MAX_RATIO
         and coverage >= decisions.IMAGE_WATERMARK_MIN_BLOCK_COVERAGE
+        and spread >= decisions.IMAGE_WATERMARK_MIN_BLOCK_SPREAD
     )
-    return detected, coverage, light
+    return detected, coverage, light, spread
+
+
+def _bg_level(gray: Image.Image) -> int:
+    """背景电平：灰度直方图的 80 分位（页面大部分是背景，但不是最亮的极值）。
+
+    ★ 取极值会永远得到 255（页面常有白边）；取中位数会被大段深色表格拉低。
+      80 分位在「干净页 255 / 灰底复印件 212 / 摩尔纹 251」三种样本上都稳定。
+    """
+    hist = gray.histogram()
+    target = sum(hist) * 0.8
+    cum = 0
+    for v, c in enumerate(hist):
+        cum += c
+        if cum >= target:
+            return v
+    return 255
 
 
 def _red_stamp_ratio(img: Image.Image, total: int) -> float:
@@ -232,9 +272,12 @@ def analyze(data: bytes, *, source: str = "image") -> ImageQualityReport:
     stain = _stain_ratio(gray, total)
     dark_ratio = sum(gray.histogram()[:128]) / total if total else 0.0
     skew = _estimate_skew(gray, dark_ratio)
-    wm_detected, wm_cov, light = _watermark(gray, total)
+    wm_detected, wm_cov, light, wm_spread = _watermark(gray, total)
     stamp = _red_stamp_ratio(img, total)
     hf = _high_freq_score(gray, total)
+    bg = _bg_level(gray)
+    _bg_lo, _bg_hi = decisions.IMAGE_BG_GRAY_RANGE
+    gray_bg = _bg_lo <= bg <= _bg_hi
 
     reasons: list[str] = []
     if source == "image" and min(w, h) < decisions.IMAGE_MIN_SIDE_PX:
@@ -257,7 +300,7 @@ def analyze(data: bytes, *, source: str = "image") -> ImageQualityReport:
         noise > decisions.IMAGE_NOISE_ENHANCE_RATIO
         or stain > decisions.IMAGE_STAIN_ENHANCE_RATIO
         or abs(skew) > decisions.IMAGE_SKEW_ENHANCE_DEG
-        or 0.35 < light < 0.9  # 整页偏灰（底色脏 / 扫描曝光不足）→ 拉伸对比度
+        or gray_bg
     ):
         verdict = VERDICT_ENHANCE
         if noise > decisions.IMAGE_NOISE_ENHANCE_RATIO:
@@ -266,15 +309,22 @@ def analyze(data: bytes, *, source: str = "image") -> ImageQualityReport:
             reasons.append(f"污渍/墨块 {stain:.2%} 超阈值，去污")
         if abs(skew) > decisions.IMAGE_SKEW_ENHANCE_DEG:
             reasons.append(f"倾斜 {skew:.1f}°，纠偏")
-        if 0.35 < light < 0.9:
-            reasons.append(f"底色偏灰（浅灰占比 {light:.0%}），拉伸对比度")
+        if gray_bg:
+            reasons.append(f"底色偏灰（背景电平 {bg}），拉伸对比度并二值化")
     else:
         verdict = VERDICT_PASS
 
     # 水印只标记，不改变处置（它不影响 OCR 读字，但会污染文本，交上游判断）
     if wm_detected:
         reasons.append(
-            f"检测到水印（覆盖 {wm_cov:.0%}），按策略只标记不擦除"
+            f"检测到水印（覆盖 {wm_cov:.0%}、块间离散 {wm_spread:.1f}×），"
+            "按策略只标记不擦除"
+        )
+    elif light > 0.05 and not gray_bg:
+        # 有浅灰纹理但不成条带 —— 网纹 / 摩尔纹，提示重扫，绝不判水印
+        reasons.append(
+            f"整页均匀浅灰纹理（{light:.0%}，块间离散 {wm_spread:.1f}×），"
+            "疑似网纹或摩尔纹，建议重扫"
         )
 
     report = ImageQualityReport(
@@ -290,6 +340,7 @@ def analyze(data: bytes, *, source: str = "image") -> ImageQualityReport:
         light_gray_ratio=round(light, 4),
         red_stamp_ratio=round(stamp, 4),
         high_freq_score=round(hf, 4),
+        bg_level=bg,
         reasons=tuple(reasons),
     )
     return report
@@ -429,12 +480,15 @@ def _is_watermark_line(
     """单行是否判为水印行。
 
     三条硬约束同时成立才删，宁可漏删不可误删：
-      ① 归一化后长度 <= IMAGE_WATERMARK_TEXT_MAX_LINE_LEN
+      ① 归一化后长度 <= IMAGE_WATERMARK_TEXT_MAX_LINE_LEN（60）
       ② 不含句末标点（水印不会写成一句话）
-      ③ 命中密级短语（需 `phrase_rule`）或在页内 / 页间高频重复
+      ③ 命中密级短语（行长须 >= PHRASE_MIN_LEN）或在页内 / 页间高频重复
 
-    ★ 密级短语这条要图像侧也判到水印才生效（双证据）：只凭文本出现
-      「机密」二字就删整行，会把单行小节标题「机密」一起删掉。
+    ★ 密级短语**不再依赖图像侧证据**：图像侧水印检测本身会漏（斜向大字水印、
+      页眉单行水印都测不到），若要求双证据，会出现「漏检 → 文本层不清理」的
+      连环失效 —— 实测水印行就原样进了 chunk。改为「短语 + 短行 + 无标点」
+      三条同时成立，误删风险由行长下限（6 字，保护「机密」这类小标题）兜住。
+    ★ `phrase_rule=True`（图像侧也判到水印）时行长下限放宽到 4 字。
     """
     norm = _norm_line(line).lower()
     if not norm:
@@ -443,7 +497,12 @@ def _is_watermark_line(
         return False
     if any(ch in line for ch in _SENTENCE_END):
         return False
-    hit_phrase = phrase_rule and any(p in norm for p in _WATERMARK_PHRASES)
+    min_len = (
+        decisions.IMAGE_WATERMARK_PHRASE_MIN_LEN_STRONG
+        if phrase_rule
+        else decisions.IMAGE_WATERMARK_PHRASE_MIN_LEN
+    )
+    hit_phrase = len(norm) >= min_len and any(p in norm for p in _WATERMARK_PHRASES)
     repeated = repeat_counts.get(norm, 0) >= decisions.IMAGE_WATERMARK_TEXT_REPEAT
     return hit_phrase or repeated
 
@@ -455,7 +514,9 @@ def strip_watermark_text(
 
     ★ `watermark_detected=False` 时仍会清理「页内高频重复短行」——
       平铺水印在图像层可能因覆盖率高被判成灰底，但文本层的重复特征更可靠。
-    ★ 删除比例超过上限 → 判定误伤正文，回退原文（`reverted=True`）并告警。
+    ★ 删除比例超过上限时**不必然回退**：只要被删的行都命中密级短语，说明就是水印页
+      （实测平铺水印能占全文 40%），回退等于把水印留下；只有「没有任何一行含密级
+      短语」的成批删除才判为误伤表格 / 正文，回退原文（`reverted=True`）。
     """
     lines = text.split("\n")
     counts: dict[str, int] = {}
@@ -468,6 +529,7 @@ def strip_watermark_text(
     kept: list[str] = []
     removed = 0
     removed_chars = 0
+    phrase_hits = 0
     for line in lines:
         norm = _norm_line(line).lower()
         if not norm:  # 空行照留，保证段落结构不失真
@@ -476,6 +538,8 @@ def strip_watermark_text(
         if _is_watermark_line(line, counts, phrase_rule=watermark_detected):
             removed += 1
             removed_chars += len(norm)
+            if any(p in norm for p in _WATERMARK_PHRASES):
+                phrase_hits += 1
             continue
         kept.append(line)
 
@@ -484,12 +548,21 @@ def strip_watermark_text(
 
     if removed == 0:
         return text, WatermarkTextCleanup(applied=False)
-    if ratio > decisions.IMAGE_WATERMARK_TEXT_MAX_REMOVE_RATIO:
+    # ★ 只有「成批删除非水印行」才可能是误伤正文（命中整章密级词汇 / 表格重复单元格）。
+    #   按纯比例判会两头都错：短文档里一条长水印行就占 38%，而平铺水印整页 6 行
+    #   能占 40%（实测 39.8%）—— 比例高恰恰是水印页的正常形态。
+    #   判据改为：删的全是水印特征行（命中密级短语）→ 不回退；
+    #   删的没有一行含密级短语（纯靠「重复短行」规则）且比例超限 → 判定误伤，回退。
+    #   另设 90% 硬顶：连正文都删光了说明判定彻底跑偏，宁可留脏也不交空页。
+    if ratio > decisions.IMAGE_WATERMARK_TEXT_MAX_REMOVE_RATIO and (
+        phrase_hits == 0 or ratio > 0.90
+    ):
         logger.warning(
-            "水印文本清理放弃：拟删除 %.1f%%（%d 行）超过 %.0f%% 上限，"
-            "判定命中正文，回退原文",
+            "水印文本清理放弃：拟删除 %.1f%%（%d 行，其中含密级短语 %d 行）超过 %.0f%% 上限，"
+            "判定命中正文 / 表格重复行，回退原文",
             ratio * 100,
             removed,
+            phrase_hits,
             decisions.IMAGE_WATERMARK_TEXT_MAX_REMOVE_RATIO * 100,
         )
         return text, WatermarkTextCleanup(

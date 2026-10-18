@@ -455,7 +455,19 @@ IMAGE_NOISE_REJECT_RATIO: Final[float] = 0.06
 IMAGE_STAIN_ENHANCE_RATIO: Final[float] = 0.02
 """**厚暗区**（5×5 腐蚀后仍存活的暗块）占比超过 2% 触发去污。
 ★ 这个口径会连带算进粗体标题、实心 logo、黑色表格填充 —— 所以阈值定在 2%，
-  只让成片污损（咖啡渍、漏墨、装订阴影）触发，不让一个标题把整页判脏。"""
+  只让成片污损（咖啡渍、漏墨、装订阴影）触发，不让一个标题把整页判脏。
+★ 暗区二值化阈值是 image_quality._DARK_THRESHOLD（128）。原本定 90 时，
+  高斯模糊后的污渍边缘灰度升到 100–150，**整块污渍算出 0%** —— 合成脏页
+  （三个明显黑斑）实测 0.0000。改 128 后同一张图 2.17%。"""
+
+IMAGE_BG_GRAY_RANGE: Final[tuple[int, int]] = (180, 240)
+"""「底色偏灰」的背景电平区间 `[lo, hi]`。背景电平取灰度直方图 80 分位。
+
+★ 不用「浅灰占比 > 0.35」判灰底：一页复印件背景占比可达 96%，
+  被 IMAGE_WATERMARK_MAX_RATIO（0.35）挡在外面，同时顶到 0.9 的旧阈值之上，
+  结果是**灰底扫描件既不判脏也不增强**，直接进 OCR。实测就是 0.971 判 pass。
+★ 80 分位而非最大值：页面可能有白边，取极值会永远得到 255。
+  干净页 255、摩尔纹 251 都在区间外；灰底复印件 212 命中。"""
 
 IMAGE_WATERMARK_LIGHT_RANGE: Final[tuple[int, int]] = (200, 245)
 """水印候选灰阶窗口 `[lo, hi)`。半透明文字 / 浅色 logo 的像素集中在此区间；
@@ -467,9 +479,21 @@ IMAGE_WATERMARK_MAX_RATIO: Final[float] = 0.35
 ★ 上限不可省：整页均匀偏灰（底色脏、曝光不足）占比会远超 35%，那是
   **对比度问题**（走 enhance 拉伸），不是水印。只认「局部」浅灰。"""
 
-IMAGE_WATERMARK_MIN_BLOCK_COVERAGE: Final[float] = 0.5
-"""6×6 网格中「浅灰占比 >= IMAGE_WATERMARK_BLOCK_LIGHT_RATIO」的块至少要占一半，
-才算水印。单块命中多是页边阴影 / 装订线，不足以判定。"""
+IMAGE_WATERMARK_MIN_BLOCK_COVERAGE: Final[float] = 0.30
+"""6×6 网格中「浅灰占比 >= IMAGE_WATERMARK_BLOCK_LIGHT_RATIO」的块至少要占三成。
+
+★ 从 0.5 降到 0.30 是实测结果（2026-10-18 合成脏页集）：真实平铺水印
+  （每 190px 一条水印行、行距远大于块高）只命中 12/36 块 = **0.33**，
+  按 0.5 判会**整页漏检**。斜向大字水印更低（0.14），本版仍会漏 —— 由文本层
+  的密级短语规则兜底，不靠这一条。
+  0.30 同时留出余量：干净页 0.00、页眉单行水印 0.00、红章页 0.00。"""
+
+IMAGE_WATERMARK_MIN_BLOCK_SPREAD: Final[float] = 2.0
+"""块间离散度 = 最大块浅灰占比 / 最小块浅灰占比，用来把水印和「整页均匀网纹」分开。
+
+★ 真水印是**条带**：块与块之间深浅相差大（实测平铺 7.0、组合页 5.5）。
+  摩尔纹 / 灰底是**全页均匀**：块间几乎无差异（实测摩尔纹 1.08、灰底 1.15）。
+  没有这一条，摩尔纹会被判成「水印覆盖 100%」—— 实测就是这个误报。"""
 
 IMAGE_WATERMARK_BLOCK_LIGHT_RATIO: Final[float] = 0.05
 """单块内浅灰像素达到多少算「命中块」。
@@ -481,9 +505,22 @@ IMAGE_ENHANCE_MEDIAN_SIZE: Final[int] = 3
 """中值滤波窗口。3×3 对椒盐噪点足够且不糊字；5×5 只在高噪点页才有必要，
 由 `enhance()` 按 noise_ratio 分级（当前实现统一 3×3，5×5 需重新验证）。"""
 
-IMAGE_WATERMARK_TEXT_MAX_LINE_LEN: Final[int] = 30
-"""文本层水印判定的行长上限（归一化后）。真正的正文行很少短于 30 个字符
-还不带标点 —— 超过这个长度就不按水印处理，避免删掉短标题与表格行。"""
+IMAGE_WATERMARK_TEXT_MAX_LINE_LEN: Final[int] = 60
+"""文本层水印判定的行长上限（归一化后）。
+
+★ 从 30 放宽到 60 是实测结果：真实水印行会带公司名与编号
+  （「西安博信云创科技有限公司 内部资料 严禁外传 编号 BXYC-2026-0917」归一化后
+  42 字），按 30 判会**把水印行当正文保留**，正是这次要解决的问题。
+  正文行要么超 60 字，要么带句末标点 —— 由下面两条继续拦住。"""
+
+IMAGE_WATERMARK_PHRASE_MIN_LEN: Final[int] = 6
+"""命中密级短语时允许的最短行长（无图像侧证据）。
+
+★ 下限而非上限：单行小节标题「机密」「内部资料」本身不是水印，删掉就是误伤；
+  真正的水印短语行至少「内部资料严禁外传」= 8 字。定 6 是取中间值。"""
+
+IMAGE_WATERMARK_PHRASE_MIN_LEN_STRONG: Final[int] = 4
+"""图像侧也判到水印时放宽到 4 字（双证据成立，误删风险显著下降）。"""
 
 IMAGE_WATERMARK_TEXT_REPEAT: Final[int] = 2
 """同一短行在一页内出现多少次判为水印（平铺水印的典型特征是重复）。
@@ -706,8 +743,31 @@ def self_check() -> None:
         )
     if not (0 < IMAGE_WATERMARK_MIN_BLOCK_COVERAGE <= 1):
         raise RuntimeError("IMAGE_WATERMARK_MIN_BLOCK_COVERAGE MUST ∈ (0, 1]")
+    if IMAGE_WATERMARK_MIN_BLOCK_SPREAD <= 1:
+        raise RuntimeError(
+            "IMAGE_WATERMARK_MIN_BLOCK_SPREAD MUST > 1 —— 1 表示块间无差异，"
+            "整页均匀网纹会与水印无法区分"
+        )
     if not (0 < IMAGE_WATERMARK_BLOCK_LIGHT_RATIO <= 1):
         raise RuntimeError("IMAGE_WATERMARK_BLOCK_LIGHT_RATIO MUST ∈ (0, 1]")
+    _bg_lo, _bg_hi = IMAGE_BG_GRAY_RANGE
+    if not (0 < _bg_lo < _bg_hi < 255):
+        raise RuntimeError(f"IMAGE_BG_GRAY_RANGE 非法：{IMAGE_BG_GRAY_RANGE}")
+    if IMAGE_ENHANCE_MEDIAN_SIZE not in (3, 5):
+        raise RuntimeError("IMAGE_ENHANCE_MEDIAN_SIZE MUST ∈ {3, 5}")
+    if IMAGE_WATERMARK_TEXT_MAX_LINE_LEN <= 0:
+        raise RuntimeError("IMAGE_WATERMARK_TEXT_MAX_LINE_LEN MUST > 0")
+    if not (
+        IMAGE_WATERMARK_PHRASE_MIN_LEN_STRONG
+        < IMAGE_WATERMARK_PHRASE_MIN_LEN
+        <= IMAGE_WATERMARK_TEXT_MAX_LINE_LEN
+    ):
+        raise RuntimeError(
+            "水印短语行长下限顺序错：MUST strong("
+            f"{IMAGE_WATERMARK_PHRASE_MIN_LEN_STRONG}) < plain("
+            f"{IMAGE_WATERMARK_PHRASE_MIN_LEN}) <= 行长上限("
+            f"{IMAGE_WATERMARK_TEXT_MAX_LINE_LEN})"
+        )
     if IMAGE_ENHANCE_MEDIAN_SIZE not in (3, 5):
         raise RuntimeError("IMAGE_ENHANCE_MEDIAN_SIZE MUST ∈ {3, 5}")
     if IMAGE_WATERMARK_TEXT_MAX_LINE_LEN <= 0:
