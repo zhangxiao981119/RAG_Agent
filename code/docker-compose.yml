@@ -213,6 +213,11 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       TENANT_CODE: ${TENANT_CODE:-default}
+      # ★ worker 的 DB 池要单独压小：它与 api 共用 database.py，
+      #   若同样吃 40 条，api(40)+worker(40)=80 会挤掉 PG 的运维连接余量。
+      #   解析任务本身被 OCR_MAX_CONCURRENCY=1 串行化，5+5 足够。
+      DB_POOL_SIZE: ${WORKER_DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${WORKER_DB_MAX_OVERFLOW:-5}
       # M7 WU-M-15：治理审查任务在 worker 内调 LLM，必须与 api 段同源注入
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_API_KEY: ${LLM_API_KEY:-}

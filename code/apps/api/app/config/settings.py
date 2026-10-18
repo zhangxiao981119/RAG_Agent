@@ -45,6 +45,21 @@ class Settings(BaseSettings):
     login_lock_minutes: int = 15  # 账户锁定时长（分钟）
     login_rate_per_minute: int = 10  # 单 IP 每分钟最多登录尝试次数
     database_url: str = "postgresql+asyncpg://user:pass@postgres:5432/kagent"
+    # ── DB 连接池（P1-5 压测实测后标定）──────────────────────
+    # 每个**在途**问答请求长期占用 1 条连接：get_db 的 yield 覆盖整条 SSE 流，
+    # 依赖的 finally 要等响应发完才执行；流式过程中内部还会瞬时再开 1 条
+    # （SessionLocal 用于读历史 / 检索 / 落库 / 审计）。
+    # ★ 实测依据：pool_size=10 + max_overflow=10（合计 20）时，
+    #   c=10 并发 133 请求全成功；c=20 并发 76 请求失败 36 个（47%），
+    #   P50 总耗时 60s，日志为 QueuePool limit of size 10 overflow 10 reached。
+    #   即：20 恰好卡在「20 在途 × 1~2 条」的临界点上，一旦越界就雪崩。
+    # 容量换算：可用连接数 ≈ pool_size + max_overflow，按「每在途请求 2 条」取整 → 支持 ~20 并发。
+    # 扩副本 MUST 重算：40 × 副本数 + worker 20 ≤ PG max_connections(100) − 预留。
+    db_pool_size: int = 20
+    db_max_overflow: int = 20
+    # 过载时 MUST 快速失败：pool_timeout 30s 会让请求挂着不动 30 秒再 500
+    # （实测 c=20 的 P50 总耗时 60s = 两次 30s 等池），5s 直接 503 更有用。
+    db_pool_timeout_s: float = 5.0
     redis_url: str = "redis://redis:6379/0"
     redis_max_connections: int = 20  # 单进程连接池上限；× 副本数应 ≤ Redis maxclients 的余量
     redis_socket_timeout_s: float = 3.0  # 建连/读写超时（秒）—— 避免 Redis 抖动时请求无限等待

@@ -168,7 +168,18 @@ services:
       # 换到 GPU / 更强算力后置 true 启用（启用前 MUST 重标 RELEVANCE_THRESHOLD_RERANK）。
       RERANK_ENABLED: ${RERANK_ENABLED:-false}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-100}
-      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx}
+      # ★ 白名单与 dev 段保持一致（含图片）。本 compose 未起 ocr 服务时
+      #   OCR_ENABLED 必须保持 false —— 此时图片上传会被 kbs.py 拦成 415 并提示
+      #   需要开 OCR，而不是落进解析层才失败。要真正支持扫描件/图片，
+      #   MUST 先把 apps/ocr 作为一个服务加进来并把 OCR_ENABLED 置 true。
+      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx,png,jpg,jpeg,gif,webp,bmp}
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+      OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:8000}
+      IMAGE_QUALITY_GATE_ENABLED: ${IMAGE_QUALITY_GATE_ENABLED:-true}
+      IMAGE_ENHANCE_ENABLED: ${IMAGE_ENHANCE_ENABLED:-true}
+      # DB 连接池：口径见 settings.db_pool_size 的压测注释（每在途请求 1~2 条连接）
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
       MULTI_TENANT: ${MULTI_TENANT:-false}
     depends_on:
@@ -214,7 +225,14 @@ services:
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://embedding:8000/v1}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
-      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx}
+      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx,png,jpg,jpeg,gif,webp,bmp}
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+      OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:8000}
+      IMAGE_QUALITY_GATE_ENABLED: ${IMAGE_QUALITY_GATE_ENABLED:-true}
+      IMAGE_ENHANCE_ENABLED: ${IMAGE_ENHANCE_ENABLED:-true}
+      # worker 与 api 共用 settings，池不压小会吃掉 api 的连接余量（解析由 1 路上限串行化）
+      DB_POOL_SIZE: ${WORKER_DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${WORKER_DB_MAX_OVERFLOW:-5}
     volumes:
       - ./sync_data:/data/sync
     depends_on:
