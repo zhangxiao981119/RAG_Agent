@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import mimetypes
 
 from app.config.settings import get_settings
@@ -43,10 +44,31 @@ async def parse_image(data: bytes, ext: str) -> list[ParsedBlock]:
     # 原始字节直接送 OCR 服务 —— 不再内联 base64 data URL（省内存与编码时间）
     mime = mimetypes.guess_type(f"img.{ext}")[0] or "application/octet-stream"
 
+    # 质量门禁：先检测（必要时去噪/去污/纠偏）再送 OCR。
+    # verdict=reject_to_manual → ParseError（显式转人工，不静默入库错字）。
+    from app.services.parse.image_quality import prepare_for_ocr
+
+    original = data
+    data, _quality = prepare_for_ocr(data, source="image")
+    if data is not original:
+        # 增强输出统一为 PNG，MIME 必须跟着改，否则 OCR 服务按原 MIME 解码会失败
+        mime = "image/png"
+
     try:
         block = await ocr_image(data, mime)
     except OcrError as exc:
         # 边界改型：解析层契约统一 ParseError，原因原样保留（INV-M-04 不降级）
         raise ParseError(f"OCR 转录失败：{exc}") from exc
+
+    # 文本层水印清理：把「内部资料 严禁外传」这类行剔掉，别让它跟着 chunk
+    # 进 embedding（水印的伤害在文本，不在像素 —— 见 image_quality 模块说明）
+    from app.services.parse.image_quality import strip_watermark_text
+
+    cleaned, _cleanup = strip_watermark_text(
+        block.text,
+        watermark_detected=bool(_quality and _quality.watermark_detected),
+    )
+    if cleaned != block.text:
+        block = dataclasses.replace(block, text=cleaned)
 
     return [block]

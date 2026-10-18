@@ -422,7 +422,83 @@ GOT 为生成式模型，置信度 = 解码 token 平均概率的代理（见 ap
 warning 不改变主流程 —— 数据不出域约束下禁止升级外部 LLM 重转录。"""
 
 
+# ── 文档图像质量门禁（去噪 / 去污 + 质量识别）──────────────
+# 口径真源：`app/services/parse/image_quality.py`。全部为**可解释启发式**，
+# 由 Pillow 的 C 路径计算，单页 < 200ms，不引入 OpenCV / 模型 / 新容器。
+# ★ 水印只做识别（watermark_detected），**MUST NOT** 做像素级擦除 ——
+#   擦除会破坏「答案可回溯原文」的原图一致性，且销毁版权与密级标识。
+IMAGE_MIN_SIDE_PX: Final[int] = 500
+"""图片文件短边下限：低于此值转人工（`source="image"` 才生效）。
+★ 只对用户上传的图片生效：扫描件渲染页的 DPI 由 `_SCAN_RENDER_DPI`（150）决定，
+  按像素数判定会把正常的 150dpi A4 页（1240×1754）误杀 —— 那是我们自己渲染的，
+  不存在「分辨率不足」问题。"""
+
+IMAGE_SKEW_ENHANCE_DEG: Final[float] = 1.5
+"""倾斜角超过此值即纠偏。1.5° 是经验线：1° 以内对 OCR 行切分几乎无影响，
+超过 2° 时整行偏移会跨行（150dpi 下 A4 宽 1240px，1.5° ≈ 32px）。"""
+
+IMAGE_SKEW_REJECT_DEG: Final[float] = 8.0
+"""倾斜角超过此值转人工 —— 纠偏需 expand 旋转，四角空白与裁切不可控，
+且大角度倾斜通常意味着拍摄而非扫描，OCR 结果不可用。"""
+
+IMAGE_NOISE_ENHANCE_RATIO: Final[float] = 0.003
+"""**孤立暗点**占全页像素的比例，超过 0.3% 触发去噪。
+★ 指标定义在 image_quality._noise_ratio：暗像素且 3×3 邻域内暗点 <= 1 个。
+  不用「中值滤波残差」—— 笔画边缘的灰度跳变会被中值改写，实测一页干净正文
+  就能算出 5%，把正常页全部推向增强。笔画边缘至少 2 个暗邻居，天然被排除。
+★ 150dpi A4 约 218 万像素，0.3% ≈ 6500 个孤立点，肉眼已是明显脏点。"""
+
+IMAGE_NOISE_REJECT_RATIO: Final[float] = 0.06
+"""孤立暗点超过 6% 直接转人工：此时中值滤波会把正文笔画一起抹平，
+任何预处理都救不回文字，重扫是唯一解。"""
+
+IMAGE_STAIN_ENHANCE_RATIO: Final[float] = 0.02
+"""**厚暗区**（5×5 腐蚀后仍存活的暗块）占比超过 2% 触发去污。
+★ 这个口径会连带算进粗体标题、实心 logo、黑色表格填充 —— 所以阈值定在 2%，
+  只让成片污损（咖啡渍、漏墨、装订阴影）触发，不让一个标题把整页判脏。"""
+
+IMAGE_WATERMARK_LIGHT_RANGE: Final[tuple[int, int]] = (200, 245)
+"""水印候选灰阶窗口 `[lo, hi)`。半透明文字 / 浅色 logo 的像素集中在此区间；
+纯白底（>245）与正文（<200）都被排除，避免把正常灰度图判成水印。"""
+
+IMAGE_WATERMARK_MIN_RATIO: Final[float] = 0.03
+IMAGE_WATERMARK_MAX_RATIO: Final[float] = 0.35
+"""水印浅灰像素占比的下 / 上限。
+★ 上限不可省：整页均匀偏灰（底色脏、曝光不足）占比会远超 35%，那是
+  **对比度问题**（走 enhance 拉伸），不是水印。只认「局部」浅灰。"""
+
+IMAGE_WATERMARK_MIN_BLOCK_COVERAGE: Final[float] = 0.5
+"""6×6 网格中「浅灰占比 >= IMAGE_WATERMARK_BLOCK_LIGHT_RATIO」的块至少要占一半，
+才算水印。单块命中多是页边阴影 / 装订线，不足以判定。"""
+
+IMAGE_WATERMARK_BLOCK_LIGHT_RATIO: Final[float] = 0.05
+"""单块内浅灰像素达到多少算「命中块」。
+★ 不能按 30% 来定：水印是稀疏文字（一页铺 6 行斜向字），单个 100×133 的块里
+  浅灰像素通常只占 8–15%，按 30% 判会全页零命中 —— 实测就是踩了这个坑
+  （全局浅灰 16.4%、块覆盖 0.0，水印漏检）。5% 能同时拦住零星浅灰噪点。"""
+
+IMAGE_ENHANCE_MEDIAN_SIZE: Final[int] = 3
+"""中值滤波窗口。3×3 对椒盐噪点足够且不糊字；5×5 只在高噪点页才有必要，
+由 `enhance()` 按 noise_ratio 分级（当前实现统一 3×3，5×5 需重新验证）。"""
+
+IMAGE_WATERMARK_TEXT_MAX_LINE_LEN: Final[int] = 30
+"""文本层水印判定的行长上限（归一化后）。真正的正文行很少短于 30 个字符
+还不带标点 —— 超过这个长度就不按水印处理，避免删掉短标题与表格行。"""
+
+IMAGE_WATERMARK_TEXT_REPEAT: Final[int] = 2
+"""同一短行在一页内出现多少次判为水印（平铺水印的典型特征是重复）。
+★ 2 次是下限：表格里的重复单元格（如「是」「否」）也会命中，但它们通常
+  带在表格结构里、行长极短 —— 真正把误删压下去的是「不含句末标点 + 行长上限」两条。"""
+
+IMAGE_WATERMARK_TEXT_MAX_REMOVE_RATIO: Final[float] = 0.30
+"""文本层水印删除比例上限。超过 30% 判为误伤正文 → 放弃清理、回退原文并告警。
+★ 定 30% 而非更高：正常水印行只占全文 5–15%，超过 30% 基本只有一种可能 ——
+  命中了正文里的密级词汇（如「商业秘密管理办法」整章）。"""
+
+
+
 # ── 合规与保留（§8 D-15）─────────────────────────────────
+
 AUDIT_RETENTION_DAYS: Final[int] = 365
 
 
@@ -603,6 +679,47 @@ def self_check() -> None:
         )
     if not (0.0 < OCR_LOW_CONF < 1.0):
         raise RuntimeError(f"OCR_LOW_CONF MUST ∈ (0, 1)，当前 {OCR_LOW_CONF}")
+    # ── 文档图像质量门禁（顺序即语义：enhance 线 MUST 严于 reject 线）──
+    if IMAGE_MIN_SIDE_PX <= 0:
+        raise RuntimeError("IMAGE_MIN_SIDE_PX MUST > 0")
+    if not (0 < IMAGE_SKEW_ENHANCE_DEG < IMAGE_SKEW_REJECT_DEG):
+        raise RuntimeError(
+            f"倾斜阈值顺序错：IMAGE_SKEW_ENHANCE_DEG({IMAGE_SKEW_ENHANCE_DEG}) "
+            f"MUST 满足 0 < enhance < reject({IMAGE_SKEW_REJECT_DEG})"
+        )
+    if not (0 < IMAGE_NOISE_ENHANCE_RATIO < IMAGE_NOISE_REJECT_RATIO < 1):
+        raise RuntimeError(
+            "噪点阈值顺序错：MUST 0 < IMAGE_NOISE_ENHANCE_RATIO "
+            f"({IMAGE_NOISE_ENHANCE_RATIO}) < IMAGE_NOISE_REJECT_RATIO "
+            f"({IMAGE_NOISE_REJECT_RATIO}) < 1"
+        )
+    if not (0 <= IMAGE_STAIN_ENHANCE_RATIO < 1):
+        raise RuntimeError("IMAGE_STAIN_ENHANCE_RATIO MUST ∈ [0, 1)")
+    _wm_lo, _wm_hi = IMAGE_WATERMARK_LIGHT_RANGE
+    if not (0 <= _wm_lo < _wm_hi <= 255):
+        raise RuntimeError(
+            f"IMAGE_WATERMARK_LIGHT_RANGE 非法：{IMAGE_WATERMARK_LIGHT_RANGE}"
+        )
+    if not (0 < IMAGE_WATERMARK_MIN_RATIO < IMAGE_WATERMARK_MAX_RATIO < 1):
+        raise RuntimeError(
+            "水印占比阈值顺序错：MUST 0 < MIN < MAX < 1"
+        )
+    if not (0 < IMAGE_WATERMARK_MIN_BLOCK_COVERAGE <= 1):
+        raise RuntimeError("IMAGE_WATERMARK_MIN_BLOCK_COVERAGE MUST ∈ (0, 1]")
+    if not (0 < IMAGE_WATERMARK_BLOCK_LIGHT_RATIO <= 1):
+        raise RuntimeError("IMAGE_WATERMARK_BLOCK_LIGHT_RATIO MUST ∈ (0, 1]")
+    if IMAGE_ENHANCE_MEDIAN_SIZE not in (3, 5):
+        raise RuntimeError("IMAGE_ENHANCE_MEDIAN_SIZE MUST ∈ {3, 5}")
+    if IMAGE_WATERMARK_TEXT_MAX_LINE_LEN <= 0:
+        raise RuntimeError("IMAGE_WATERMARK_TEXT_MAX_LINE_LEN MUST > 0")
+    if IMAGE_WATERMARK_TEXT_REPEAT < 2:
+        raise RuntimeError(
+            "IMAGE_WATERMARK_TEXT_REPEAT MUST >= 2 —— 1 次等于「见到就删」，会误伤正文"
+        )
+    if not (0 < IMAGE_WATERMARK_TEXT_MAX_REMOVE_RATIO < 1):
+        raise RuntimeError("IMAGE_WATERMARK_TEXT_MAX_REMOVE_RATIO MUST ∈ (0, 1)")
+
+
     if level_rank(Level.SECRET) != LEVEL_RANK_SECRET:
         raise RuntimeError("level_rank 与 LEVEL_RANK_* 常量不一致")
     if level_rank(Level.PUBLIC) != LEVEL_RANK_PUBLIC:

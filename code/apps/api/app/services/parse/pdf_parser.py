@@ -394,13 +394,29 @@ async def ocr_scanned_pages(
         for page_index in range(page_start, page_end + 1):
             page = doc[page_index - 1]
             png = page.get_pixmap(dpi=_SCAN_RENDER_DPI).tobytes("png")
+            # 质量门禁：检测 + 必要时去噪/去污/纠偏；reject 显式转人工（带页码）
+            from app.services.parse.image_quality import prepare_for_ocr
+
+            try:
+                png, _quality = prepare_for_ocr(png, source="pdf_page")
+            except ParseError as exc:
+                raise ParseError(
+                    f"扫描件第 {page_index} 页质量门禁拒绝：{exc}"
+                ) from exc
             try:
                 block = await ocr_image(png, "image/png")
             except OcrError as exc:
                 raise ParseError(
                     f"扫描件第 {page_index} 页 OCR 转录失败：{exc}"
                 ) from exc
-            texts.append(block.text)
+            # 文本层水印清理（逐页）：页内重复短行 + 密级短语行
+            from app.services.parse.image_quality import strip_watermark_text
+
+            text, _cleanup = strip_watermark_text(
+                block.text,
+                watermark_detected=bool(_quality and _quality.watermark_detected),
+            )
+            texts.append(text)
     return texts
 
 
@@ -413,6 +429,10 @@ def blocks_from_page_texts(page_texts: list[str]) -> list[ParsedBlock]:
     """
     blocks: list[ParsedBlock] = []
     acc = _HeadingAccumulator()
+    # 跨页重复短行清理（平铺水印 / 页眉页脚）—— 只有聚合期才看得到全文档页序
+    from app.services.parse.image_quality import strip_repeated_page_lines
+
+    page_texts, _removed = strip_repeated_page_lines(page_texts)
     for page_no, page_text in enumerate(page_texts, start=1):
         acc.feed(page_text.split("\n"), page_no, blocks)
         acc.flush(blocks, page_no)

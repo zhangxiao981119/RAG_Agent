@@ -88,6 +88,14 @@ class Settings(BaseSettings):
     # ocr_enabled=true 时必须显式注入（compose 内为 http://ocr:8000）；
     # 留空且开关开启 → 解析层直接 ParseError，不做任何降级（无双引擎兼容）。
     ocr_base_url: str = ""
+    # ── 文档图像质量门禁（去噪 / 去污 + 质量识别）─────────────
+    # ★ 门禁本身默认开：纯 CPU（Pillow C 路径，单页 < 200ms），无外部依赖，
+    #   只做检测与分流 —— 关掉会失去「转人工」这一唯一的质量兜底。
+    image_quality_gate_enabled: bool = True
+    # ★ 增强默认开，但只在 verdict=enhance（脏 / 歪 / 灰底）时触发，干净页零改动。
+    #   若某批语料的评测基线需要冻结，置 false 只保留检测不动像素 ——
+    #   改这个开关会改变入库文本，MUST 重跑全量评估后再回填指标。
+    image_enhance_enabled: bool = True
     audit_retention_days: int = 365
     multi_tenant: bool = False
     # ── M5 生产初始化 ────────────────────────────────────────
