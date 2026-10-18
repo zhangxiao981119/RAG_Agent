@@ -164,3 +164,61 @@ async def test_low_confidence_warns_but_succeeds(
         block = await ocr_image(b"png-bytes")
     assert block.text == "模糊页内容"
     assert any("低于阈值" in rec.message for rec in caplog.records)
+
+
+# ── 并发闸与错误分类（2026-10-18 实测 12 并发把 OCR 服务打 OOM 后补）──────
+
+
+@pytest.mark.asyncio
+async def test_concurrency_is_capped(monkeypatch: pytest.MonkeyPatch):
+    """并发请求数 MUST 被 OCR_MAX_CONCURRENCY 卡住。
+
+    背景：12 张图并发上传时 worker 同时打出 12 个 OCR 请求，
+    OCR 服务（4GB 容器上限）内存被打爆、进程被 kill，9/12 张失败。
+    没有这道闸，批量上传图片等于对 OCR 服务做一次压力测试。
+    """
+    import asyncio
+
+    from app.config.decisions import OCR_MAX_CONCURRENCY
+
+    _set_base_url(monkeypatch, _OCR_URL)
+
+    in_flight = 0
+    peak = 0
+
+    class _SlowClient(_FakeAsyncClient):
+        async def post(self, url: str, **kwargs: object) -> httpx.Response:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.02)  # 模拟真实推理耗时，制造重叠窗口
+            in_flight -= 1
+            return _http_response(200, {"text": "内容", "confidence": 0.9})
+
+    monkeypatch.setattr(ocr_mod.httpx, "AsyncClient", _SlowClient)
+
+    blocks = await asyncio.gather(*[ocr_image(b"x") for _ in range(8)])
+
+    assert len(blocks) == 8, "限流 MUST NOT 丢请求"
+    assert peak <= OCR_MAX_CONCURRENCY, f"并发峰值 {peak} 超过上限 {OCR_MAX_CONCURRENCY}"
+
+
+@pytest.mark.asyncio
+async def test_timeout_reports_timeout_not_unreachable(monkeypatch: pytest.MonkeyPatch):
+    """超时与不可达 MUST 分开报：排查方向不同（服务太慢 vs 网络/进程挂了）。"""
+    _set_base_url(monkeypatch, _OCR_URL)
+    _install(monkeypatch, httpx.ReadTimeout("timed out"))
+    with pytest.raises(OcrError, match="超时"):
+        await ocr_image(b"png-bytes")
+
+
+@pytest.mark.asyncio
+async def test_disconnect_reports_interrupted(monkeypatch: pytest.MonkeyPatch):
+    """连接被中断（典型 OOM 被杀）→ 文案点明真因，不混进「不可达」。"""
+    _set_base_url(monkeypatch, _OCR_URL)
+    _install(
+        monkeypatch,
+        httpx.RemoteProtocolError("Server disconnected without sending a response."),
+    )
+    with pytest.raises(OcrError, match="连接被中断"):
+        await ocr_image(b"png-bytes")

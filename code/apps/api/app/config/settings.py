@@ -76,8 +76,14 @@ class Settings(BaseSettings):
     #   decisions.RELEVANCE_THRESHOLD_RERANK）。
     rerank_enabled: bool = False
     max_upload_mb: int = 100
+    # ★ 图片扩展名与 services/parse/image_parser.IMAGE_EXTS 对齐。
+    #   图片能否真正入库还取决于 ocr_enabled：关闭时上传层直接 415 并指向
+    #   OCR_ENABLED（见 api/kbs.py 的联动校验），不会落到解析层才失败。
     allowed_ext: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["pdf", "md", "txt", "xls", "xlsx", "docx"]
+        default_factory=lambda: [
+            "pdf", "md", "txt", "xls", "xlsx", "docx",
+            "png", "jpg", "jpeg", "gif", "webp", "bmp",
+        ]
     )
     # ── M7 多模态：扫描件 OCR / 视觉抽取 ─────────────────────
     # ★ 默认 false：保持既有语义「仅支持文本层 PDF」，扫描件 PDF 与图片在解析层被拒绝。

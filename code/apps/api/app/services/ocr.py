@@ -13,16 +13,32 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
 import httpx
 
-from app.config.decisions import OCR_LOW_CONF, OCR_TIMEOUT_S
+from app.config.decisions import OCR_LOW_CONF, OCR_MAX_CONCURRENCY, OCR_TIMEOUT_S
 from app.config.settings import get_settings
 from app.services.parse import ParsedBlock
 
 logger = logging.getLogger(__name__)
+
+# 进程内并发闸：同一时刻最多 N 个请求在途（见 decisions.OCR_MAX_CONCURRENCY）。
+# ★ 按事件循环懒建：Semaphore 跨 loop 复用会在测试（每个用例一个 loop）里抛
+#   「bound to a different event loop」，所以 loop 变了就重建一个。
+_semaphore: asyncio.Semaphore | None = None
+_semaphore_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _ocr_semaphore() -> asyncio.Semaphore:
+    global _semaphore, _semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _semaphore is None or _semaphore_loop is not loop:
+        _semaphore = asyncio.Semaphore(OCR_MAX_CONCURRENCY)
+        _semaphore_loop = loop
+    return _semaphore
 
 # GOT-OCR 会按文档结构输出 LaTeX 风格标记：单行的 `\title{` / `}`，
 # 以及少量转义符号（`\(2026-0917\)`）。这些 token 会原样进入 chunk 与 embedding，
@@ -82,18 +98,31 @@ async def ocr_image(data: bytes, mime: str = "image/png") -> ParsedBlock:
         )
     base = settings.ocr_base_url.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=OCR_TIMEOUT_S) as client:
-            resp = await client.post(
-                f"{base}/ocr",
-                content=data,
-                headers={"Content-Type": mime},
-            )
-            resp.raise_for_status()
-            payload = resp.json()
+        # 并发闸在 httpx 之外：排队时间不计入超时（否则排队 3 张就必然超时）
+        async with _ocr_semaphore():
+            async with httpx.AsyncClient(timeout=OCR_TIMEOUT_S) as client:
+                resp = await client.post(
+                    f"{base}/ocr",
+                    content=data,
+                    headers={"Content-Type": mime},
+                )
+                resp.raise_for_status()
+                payload = resp.json()
     except httpx.HTTPStatusError as exc:
         detail = (exc.response.text or "")[:200]
         raise OcrError(
             f"OCR 服务返回错误：HTTP {exc.response.status_code} {detail}"
+        ) from exc
+    except httpx.TimeoutException as exc:
+        # 与「不可达」分开报：超时说明服务活着但太慢，排查方向完全不同
+        raise OcrError(
+            f"OCR 服务超时（{OCR_TIMEOUT_S:.0f}s 未返回）：{type(exc).__name__}"
+        ) from exc
+    except httpx.RemoteProtocolError as exc:
+        # 最典型的真因是服务端 OOM 被 kill；曾经统一报「不可达」，
+        # 排查时全被误导到网络/DNS 上（2026-10-18 实测 12 并发时踩到）
+        raise OcrError(
+            f"OCR 服务连接被中断（常见原因：服务端 OOM 重启 / 进程退出）：{exc}"
         ) from exc
     except httpx.HTTPError as exc:
         raise OcrError(f"OCR 服务不可达：{exc}") from exc

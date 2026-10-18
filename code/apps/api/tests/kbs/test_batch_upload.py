@@ -213,3 +213,63 @@ def test_forbidden_without_kb_authorization(client):
     )
 
     assert resp.status_code == 403
+
+
+# ── 图片扩展名联动（P0-1）─────────────────────────────────────────
+# 背景：图片扩展名进了 allowed_ext 默认值，但图片必须经本地 OCR 才能解析。
+# 若只在解析层 fail-closed，用户看到的是「上传成功 + job 失败」，排查成本高。
+
+
+def test_default_allowed_ext_includes_image_types():
+    """代码默认白名单 MUST 与 IMAGE_EXTS 对齐 —— 否则图片在入口就被拒，门禁永远不执行。
+
+    ★ 断言的是 `Settings` 类默认值，不是 `get_settings()`：后者读环境变量，
+      部署侧配错（本次就踩到 ALLOWED_EXT 未带图片）会让单测跟着红，
+      变成「环境问题伪装成代码回归」。
+    """
+    from app.config.settings import Settings
+    from app.services.parse.image_parser import IMAGE_EXTS
+
+    factory = Settings.model_fields["allowed_ext"].default_factory
+    default_ext = factory()
+    missing = [e for e in IMAGE_EXTS if e not in default_ext]
+    assert missing == [], f"默认白名单缺图片扩展名：{missing}"
+
+
+def test_image_upload_rejected_when_ocr_disabled(client, monkeypatch: pytest.MonkeyPatch):
+    """OCR 关闭时上传图片 → 415，且报错直接指向开哪个开关。"""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    # 与部署环境解耦：即便容器的 ALLOWED_EXT 还是旧值，也要验证到联动分支
+    monkeypatch.setattr(settings, "allowed_ext", [*settings.allowed_ext, "png"])
+
+    mount, arq = client
+    c = mount(_kb(), _user(authorized=[_KB_ID]))
+    resp = c.post(
+        f"/api/kbs/{_KB_ID}/documents",
+        files=[("file", _file("scan.png", b"\x89PNG\r\n\x1a\n"))],
+    )
+
+    assert resp.status_code == 415
+    detail = resp.json()["detail"]
+    assert "IMAGE_REQUIRES_OCR" in detail
+    assert "OCR_ENABLED=true" in detail
+    assert arq.jobs == [], "被拒的图片 MUST NOT 入队（否则白跑一次解析）"
+
+
+def test_image_upload_accepted_when_ocr_enabled(client, monkeypatch: pytest.MonkeyPatch):
+    """OCR 开启时图片正常放行并入队 —— 白名单与开关的联动不能反向误伤。"""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "ocr_enabled", True)
+    monkeypatch.setattr(settings, "allowed_ext", [*settings.allowed_ext, "png"])
+
+    mount, arq = client
+    c = mount(_kb(), _user(authorized=[_KB_ID]))
+    resp = c.post(
+        f"/api/kbs/{_KB_ID}/documents",
+        files=[("file", _file("scan.png", b"\x89PNG\r\n\x1a\n"))],
+    )
+
+    assert resp.status_code == 201
+    assert resp.json()["filename"] == "scan.png"
+    assert len(arq.jobs) == 1

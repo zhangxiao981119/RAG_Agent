@@ -34,6 +34,7 @@ from app.services import audit
 from app.services import kb_member as kb_member_service
 from app.services.acl import compute_doc_acl_tags
 from app.services.acl.subjects import invalidate_tenant_acl
+from app.services.parse.image_parser import IMAGE_EXTS
 from app.services.storage import get_storage
 
 router = APIRouter(tags=["knowledge-bases"])
@@ -355,6 +356,17 @@ async def _upload_single(
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail=f"UNSUPPORTED_FILE_TYPE: 支持的类型 {', '.join(settings.allowed_ext)}",
+        )
+    # ★ 图片联动：扩展名放行不等于能解析 —— 图片必须经本地 OCR 转录。
+    #   OCR 关闭时在这里拦下并给出「怎么开」，而不是让 job 落 last_error
+    #   （解析层的 fail-closed 仍在，这里是更早、更可读的一道）。
+    if ext in IMAGE_EXTS and not settings.ocr_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=(
+                f"IMAGE_REQUIRES_OCR: {ext} 属图片，需置 OCR_ENABLED=true 并注入 "
+                f"OCR_BASE_URL（本地 OCR 服务）后才能入库。"
+            ),
         )
 
     # 落对象存储

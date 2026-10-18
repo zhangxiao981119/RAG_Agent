@@ -421,6 +421,24 @@ OCR_LOW_CONF: Final[float] = 0.60
 GOT 为生成式模型，置信度 = 解码 token 平均概率的代理（见 apps/ocr 服务）；
 warning 不改变主流程 —— 数据不出域约束下禁止升级外部 LLM 重转录。"""
 
+OCR_MAX_CONCURRENCY: Final[int] = 1
+"""同一进程内并发送往 OCR 服务的最大请求数（客户端限流，不是服务端队列）。
+
+★ 为什么必须有这道闸（实测，不是估算）：
+  12 张 150dpi A4 图并发上传时，worker 同时发出 12 个 OCR 请求，
+  OCR 服务（GOT-OCR2.0 fp32 / CPU / 容器 4GB 上限）被压垮 → 进程反复重启
+  → 客户端收到 `Server disconnected` / `All connection attempts failed`，
+  9~10/12 张失败。单张串行实测 42.5~44.0s，完全正常 —— 并发问题，非单页性能问题。
+★ 取 1 而非 2 的依据：设 2 实测仍失败 —— 两个请求各跑满 180s 超时
+  （CPU 争抢 + 内存逼近 4GB 上限，容器 RestartCount 累加），说明 4GB 上限
+  只够承载 1 路推理（权重 fp32 驻留约 2.3GB + 推理峰值）。
+  要开 2 路并发 MUST 先把 `docker-compose.yml` 的 ocr `mem_limit` 抬到 6~8g 并重跑本组验证，
+  不能只改这个常量。
+★ 语义边界：限流只影响排队顺序，MUST NOT 改变失败语义 —— 排队期间不超时，
+  真正超时仍按 OCR_TIMEOUT_S 显式失败，不静默跳页。
+★ 吞吐代价（必须知道）：串行 ≈ 45s/张 ≈ 80 张/小时。批量扫描件靠 CPU 撑不住，
+  真正的解法是 GPU 推理或提高内存后放开并发，不是调这个常量。"""
+
 
 # ── 文档图像质量门禁（去噪 / 去污 + 质量识别）──────────────
 # 口径真源：`app/services/parse/image_quality.py`。全部为**可解释启发式**，
@@ -512,6 +530,23 @@ IMAGE_WATERMARK_TEXT_MAX_LINE_LEN: Final[int] = 60
   （「西安博信云创科技有限公司 内部资料 严禁外传 编号 BXYC-2026-0917」归一化后
   42 字），按 30 判会**把水印行当正文保留**，正是这次要解决的问题。
   正文行要么超 60 字，要么带句末标点 —— 由下面两条继续拦住。"""
+
+IMAGE_WATERMARK_STRONG_MAX_LINE_LEN: Final[int] = 80
+"""强特征水印行的行长上限 —— 比普通上限（60）更宽，因为它不受「无句末标点」约束。
+
+★ 为什么两档（2026-10-18 端到端实测）：12_combo（平铺水印 + 噪点 + 2° 倾斜）
+  增强后，OCR 把水印行末尾的图案噪点读成句号 → `…编号 BXYC-2026-0917。`
+  → 「不含句末标点」这条硬约束把它判成正文放过，3 处 BXYC 编号进了 chunk。
+★ 放宽只给强特征（密级短语 / 「公司 + 公文编号」），普通短行仍按 60 + 无标点判，
+  避免把带标点的正文短句一起删掉。"""
+
+IMAGE_WATERMARK_DOCNO_MAX_LINE_LEN: Final[int] = 50
+"""「公司 + 公文编号」这一强特征的行长上限 —— 比密级短语那档更严。
+
+★ 实测：真实水印行归一化 42~43 字（含公司名、编号）；正文引用文号的行
+  多在 60 字以上。定 50 正好把两者分开，避免删掉正文里的文号引用。
+★ 与 STRONG_MAX_LINE_LEN(80) 的区别：密级短语（内部资料 / 严禁外传）正文
+  几乎不会用，可以放到 80；「公司」「编号」是正文高频词，只能靠短行长区隔。"""
 
 IMAGE_WATERMARK_PHRASE_MIN_LEN: Final[int] = 6
 """命中密级短语时允许的最短行长（无图像侧证据）。
@@ -705,6 +740,8 @@ def self_check() -> None:
         )
     if OCR_TIMEOUT_S <= 0:
         raise RuntimeError("OCR_TIMEOUT_S MUST > 0")
+    if OCR_MAX_CONCURRENCY < 1:
+        raise RuntimeError("OCR_MAX_CONCURRENCY MUST >= 1（0 会让所有 OCR 请求永久阻塞）")
     # 单段最坏耗时 MUST 仍在 parse_job_timeout 之内 —— 否则分段失去了意义
     # 注：_get_settings 已在函数前段（扫描件 OCR 分支）导入，此处复用
     if OCR_MAX_SCAN_PAGES * OCR_TIMEOUT_S >= _get_settings().parse_job_timeout_seconds:
@@ -757,6 +794,13 @@ def self_check() -> None:
         raise RuntimeError("IMAGE_ENHANCE_MEDIAN_SIZE MUST ∈ {3, 5}")
     if IMAGE_WATERMARK_TEXT_MAX_LINE_LEN <= 0:
         raise RuntimeError("IMAGE_WATERMARK_TEXT_MAX_LINE_LEN MUST > 0")
+    if IMAGE_WATERMARK_STRONG_MAX_LINE_LEN < IMAGE_WATERMARK_TEXT_MAX_LINE_LEN:
+        raise RuntimeError(
+            "IMAGE_WATERMARK_STRONG_MAX_LINE_LEN MUST >= IMAGE_WATERMARK_TEXT_MAX_LINE_LEN "
+            "—— 强特征行的行长上限更宽才有意义，否则两道口子等价"
+        )
+    if IMAGE_WATERMARK_DOCNO_MAX_LINE_LEN <= 0:
+        raise RuntimeError("IMAGE_WATERMARK_DOCNO_MAX_LINE_LEN MUST > 0")
     if not (
         IMAGE_WATERMARK_PHRASE_MIN_LEN_STRONG
         < IMAGE_WATERMARK_PHRASE_MIN_LEN
@@ -768,10 +812,6 @@ def self_check() -> None:
             f"{IMAGE_WATERMARK_PHRASE_MIN_LEN}) <= 行长上限("
             f"{IMAGE_WATERMARK_TEXT_MAX_LINE_LEN})"
         )
-    if IMAGE_ENHANCE_MEDIAN_SIZE not in (3, 5):
-        raise RuntimeError("IMAGE_ENHANCE_MEDIAN_SIZE MUST ∈ {3, 5}")
-    if IMAGE_WATERMARK_TEXT_MAX_LINE_LEN <= 0:
-        raise RuntimeError("IMAGE_WATERMARK_TEXT_MAX_LINE_LEN MUST > 0")
     if IMAGE_WATERMARK_TEXT_REPEAT < 2:
         raise RuntimeError(
             "IMAGE_WATERMARK_TEXT_REPEAT MUST >= 2 —— 1 次等于「见到就删」，会误伤正文"

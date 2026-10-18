@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from dataclasses import dataclass, field
 
 from PIL import Image, ImageChops, ImageFilter, ImageOps
@@ -456,6 +457,43 @@ _WATERMARK_PHRASES: tuple[str, ...] = (
 # 句末标点：水印行几乎不带句读，带标点的短行更可能是真内容
 _SENTENCE_END = "。！？；.!?;"
 
+# ── 强水印特征（命中即可无视「无句末标点」这条约束）──────────────
+# ★ 为什么需要「强特征」这一档（2026-10-18 端到端实测踩到）：
+#   12_combo（平铺水印 + 噪点 + 2° 倾斜）增强后，OCR 把水印行末尾的图案噪点
+#   读成了句号 —— `…编号 BXYC-2026-0917。` —— 而「不含句末标点」这条硬约束
+#   直接把它判成正文放过，导致 3 处 BXYC 编号进了 chunk 与 embedding。
+#   噪点 / 倾斜 / 摩尔纹都会稳定触发这个现象，不是偶发。
+_STRONG_WM_PHRASES: tuple[str, ...] = (
+    "内部资料",
+    "严禁外传",
+    "请勿外传",
+    "不得外传",
+    "受控文件",
+    "内部使用",
+)
+
+# 公文编号形态（BXYC-2026-0917）。单靠编号不够 —— 正文也会引用文号，
+# 所以要求同时出现「公司 / 集团 / 编号 / 归档」这类组织或归档用语才判水印。
+_DOC_NO_RE = re.compile(r"[A-Z]{2,8}-\d{4}-\d{3,8}")
+_ORG_HINT: tuple[str, ...] = ("公司", "集团", "编号", "归档", "文件")
+
+
+def _strong_watermark(norm: str, raw: str) -> bool:
+    """强特征判定：命中即删，不受「无句末标点」限制。
+
+    两档行长上限，各有依据：
+      ① 密级短语（内部资料 / 严禁外传）—— 正文几乎不会用，放到 80 字
+      ② 公司 + 公文编号 —— 正文引用文号的行往往更长，只认 50 字以内的
+         （实测真实水印行归一化 42~43 字；正文引用文号多在 60 字以上）
+    """
+    if not norm:
+        return False
+    if any(p in norm for p in _STRONG_WM_PHRASES):
+        return len(norm) <= decisions.IMAGE_WATERMARK_STRONG_MAX_LINE_LEN
+    if _DOC_NO_RE.search(raw.upper()) and any(h in norm for h in _ORG_HINT):
+        return len(norm) <= decisions.IMAGE_WATERMARK_DOCNO_MAX_LINE_LEN
+    return False
+
 
 @dataclass(frozen=True)
 class WatermarkTextCleanup:
@@ -493,6 +531,9 @@ def _is_watermark_line(
     norm = _norm_line(line).lower()
     if not norm:
         return False
+    # 强特征优先：密级短语 / 「公司 + 编号」不看标点（OCR 会把噪点读成句号）
+    if _strong_watermark(norm, line):
+        return True
     if len(norm) > decisions.IMAGE_WATERMARK_TEXT_MAX_LINE_LEN:
         return False
     if any(ch in line for ch in _SENTENCE_END):
@@ -538,7 +579,11 @@ def strip_watermark_text(
         if _is_watermark_line(line, counts, phrase_rule=watermark_detected):
             removed += 1
             removed_chars += len(norm)
-            if any(p in norm for p in _WATERMARK_PHRASES):
+            # 「有证据」既包括密级短语，也包括强特征（公司 + 公文编号）——
+            # 被倾斜 / 噪点毁掉的水印行往往只剩编号，只算短语会把回退判据误导成误伤
+            if any(p in norm for p in _WATERMARK_PHRASES) or _strong_watermark(
+                norm, line
+            ):
                 phrase_hits += 1
             continue
         kept.append(line)
@@ -558,7 +603,7 @@ def strip_watermark_text(
         phrase_hits == 0 or ratio > 0.90
     ):
         logger.warning(
-            "水印文本清理放弃：拟删除 %.1f%%（%d 行，其中含密级短语 %d 行）超过 %.0f%% 上限，"
+            "水印文本清理放弃：拟删除 %.1f%%（%d 行，其中含水印特征 %d 行）超过 %.0f%% 上限，"
             "判定命中正文 / 表格重复行，回退原文",
             ratio * 100,
             removed,

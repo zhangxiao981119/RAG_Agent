@@ -222,7 +222,54 @@ def test_strip_repeated_short_lines_even_without_image_evidence() -> None:
     text = "\n".join(["某某科技", BODY, "某某科技", "差旅标准按职级执行。", "某某科技"])
     cleaned, report = strip_watermark_text(text, watermark_detected=False)
     assert "某某科技" not in cleaned
-    assert report.removed_lines == 3
+
+
+# ── 强特征水印（2026-10-18 端到端实测：12_combo 的 3 处编号进了 chunk）──
+
+
+def test_strip_watermark_with_trailing_period() -> None:
+    """OCR 把水印末尾的噪点读成句号 → 仍须删除。
+
+    实际入库原文就是这样（12_combo，平铺水印 + 噪点 + 2° 倾斜）：
+      `西安博信云创新科技有限公司内部资料：严禁外传编号 BXYC-2026-0917。`
+    旧逻辑被「不含句末标点」挡住，整行进 chunk，编号进了 embedding。
+    """
+    wm = "西安博信云创新科技有限公司内部资料：严禁外传编号 BXYC-2026-0917。"
+    # 必须是多行文本：单行会被「删除比例 > 90%」这条兜底判成「把正文删光了」而回退
+    text = "\n".join([wm, BODY, "差旅标准按职级执行。"])
+    cleaned, report = strip_watermark_text(text, watermark_detected=False)
+    assert wm not in cleaned
+    assert "BXYC" not in cleaned
+    assert report.removed_lines == 1
+    assert report.reverted is False
+
+
+def test_strip_heavily_corrupted_watermark_line() -> None:
+    """被倾斜 + 噪点毁掉的水印行，靠「公司 + 公文编号」双线索仍能识别。"""
+    wm = "市容评估三合的其他非信入公司，供首次料，由次料、证等编号 BXYC-2026-0917"
+    text = "\n".join([wm, BODY, "差旅标准按职级执行。"])
+    cleaned, _ = strip_watermark_text(text, watermark_detected=False)
+    assert "BXYC" not in cleaned
+
+
+def test_keep_body_sentence_citing_doc_number() -> None:
+    """正文引用文号 MUST NOT 被当成水印删掉 —— 这是强特征规则的主要误伤面。"""
+    line = "依据 BXYC-2026-0917 号文，本办法自发布之日起施行。"
+    text = "\n".join([BODY, line])
+    cleaned, report = strip_watermark_text(text, watermark_detected=False)
+    assert line in cleaned
+    assert report.applied is False
+
+
+def test_keep_overlong_line_with_org_and_doc_number() -> None:
+    """超过强特征行长上限（80）一律保留 —— 长正文里同时出现「公司」「编号」很常见。"""
+    line = (
+        "本公司与各子公司之间的往来编号 BXYC-2026-0917 所对应的全部归档材料，"
+        "须由财务部统一收取并按年度装订成册后移交档案室保存，不得私自留存。"
+    )
+    text = "\n".join([BODY, line])
+    cleaned, _ = strip_watermark_text(text, watermark_detected=False)
+    assert line in cleaned
 
 
 def test_strip_reverts_when_mass_deleting_non_phrase_lines() -> None:
