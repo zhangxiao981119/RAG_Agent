@@ -101,11 +101,6 @@ services:
     build:
       context: .
       dockerfile: apps/ocr/Dockerfile
-      args:
-        # GitHub clone 官方推理代码须走代理；Clash 开启时构建：
-        #   OCR_BUILD_PROXY=http://host.docker.internal:7897 docker compose build ocr
-        HTTPS_PROXY: ${OCR_BUILD_PROXY:-}
-        HTTP_PROXY: ${OCR_BUILD_PROXY:-}
     restart: unless-stopped
     environment:
       # 模型权重下载源；hf-mirror.com 已失效（对所有仓库 308 重定向到 huggingface.co，

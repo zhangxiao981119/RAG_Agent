@@ -336,14 +336,26 @@ MAX_UPLOAD_MB: Final[int] = 100
 # ── 扫描件 OCR · 本地引擎（B'：GOT-OCR2.0 单引擎 fail-closed）──
 # 引擎真源是 apps/ocr 服务（本地 HTTP 服务，数据不出域）；
 # 此处只冻结调用侧的资源护栏口径，MUST NOT 引入第二引擎兜底。
-OCR_MAX_SCAN_PAGES: Final[int] = 50
+OCR_MAX_SCAN_PAGES: Final[int] = 8
 """单份扫描件 PDF 允许 OCR 的最大页数，超限 ParseError。
-防单任务占用 OCR 服务过久（CPU 推理约 3~8s/页，50 页 ≈ 3~7 分钟，
-远在 parse_job_timeout 1800s 内）；超大扫描件应先拆分再上传。"""
+★ 该值由 OCR_TIMEOUT_S 与 parse_job_timeout（1800s）共同定：8 × 180s = 1440s，
+  再留约 360s 给解析与嵌入，仍在单个任务预算内。
+★ 不能沿用旧的「50 页」：那个估算基于「3~8s/页」，实测（见 OCR_TIMEOUT_S）
+  高出一到两个数量级 —— 50 页按 22~180s/页 需 1100~9000s，早已越过 1800s
+  任务超时，任务会在中途被 arq 杀掉。超大扫描件应先拆分再上传。"""
 
-OCR_TIMEOUT_S: Final[float] = 30.0
+OCR_TIMEOUT_S: Final[float] = 180.0
 """OCR 客户端单页调用超时（秒）。超时即该页失败 → 整份 ParseError，
-任务走 arq 重试 → 死信 → 恢复后重跑（显式失败，MUST NOT 静默跳页或换引擎）。"""
+任务走 arq 重试 → 死信 → 恢复后重跑（显式失败，MUST NOT 静默跳页或换引擎）。
+
+★ 180 的实测依据（本机 CPU + apps/ocr 的 GOT-OCR2.0 fp32，1024×1024 输入）：
+  · 稀疏页（3 行）：22.2s，约 26 输出 token
+  · 密集页（41 行）：63.5s，608 输出 token
+  线性拟合得：固定开销（ViT 编码 + 256 图像 token 预填充）≈ 20s，
+  解码 ≈ 0.071s/token。即 180s 可容纳约 2250 输出 token，
+  相对实测密集页留 2.8 倍余量。
+★ 上游生成硬上限 max_new_tokens=4096 对应约 310s：触及该上限的病态页会在
+  180s 处显式超时失败（不无限等待，也不静默跳页）。"""
 
 OCR_LOW_CONF: Final[float] = 0.60
 """单页置信度告警阈值：低于此值仅打 warning 进审计日志，仍正常入库。

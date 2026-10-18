@@ -1,26 +1,23 @@
-# PyPI 走清华镜像（构建环境国内网络）
--i https://pypi.tuna.tsinghua.edu.cn/simple
-# torch 走 CPU 专用源（CUDA 版体积 ~3GB 且容器无 GPU 无意义）。
+# PyPI 走阿里云镜像（构建环境国内网络；清华源在构建容器内持续 SSL EOF，实测不可用）
+-i https://mirrors.aliyun.com/pypi/simple/
+# torch/torchvision 走 CPU 专用源（CUDA 版体积 ~3GB 且容器无 GPU 无意义）。
 # ★ 不走 download.pytorch.org：大 wheel 经 Clash 代理传输曾在 106MB 处中断，
 #   pip 拿到残缺文件报 hash 不匹配。改阿里云 pytorch-wheels 镜像国内直连，
-#   并锁定 sha256（与 pytorch 官方 index 元数据核对一致）。
+#   并锁定 sha256（与镜像站实际分发的文件核对一致）。
 torch @ https://mirrors.aliyun.com/pytorch-wheels/cpu/torch-2.1.2%2Bcpu-cp310-cp310-linux_x86_64.whl#sha256=bf3ca897f8c7c218dd6c4b1cc5eec57b4f4e71106b0b8120e92f5fdaf4acf6cd
+# ★ torchvision 必须显式钉 CPU 轮子（与 torch 2.1.2 配对）：默认 PyPI 源分发的是
+#   CUDA 变体，其元数据要求 torch==2.1.2，会把已装的 2.1.2+cpu 换成 CUDA 版 torch。
+torchvision @ https://mirrors.aliyun.com/pytorch-wheels/cpu/torchvision-0.16.2%2Bcpu-cp310-cp310-linux_x86_64.whl#sha256=63347ff53ee460c63db285ea1566692f2d88a71f43d287596ab2f1880e285d5d
 # GOT-OCR2.0 官方锁定 transformers 4.37.0（自定义架构 API 兼容边界）
 transformers==4.37.0
 # torch 2.1.2 编译于 NumPy 1.x ABI，NumPy 2.x 会触发 _ARRAY_API 不兼容
 numpy<2
-# GOT 推理链（GOT/model 包 import 链）唯一额外依赖；headless 版无 GUI 依赖
-opencv-python-headless
-sentencepiece
+# vendored 推理代码的依赖：modeling_GOT.py 用 torchvision.transforms 做图像预处理，
+# got_vision_b.py 只用 torch，tokenization_qwen.py 用 tiktoken 读 qwen.tiktoken
+tiktoken
 accelerate
 safetensors
 pillow
-# GOT 官方推理代码（GOT/ 包）的 import 依赖
-bitarray
-easydict
-einops
-timm
-tiktoken
 # 服务框架
 fastapi
 uvicorn[standard]

@@ -6,27 +6,16 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# torch 走 CPU 专用源；transformers 等走 PyPI
-# ★ compose 的 build context 是仓库根（code/），COPY 源路径须写 apps/ocr/ 全路径
+# 依赖全部走国内镜像源（见 requirements.txt）；构建期不再需要 apt 包 ——
+# 官方推理代码已 vendored 进仓库，无需 git clone GitHub
 COPY apps/ocr/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# GOT-OCR2.0 官方推理代码（GOT/ 包）vendored 进镜像；
-# 模型权重不烧镜像，运行时经 HF_ENDPOINT（默认 hf-mirror.com）下载到挂载的 hf_cache。
-# ★ GitHub 国内直连不可达：Clash 开启时构建须传代理 ——
-#   docker compose build ocr --build-arg HTTPS_PROXY=http://host.docker.internal:7897
-#   （Docker 内建代理 ARG 对 RUN 的 git clone 自动生效）
-RUN git clone --depth 1 https://github.com/Ucas-HaoranWei/GOT-OCR2.0.git /app/GOT-OCR2.0
-
-# ★ 官方仓库把推理代码放在 GOT-OCR-2.0-master 子目录（仓库根没有 GOT/ 包），
-#   PYTHONPATH 须指向该子目录才能 from GOT import ...；
-#   放在 clone 层之后，避免改 ENV 使 pip 安装层缓存全部失效
-ENV PYTHONPATH=/app/GOT-OCR2.0/GOT-OCR-2.0-master
-
+# GOT-OCR2.0 官方推理代码 + 自定义 tokenizer，已固化进仓库（apps/ocr/vendor）。
+# 权重不烧镜像，运行时经 HF_ENDPOINT 下载到挂载的 hf_cache。
+# ★ 不用 transformers trust_remote_code 动态加载模型：check_imports 会因
+#   modeling_GOT.py 引用 verovio（仅 render 分支用）拒绝加载模块。
+COPY apps/ocr/vendor ./vendor
 COPY apps/ocr/main.py ./
 
 EXPOSE 8000
