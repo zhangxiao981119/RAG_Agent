@@ -1,0 +1,39 @@
+# 压测专用 overlay —— 只在做并发压测时叠加，生产部署 MUST NOT 使用。
+#
+#   docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d api
+#
+# 做三件事（为什么要做，见 项目待优化清单.md P1-5）：
+#   1. 起一个本地 OpenAI 兼容桩（llm-stub），把上游模型时延从自建链路时延里剥掉。
+#      真上游在 20 并发下的 P95 主要反映对方排队，不是本项目代码的容量。
+#   2. 把 api 的 LLM_BASE_URL 指向桩。
+#   3. 抬高单用户限流 —— 压测要测系统容量，不是测限流策略（限流策略另有单测覆盖）。
+#      恢复：docker compose up -d api（不带 overlay）即可回到 .env 口径。
+services:
+  llm-stub:
+    image: code-api
+    # 桩与被压服务同镜像，省一次构建；bind mount 脚本，改参数不用重建
+    entrypoint: ["python", "/tmp/stub_llm.py"]
+    volumes:
+      - ./apps/api/scripts/stub_llm.py:/tmp/stub_llm.py:ro
+    environment:
+      STUB_TTFT_MS: ${STUB_TTFT_MS:-400}
+      STUB_TOKEN_MS: ${STUB_TOKEN_MS:-15}
+      STUB_TOKENS: ${STUB_TOKENS:-120}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8099/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    depends_on:
+      llm-stub:
+        condition: service_healthy
+    environment:
+      LLM_BASE_URL: http://llm-stub:8099/v1
+      LLM_API_KEY: sk-loadtest-not-a-real-credential
+      # ↑ 别写成 "stub"：decisions.self_check() 用子串匹配校验"密钥没进脱敏快照"，
+      #   "stub" 会被 llm-stub 这个主机名命中从而误判，启动直接失败。
+      # 20 并发 × 饱和压 ≈ 十几 QPS ≈ 上千次/分钟，会全撞 429；
+      # 压测期间放开，压测后按原值 20 复验限流本身仍生效。
+      CHAT_RATE_LIMIT_PER_MINUTE: "1000000"
