@@ -105,6 +105,9 @@ def svc(monkeypatch: pytest.MonkeyPatch):
     def _make(h: Harness):
         monkeypatch.setattr(retrieve_mod, "get_embedding_service", lambda: FakeEmbedding())
         monkeypatch.setattr(retrieve_mod, "get_rerank_service", lambda: FakeRerank(h))
+        # ★ 重排默认关闭（settings.rerank_enabled=false）—— 本套用例专测 rerank 在线 / 降级
+        #   两种口径，必须显式打开开关，否则 get_rerank_service 根本不会被调用、用例覆盖路径失效。
+        monkeypatch.setattr(retrieve_mod, "get_settings", lambda: SimpleNamespace(rerank_enabled=True))
         # 关掉 FTS 路径：审查加权行为与关键词路无关，减少分支
         monkeypatch.setattr(decisions, "KEYWORD_TSQUERY_ENABLED", False)
         # retrieve(session, ...) 的 session 由调用方管理（生产是 API 层传 AsyncSession）

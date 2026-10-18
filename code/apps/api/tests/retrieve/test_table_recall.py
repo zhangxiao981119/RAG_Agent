@@ -119,6 +119,9 @@ def svc(monkeypatch: pytest.MonkeyPatch):
     def _make(h: Harness):
         monkeypatch.setattr(retrieve_mod, "get_embedding_service", lambda: FakeEmbedding())
         monkeypatch.setattr(retrieve_mod, "get_rerank_service", lambda: FakeRerank(h))
+        # ★ 重排默认关闭（settings.rerank_enabled=false）—— 本文件含 rerank 降级回捞用例，
+        #   必须显式打开开关，否则 get_rerank_service 根本不会被调用。
+        monkeypatch.setattr(retrieve_mod, "get_settings", lambda: SimpleNamespace(rerank_enabled=True))
         monkeypatch.setattr(decisions, "KEYWORD_TSQUERY_ENABLED", False)
         return RetrievalService(), lambda: FakeSession(h)
 

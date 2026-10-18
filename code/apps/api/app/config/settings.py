@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     embedding_dim: int = 1024
     rerank_base_url: str | None = None
     rerank_model: str = "bge-reranker-v2-m3"
+    # ── 重排开关（显式关闭，消除「白等超时再降级」）──────────
+    # ★ 默认 false。实测依据（本机 CPU，torch 引擎，16 核无配额限制）：
+    #   bge-reranker-v2-m3 单次重排 8 条耗时 10.5s、25 条 35.4s、50 条 66.0s，
+    #   远超 rerank_timeout_seconds(3s) —— 开启也必然逐次超时降级，且降级前
+    #   白等满 3s（链式多轮按轮数放大，实测 multi:3 白等约 9s）。
+    #   false 时检索层**不发起调用**，直接走 vector 口径：与现状实际行为完全一致，
+    #   只是不再空等、不再刷误导性的「重排降级」告警。
+    #   换到 GPU / 更强算力后置 RERANK_ENABLED=true 即可启用（启用前 MUST 标定
+    #   decisions.RELEVANCE_THRESHOLD_RERANK）。
+    rerank_enabled: bool = False
     max_upload_mb: int = 100
     allowed_ext: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["pdf", "md", "txt", "xls", "xlsx", "docx"]

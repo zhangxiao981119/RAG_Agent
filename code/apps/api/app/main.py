@@ -125,20 +125,25 @@ async def lifespan(_: FastAPI):
     # 降级是设计允许的，因此探活失败**不拒绝启动**，只告警 + 打点。
     # 目的：让「重排服务不可用」这件事在启动时就被看见，
     # 而不是等某个请求静默降级后才在日志里浮现。
-    try:
-        from app.services.rerank import get_rerank_service
-        _rerank_ok = await get_rerank_service().healthcheck()
-        if not _rerank_ok:
-            metrics.incr("rag.rerank.startup_probe", result="unhealthy")
-            logger.warning(
-                "启动探活：重排服务不可用，检索将走降级链路（用向量余弦分）",
-                extra={"hint": "检查 RERANK_BASE_URL 与推理服务；降级态下阈值口径为 vector"},
-            )
-        else:
-            metrics.incr("rag.rerank.startup_probe", result="healthy")
-            logger.info("启动探活：重排服务可用")
-    except Exception:
-        logger.warning("重排启动探活异常", exc_info=True)
+    # ★ 重排显式关闭（settings.rerank_enabled=false）时**跳过探活** —— 否则每次启动
+    #   都会为一个已停用的组件白等最多 rerank_timeout_seconds 并刷出误导性 unhealthy 告警。
+    if get_settings().rerank_enabled:
+        try:
+            from app.services.rerank import get_rerank_service
+            _rerank_ok = await get_rerank_service().healthcheck()
+            if not _rerank_ok:
+                metrics.incr("rag.rerank.startup_probe", result="unhealthy")
+                logger.warning(
+                    "启动探活：重排服务不可用，检索将走降级链路（用向量余弦分）",
+                    extra={"hint": "检查 RERANK_BASE_URL 与推理服务；降级态下阈值口径为 vector"},
+                )
+            else:
+                metrics.incr("rag.rerank.startup_probe", result="healthy")
+                logger.info("启动探活：重排服务可用")
+        except Exception:
+            logger.warning("重排启动探活异常", exc_info=True)
+    else:
+        logger.info("启动探活：重排已关闭（RERANK_ENABLED=false），跳过探活")
 
     # ── 索引口径启动检查（方案一：索引/模型版本）──────────
     # 统计口径与当前不一致的 chunk（换模型 / 改向量公式后未重算的那批）。

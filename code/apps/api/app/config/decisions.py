@@ -36,8 +36,9 @@ RELEVANCE_THRESHOLD_VECTOR: Final[float] = 0.50
 
 RELEVANCE_THRESHOLD_RERANK: Final[float] = 0.50
 """重排在线时的阈值。口径 = rerank 绝对相关性分。
-★ 该值尚未标定（重排服务此前不可用），沿用向量口径值仅为占位；
-  重排恢复后 MUST 用 scripts/calibrate_threshold.py --mode rerank 重新标定。"""
+★ 重排**默认关闭**（settings.rerank_enabled=false），本值**未标定** —— 沿用向量
+  口径值仅为占位。若把 RERANK_ENABLED 置 true，MUST 先用
+  scripts/calibrate_threshold.py --mode rerank 重新标定，否则会拿未标定的阈值判定。"""
 
 
 def active_threshold(use_rerank: bool) -> float:
@@ -151,8 +152,12 @@ QUERY_REWRITE_HISTORY_BUDGET_TOKENS: Final[int] = 32_000
 # ── Query 改写（RAG 前置增强）─────────────────────────
 QUERY_REWRITE_ENABLED: Final[bool] = True
 """检索前对用户问题做打分 + 可选改写。一次 LLM 调用完成评分和决策。"""
-QUERY_REWRITE_TIMEOUT_SECONDS: Final[float] = 5.0
-"""改写 LLM 调用超时。超时或失败 → 静默回退原始 question，不阻塞主流程。"""
+QUERY_REWRITE_TIMEOUT_SECONDS: Final[float] = 12.0
+"""改写 LLM 调用超时。超时或失败 → 静默回退原始 question，不阻塞主流程。
+★ 由 5.0 上调至 12.0：本机 LLM 上游（agicto.cn deepseek-v4-flash）实测吞吐约 15 token/s，
+  改写 prompt 813 字符、输出仅约 100 字符，真实耗时 5.41 / 6.88 / 9.46s ——
+  旧 5s 口径下 3/3 全部超时，score 回落 100，使 should_use_chain 恒为 false，
+  链式推理因此形同虚设（改写超时不只影响改写质量，还直接掐断链式触发）。"""
 QUERY_REWRITE_SCORE_THRESHOLD: Final[int] = 90
 """百分制改写阈值：score >= 阈值 直接跳过改写；score < 阈值 执行改写。
 打分维度 = 明确度 + 检索友好度 - 指代依赖度/2，clamp 到 [0, 100]。"""
@@ -220,8 +225,11 @@ CHAIN_SUBQUESTION_MAX_CHARS: Final[int] = 120
 ★ 只约束拆解产物，不约束原始问题 —— 原始问题（含带图转录拼接）可能远超此值，
   它是既定输入，截断会改变用户语义，故不受此限。"""
 
-CHAIN_DECOMPOSE_TIMEOUT_SECONDS: Final[float] = 5.0
-"""拆解 LLM 调用超时。超时 / 异常 / JSON 非法 → 降级单趟检索并打点（不阻断主流程）。"""
+CHAIN_DECOMPOSE_TIMEOUT_SECONDS: Final[float] = 10.0
+"""拆解 LLM 调用超时。超时 / 异常 / JSON 非法 → 降级单趟检索并打点（不阻断主流程）。
+★ 由 5.0 上调至 10.0：本机 LLM 上游实测拆解耗时 3343ms —— 距 5s 上限余量过小，
+  一旦上游抖动就会频繁降级单趟（链式推理失守）。与 QUERY_REWRITE_TIMEOUT_SECONDS
+  同源：上游吞吐约 15 token/s，拆解 prompt 与改写 prompt 同量级，10s 覆盖其真实耗时。"""
 
 
 def should_use_chain(rewrite_score: int | None) -> bool:

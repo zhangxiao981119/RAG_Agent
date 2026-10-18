@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import decisions
 from app.config.index_profile import current_index_profile
+from app.config.settings import get_settings
 from app.infra import metrics, trace
 from app.services.acl.visibility import pushdown_params  # noqa: F401  (外部引用，保留导出)
 from app.services.embedding import get_embedding_service
@@ -277,40 +278,53 @@ class RetrievalService:
         reranked_ids: list[uuid.UUID] = []
         rerank_scores: dict[uuid.UUID, float] = {}
         use_rerank = True
-        try:
-            rerank_service = get_rerank_service()
-            documents = [all_chunks[cid]["content"] for cid in candidate_ids]
-            results = await rerank_service.rerank(query, documents, decisions.TOP_K_RERANK)
-            # results 按相关性绝对分降序，直接采用（relevance_score 已是 0~1 的 sigmoid 分）
-            for idx, score in results:
-                # 防御越界：异常 rerank 服务返回的 idx 可能超出 candidate_ids 范围
-                if not (0 <= idx < len(candidate_ids)):
-                    continue
-                cid = candidate_ids[idx]
-                reranked_ids.append(cid)
-                rerank_scores[cid] = float(score)
-        except RerankTimeout:
-            # ★ 降级必须打点。此前这里只有 use_rerank=False，
-            #   导致重排服务长期不可用而无人知晓（rollback 静默失败）。
+        rerank_off = not get_settings().rerank_enabled
+        if rerank_off:
+            # ★ 重排显式关闭（RERANK_ENABLED=false）：不发起调用，直接走 vector 口径。
+            #   关闭 ≠ 降级 —— 故不计 rag.rerank.degraded、不刷降级告警，消除误导性日志。
+            #   依据：本机 CPU 实测 bge-reranker-v2-m3 单次 8 条 10.5s、50 条 66s，
+            #   远超 rerank_timeout_seconds(3s)，开启也必然逐次降级（白等 3s 后才降级，
+            #   链式多轮时按轮数放大到 9s 级）。换到 GPU / 更强算力后置 true 即可启用。
             use_rerank = False
-            metrics.incr("rag.rerank.degraded", reason="timeout")
-            logger.warning(
-                "rerank 降级到 vector_score",
-                extra={"reason": "timeout", "trace_id": trace.get_trace_id()},
-            )
-        except Exception:
-            # rerank 服务异常（JSON 解析错、HTTP 5xx 等）按降级处理，
-            # 避免单点故障让整个检索失败（rerank 设计意图就是"失败即降级"）
-            use_rerank = False
-            metrics.incr("rag.rerank.degraded", reason="error")
-            logger.warning(
-                "rerank 异常，降级到 vector_score",
-                extra={"reason": "error", "trace_id": trace.get_trace_id()},
-                exc_info=True,
-            )
+        else:
+            try:
+                rerank_service = get_rerank_service()
+                documents = [all_chunks[cid]["content"] for cid in candidate_ids]
+                results = await rerank_service.rerank(query, documents, decisions.TOP_K_RERANK)
+                # results 按相关性绝对分降序，直接采用（relevance_score 已是 0~1 的 sigmoid 分）
+                for idx, score in results:
+                    # 防御越界：异常 rerank 服务返回的 idx 可能超出 candidate_ids 范围
+                    if not (0 <= idx < len(candidate_ids)):
+                        continue
+                    cid = candidate_ids[idx]
+                    reranked_ids.append(cid)
+                    rerank_scores[cid] = float(score)
+            except RerankTimeout:
+                # ★ 降级必须打点。此前这里只有 use_rerank=False，
+                #   导致重排服务长期不可用而无人知晓（rollback 静默失败）。
+                use_rerank = False
+                metrics.incr("rag.rerank.degraded", reason="timeout")
+                logger.warning(
+                    "rerank 降级到 vector_score",
+                    extra={"reason": "timeout", "trace_id": trace.get_trace_id()},
+                )
+            except Exception:
+                # rerank 服务异常（JSON 解析错、HTTP 5xx 等）按降级处理，
+                # 避免单点故障让整个检索失败（rerank 设计意图就是"失败即降级"）
+                use_rerank = False
+                metrics.incr("rag.rerank.degraded", reason="error")
+                logger.warning(
+                    "rerank 异常，降级到 vector_score",
+                    extra={"reason": "error", "trace_id": trace.get_trace_id()},
+                    exc_info=True,
+                )
         rerank_ms = (time.perf_counter() - t0) * 1000
         stages["rerank"] = int(rerank_ms)
-        metrics.observe_ms("rag.rerank.duration", rerank_ms, mode="on" if use_rerank else "degraded")
+        # mode 三态：off（配置关闭，无耗时） / on（重排生效） / degraded（发起后失败降级）
+        metrics.observe_ms(
+            "rag.rerank.duration", rerank_ms,
+            mode="off" if rerank_off else ("on" if use_rerank else "degraded"),
+        )
 
         # ⑤ 构造 RetrievedChunk
         #    rerank 在线：候选集 = rerank 返回项，顺序即重排顺序，final=绝对 rerank 分

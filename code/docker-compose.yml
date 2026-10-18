@@ -161,6 +161,9 @@ services:
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
       RERANK_BASE_URL: ${RERANK_BASE_URL:-http://reranker:8000/v1}
       RERANK_MODEL: ${RERANKER_MODEL:-bge-reranker-v2-m3}
+      # ★ 重排开关：默认 false（本机 CPU 下重排远超 3s 超时，开启也必降级且白等）。
+      #   false 时检索层不发起调用、健康检查不探活、启动不探活，直接走 vector 口径。
+      RERANK_ENABLED: ${RERANK_ENABLED:-false}
       # B' 扫描件 OCR：与 worker 同源注入（api 自身不走 OCR，保持 settings 口径一致）
       OCR_ENABLED: ${OCR_ENABLED:-false}
       OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:8000}
