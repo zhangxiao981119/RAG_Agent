@@ -116,6 +116,11 @@ async def main() -> int:
     ap.add_argument("--kb", required=True)
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument(
+        "--serial",
+        action="store_true",
+        help="逐张上传，等上一张到终态再传下一张（OCR 服务内存受限时用）",
+    )
+    ap.add_argument(
         "--skip-upload",
         action="store_true",
         help="不重新上传，只轮询并出报告（避免重复上传产生新版本）",
@@ -135,13 +140,17 @@ async def main() -> int:
         if args.skip_upload:
             print(f"跳过上传，直接轮询 {len(names)} 个已有文档\n")
         else:
-            print(f"登录成功，开始上传 {len(files)} 张 → KB {args.kb}\n")
+            mode = "逐张（等终态）" if args.serial else "批量"
+            print(f"登录成功，{mode}上传 {len(files)} 张 → KB {args.kb}\n")
             uploaded = []
             for f in files:
                 res = await upload(c, args.kb, f)
                 mark = "OK " if res["code"] == 201 else f"{res['code']}"
-                print(f"[{mark}] {f.name}  {str(res['body'])[:110]}")
+                print(f"[{mark}] {f.name}  {str(res['body'])[:110]}", flush=True)
                 uploaded.append(res)
+                if args.serial and res["code"] == 201:
+                    # 单张等到终态再传下一张：OCR 服务内存受限时避免队列堆积
+                    await wait_done(c, args.kb, {f.name}, args.timeout)
 
             names = {r["file"] for r in uploaded if r["code"] == 201}
             if not names:
