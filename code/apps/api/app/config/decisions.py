@@ -337,16 +337,27 @@ MAX_UPLOAD_MB: Final[int] = 100
 # 引擎真源是 apps/ocr 服务（本地 HTTP 服务，数据不出域）；
 # 此处只冻结调用侧的资源护栏口径，MUST NOT 引入第二引擎兜底。
 OCR_MAX_SCAN_PAGES: Final[int] = 8
-"""单份扫描件 PDF 允许 OCR 的最大页数，超限 ParseError。
+"""单个 OCR **分段**的最大页数 —— 分段是执行单元，不是语义边界（方案 C）。
 ★ 该值由 OCR_TIMEOUT_S 与 parse_job_timeout（1800s）共同定：8 × 180s = 1440s，
   再留约 360s 给解析与嵌入，仍在单个任务预算内。
-★ 不能沿用旧的「50 页」：那个估算基于「3~8s/页」，实测（见 OCR_TIMEOUT_S）
-  高出一到两个数量级 —— 50 页按 22~180s/页 需 1100~9000s，早已越过 1800s
-  任务超时，任务会在中途被 arq 杀掉。超大扫描件应先拆分再上传。"""
+★ 扫描件解析按本值切成若干段串行执行（run_parse_segment）：单段最坏耗时
+  1440s < 1800s，因此 **MUST NOT 为支持超大扫描件去抬高 parse_job_timeout**
+  —— 那个超时同时管着 sync / governance 任务，抬高会污染它们的失败判定。
+  超大文档靠「多段链式入队」摊薄，而不是靠拉长单个任务超时。
+★ 不能沿用旧的「50 页整份一次 OCR」：那个估算基于「3~8s/页」，实测
+  （见 OCR_TIMEOUT_S）高出一到两个数量级 —— 50 页按 22~180s/页 需
+  1100~9000s，早已越过 1800s，任务会在中途被 arq 杀掉。"""
+
+OCR_MAX_DOC_PAGES: Final[int] = 200
+"""单份扫描件 PDF 允许 OCR 的**文档级**最大页数（防 DOS 护栏），超限 ParseError。
+★ 与 OCR_MAX_SCAN_PAGES 职责不同：后者是「单段」上限，决定段数；
+  本值是「整份文档」上限，防止超长扫描件把段链拉成千段、长时间占用 OCR 服务。
+★ 200 的依据：50 页的诉求留 4 倍余量即可覆盖常规报表/合同；再大应拆分上传。"""
 
 OCR_TIMEOUT_S: Final[float] = 180.0
-"""OCR 客户端单页调用超时（秒）。超时即该页失败 → 整份 ParseError，
+"""OCR 客户端单页调用超时（秒）。超时即该页失败 → 该分段 ParseError，
 任务走 arq 重试 → 死信 → 恢复后重跑（显式失败，MUST NOT 静默跳页或换引擎）。
+★ 重试只重跑失败的**那一段**（段结果已落库，成功段不重复 OCR，见 run_parse_segment）。
 
 ★ 180 的实测依据（本机 CPU + apps/ocr 的 GOT-OCR2.0 fp32，1024×1024 输入）：
   · 稀疏页（3 行）：22.2s，约 26 输出 token
@@ -523,11 +534,27 @@ def self_check() -> None:
         )
     if MAX_UPLOAD_MB <= 0:
         raise RuntimeError("MAX_UPLOAD_MB MUST > 0")
-    # ── OCR 资源护栏口径（B'）──
+    # ── OCR 资源护栏口径（B' / 方案 C 分段）──
     if OCR_MAX_SCAN_PAGES <= 0:
         raise RuntimeError("OCR_MAX_SCAN_PAGES MUST > 0")
+    if OCR_MAX_DOC_PAGES <= 0:
+        raise RuntimeError("OCR_MAX_DOC_PAGES MUST > 0")
+    if OCR_MAX_SCAN_PAGES > OCR_MAX_DOC_PAGES:
+        raise RuntimeError(
+            "OCR_MAX_SCAN_PAGES MUST <= OCR_MAX_DOC_PAGES —— "
+            "单段上限大于文档上限会让「段数」恒等式失效（至少一段却超过文档上限）"
+        )
     if OCR_TIMEOUT_S <= 0:
         raise RuntimeError("OCR_TIMEOUT_S MUST > 0")
+    # 单段最坏耗时 MUST 仍在 parse_job_timeout 之内 —— 否则分段失去了意义
+    # 注：_get_settings 已在函数前段（扫描件 OCR 分支）导入，此处复用
+    if OCR_MAX_SCAN_PAGES * OCR_TIMEOUT_S >= _get_settings().parse_job_timeout_seconds:
+        raise RuntimeError(
+            f"OCR_MAX_SCAN_PAGES({OCR_MAX_SCAN_PAGES}) × OCR_TIMEOUT_S({OCR_TIMEOUT_S}) "
+            f"= {OCR_MAX_SCAN_PAGES * OCR_TIMEOUT_S}s 已达 parse_job_timeout"
+            f"（{_get_settings().parse_job_timeout_seconds}s），单段可能被 arq 中途杀掉。"
+            "请调小段长或调大 parse_job_timeout_seconds。"
+        )
     if not (0.0 < OCR_LOW_CONF < 1.0):
         raise RuntimeError(f"OCR_LOW_CONF MUST ∈ (0, 1)，当前 {OCR_LOW_CONF}")
     if level_rank(Level.SECRET) != LEVEL_RANK_SECRET:

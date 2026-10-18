@@ -18,7 +18,13 @@ fitz = pytest.importorskip("pymupdf")
 from app.config import decisions  # noqa: E402
 from app.services.chunk import chunk_blocks  # noqa: E402
 from app.services.parse.base import ParsedBlock, ParseError  # noqa: E402
-from app.services.parse.pdf_parser import parse_pdf, parse_pdf_async  # noqa: E402
+from app.services.parse.pdf_parser import (  # noqa: E402
+    blocks_from_page_texts,
+    ensure_scanned_page_count,
+    ocr_scanned_pages,
+    parse_pdf,
+    parse_pdf_async,
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -318,7 +324,7 @@ def _patch_ocr(
 ) -> list:
     """打桩 OCR 客户端：按调用序返回各页文本；返回调用记录容器。
 
-    ★ 桩打在 ocr 模块属性上 —— _parse_scanned_pdf 每次调用时才做
+    ★ 桩打在 ocr 模块属性上 —— ocr_scanned_pages 每次调用时才做
       from-import，读到的是打桩后的属性（与 test_image_parser 同一模式）。
     """
     from app.services import ocr as ocr_mod
@@ -336,59 +342,71 @@ def _patch_ocr(
 
 
 class TestScannedPdfOcrPath:
-    """WU-M-10 + B'：纯扫描件改道本地 OCR；文本层优先原则不变。"""
+    """方案 C：扫描件 OCR 原语（ocr_scanned_pages / blocks_from_page_texts /
+    ensure_scanned_page_count）+ 文本层优先原则不变。
+
+    分段编排（run_parse_segment / run_parse_finalize）在 worker 内，不在此测。
+    """
 
     @pytest.mark.asyncio
-    async def test_scanned_pdf_goes_to_ocr_and_fills_page_no(
+    async def test_ocr_scanned_pages_returns_raw_text_per_page(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """纯扫描件 + OCR 开 → 逐页 OCR 转录，每页块 MUST 带 page_no（INV-M-05）。"""
+        """按页区间 OCR → 每页原始文本按序返回（不做标题识别），PNG 字节直传。"""
         _set_ocr(monkeypatch, True)
         calls = _patch_ocr(monkeypatch, ["page one content", "page two content"])
         data = _make_scanned_pdf(["page one content", "page two content"])
 
-        blocks = await parse_pdf_async(data)
+        texts = await ocr_scanned_pages(data, 1, 2)
 
         assert len(calls) == 2, "每页 MUST 各发起一次 OCR 调用"
-        assert [b.page_no for b in blocks] == [1, 2]
-        assert blocks[0].text == "page one content"
-        assert blocks[1].text == "page two content"
+        assert texts == ["page one content", "page two content"]
         assert all(c[1] == "image/png" for c in calls), "渲染页以 PNG 字节直传"
 
     @pytest.mark.asyncio
-    async def test_scanned_pdf_rejected_when_ocr_disabled(
+    async def test_ocr_scanned_pages_honors_page_range(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """OCR 关 → 维持原 ParseError（fail-closed，M7 D6）。"""
-        _set_ocr(monkeypatch, False)
-        data = _make_scanned_pdf(["any content"])
-        with pytest.raises(ParseError, match="疑似扫描件"):
-            await parse_pdf_async(data)
+        """只渲染/OCR 请求区间内的页 —— 分段的基础（每段只处理本段页）。"""
+        _set_ocr(monkeypatch, True)
+        calls = _patch_ocr(monkeypatch, ["p2", "p3"])
+        data = _make_scanned_pdf(["p1", "p2", "p3", "p4"])
+
+        texts = await ocr_scanned_pages(data, 2, 3)
+
+        assert texts == ["p2", "p3"]
+        assert len(calls) == 2
 
     @pytest.mark.asyncio
-    async def test_scanned_pdf_rejected_when_base_url_missing(
+    async def test_ocr_scanned_pages_rejected_when_ocr_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """OCR 关 → ParseError（fail-closed，M7 D6）。"""
+        _set_ocr(monkeypatch, False)
+        data = _make_scanned_pdf(["any content"])
+        with pytest.raises(ParseError, match="OCR_ENABLED=false"):
+            await ocr_scanned_pages(data, 1, 1)
+
+    @pytest.mark.asyncio
+    async def test_ocr_scanned_pages_rejected_when_base_url_missing(
         self, monkeypatch: pytest.MonkeyPatch
     ):
         """B'：开关已开但服务地址未配置 → ParseError（fail-closed，不降级）。"""
         _set_ocr(monkeypatch, True, base_url="")
         data = _make_scanned_pdf(["any content"])
         with pytest.raises(ParseError, match="OCR_BASE_URL"):
-            await parse_pdf_async(data)
+            await ocr_scanned_pages(data, 1, 1)
 
-    @pytest.mark.asyncio
-    async def test_scanned_pdf_rejected_over_max_pages(
+    def test_scanned_document_over_max_pages_rejected(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """B'：页数超过 OCR_MAX_SCAN_PAGES → ParseError，且不发起任何 OCR 调用。"""
+        """文档级页数超过 OCR_MAX_DOC_PAGES → ParseError（防 DOS，分段也救不了）。"""
         from app.config import decisions as decisions_mod
 
-        _set_ocr(monkeypatch, True)
-        calls = _patch_ocr(monkeypatch, ["x"])
-        monkeypatch.setattr(decisions_mod, "OCR_MAX_SCAN_PAGES", 1)
-        data = _make_scanned_pdf(["p1", "p2"])
-        with pytest.raises(ParseError, match="超过单份 OCR 上限"):
-            await parse_pdf_async(data)
-        assert calls == [], "超限 MUST 在渲染前拒绝，不发起任何 OCR 调用"
+        monkeypatch.setattr(decisions_mod, "OCR_MAX_DOC_PAGES", 2)
+        with pytest.raises(ParseError, match="超过单份文档 OCR 上限"):
+            ensure_scanned_page_count(3)
+        ensure_scanned_page_count(2)  # 边界值放行
 
     @pytest.mark.asyncio
     async def test_ocr_failure_carries_page_no(
@@ -405,7 +423,26 @@ class TestScannedPdfOcrPath:
         )
         data = _make_scanned_pdf(["page one content", "page two content"])
         with pytest.raises(ParseError, match="第 2 页"):
-            await parse_pdf_async(data)
+            await ocr_scanned_pages(data, 1, 2)
+
+    def test_blocks_from_page_texts_fills_page_no_and_carries_heading(self):
+        """聚合期：全局页序 → 每块带正确 page_no，标题跨页延续（INV-M-05）。"""
+        page_texts = [
+            "1. 概述\n第一页正文",
+            "第二页延续正文",       # 无新标题 → 沿用第 1 页的 heading
+            "2. 权限\n第三页正文",
+        ]
+        blocks = blocks_from_page_texts(page_texts)
+
+        assert [b.page_no for b in blocks] == [1, 2, 3]
+        assert blocks[0].heading_path == "1. 概述"
+        assert blocks[1].heading_path == "1. 概述", "跨页标题 MUST 延续"
+        assert blocks[2].heading_path == "2. 权限"
+
+    def test_blocks_from_page_texts_skips_empty_pages(self):
+        """空页（OCR 无内容）不产块，但仍占页序 —— 后续页页码不串。"""
+        blocks = blocks_from_page_texts(["", "有内容"])
+        assert [b.page_no for b in blocks] == [2]
 
     @pytest.mark.asyncio
     async def test_text_layer_pdf_never_calls_ocr(
@@ -422,6 +459,16 @@ class TestScannedPdfOcrPath:
 
         blocks = await parse_pdf_async(_make_pdf(SMALL))
         assert any(b.is_table for b in blocks), "文本层管线的表格识别结果不变"
+
+    @pytest.mark.asyncio
+    async def test_parse_pdf_async_rejects_scanned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """扫描件 MUST 经 worker 分段流水线；parse_pdf_async 对扫描件 fail-closed。"""
+        _set_ocr(monkeypatch, True)
+        data = _make_scanned_pdf(["any content"])
+        with pytest.raises(ParseError, match="疑似扫描件"):
+            await parse_pdf_async(data)
 
     @pytest.mark.asyncio
     async def test_sync_entry_still_rejects_scanned(

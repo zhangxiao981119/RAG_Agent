@@ -28,6 +28,8 @@ async def get_job(
         status=job.status,
         attempts=job.attempts,
         max_attempts=job.max_attempts,
+        pages_done=job.pages_done,
+        pages_total=job.pages_total,
         last_error=job.last_error,
         started_at=job.started_at,
         finished_at=job.finished_at,

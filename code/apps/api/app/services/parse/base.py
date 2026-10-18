@@ -4,7 +4,8 @@
 输出：ParsedBlock 列表（带 heading_path / page_no / is_table）
 
 分派表：
-  · .pdf   → pypdf（仅文本层 PDF；扫描件 B' 起走本地 OCR，见 parse_pdf_async）
+  · .pdf   → pypdf（仅文本层 PDF；纯扫描件由 worker 的分段 OCR 流水线处理，
+             见 workers/parse_job.py 的 run_parse_segment，本入口对扫描件 fail-closed）
   · .md    → markdown 标题层级切分
   · .txt   → 按空行切段
   · .xlsx  → openpyxl，按 sheet 整表输出（chunk 服务整表不切）
@@ -14,7 +15,7 @@
 
 ★ PDF 标题识别：pypdf 不带 layout，这里用行首模式匹配
   （"第 X 章/X.Y 标题/数字. 序号"），识别不到则退化为"第 N 页"。
-  扫描件 PDF（extract_text 返回空）→ 异步入口改道本地 OCR，同步入口抛 ParseError。
+  纯扫描件 PDF → worker 分段 OCR 流水线；同步入口 parse_pdf 对扫描件抛 ParseError。
 """
 from __future__ import annotations
 
@@ -107,12 +108,12 @@ def parse_bytes(ext: str, data: bytes) -> list[ParsedBlock]:
 
 
 async def parse_bytes_async(ext: str, data: bytes) -> list[ParsedBlock]:
-    """异步分派入口 —— worker 的统一调用点（M7 WU-M-09 / WU-M-10）。
+    """异步分派入口 —— worker 普通文档路径的统一调用点（M7 WU-M-09 / WU-M-10）。
 
-    图片扩展名走视觉链路（异步 LLM 调用）；pdf 走 parse_pdf_async
-    （文本层优先，纯扫描件改道视觉链路）；其余走既有同步 parse_bytes；
-    NUL 清洗对全部分支同样收口（同一唯一出口的口径不变）。
-    ★ ocr_enabled=false 时图片 / 扫描件在此处 ParseError（fail-closed）。
+    图片扩展名走本地 OCR（异步 HTTP）；pdf 走 parse_pdf_async（仅文本层，
+    纯扫描件由 worker 分段流水线另走，本入口对扫描件 ParseError）；
+    其余走既有同步 parse_bytes；NUL 清洗对全部分支同样收口（同一唯一出口的口径不变）。
+    ★ ocr_enabled=false 时图片在此处 ParseError（fail-closed）。
     """
     ext_l = ext.lower()
     if ext_l in IMAGE_EXTS:

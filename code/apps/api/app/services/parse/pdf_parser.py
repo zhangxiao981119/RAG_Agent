@@ -4,10 +4,15 @@
   · 表格页：pdfplumber 识别表格 → 表格块；同页文本用 pdfplumber 的词坐标
     **排除表格区域**后重建，避免同一份数据在blocks 里出现两次
   · 无表格页：pypdf 的 extract_text() + 行首模式匹配标题（pypdf 无 layout）
-  · 纯扫描件（全文文本层总长 < 10）：B' 起改道本地 OCR 服务（apps/ocr，
-    GOT-OCR2.0）—— PyMuPDF 逐页渲染 PNG → OCR 转录 → 每页一个块并填
-    page_no（INV-M-05 可回链）；受 settings.ocr_enabled + ocr_base_url 双门控，
-    任一未就绪均维持 ParseError（fail-closed，无双引擎兜底）。
+  · 纯扫描件（全文文本层总长 < 10）：不在此文件内整份 OCR，而由 worker 的
+    **分段流水线**（run_parse_segment / run_parse_finalize，方案 C）驱动 ——
+    本文件只提供三个原语：ocr_scanned_pages（按页区间渲染 PNG → 本地 OCR
+    服务 apps/ocr 转录，不做标题识别）、blocks_from_page_texts（聚合期按全局
+    页序做跨页标题累积 + 每页 flush，填 page_no —— INV-M-05 可回链）、
+    ensure_scanned_page_count（文档级页数护栏）。受 settings.ocr_enabled +
+    ocr_base_url 双门控，任一未就绪均维持 ParseError（fail-closed，无兜底）。
+    ★ 为什么分段而不整份一次 OCR：单页实测 22~180s，整份 OCR 会越过
+      parse_job_timeout（1800s）被 arq 杀掉；段长 = OCR_MAX_SCAN_PAGES。
 
 ★ 文本层优先原则不变：只要全文文本层总量达标（>= 10），绝不进入视觉链路 ——
   混合文档中个别无文本的页与改造前一样被跳过，行为逐字节一致。
@@ -26,6 +31,7 @@ from __future__ import annotations
 
 import io
 import re
+from collections.abc import Iterable
 
 from app.services.parse.base import ParsedBlock, ParseError, cell_to_text
 
@@ -214,8 +220,21 @@ def _extract_page_tables(
     return tables, outside
 
 
-def _extract_page_texts(data: bytes) -> list[str]:
-    """逐页抽取文本层（pypdf）。返回每页文本列表，页序即 page_no。"""
+_SCANNED_TEXT_MIN_CHARS: int = 10
+"""文本层总量低于此值 → 判定为扫描件。口径单点：parse_pdf / parse_pdf_async
+与 worker 的路径分派共用同一判定（见 is_scanned_text_layer），改一处即全局生效。"""
+
+
+def is_scanned_text_layer(page_texts: list[str]) -> bool:
+    """逐页文本层是否判定为扫描件（总量 < _SCANNED_TEXT_MIN_CHARS）。"""
+    return sum(len(t) for t in page_texts) < _SCANNED_TEXT_MIN_CHARS
+
+
+def extract_pdf_page_texts(data: bytes) -> list[str]:
+    """逐页抽取文本层（pypdf）。返回每页文本列表，页序即 page_no，长度即页数。
+
+    公开入口：worker 用它一次判定「是否扫描件 + 总页数」，避免自己重开 PDF。
+    """
     try:
         reader = PdfReader(io.BytesIO(data))  # type: ignore[call-arg]
     except Exception as exc:
@@ -231,62 +250,73 @@ def _extract_page_texts(data: bytes) -> list[str]:
     return page_texts
 
 
+class _HeadingAccumulator:
+    """跨页标题累积 + 页内块 flush（文本层管线与扫描件聚合期共用，口径单点）。
+
+    ★ heading 跨页延续：标题一旦出现，后续页直到下一个标题都归属它。
+    ★ 每页结束 MUST flush —— 否则 page_no 会串页（INV-M-05 要求每块带正确页码）。
+    ★ 扫描件被切成多段后，标题累积 MUST 在聚合期（blocks_from_page_texts）
+      统一进行，段内只产原始文本 —— 否则跨段标题会断。
+    """
+
+    def __init__(self) -> None:
+        self.heading = ""
+        self._buffer: list[str] = []
+
+    def feed(self, lines: Iterable[str], page_no: int, blocks: list[ParsedBlock]) -> None:
+        """逐行累积：标题行先 flush 当前缓冲再更新 heading，其余行进缓冲。"""
+        for line in lines:
+            if _is_heading(line):
+                self.flush(blocks, page_no)
+                self.heading = line.strip()
+            else:
+                self._buffer.append(line)
+
+    def flush(self, blocks: list[ParsedBlock], page_no: int) -> None:
+        """把缓冲内容落为一个块（空则丢弃），块带当前 heading 与页码。"""
+        content = "\n".join(self._buffer).strip()
+        if content:
+            blocks.append(
+                ParsedBlock(text=content, heading_path=self.heading, page_no=page_no)
+            )
+        self._buffer = []
+
+
 def _text_layer_pipeline(page_texts: list[str], data: bytes) -> list[ParsedBlock]:
     """文本层主管线：表格识别 + 标题切分（逻辑与 M7 前完全一致，逐字节未改）。"""
     tables_by_page, outside_by_page = _extract_page_tables(data)
 
     blocks: list[ParsedBlock] = []
-    current_heading = ""
-    buffer: list[str] = []
-
-    def flush(page_no: int) -> None:
-        nonlocal buffer
-        content = "\n".join(buffer).strip()
-        if content:
-            blocks.append(
-                ParsedBlock(text=content, heading_path=current_heading, page_no=page_no)
-            )
-        buffer = []
+    acc = _HeadingAccumulator()
 
     for page_index, page_text in enumerate(page_texts, start=1):
         rows_list = tables_by_page.get(page_index)
 
         if rows_list is not None:
-            # 表格页：用 pdfplumber 重建的"表格之外"文本，避免同一数据入块两次
+            # 表格页：表格块用「表格之前」的 heading，随后用 pdfplumber 重建的
+            # "表格之外"文本继续累积标题，避免同一数据入块两次
             outside = outside_by_page.get(page_index) or page_text
             for rows in rows_list:
-                blocks.append(_table_to_block(rows, current_heading, page_index))
-            for line in outside.split("\n"):
-                if _is_heading(line):
-                    flush(page_index)
-                    current_heading = line.strip()
-                else:
-                    buffer.append(line)
-            flush(page_index)
-            continue
+                blocks.append(_table_to_block(rows, acc.heading, page_index))
+            acc.feed(outside.split("\n"), page_index, blocks)
+        else:
+            acc.feed(page_text.split("\n"), page_index, blocks)
 
-        # 无表格页：走原来的 pypdf 路径（行为与改造前一致）
-        for line in page_text.split("\n"):
-            if _is_heading(line):
-                flush(page_index)
-                current_heading = line.strip()
-            else:
-                buffer.append(line)
-        flush(page_index)
+        acc.flush(blocks, page_index)
 
     return blocks
 
 
 def parse_pdf(data: bytes) -> list[ParsedBlock]:
     """同步入口（纯文本层）。扫描件在此仍 ParseError —— OCR 链路是异步的，
-    同步签名承载不了；扫描件请走 parse_pdf_async（worker 统一入口）。"""
-    page_texts = _extract_page_texts(data)
+    同步签名承载不了；扫描件请走 worker 的分段 OCR 流水线。"""
+    page_texts = extract_pdf_page_texts(data)
 
     # ── ① 先取全文文本判定扫描件（优先级最高，先于表格识别）──
-    if sum(len(t) for t in page_texts) < 10:
+    if is_scanned_text_layer(page_texts):
         raise ParseError(
-            "PDF 文本层为空，疑似扫描件。本系统未启用 OCR（见手册 §8 D-04/D-06），"
-            "请提供文本层 PDF 或置 OCR_ENABLED=true 并部署本地 OCR 服务。"
+            "PDF 文本层为空，疑似扫描件。请提供文本层 PDF 或置 OCR_ENABLED=true "
+            "并部署本地 OCR 服务（扫描件经 worker 分段流水线处理）。"
         )
 
     return _text_layer_pipeline(page_texts, data)
@@ -296,34 +326,58 @@ def parse_pdf(data: bytes) -> list[ParsedBlock]:
 _SCAN_RENDER_DPI: int = 150
 
 
-async def _parse_scanned_pdf(data: bytes, page_count: int) -> list[ParsedBlock]:
-    """纯扫描件 → 逐页渲染 PNG → 本地 OCR 转录 → 每页一块（M7 WU-M-10 / INV-M-05 / B'）。
+def ensure_ocr_ready() -> None:
+    """OCR 服务就绪门控（fail-closed）：未启用 / 未配置地址 → ParseError。
 
-    ★ 延迟导入 ocr client 与 settings：与 image_parser 同理，避免包初始化期环链。
-    ★ 单引擎 fail-closed（B'）：服务未配置 / 任一页 OCR 失败 / 无可读内容
-      → ParseError（带页码），整份进 job last_error，走 arq 重试 → 死信 → 重跑；
-      不静默跳页 —— 跳过等于把缺页知识当完整知识入库，也不换引擎兜底。
+    ★ 属**永久性**约束 —— 重试不会自愈（配置不改就永远失败），
+      调用方（worker 段流水线）据此直接判死而非重试。
+    ★ 与 ocr_scanned_pages 各自调用一次：前者用于失败分类，后者保证
+      任何直连调用者也 fail-closed，不依赖调用方记得先检查。
     """
-    from app.config import decisions
     from app.config.settings import get_settings
-    from app.services.ocr import OcrError, ocr_image
 
     settings = get_settings()
     if not settings.ocr_enabled:
         raise ParseError(
-            "PDF 文本层为空，疑似扫描件。本系统未启用 OCR（见手册 §8 D-04/D-06），"
-            "请提供文本层 PDF 或置 OCR_ENABLED=true 并部署本地 OCR 服务。"
+            "扫描件 OCR 未启用（OCR_ENABLED=false，fail-closed 无纯文本降级）。"
+            "请置 OCR_ENABLED=true 并部署本地 apps/ocr 服务。"
         )
     if not settings.ocr_base_url:
         raise ParseError(
             "扫描件 OCR 已启用但未配置 OCR_BASE_URL（fail-closed）。"
             "请部署 apps/ocr 服务并注入 OCR_BASE_URL。"
         )
-    if page_count > decisions.OCR_MAX_SCAN_PAGES:
+
+
+def ensure_scanned_page_count(page_count: int) -> None:
+    """文档级页数护栏：超过 OCR_MAX_DOC_PAGES → ParseError（防 DOS）。
+
+    ★ 与单段上限（OCR_MAX_SCAN_PAGES）职责不同：单段上限决定段数，
+      本函数只管「整份文档」上限，防止超长扫描件把段链拉成千段。
+    """
+    from app.config import decisions
+
+    if page_count > decisions.OCR_MAX_DOC_PAGES:
         raise ParseError(
-            f"扫描件共 {page_count} 页，超过单份 OCR 上限 "
-            f"{decisions.OCR_MAX_SCAN_PAGES} 页，请拆分后上传。"
+            f"扫描件共 {page_count} 页，超过单份文档 OCR 上限 "
+            f"{decisions.OCR_MAX_DOC_PAGES} 页，请拆分后上传。"
         )
+
+
+async def ocr_scanned_pages(
+    data: bytes, page_start: int, page_end: int
+) -> list[str]:
+    """渲染并逐页 OCR 扫描件 [page_start, page_end]（1-based 闭区间），
+    返回**每页原始文本**（不做标题识别，标题累积见 blocks_from_page_texts）。
+
+    ★ 只做「图片 → 文本」，区间由调用方（worker 分段）决定 —— 单段页数
+      由 OCR_MAX_SCAN_PAGES 约束，保证单段耗时落在 parse_job_timeout 内。
+    ★ 单引擎 fail-closed：服务未配置 / 任一页 OCR 失败 → ParseError（带页码），
+      不静默跳页、不换引擎兜底。
+    """
+    from app.services.ocr import OcrError, ocr_image
+
+    ensure_ocr_ready()
 
     try:
         import pymupdf
@@ -335,10 +389,9 @@ async def _parse_scanned_pdf(data: bytes, page_count: int) -> list[ParsedBlock]:
     except Exception as exc:
         raise ParseError(f"扫描件 PDF 打开失败: {exc}") from exc
 
-    blocks: list[ParsedBlock] = []
-    current_heading = ""
+    texts: list[str] = []
     with doc:
-        for page_index in range(1, page_count + 1):
+        for page_index in range(page_start, page_end + 1):
             page = doc[page_index - 1]
             png = page.get_pixmap(dpi=_SCAN_RENDER_DPI).tobytes("png")
             try:
@@ -347,40 +400,34 @@ async def _parse_scanned_pdf(data: bytes, page_count: int) -> list[ParsedBlock]:
                 raise ParseError(
                     f"扫描件第 {page_index} 页 OCR 转录失败：{exc}"
                 ) from exc
+            texts.append(block.text)
+    return texts
 
-            # 页内行级标题识别：与文本层管线同一套 _is_heading，保证
-            # heading_path 口径一致；非标题行按页聚合为一个块
-            content_lines: list[str] = []
-            for line in block.text.split("\n"):
-                if _is_heading(line):
-                    if content_lines:
-                        blocks.append(
-                            ParsedBlock(
-                                text="\n".join(content_lines).strip(),
-                                heading_path=current_heading,
-                                page_no=page_index,
-                            )
-                        )
-                        content_lines = []
-                    current_heading = line.strip()
-                else:
-                    content_lines.append(line)
-            if content_lines:
-                blocks.append(
-                    ParsedBlock(
-                        text="\n".join(content_lines).strip(),
-                        heading_path=current_heading,
-                        page_no=page_index,
-                    )
-                )
+
+def blocks_from_page_texts(page_texts: list[str]) -> list[ParsedBlock]:
+    """全局页序的**每页原始文本** → blocks（跨页标题累积 + 每页 flush）。
+
+    扫描件分段流水线的聚合期唯一入口（run_parse_finalize）：段只产原始文本，
+    标题识别推迟到这里，保证跨段标题延续与「整份一次解析」口径一致。
+    page_texts[i] 对应 page_no = i + 1（INV-M-05 可回链）。
+    """
+    blocks: list[ParsedBlock] = []
+    acc = _HeadingAccumulator()
+    for page_no, page_text in enumerate(page_texts, start=1):
+        acc.feed(page_text.split("\n"), page_no, blocks)
+        acc.flush(blocks, page_no)
     return blocks
 
 
 async def parse_pdf_async(data: bytes) -> list[ParsedBlock]:
-    """异步入口 —— 文本层优先，纯扫描件改道本地 OCR 链路（M7 WU-M-10 / B'）。"""
-    page_texts = _extract_page_texts(data)
+    """异步入口 —— **仅文本层**。扫描件 MUST 经 worker 的分段 OCR 流水线
+    （run_parse_segment），此处 fail-closed 拒绝，避免整份一次 OCR 越过任务超时。"""
+    page_texts = extract_pdf_page_texts(data)
 
-    if sum(len(t) for t in page_texts) >= 10:
-        return _text_layer_pipeline(page_texts, data)
+    if is_scanned_text_layer(page_texts):
+        raise ParseError(
+            "PDF 文本层为空，疑似扫描件：扫描件 MUST 经 worker 分段 OCR 流水线"
+            "（run_parse_segment）处理，此处不承载扫描件。"
+        )
 
-    return await _parse_scanned_pdf(data, page_count=len(page_texts))
+    return _text_layer_pipeline(page_texts, data)

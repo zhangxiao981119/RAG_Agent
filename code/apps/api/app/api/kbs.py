@@ -412,9 +412,11 @@ async def _upload_single(
     )
 
     # 入队 arq 任务（复用 lifespan 初始化的全局连接池）
+    # ★ 方案 C：统一走 run_parse_segment 首段（index=0）—— 首段内部判定路径，
+    #   普通文档一次跑完，纯扫描件转分段 OCR 链
     # 透传 trace_id，让 worker 日志与本次上传请求同链
     await request.app.state.arq_pool.enqueue_job(
-        "run_parse_job", str(parse_job.id), trace.get_trace_id(),
+        "run_parse_segment", str(parse_job.id), 0, trace.get_trace_id(),
         _queue_name=settings.arq_queue_name,
     )
 

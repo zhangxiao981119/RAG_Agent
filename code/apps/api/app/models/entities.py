@@ -313,11 +313,54 @@ class ParseJob(Base):
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="3")
     last_error: Mapped[str | None] = mapped_column(Text)
+    # 方案 C 分段进度：非扫描件恒为 0/0；扫描件 pages_total=文档页数、
+    # pages_done=已完成 OCR 的页数（段成功时累加），经 GET /jobs 上报给前端。
+    pages_done: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    pages_total: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (CheckConstraint("status IN ('queued','running','succeeded','failed','dead')", name="ck_parse_jobs_status"),)
+
+
+class ParseSegment(Base):
+    """方案 C：扫描件 OCR 的分段执行单元（执行单元，不是语义边界）。
+
+    大扫描件在单个 arq 任务里 OCR 会越过 parse_job_timeout 被杀；改为按
+    OCR_MAX_SCAN_PAGES 切段串行执行 —— 每段只做「渲染 + 逐页 OCR」，
+    产出**每页原始文本**落本表 page_texts，不做标题识别（标题跨页累积推迟到
+    聚合任务 run_parse_finalize，保证 heading 口径与整份一次解析时一致）。
+
+    ★ 段结果是**已完成进度**：重试时若本段已 succeeded 直接跳过 OCR，
+      只重跑失败段（这是把 segment 落库的唯一理由）。
+    ★ page_texts 为 JSONB 字符串数组，索引 i 对应 page_no = page_start + i，
+      聚合期按 segment_index 升序拼接即得全局页序（INV-M-05 可回链）。
+    """
+
+    __tablename__ = "parse_segments"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("parse_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    segment_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_start: Mapped[int] = mapped_column(Integer, nullable=False)  # 1-based，含
+    page_end: Mapped[int] = mapped_column(Integer, nullable=False)    # 1-based，含
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    page_texts: Mapped[list[str] | None] = mapped_column(JSONB)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued','running','succeeded','failed','dead')",
+            name="ck_parse_segments_status",
+        ),
+        UniqueConstraint("job_id", "segment_index", name="uq_parse_segments_job_index"),
+    )
 
 
 class GovernanceJob(Base):

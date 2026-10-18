@@ -11,7 +11,7 @@
   7. 审查失败重试耗尽：job dead + 文档 failed（INV-M-12 降级未审查）
   8. 幂等：文档已 done 时重复 job 直接成功，不再调 LLM
   9. cron 扫描：pending 文档建 job + 入队，enqueue 先于 commit（无 zombie）
-  10. INV-M-10：run_parse_job 源码零治理引用 + 治理任务独立注册
+  10. INV-M-10：解析任务源码零治理引用 + 治理任务独立注册
   11. INV-M-11：审查只写治理列（update 仅 governance_weight），不改原文
   12. governance_report 含四维依据（DoD：结论有 governance_report 依据）
 """
@@ -28,7 +28,13 @@ from sqlalchemy import Select, Update
 from app.config.prompts import NO_ANSWER_TEXT
 from app.models import Document, GovernanceJob
 from app.services import governance
-from app.workers.parse_job import WorkerSettings, run_parse_job, run_sync_all, scan_and_enqueue
+from app.workers.parse_job import (
+    WorkerSettings,
+    run_parse_finalize,
+    run_parse_segment,
+    run_sync_all,
+    scan_and_enqueue,
+)
 
 NOW = datetime(2026, 10, 17, tzinfo=timezone.utc)
 TENANT = uuid.uuid4()
@@ -371,9 +377,14 @@ async def test_scan_no_pending_is_noop(harness: Harness) -> None:
 
 
 def test_inv_m_10_parse_job_has_no_governance_call() -> None:
-    """run_parse_job 函数体零治理引用；治理任务独立注册进 functions/cron。"""
-    source = inspect.getsource(run_parse_job)
-    assert "governance" not in source.lower()
+    """解析任务函数体零治理引用；治理任务独立注册进 functions/cron。
+
+    ★ 方案 C 后解析主路径拆成 run_parse_segment（分段 OCR）与
+      run_parse_finalize（归并入库）两个 arq 任务，两者都必须与治理解耦。
+    """
+    for fn in (run_parse_segment, run_parse_finalize):
+        source = inspect.getsource(fn)
+        assert "governance" not in source.lower(), f"{fn.__name__} 不应引用治理"
     names = [fn.__name__ for fn in WorkerSettings.functions]
     assert "execute_governance_job" in names
     assert "scan_and_enqueue" in names

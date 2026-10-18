@@ -21,7 +21,7 @@
 from app.infra.arq_pool import get_arq_pool
 
 pool = await get_arq_pool()
-await pool.enqueue_job("run_parse_job", str(job_id))
+await pool.enqueue_job("run_parse_segment", str(job_id), 0)
 ```
 
 > ★ **调用方 MUST NOT 调用 `close()`。**

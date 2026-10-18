@@ -199,7 +199,7 @@ async def _sync_one_file(
         # MUST NOT 在此关闭池 —— 池是进程级共享资源，关掉会让后续所有入队重新建连
         # 透传当前 trace_id：手动触发时=请求 trace，cron 触发时=该轮新 trace
         await pool.enqueue_job(
-            "run_parse_job", str(parse_job.id), trace.get_trace_id(),
+            "run_parse_segment", str(parse_job.id), 0, trace.get_trace_id(),
             _queue_name=settings.arq_queue_name,
         )
 
@@ -286,7 +286,7 @@ async def _sync_web_page(
 
         pool = await get_arq_pool()
         await pool.enqueue_job(
-            "run_parse_job", str(parse_job.id), trace.get_trace_id(),
+            "run_parse_segment", str(parse_job.id), 0, trace.get_trace_id(),
             _queue_name=settings.arq_queue_name,
         )
         await session.commit()
