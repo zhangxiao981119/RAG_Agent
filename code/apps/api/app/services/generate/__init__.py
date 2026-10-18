@@ -54,21 +54,61 @@ logger = logging.getLogger(__name__)
 # 因此改为「归一化 → 首句语义匹配」：只认首句，避免把
 # 「知识库中收录了员工手册，其中规定……」这类正常回答误判为拒答。
 _MARKUP_RE = re.compile(r"[*_`#>~|]")
-_CITE_RE = re.compile(r"\[\d+\]")
+_CITE_RE = re.compile(r"(?<![A-Za-z0-9_.\]])\[\d+\]")
+# 负向后顾不可少：代码里的数组下标 `arr[0]`、`arr[1]` 会被朴素正则当成引用编号。
+# 真实案例：问「写段 Python 快速排序」，模型吐出的实现里每行都有 arr[0]，
+# 于是"零引用"兜底认定它带了引用、直接放行 —— 恰恰放过了要拦的那条。
 _ZW_RE = re.compile(r"[\u200b-\u200f\ufeff]")
 
-# 首句拒答语义：知识库(中/里) + 否定词 + （≤20 字修饰）+ 拒答动词
+# 首句拒答语义：知识库(中/里) + 否定词 + 修饰 + 收尾
 # 覆盖三类真实写法：
 #   「知识库中没有直接规定……」（中间插"直接"）
 #   「知识库中没有关于"策略模式适用场景"的正文说明」（中间插一整个定语）
 #   「知识库中未找到 **XYZ-2000** 的相关内容」
+# 收尾分两种：动词收尾（找到/说明/规定…）与名词收尾（…的任何内容/正文/记录）。
+# 只覆盖动词会漏掉「知识库中没有关于公司年会安排的任何内容」这类纯名词句。
 _REFUSAL_HEAD_RE = re.compile(
-    r"^(?:抱歉[，,]?|对不起[，,]?|不好意思[，,]?)?"
-    r"知识库(?:中|里|内)?"
+    r"^(?:\d+\s*[.、,)）]\s*)?"
+    r"(?:\*\*)?(?:抱歉[，,]?|对不起[，,]?|不好意思[，,]?)?"
+    r"知识库"
+    # 「知识库中」「知识库里」之外，还有「知识库的库存清单中未找到…」这类
+    # 带限定成分的写法（真实样本：问广州仓库存，答"知识库的库存清单中未找到
+    # 广州仓这一仓库的库存记录"），所以否定词前允许 ≤12 字限定语。
+    r"[^。！？\n]{0,12}?"
     r"(?:未|没有|无法|没能|尚未|暂未)"
-    r"[^。！？\n]{0,20}?"
-    r"(?:找到|检索到|收录|包含|涵盖|提及|说明|规定|提供)"
+    r"(?:"
+    r"[^。！？\n]{0,20}?(?:找到|检索到|收录|包含|涵盖|提及|说明|规定|提供)"
+    r"|"
+    r"关于[^。！？\n]{0,30}?的(?:任何)?(?:内容|正文|说明|记录|条目|资料)"
+    r")"
 )
+
+
+# 「知识库中仅能确认 X，具体 Y 未找到相关内容」——先给一点能确认的，再声明关键点缺失。
+# 这是部分确认型拒答，语义上仍是"这个问题答不了"，必须计入拒答。
+_PARTIAL_REFUSAL_RE = re.compile(
+    r"知识库(?:中|里|内)?(?:仅|只)"
+    r"[^。！？]{0,30}?"
+    r"(?:未找到|没有|未提及|未说明|未收录|未出现|无法确认)"
+)
+
+_HEADING_LINE_RE = re.compile(r"^[ \t]*#{1,6}[ \t]*[^\n]*$")
+
+
+def _strip_leading_headings(text: str) -> str:
+    """剥掉正文开头的 markdown 标题行与空行。
+
+    ★ 必须做这一步再判拒答。真实缺陷：模型拒答时会先写一个 `#### 说明`
+    / `#### 结论` / `#### 关于打卡定位范围` 当小标题，正文第一句才是契约句。
+    归一化把 `####` 去掉后，字符串变成"说明知识库中未找到…"，首句以标题
+    文字开头，前缀匹配直接失效 —— 于是 3 条已明确拒答的回答被当成正常回答，
+    还挂着引用流出。标题是**排版噪声，不是答案内容**，判定前必须先剔除。
+    """
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines) and (not lines[i].strip() or _HEADING_LINE_RE.match(lines[i])):
+        i += 1
+    return "\n".join(lines[i:])
 
 
 def _normalize_for_refusal(text: str) -> str:
@@ -83,20 +123,51 @@ def _normalize_for_refusal(text: str) -> str:
 def is_no_answer_output(text: str) -> bool:
     """生成结果是否为拒答。命中任一条件即判拒答：
 
-    1. 归一化后以 NO_ANSWER_TEXT 开头（契约原句，允许尾随补充说明）
-    2. 首句呈现「知识库中未找到/没有…」的拒答语义（覆盖加粗、插入主语、
-       换说法、给替代信息等变体）
+    1. 剥掉开头标题后，以 NO_ANSWER_TEXT 开头（契约原句，允许尾随补充说明）
+    2. 首个实质句呈现「知识库中未找到/没有…」的拒答语义（覆盖加粗、插入
+       主语、换说法、给替代信息等变体）
+    3. 首个实质句是「知识库只确认了 X，Y 未找到」的部分确认型拒答
+
+    ★ 只判首个实质句，不做全文搜索：可答回答里也可能在末尾补一句
+    "另有部分细节知识库未收录"，全文搜索会把它误判成拒答（正是之前
+    提示词收太紧导致的过度拒答）。
     """
     if not text or not text.strip():
         return False
-    normalized = _normalize_for_refusal(text)
+    body = _strip_leading_headings(text)
+    normalized = _normalize_for_refusal(body)
+    if not normalized:
+        return False
     if normalized.startswith(NO_ANSWER_TEXT):
         return True
     head = re.split(r"[。！？；]", normalized, maxsplit=1)[0]
-    return bool(_REFUSAL_HEAD_RE.match(head))
+    return bool(_REFUSAL_HEAD_RE.match(head) or _PARTIAL_REFUSAL_RE.search(head))
 
 
-def is_unattributed_output(text: str, citation_count: int) -> bool:
+# 零引用时的容差阈值：答案的 3-gram 有多大比例能在上下文里找到。
+# 高于阈值 = 模型在概括上下文，只是漏标了 [n]（排版问题，不该判拒答）；
+# 低于阈值 = 内容根本不在上下文里，是凭先验编的（必须拒答）。
+_UNATTRIBUTED_MIN_OVERLAP = 0.55
+
+
+def _context_overlap(answer: str, context_text: str) -> float:
+    """答案与上下文的字符级重合度（3-gram 命中率）。
+
+    用字符 3-gram 而不是分词：中文分词器会引入词典依赖，而 3-gram 对
+    "换个说法但用词相同"的概括足够敏感，又不至于因为虚词相同就误判。
+    """
+    a = re.sub(r"[\s\W_]+", "", answer)
+    c = re.sub(r"[\s\W_]+", "", context_text)
+    if len(a) < 12 or not c:
+        return 0.0
+    grams = [a[i : i + 3] for i in range(len(a) - 2)]
+    hit = sum(1 for g in grams if g in c)
+    return hit / len(grams)
+
+
+def is_unattributed_output(
+    text: str, citation_count: int, context_text: str = ""
+) -> bool:
     """检索到了内容，但答案里一条有效引用都没有 —— 判为脱离检索结果作答。
 
     提示词契约要求结论后标 `[n]`。零引用意味着模型在凭先验自由发挥，
@@ -106,10 +177,19 @@ def is_unattributed_output(text: str, citation_count: int) -> bool:
 
     兜底放在生成层出口而不是提示词：温度再低也有跑偏的时候，
     「有没有引用」是当前上下文里唯一一个不依赖模型自觉的硬信号。
+
+    ★ 但零引用不等于幻觉。真实误伤：问「Netty 的 Channel 和传统 IO 流有什么区别」，
+    模型把上下文概括得很准，只是整篇没标 [n]，被直接判成拒答 → 可答题漏答。
+    所以零引用时再补一步内容比对：答案用词基本都来自上下文（重合度 ≥ 阈值）
+    就放行，只把"内容压根不在上下文里"的判为拒答。
     """
     if citation_count <= 0:
         return False
-    return not _CITE_RE.search(text)
+    if _CITE_RE.search(text):
+        return False
+    if context_text and _context_overlap(text, context_text) >= _UNATTRIBUTED_MIN_OVERLAP:
+        return False
+    return True
 
 
 # 「绕道作答」的典型形态：模型不敢直接说"没找到"，改用一个小标题把
@@ -399,7 +479,9 @@ class GenerationService:
         #   覆盖模型对契约句的常见变体（加粗/插主语/补一句解释），见 is_no_answer_output。
         _is_no_answer = is_no_answer_output(formatted)
         # ★ 有上下文却零引用 ⇒ 模型脱离检索结果自由发挥（幻觉），同样按拒答处理。
-        _unattributed = is_unattributed_output(formatted, len(citations))
+        _unattributed = is_unattributed_output(
+            formatted, len(citations), _build_context(chunks)
+        )
         # ★ 用「知识库中的相关信息」当标题绕道作答 ⇒ 没答问题，按拒答处理。
         _offtopic = is_offtopic_fallback(formatted)
         _refused = _is_no_answer or _unattributed or _offtopic
@@ -689,7 +771,9 @@ class StreamGenerationService(GenerationService):
 
         # ★ 有上下文却零引用 ⇒ 模型脱离检索结果自由发挥（幻觉）。
         #   流式下 delta 已经发出，前端收到 refused 后清空正文与引用。
-        if is_unattributed_output(full_text, len(citations)) or is_offtopic_fallback(full_text):
+        if is_unattributed_output(
+            full_text, len(citations), _build_context(chunks)
+        ) or is_offtopic_fallback(full_text):
             logger.warning(
                 "UNGROUNDED: 检索到 %d 条上下文但答案零引用/绕道作答，按拒答处理",
                 len(citations),

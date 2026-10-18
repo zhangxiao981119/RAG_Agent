@@ -59,7 +59,7 @@
 | 密级脱敏 | 4 档密级（公开/内部/机密/绝密），回答中手机号/身份证/银行卡自动打码（引用原文不打码） | [services/mask.py](code/apps/api/app/services/mask.py) |
 | 限流与配额 | Redis 令牌桶（单用户 20 次/分钟）+ 用户/租户双层 token 配额 + 四级降级 | [services/quota.py](code/apps/api/app/services/quota.py) |
 | 文档预览 | 6 种格式统一转纯文本供前端预览（md/txt/docx/xlsx/xls/pdf），无文本层给明确提示 | [services/preview.py](code/apps/api/app/services/preview.py) |
-| 评估门禁 | **206 条** eval 用例集（103 可答 + 103 不可答，覆盖 11 类场景）自动跑检索 + 生成，判定"该答的答了 / 不该答的拒了"，实测可答 **100%**（103/103）/ 漏答 **0%** / 拒答正确 **94.2%**（97/103）/ 命中率 **100%**（102 条有期望文档标注） | [services/eval_service.py](code/apps/api/app/services/eval_service.py) |
+| 评估门禁 | **206 条** eval 用例集（103 可答 + 103 不可答，覆盖 11 类场景）自动跑检索 + 生成，判定"该答的答了 / 不该答的拒了"，实测可答 **100%**（103/103）/ 漏答 **0%** / 拒答正确 **99.0%**（102/103）/ 命中率 **100%**（102 条有期望文档标注） | [services/eval_service.py](code/apps/api/app/services/eval_service.py) |
 | 指标可观测 | `prometheus_client` 标准指标 + `/metrics` 端点（路径标签用路由模板，避免高基数）；admin 指标接口另聚合 **TTFT（P50/P95/P99）** 与**三路召回 covered/unique 贡献**（量化「去掉任一路会漏多少」） | [infra/metrics.py](code/apps/api/app/infra/metrics.py) · [api/audit.py](code/apps/api/app/api/audit.py) |
 | 提示词版本管理 | 锁定区（角色 / 合规约束 / 拒答文案，代码内置不可在线改）+ 可编辑区（落库、可切换版本）；激活前校验 + Redis 60s 缓存、写后失效 | [services/prompt_registry.py](code/apps/api/app/services/prompt_registry.py) · [api/prompts.py](code/apps/api/app/api/prompts.py) |
 | 索引 / 口径版本 | `IndexProfile` 单一真源（embedding_model / dim / text_version / chunker_version），指纹取 SHA1 前 12 位；检索按口径过滤（fail-closed），重算脚本支持 `--check` 检测过期 chunk | [config/index_profile.py](code/apps/api/app/config/index_profile.py) · [scripts/reindex_embeddings.py](code/apps/api/scripts/reindex_embeddings.py) |
@@ -249,7 +249,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 | F17 | 数据同步 | 本地目录 + Git 源，定时增量 + 手动触发 |
 | F18 | 多轮对话 | 会话列表 + 消息历史 + 上下文压缩 |
 | F19 | 文档预览 | `GET /documents/{id}/raw`，6 种格式统一转纯文本；不支持格式返回 415 |
-| F20 | 评估门禁 | **206 条**用例集（103 可答 + 103 不可答，11 类场景）自动跑检索 + 生成，检查可答/拒答准确率出报告（实测可答 100% / 漏答 0% / 拒答 94.2% / 命中 100%） |
+| F20 | 评估门禁 | **206 条**用例集（103 可答 + 103 不可答，11 类场景）自动跑检索 + 生成，检查可答/拒答准确率出报告（实测可答 100% / 漏答 0% / 拒答 99.0% / 命中 100%） |
 | F21 | 微调样本闭环 | 采纳问答落库 → admin 查看 → 导出打标（增量取出） |
 | F22 | 安全加固 | 提示注入检测（8 规则/4 类，命中降权）+ 令牌桶限流（20 次/分钟）+ 配额四级降级 + 敏感词双向拦截 + 按部门灰度开关 |
 | F23 | 前端体验 | 上传进度、批量删除、列表分页、SSE 断网提示与一键重试（保留已流出文本） |
