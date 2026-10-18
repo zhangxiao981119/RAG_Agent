@@ -351,6 +351,17 @@ code/
 - **资源复用**：Redis 与 arq 连接池**进程级共享**（请求级调用点拿到的 `aclose()` 是 no-op）—— 高并发下不会每请求新建/关闭连接
 - **质量门禁**：**63 条** eval 用例集（43 可答 + 20 不可答）自动检查可答/拒答准确率；pytest **219 个用例（17 个测试文件，1 条按环境跳过）**覆盖 ACL 判定 / RRF 融合 / 阈值闸门 / 分块 / 记忆过滤 / 注入检测 / 解析 / CoT / Query 改写等核心链路；关键口径被改坏则启动自检拒绝启动（fail-closed）
 
+### 评测集构建流水线
+
+用例集不是手写几条凑数，而是「候选 → 检索预检 → 入库 → 跑批」四段，目的是**不让语料里根本没有依据的问题混进评测集**（否则测出来的只是标注错误）：
+
+| 步骤 | 脚本 | 做什么 |
+|------|------|--------|
+| 1. 预检 | [scripts/precheck_cases.py](code/apps/api/scripts/precheck_cases.py) | 只跑检索层、不调大模型，逐条输出 top1 分数 / 命中文件 / 是否过阈值，先确认这条问题在语料里有没有依据 |
+| 2. 入库 | [scripts/import_eval_cases.py](code/apps/api/scripts/import_eval_cases.py) | 写入 `eval_cases`；写入前整表备份为 `eval_cases_backup_<tag>`；`--keep-failed` 保留未通过预检的用例（失败用例才是要测出来的缺陷） |
+| 3. 跑批 | [scripts/run_eval.py](code/apps/api/scripts/run_eval.py) | 逐条走检索 + 生成，统计拒答正确率 / 漏答率 / 命中率，结果落 `eval_runs` 并做用例集指纹基线比对 |
+| 4. 标定 | [scripts/calibrate_threshold.py](code/apps/api/scripts/calibrate_threshold.py) | 纯检索层采集 top1 分数分布，算不同阈值下的 F1；采集前把阈值临时置零，避免用被截断的数据反推阈值 |
+
 ### 上线前自检发现的真实缺陷（已修复）
 
 这些都是我在**交付前的自检/复查批次**里自己找出来并修掉的，不是线上事故记录：
