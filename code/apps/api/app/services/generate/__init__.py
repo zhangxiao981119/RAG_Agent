@@ -92,6 +92,21 @@ _PARTIAL_REFUSAL_RE = re.compile(
     r"(?:未找到|没有|未提及|未说明|未收录|未出现|无法确认)"
 )
 
+# 「关于考勤打卡的定位范围（如允许打卡的位置），知识库中未找到相关内容。」
+# —— 话题前置式：拒答短语不在句首，而在「关于 X，…」的后半句。
+# 真实漏判样本（206 条评测第 103 条）就是这种写法：现行两条正则都要求以
+# 「知识库」或「仅/只」开头，于是整条被判成可答，后被引用的相关内容掩盖。
+# ★ 限定「关于/对于/就/针对」+ 逗号 + 紧随其后的否定，且话题段 ≤ 40 字：
+#   不做全文搜索，避免把「知识库中没有上限，但第八条规定…」这类**有实质内容**
+#   的回答误判成拒答（那会制造漏答）。
+_TOPIC_FRAMED_REFUSAL_RE = re.compile(
+    r"^(?:关于|对于|就|针对)[^。！？]{1,40}?[，,]\s*(?:\*\*)?"
+    r"知识库(?:中|里|内)?[^。！？]{0,12}?"
+    # ★ 只认「查不到」类否定，不认「没有」：后者常是实质回答
+    #   （「关于住宿，知识库中没有明文上限，但第八条规定…」），算拒答就是漏答。
+    r"(?:未找到|未收录|未提及|未说明|未出现|未涉及|无法确认|查无)"
+)
+
 _HEADING_LINE_RE = re.compile(r"^[ \t]*#{1,6}[ \t]*[^\n]*$")
 
 
@@ -127,6 +142,8 @@ def is_no_answer_output(text: str) -> bool:
     2. 首个实质句呈现「知识库中未找到/没有…」的拒答语义（覆盖加粗、插入
        主语、换说法、给替代信息等变体）
     3. 首个实质句是「知识库只确认了 X，Y 未找到」的部分确认型拒答
+    4. 首个实质句是「关于 X，知识库中未找到…」的话题前置式拒答
+       （拒答短语不在句首，实测每 206 条会有 1 条栽在这里）
 
     ★ 只判首个实质句，不做全文搜索：可答回答里也可能在末尾补一句
     "另有部分细节知识库未收录"，全文搜索会把它误判成拒答（正是之前
@@ -141,7 +158,11 @@ def is_no_answer_output(text: str) -> bool:
     if normalized.startswith(NO_ANSWER_TEXT):
         return True
     head = re.split(r"[。！？；]", normalized, maxsplit=1)[0]
-    return bool(_REFUSAL_HEAD_RE.match(head) or _PARTIAL_REFUSAL_RE.search(head))
+    return bool(
+        _REFUSAL_HEAD_RE.match(head)
+        or _PARTIAL_REFUSAL_RE.search(head)
+        or _TOPIC_FRAMED_REFUSAL_RE.match(head)
+    )
 
 
 # 零引用时的容差阈值：答案的 3-gram 有多大比例能在上下文里找到。
