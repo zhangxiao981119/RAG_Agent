@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from typing import AsyncIterator
 
@@ -89,6 +90,20 @@ def _validate_images(images: list[ImageRef]) -> None:
 def _sse(event: str, data: dict) -> str:
     """构造 SSE 事件块。data 用 JSON 序列化。"""
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
+# 历史答案中的旧引用编号标记，如 [1]、[12]
+_CITATION_MARK_RE = re.compile(r"\[\d+\]")
+
+
+def _strip_citation_marks(content: str) -> str:
+    """剥离历史 assistant 消息中的旧 [n] 引用编号。
+
+    本轮 <context> 会重新编号；历史里的旧编号若被模型沿用且恰好落在本轮
+    1..N 范围内，L3 引用校验无法识别语义错位（编号合法、指向错误）。
+    前端渲染历史走 DB 原文，不受此处 prompt 侧剥离影响。
+    """
+    return _CITATION_MARK_RE.sub("", content)
 
 
 @router.post("/chat/ask")
@@ -289,15 +304,24 @@ async def chat_ask(
                     .where(
                         Message.conversation_id == conversation_id,
                         Message.role.in_(["user", "assistant"]),
+                        # 显式排除本轮 user 消息。此前用 [:-1] 切片"跳过最新一条"
+                        # 方向写反，实际丢的是最旧一条、本轮问题反而混入历史
+                        # （改写与生成各重复一次）。
+                        Message.id != user_msg.id,
                     )
                     .order_by(Message.created_at.desc())
                     .limit(decisions.HISTORY_FETCH_MAX_ROWS)
                 )).scalars().all()
-                # 按时间正序，跳过最新那条（当前正在处理的 user message）
-                for m in reversed(rewrite_rows[:-1]):
+                # 按时间正序；assistant 占位行（空 content）跳过
+                for m in reversed(rewrite_rows):
                     if m.role == "assistant" and not m.content:
                         continue
-                    rewrite_history.append({"role": m.role, "content": m.content})
+                    content = (
+                        _strip_citation_marks(m.content)
+                        if m.role == "assistant"
+                        else m.content
+                    )
+                    rewrite_history.append({"role": m.role, "content": content})
 
             # 评分 + 改写（一次 LLM 调用完成，score >= 90 直接跳过）
             # 带图时用拼接后的问题（含转录文本），改写模型才能消解对图片内容的指代
@@ -310,6 +334,53 @@ async def chat_ask(
             else:
                 logger.info("chat.rewrite: score=%d, status=%s, 使用原始问题",
                             rewrite_score, rewrite_status)
+
+            # ── 澄清判定（反问用户，不消耗检索）─────────────────────
+            # 三条件同时成立才触发：改写分低于阈值（问题不自包含）、改写未
+            # 产出可用 query、会话无历史可消解。此时带模糊问题去检索只会换来
+            # NO_RELEVANT_CONTENT 拒答，不如直接反问。
+            # 超时/LLM 失败路径 score 恒回 100（复杂度未知）→ 不触发，维持原行为。
+            if (
+                rewrite_score < decisions.QUERY_REWRITE_SCORE_THRESHOLD
+                and rewrite_status != "rewritten"
+                and not rewrite_history
+            ):
+                logger.info("chat.clarify: score=%d, status=%s, 无历史可消解，反问用户",
+                            rewrite_score, rewrite_status)
+                yield _sse("refused", {
+                    "reason": "NEED_CLARIFICATION",
+                    "message": "问题不够明确，请补充具体对象或背景后重试",
+                })
+                await _persist_assistant(
+                    conversation_id, user, message_id,
+                    text="", refused=True, citations=[],
+                    meta={"refused": True, "reason": "NEED_CLARIFICATION"},
+                )
+                _total_ms = int((_time.monotonic() - _t0) * 1000)
+                await audit.record(
+                    user.tenant_id, user.user_id, "chat.ask",
+                    object_type="conversation", object_id=str(conversation_id),
+                    detail={
+                        "question": payload.question,
+                        "kb_ids": [str(kb) for kb in effective_kb_ids],
+                        "doc_ids": [],
+                        "refused": True,
+                        "refuse_reason": "NEED_CLARIFICATION",
+                        "rewrite_status": rewrite_status,
+                        "rewrite_score": rewrite_score,
+                    },
+                )
+                await audit.record(
+                    user.tenant_id, user.user_id, "chat.ask.metric",
+                    object_type="conversation", object_id=str(conversation_id),
+                    detail={
+                        "total_ms": _total_ms,
+                        "refused": True,
+                        "refuse_reason": "NEED_CLARIFICATION",
+                        "chunks_count": 0,
+                    },
+                )
+                return
 
             # 检索（用改写后的 query，原始 question 留给 generation）
             # ★ 走链式检索入口：按 rewrite_score 复杂度信号决定是否拆解为多轮检索，

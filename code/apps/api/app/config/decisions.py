@@ -67,7 +67,8 @@ TOP_K_RECALL: Final[int] = 50                   # 每路召回条数
 TOP_K_RERANK: Final[int] = 8                    # 重排后取用条数
 RRF_K: Final[int] = 60
 MAX_HISTORY_TURNS: Final[int] = 6               # 短期记忆：最近 6 条历史消息（3 轮问答）—— generation 默认保留轮数
-MEMORY_COMPRESS_THRESHOLD: Final[int] = 12      # 历史超过 12 条时触发压缩（条数兜底，超限 token 也会触发）
+# 压缩触发唯一口径 = token 预算超限（见 MEMORY_COMPRESS_* 与 memory.compress_history）；
+# 曾有 MEMORY_COMPRESS_THRESHOLD=12 的"条数兜底"常量但全仓零引用，已删除，避免双口径误导。
 MEMORY_MAX_FACTS: Final[int] = 20                # 长期记忆：用户画像最多缓存 20 条关键事实
 MEMORY_MAX_PROFILE_CHARS: Final[int] = 800      # 长期记忆：用户画像文本上限
 
@@ -147,9 +148,12 @@ HISTORY_FETCH_MAX_ROWS: Final[int] = 500
 后续各阶段（改写/压缩/generation）均按各自 token budget 再裁剪。"""
 
 # ── Query 改写阶段的 history token budget ───────────────
-QUERY_REWRITE_HISTORY_BUDGET_TOKENS: Final[int] = 32_000
-"""改写 LLM 调用里 history 能占用的 token 数上限（占 128K 窗口的 1/4）。
-改写 prompt + 输出空间 + 当前问题 ≈ 8K，history 留 32K 足够装下 160+ 条短对话。
+QUERY_REWRITE_HISTORY_BUDGET_TOKENS: Final[int] = 12_000
+"""改写 LLM 调用里 history 能占用的 token 数上限。
+★ 由 32K 下调至 12K：旧值按 128K 窗口口径写，但改写与生成同走 deepseek-chat
+  32K 窗口 —— 长会话时改写请求自身超窗报错、静默回退（score 恒回 100），
+  改写与链式触发在长会话里双双永久失效。
+  12K + 改写 prompt/当前问题/输出 ≈ 20K，稳落在 32K 窗口内。
 截断策略：从最新的历史往前累积，超过 budget 就丢弃更早的。"""
 
 # ── Query 改写（RAG 前置增强）─────────────────────────
