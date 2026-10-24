@@ -88,6 +88,18 @@ LLM_MODEL=<本地部署的视觉模型，如 Qwen2.5-VL-7B-Instruct>
 docker compose -p kagent -f docker-compose.prod.yml up -d --build
 ```
 
+★ **只重建 api 不重建 worker 会导致"任务成功但结果不对"**：api 与 worker 各自构建独立镜像
+（`code-api` / `code-worker`），`docker compose build api` 只更新前者。worker 静默跑旧代码时，
+解析任务照常返回 `indexed`，但新版解析逻辑（如内嵌图转录）完全不生效，且日志里没有任何异常 ——
+2026-10 排查内嵌图不生效时即栽在这里。升级代码 MUST 重建两者，或直接用上面的
+`up -d --build`（会重建全部服务）。验证方式：
+
+```bash
+# 两边都应打印 True（False 说明该服务跑的是旧镜像）
+docker compose -p kagent exec api    python -c "import app.services.parse.docx_parser as m; print('api', hasattr(m, 'parse_docx_async'))"
+docker compose -p kagent exec worker python -c "import app.services.parse.docx_parser as m; print('worker', hasattr(m, 'parse_docx_async'))"
+```
+
 ### 3.3 观察启动过程
 
 启动顺序由编排保证：**postgres 健康 → migrate 一次性服务执行 `alembic upgrade head` → migrate 成功后 api/worker 才启动**。migrate 失败则下游服务不启动（fail-fast），避免用旧 schema 跑新代码。
