@@ -43,6 +43,20 @@ def _image_size(data: bytes) -> tuple[int, int] | None:
         return None
 
 
+def _flatten_cell_text(text: str) -> str:
+    """把单元格转录压成单行：换行 → ` / `，Tab → ` | `。
+
+    ★ 单元格转录会被拼进外层表格的 TSV 行里，换行与 Tab 都是行列分隔符 ——
+      原样写入会把一格内容撑成多行多列，整表的行内绑定直接被打散。
+    """
+    lines: list[str] = []
+    for line in text.splitlines():
+        cells = [cell.strip() for cell in line.split("\t") if cell.strip()]
+        if cells:
+            lines.append(" | ".join(cells))
+    return " / ".join(lines)
+
+
 class EmbeddedImageRunner:
     """单份文档的内嵌图转录编排器：去重、过滤、分类预算、串行转录、计数。
 
@@ -115,7 +129,16 @@ class EmbeddedImageRunner:
         self._transcribed[category] = self._transcribed.get(category, 0) + 1
         block.heading_path = heading_path
         block.page_no = page_no
-        block.text = f"[图片转录] {block.text}"
+        if category == "table_cell":
+            # 单元格转录要回填外层表格：压平行列分隔符，并撤销"表格块"标记 ——
+            # 单元格里的图片表格嵌套不进 TSV，只能退化成一行描述
+            block.text = f"[图片转录] {_flatten_cell_text(block.text)}"
+            block.is_table = False
+            block.table_header = []
+        elif not block.is_table:
+            # 段落里的表格图不加前缀：前缀会落在表头行首，chunk 层据此识别表头，
+            # 加了就变成"一个叫 [图片转录] 型号 的列名"，表头语义被污染
+            block.text = f"[图片转录] {block.text}"
         return block
 
     def log_summary(self, source: str) -> None:
