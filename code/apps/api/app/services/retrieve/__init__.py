@@ -25,6 +25,7 @@ from app.config.settings import get_settings
 from app.infra import metrics, trace
 from app.services.acl.visibility import pushdown_params  # noqa: F401  (外部引用，保留导出)
 from app.services.embedding import get_embedding_service
+from app.services.keyword_text import build_fts_query, build_ilike_terms
 from app.services.retrieve.base import RetrievalResult, RetrievedChunk
 from app.services.retrieve.chain import (
     ChainDecomposeError,
@@ -67,37 +68,52 @@ ORDER BY c.embedding <=> '{{query_vec}}'::vector
 LIMIT :limit
 """
 
-# 关键词召回（ILIKE 子串匹配）
-# ESCAPE '\' 让 pattern 中的 \% \_ 当字面量，避免用户输入的 %/_ 被当 SQL 通配符
+# 关键词召回（ILIKE / 正则子串匹配）
+# ★ 此前是「整句子串」：自然问句整句几乎不可能原样出现在 chunk 里，实测 206 条评测
+#   用例 0 命中，还白花约 11ms 全表扫描。改为「合格词元的正则 OR」（keyword_text.
+#   build_ilike_terms）：中文 >= 3 字的连续段、ASCII 标识符/长词，单次扫描同时覆盖
+#   content 与 heading_path，实测 63/206 命中、平均 5.2 行、耗时与原来持平。
+# ★ 用 ~* 而非 ILIKE：多词元 OR 若用多条 ILIKE 要写成 N 个分支（每支一次匹配），
+#   正则一条即可；词元经 Python re.escape，不存在通配/正则注入。
+# ★ ORDER BY：LIMIT 50 若不带排序，取的是堆表顺序 —— 命中集里哪 50 条进 RRF 完全
+#   随机（评测不可复现）。按**最长词元**的首次出现位置升序；正文未命中用标题位置
+#   兜底，两处都没有落 2147483647 排最后。
+#   :needle 是最长词元的小写原文，专供 strpos 使用（strpos 不做通配语义）。
 _KEYWORD_SQL = text(f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
        c.level_rank, c.acl_tags, c.table_group_id,
        COALESCE(c.governance_weight, 0) AS governance_weight
 FROM chunks c
 {_WHERE_BASE}
-  AND (c.content ILIKE :pattern ESCAPE '\\' OR c.heading_path ILIKE :pattern ESCAPE '\\')
+  AND (c.content ~* :pattern OR c.heading_path ~* :pattern)
+ORDER BY LEAST(
+    CASE WHEN strpos(lower(c.content), :needle) > 0
+         THEN strpos(lower(c.content), :needle) ELSE 2147483647 END,
+    CASE WHEN strpos(lower(c.heading_path), :needle) > 0
+         THEN strpos(lower(c.heading_path), :needle) ELSE 2147483647 END
+)
 LIMIT :limit
 """)
 
-# ★ 关键词召回（tsquery 路径）—— 走 entities.py 里已建但此前未使用的 idx_chunk_fts
+# ★ 关键词召回（tsquery 路径）—— 走迁移 0020 新建的 idx_chunk_fts_vec
 #   收益：索引可用 + 词元级匹配（不再只靠子串），且 ts_rank 提供真实排序分。
-#   限制：PostgreSQL 'simple' 配置不做中文分词，中文仍靠上面的 ILIKE 路径。
+#   过滤与排序都读 fts_vec（生成列 = to_tsvector('simple', fts_text)）：
+#   fts_text 是入库侧预切分的中文 2-gram + ASCII 整词，PostgreSQL 'simple'
+#   配置本身不切中文，直接索引 content 时中文恒不命中。
+#   ★ MUST 读 fts_vec 而不是每次 to_tsvector(fts_text)：ts_rank 需要 tsvector，
+#     表达式索引不返回它，会退化成对每条命中行重算 + detoast 原文（实测 142ms，
+#     命中数百行时）；读存储列后同一查询 1.9ms。
 #   ★ to_tsquery 必须**内联**写两遍，不能写成 `FROM chunks c, to_tsquery(...) AS q(query)`：
-#     @@ 右侧一旦是函数扫描产出的列变量，planner 无法把它当常量去匹配 GIN
-#     表达式索引 idx_chunk_fts，索引条件会退化为每行 Filter（逐行重算 to_tsvector）。
-#   ★ 另需连接级 plan_cache_mode=force_custom_plan（见 database.py）：generic plan
-#     估不出 tsquery 的选择性，会改用 idx_chunk_filter/idx_chunk_acl 的 BitmapAnd
-#     并把 @@ 降级成 Filter —— 实测从约 5ms 劣化到 45ms 量级。
+#     @@ 右侧一旦是函数扫描产出的列变量，planner 无法把它当常量去匹配 GIN 索引，
+#     索引条件会退化为每行 Filter。
 _KEYWORD_FTS_SQL = text(f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
        c.level_rank, c.acl_tags, c.table_group_id,
        COALESCE(c.governance_weight, 0) AS governance_weight,
-       ts_rank(
-           to_tsvector('simple', c.content), to_tsquery('simple', :tsquery)
-       ) AS keyword_score
+       ts_rank(c.fts_vec, to_tsquery('simple', :tsquery)) AS keyword_score
 FROM chunks c
 {_WHERE_BASE}
-  AND to_tsvector('simple', c.content) @@ to_tsquery('simple', :tsquery)
+  AND c.fts_vec @@ to_tsquery('simple', :tsquery)
 ORDER BY keyword_score DESC
 LIMIT :limit
 """)
@@ -122,31 +138,8 @@ ORDER BY c.chunk_index
 LIMIT :recall_limit
 """)
 
-# 从查询中提取可安全用于 tsquery 的词元：仅 ASCII 字母/数字/下划线，长度 >= 2。
-# 只提取这类词元有两个原因：
-#   ① 它们是 tsquery 能正确处理的（无需转义操作符，也匹配得上 'simple' 分词结果）
-#   ② 中文/日文等无法被 'simple' 配置分词，交给 ILIKE 路径处理
-_TS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}")
-
-
-def build_tsquery(query: str, max_tokens: int = 12) -> str | None:
-    """把查询里的 ASCII/数字词元拼成 tsquery（OR 连接）。
-
-    返回 None 表示无可用词元 —— 调用方应当跳过 FTS 路径。
-    OR 而非 AND：关键词召回是**召回**路径，优先保召回率，精排交给 RRF 与重排。
-    """
-    tokens = _TS_TOKEN_RE.findall(query[:400])
-    if not tokens:
-        return None
-    # 去重并保持出现顺序，避免重复词元膨胀 tsquery
-    seen: list[str] = []
-    for tk in tokens:
-        low = tk.lower()
-        if low not in seen:
-            seen.append(low)
-        if len(seen) >= max_tokens:
-            break
-    return " | ".join(seen)
+# 查询侧的 tsquery 构造在 keyword_text 模块 —— 与入库侧的 to_fts_text 共用切分规则，
+# 中文 bigram 才能与索引里的 token 对上（各写一份必然静默 0 召回）。
 
 
 def _build_rrf_scores(
@@ -221,32 +214,33 @@ class RetrievalService:
         metrics.observe_ms("rag.retrieve.embed", embed_ms)
         metrics.observe_ms("rag.retrieve.vector_sql", vector_ms)
 
-        # ② 关键词召回（双路径：tsquery 走全文索引 + ILIKE 兜中文）
+        # ② 关键词召回（双路径：ILIKE 子串 + tsquery 全文索引）
         #    两路分开计时：ILIKE 是顺序扫描（随数据量线性变差），
-        #    tsquery 走 GIN 索引，混在一起会把扩展前后的差异互相掩盖。
+        #    tsquery 走 GIN 索引，混在一起会把两路的成本差异互相掩盖。
         t0 = time.perf_counter()
-        # 转义 ILIKE 通配符 % 和 _，避免用户输入改变匹配语义
-        # （如查询 "100% 完成" 不应把 % 当任意字符通配）
-        escaped = (
-            query[:200]
-            .replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
-        pattern = f"%{escaped}%"
-        keyword_result = await session.execute(
-            _KEYWORD_SQL,
-            {**pushdown, "pattern": pattern, "limit": decisions.TOP_K_RECALL},
-        )
-        keyword_rows = list(keyword_result.fetchall())
+        ilike_terms = build_ilike_terms(query)
+        keyword_rows: list = []
+        if ilike_terms:
+            # 词元已按长度降序，第一个即最长词元，用作排序 needle
+            keyword_result = await session.execute(
+                _KEYWORD_SQL,
+                {
+                    **pushdown,
+                    # re.escape 后做正则分支：词元里的 . * + ? 等不会被当元字符
+                    "pattern": "|".join(re.escape(term) for term in ilike_terms),
+                    "needle": ilike_terms[0].lower(),
+                    "limit": decisions.TOP_K_RECALL,
+                },
+            )
+            keyword_rows = list(keyword_result.fetchall())
         ilike_ms = (time.perf_counter() - t0) * 1000
         stages["keyword_ilike"] = int(ilike_ms)
         metrics.observe_ms("rag.retrieve.keyword_ilike", ilike_ms)
 
-        # ★ tsquery 路径：走 idx_chunk_fts 索引，只用 ASCII/数字词元
+        # ★ tsquery 路径：走 idx_chunk_fts_vec，中文按 3 字窗口、ASCII 按整词
         fts_rows = []
         fts_ms = 0.0
-        tsquery = build_tsquery(query) if decisions.KEYWORD_TSQUERY_ENABLED else None
+        tsquery = build_fts_query(query) if decisions.KEYWORD_TSQUERY_ENABLED else None
         if tsquery:
             t_fts = time.perf_counter()
             try:

@@ -39,6 +39,7 @@ from app.models import Chunk, Document, ParseJob, ParseSegment
 from app.services.chunk import chunk_blocks, to_embedding_text
 from app.services.embedding import get_embedding_service
 from app.services.governance import execute_governance_job, scan_and_enqueue
+from app.services.keyword_text import to_fts_text
 from app.services.parse import ParseError, parse_bytes_async
 from app.services.parse.pdf_parser import (
     blocks_from_page_texts,
@@ -190,6 +191,9 @@ async def _index_document(
                     document_id=doc_ext["id"],
                     chunk_index=index,
                     content=chunk.content,
+                    # 关键词召回的预切分文本（中文 2-gram + ASCII 整词），
+                    # 与查询侧共用 keyword_text.to_fts_text
+                    fts_text=to_fts_text(chunk.content, chunk.heading_path),
                     token_count=chunk.token_count,
                     heading_path=chunk.heading_path or None,
                     page_no=chunk.page_no,
@@ -486,6 +490,9 @@ async def run_parse_finalize(
                     document_id=doc_ext["id"],
                     chunk_index=index,
                     content=chunk.content,
+                    # 关键词召回的预切分文本（中文 2-gram + ASCII 整词），
+                    # 与查询侧共用 keyword_text.to_fts_text
+                    fts_text=to_fts_text(chunk.content, chunk.heading_path),
                     token_count=chunk.token_count,
                     heading_path=chunk.heading_path or None,
                     page_no=chunk.page_no,

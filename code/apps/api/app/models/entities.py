@@ -8,6 +8,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Computed,
     DateTime,
     ForeignKey,
     Index,
@@ -18,7 +19,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, INET, JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, INET, JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -222,6 +223,16 @@ class Chunk(Base):
     document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # M8 关键词召回（迁移 0020）：中文重叠 2-gram + ASCII 整词的预切分文本。
+    # 由 keyword_text.to_fts_text 生成；'simple' 配置不能切中文，故必须在入库侧切好，
+    # 查询侧再用同一模块生成 tsquery。为 NULL 表示该行尚未回填。
+    fts_text: Mapped[str | None] = mapped_column(Text)
+    # 生成列：fts_text 落库后由 PG 自动算出 tsvector（应用侧 MUST NOT 写入）。
+    # ★ 不存 tsvector 而是每次 to_tsvector 的代价：ts_rank 对每条命中行重算并
+    #   detoast 原文，实测 142ms（命中数百行）；用存储列后 1.9ms。
+    fts_vec = mapped_column(
+        TSVECTOR, Computed("to_tsvector('simple', fts_text)", persisted=True)
+    )
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     heading_path: Mapped[str | None] = mapped_column(Text)
     page_no: Mapped[int | None] = mapped_column(Integer)
@@ -251,6 +262,9 @@ class Chunk(Base):
         Index("idx_chunk_acl", "acl_tags", postgresql_using="gin"),
         Index("idx_chunk_deny", "deny_subjects", postgresql_using="gin"),
         Index("idx_chunk_fts", text("to_tsvector('simple', content)"), postgresql_using="gin"),
+        # 中文关键词召回（迁移 0020）：索引建在预切分文本生成的 tsvector 存储列上。
+        # ★ 不用表达式索引：ts_rank 拿不到索引里算好的 tsvector，仍会逐行重算。
+        Index("idx_chunk_fts_vec", "fts_vec", postgresql_using="gin"),
         Index(
             "idx_chunk_emb",
             "embedding",

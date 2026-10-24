@@ -54,9 +54,24 @@ def active_threshold(use_rerank: bool) -> float:
 
 # ── 关键词召回路径 ────────────────────────────────────────
 KEYWORD_TSQUERY_ENABLED: Final[bool] = True
-"""启用 tsquery 路径（走 idx_chunk_fts 全文索引）。仅对 ASCII/数字词元生效 ——
-PostgreSQL 的 'simple' 配置不做中文分词，中文仍走 ILIKE 子串匹配。
-两路结果共同进入 RRF，互不替代。"""
+"""启用 tsquery 路径（走 chunks.fts_vec 上的 GIN 索引 idx_chunk_fts_vec）。
+
+入库时由 keyword_text.to_fts_text 预切分（中文重叠 2-gram + ASCII 整词）写入 fts_text，
+由生成列 fts_vec 落成 tsvector；查询侧用同一模块生成 tsquery —— 'simple' 配置不做
+中文分词，不预切分则中文恒不命中。
+与 ILIKE 子串路互补：tsquery 是词元级（3 字窗口），ILIKE 覆盖短词元与标识符子串
+（如 `get_retrieval` 命中 `get_retrieval_service`），两路结果共同进入 RRF，互不替代。"""
+
+FTS_QUERY_MAX_CJK_RUNS: Final[int] = 2
+"""查询侧最多取几个中文连续段生成 tsquery 词元（按长度降序取）。
+
+长问句里靠后的段落多为补充说明，只取最长两段既覆盖核心名词，又控制 tsquery 体积。"""
+
+FTS_QUERY_MAX_TERMS: Final[int] = 24
+"""单条 tsquery 的词元上限（中文 3 字窗口 + ASCII 词元各自计数），超出截断。"""
+
+ILIKE_MAX_TERMS: Final[int] = 6
+"""ILIKE 子串路的词元上限。每个词元都是正则的一个分支，过多会拖慢单次全表扫描。"""
 
 GENERATION_TEMPERATURE: Final[float] = 0.0      # L2
 # 生成温度固定 0：RAG 问答要的是"同一份上下文给出同一个答案"，评测门禁与线上

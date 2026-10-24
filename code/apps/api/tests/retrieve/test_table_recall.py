@@ -79,7 +79,7 @@ class FakeSession:
         sql = stmt.text if hasattr(stmt, "text") else str(stmt)
         if "<=>" in sql:
             return FakeResult(self._h.vector_rows)
-        if "ILIKE" in sql:
+        if "~*" in sql:
             return FakeResult([])
         if "ts_rank" in sql:
             return FakeResult([])
