@@ -27,7 +27,7 @@
 2. 路由文件在 middleware 重构时不能改
 3. API 响应严格遵循 §5.2 schema ({"code":0, "data":..., "msg":""})
 4. LLM 流式序列: meta→stage→citations→delta...→done / refused
-5. 文档解析覆盖 PDF/xlsx/md/txt/docx/xls，扫描版 PDF 抛错
+5. 文档解析覆盖 PDF/xlsx/md/txt/docx/xls/pptx，扫描版 PDF 抛错
 6. 表格整表作为一个chunk；超 CHUNK_MAX_TOKENS 时按行组切，**每组重复注入表头**
 7. PDF 表格由 pdfplumber 识别（pypdf 只出文本层，会把列关系拍平）；
    同页正文用词坐标排除表格区域，避免同一数据入块两次

@@ -287,7 +287,7 @@ export function DocumentsPage() {
 
       {selectedKbCanUpload ? (
         <Dragger
-          accept=".pdf,.md,.txt,.xls,.xlsx,.docx"
+          accept=".pdf,.md,.txt,.xls,.xlsx,.docx,.pptx"
           multiple
           showUploadList={false}
           disabled={uploading || !selectedKb}

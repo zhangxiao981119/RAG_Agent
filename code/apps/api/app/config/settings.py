@@ -96,7 +96,7 @@ class Settings(BaseSettings):
     #   OCR_ENABLED（见 api/kbs.py 的联动校验），不会落到解析层才失败。
     allowed_ext: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: [
-            "pdf", "md", "txt", "xls", "xlsx", "docx",
+            "pdf", "md", "txt", "xls", "xlsx", "docx", "pptx",
             "png", "jpg", "jpeg", "gif", "webp", "bmp",
         ]
     )

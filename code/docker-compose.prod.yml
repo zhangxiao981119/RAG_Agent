@@ -172,7 +172,7 @@ services:
       #   OCR_ENABLED 必须保持 false —— 此时图片上传会被 kbs.py 拦成 415 并提示
       #   需要开 OCR，而不是落进解析层才失败。要真正支持扫描件/图片，
       #   MUST 先把 apps/ocr 作为一个服务加进来并把 OCR_ENABLED 置 true。
-      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx,png,jpg,jpeg,gif,webp,bmp}
+      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx,pptx,png,jpg,jpeg,gif,webp,bmp}
       OCR_ENABLED: ${OCR_ENABLED:-false}
       OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:8000}
       IMAGE_QUALITY_GATE_ENABLED: ${IMAGE_QUALITY_GATE_ENABLED:-true}
@@ -225,7 +225,7 @@ services:
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://embedding:8000/v1}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
-      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx,png,jpg,jpeg,gif,webp,bmp}
+      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx,pptx,png,jpg,jpeg,gif,webp,bmp}
       OCR_ENABLED: ${OCR_ENABLED:-false}
       OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:8000}
       IMAGE_QUALITY_GATE_ENABLED: ${IMAGE_QUALITY_GATE_ENABLED:-true}

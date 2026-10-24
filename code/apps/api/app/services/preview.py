@@ -3,6 +3,7 @@
 支持格式（与上传白名单一致）：
   · md / txt     原文直接返回
   · docx         python-docx 提取段落 + 表格
+  · pptx         python-pptx 按页提取文本框 + 表格
   · xlsx         openpyxl 提取工作表（tab 分隔）
   · xls          xlrd 提取工作表
   · pdf          pypdf 逐页提取文本层（扫描件无文本层时给提示）
@@ -27,6 +28,7 @@ def extract_preview_text(ext: str, data: bytes) -> str:
         "md": _text_plain,
         "txt": _text_plain,
         "docx": _docx_text,
+        "pptx": _pptx_text,
         "xlsx": _xlsx_text,
         "xls": _xls_text,
         "pdf": _pdf_text,
@@ -64,6 +66,26 @@ def _docx_text(data: bytes) -> str:
         for row in table.rows:
             cells = [c.text.strip() for c in row.cells]
             parts.append("\t".join(cells))
+    return "\n".join(parts)
+
+
+def _pptx_text(data: bytes) -> str:
+    from pptx import Presentation
+
+    prs = Presentation(BytesIO(data))
+    parts: list[str] = []
+    for page_no, slide in enumerate(prs.slides, start=1):
+        parts.append(f"--- 第 {page_no} 页 ---")
+        for shape in slide.shapes:
+            if shape.has_table:
+                for row in shape.table.rows:
+                    cells = [c.text.strip() for c in row.cells]
+                    parts.append("\t".join(cells))
+            elif shape.has_text_frame:
+                text = shape.text_frame.text.strip()
+                if text:
+                    parts.append(text)
+        parts.append("")
     return "\n".join(parts)
 
 

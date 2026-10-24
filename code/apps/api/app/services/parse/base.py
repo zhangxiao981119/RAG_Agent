@@ -8,11 +8,14 @@
              见 workers/parse_job.py 的 run_parse_segment，本入口对扫描件 fail-closed）
   · .md    → markdown 标题层级切分
   · .txt   → 按空行切段
-  · .xlsx  → openpyxl，按 sheet 整表输出（chunk 服务整表不切）
+  · .xlsx  → openpyxl，按 sheet 整表输出（chunk 服务整表不切）；异步入口在
+             ocr_enabled=true 时还会把 sheet 内嵌图经视觉 LLM 转录进锚点格
+  · .pptx  → python-pptx，按页/标题/段落/表格切分；异步入口在 ocr_enabled=true
+             时还会把页内图片经视觉 LLM 转录为「[图片转录]」块
   · .docx  → python-docx，按标题/段落/表格切分；异步入口在 ocr_enabled=true 时
              还会把段落内嵌图经视觉 LLM 转录为「[图片转录]」块插回文档流
-  · .png/.jpg/.jpeg/.gif/.webp/.bmp → 本地 OCR 服务转录（异步，见 parse_bytes_async；
-    受 settings.ocr_enabled + ocr_base_url 双门控，M7 WU-M-09 / B'）
+  · .png/.jpg/.jpeg/.gif/.webp/.bmp → 视觉 LLM 转录（异步，见 parse_bytes_async；
+    受 settings.ocr_enabled 门控；表格截图会拿到 is_table / table_header）
 
 ★ PDF 标题识别：pypdf 不带 layout，这里用行首模式匹配
   （"第 X 章/X.Y 标题/数字. 序号"），识别不到则退化为"第 N 页"。
@@ -62,9 +65,10 @@ def cell_to_text(v: object) -> str:
 from app.services.parse.markdown_parser import parse_markdown  # noqa: E402
 from app.services.parse.pdf_parser import parse_pdf, parse_pdf_async  # noqa: E402
 from app.services.parse.text_parser import parse_text  # noqa: E402
-from app.services.parse.xlsx_parser import parse_xlsx  # noqa: E402
+from app.services.parse.xlsx_parser import parse_xlsx, parse_xlsx_async  # noqa: E402
 from app.services.parse.xls_parser import parse_xls  # noqa: E402
 from app.services.parse.docx_parser import parse_docx, parse_docx_async  # noqa: E402
+from app.services.parse.pptx_parser import parse_pptx, parse_pptx_async  # noqa: E402
 from app.services.parse.html_parser import parse_html  # noqa: E402
 from app.services.parse.image_parser import IMAGE_EXTS, parse_image  # noqa: E402
 
@@ -76,6 +80,7 @@ _DISPATCH = {
     "xlsx": parse_xlsx,
     "xls": parse_xls,
     "docx": parse_docx,
+    "pptx": parse_pptx,
     # M7 WU-M-14：web 同步源的抓取产物（ext=html）走标准 ParseJob 链路
     # （重试/状态机/审计复用）。html 只来自同步抓取 —— 上传端点的 ALLOWED_EXT
     # 仍不含 html，用户直接上传 .html 依然被拒（边界不变）
@@ -111,12 +116,14 @@ def parse_bytes(ext: str, data: bytes) -> list[ParsedBlock]:
 async def parse_bytes_async(ext: str, data: bytes) -> list[ParsedBlock]:
     """异步分派入口 —— worker 普通文档路径的统一调用点（M7 WU-M-09 / WU-M-10）。
 
-    图片扩展名走本地 OCR（异步 HTTP）；pdf 走 parse_pdf_async（仅文本层，
+    图片扩展名走视觉 LLM 转录（异步 HTTP）；pdf 走 parse_pdf_async（仅文本层，
     纯扫描件由 worker 分段流水线另走，本入口对扫描件 ParseError）；
-    docx 走 parse_docx_async（ocr_enabled=true 时段落内嵌图经视觉 LLM 转录插回文档流）；
+    docx 走 parse_docx_async（段落内嵌图转录插回文档流）；
+    xlsx 走 parse_xlsx_async（sheet 内嵌图转录进锚点格）；
+    pptx 走 parse_pptx_async（页内图片转录为独立块）；
     其余走既有同步 parse_bytes；NUL 清洗对全部分支同样收口（同一唯一出口的口径不变）。
     ★ ocr_enabled=false 时图片在此处 ParseError（fail-closed）；
-      docx/pdf 的内嵌图则整体跳过、只入文本（D1a 口径，各入口内部门控）。
+      docx/pdf/xlsx/pptx 的内嵌图则整体跳过、只入文本（D1a 口径，各入口内部门控）。
     """
     ext_l = ext.lower()
     if ext_l in IMAGE_EXTS:
@@ -125,4 +132,8 @@ async def parse_bytes_async(ext: str, data: bytes) -> list[ParsedBlock]:
         return _strip_nul(await parse_pdf_async(data))
     if ext_l == "docx":
         return _strip_nul(await parse_docx_async(data))
+    if ext_l == "xlsx":
+        return _strip_nul(await parse_xlsx_async(data))
+    if ext_l == "pptx":
+        return _strip_nul(await parse_pptx_async(data))
     return parse_bytes(ext_l, data)

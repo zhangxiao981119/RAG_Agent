@@ -168,7 +168,7 @@ services:
       OCR_ENABLED: ${OCR_ENABLED:-false}
       OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:8000}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-100}
-      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx,png,jpg,jpeg,gif,webp,bmp}
+      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx,pptx,png,jpg,jpeg,gif,webp,bmp}
       # 图像质量门禁（去噪/去污 + 质量识别）：阈值在 decisions.py，这里是开关。
       # ★ 与 worker 同源注入 —— 上传层放行图片，解析层才真正过门禁。
       IMAGE_QUALITY_GATE_ENABLED: ${IMAGE_QUALITY_GATE_ENABLED:-true}
@@ -234,7 +234,7 @@ services:
       # B' 扫描件 OCR：解析任务在 worker 内调用本地 ocr 服务（fail-closed，未启用时不触达）
       OCR_ENABLED: ${OCR_ENABLED:-false}
       OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:8000}
-      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx,png,jpg,jpeg,gif,webp,bmp}
+      ALLOWED_EXT: ${ALLOWED_EXT:-pdf,md,txt,xls,xlsx,docx,pptx,png,jpg,jpeg,gif,webp,bmp}
       # 图像质量门禁开关（解析在 worker 内执行，必须与 api 段同源）
       IMAGE_QUALITY_GATE_ENABLED: ${IMAGE_QUALITY_GATE_ENABLED:-true}
       IMAGE_ENHANCE_ENABLED: ${IMAGE_ENHANCE_ENABLED:-true}

@@ -25,7 +25,7 @@ from app.infra import metrics
 class Modality(str, Enum):
     """知识 / 提问的形态。禁止在各层散落裸字符串（WU-M-02）。"""
 
-    TEXT = "text"    # 文本类知识：pdf(文本层) / md / txt / docx / xlsx / xls / html
+    TEXT = "text"    # 文本类知识：pdf(文本层) / md / txt / docx / pptx / xlsx / xls / html
     IMAGE = "image"  # 图片类：图片文件、扫描件 PDF、聊天带图提问
     WEB = "web"      # 网页源：内部网址抓取到的 html 页面
 
@@ -44,7 +44,7 @@ IMAGE_EXTS: Final[frozenset[str]] = frozenset(
 )
 # 文本类扩展名：含 html/htm —— 网页抓取落盘后的形态（不参与上传白名单）
 TEXT_EXTS: Final[frozenset[str]] = frozenset(
-    {"pdf", "md", "txt", "docx", "xlsx", "xls", "html", "htm"}
+    {"pdf", "md", "txt", "docx", "pptx", "xlsx", "xls", "html", "htm"}
 )
 
 # 形态 → 处理链路标识，供后续 WU 选择具体处理器：
