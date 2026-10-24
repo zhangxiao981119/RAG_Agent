@@ -3,7 +3,7 @@
 """回填 chunks.fts_text（中文重叠 2-gram + ASCII 整词）。
 
 背景：迁移 0020 只加列与索引，已有 chunk 的 fts_text 为 NULL；查询侧切到
-idx_chunk_fts_text 之前必须回填。切分口径 MUST 用
+idx_chunk_fts_vec 之前必须回填。切分口径 MUST 用
 app/services/keyword_text.to_fts_text —— 在 SQL 里另写一份 bigram 逻辑必然与查询侧
 不一致，表现为静默 0 召回（不报错、不告警）。
 

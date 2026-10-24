@@ -931,7 +931,12 @@ CREATE INDEX idx_chunk_doc      ON chunks(document_id);
 CREATE INDEX idx_chunk_filter   ON chunks(tenant_id, kb_id, is_latest, level_rank);
 CREATE INDEX idx_chunk_acl      ON chunks USING GIN (acl_tags);
 CREATE INDEX idx_chunk_deny     ON chunks USING GIN (deny_subjects);
-CREATE INDEX idx_chunk_fts      ON chunks USING GIN (to_tsvector('simple', content));
+-- 关键词召回：'simple' 不切中文，故入库时预切片成 fts_text（中文 2-gram + ASCII 整词），
+-- fts_vec 为它生成的 tsvector 存储列；旧表达式索引 idx_chunk_fts 由迁移 0021 删除
+ALTER TABLE chunks ADD COLUMN fts_text TEXT;
+ALTER TABLE chunks ADD COLUMN fts_vec  TSVECTOR
+    GENERATED ALWAYS AS (to_tsvector('simple', fts_text)) STORED;
+CREATE INDEX idx_chunk_fts_vec  ON chunks USING GIN (fts_vec);
 CREATE INDEX idx_chunk_emb      ON chunks USING hnsw (embedding vector_cosine_ops);
 ```
 

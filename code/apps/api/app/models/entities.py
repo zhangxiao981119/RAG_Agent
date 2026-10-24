@@ -261,8 +261,8 @@ class Chunk(Base):
         Index("idx_chunk_filter", "tenant_id", "kb_id", "is_latest", "level_rank"),
         Index("idx_chunk_acl", "acl_tags", postgresql_using="gin"),
         Index("idx_chunk_deny", "deny_subjects", postgresql_using="gin"),
-        Index("idx_chunk_fts", text("to_tsvector('simple', content)"), postgresql_using="gin"),
-        # 中文关键词召回（迁移 0020）：索引建在预切分文本生成的 tsvector 存储列上。
+        # 关键词召回（迁移 0020 替代旧的 idx_chunk_fts）：索引建在预切分文本生成的
+        # tsvector 存储列上，中文 2-gram 也因此可命中。
         # ★ 不用表达式索引：ts_rank 拿不到索引里算好的 tsvector，仍会逐行重算。
         Index("idx_chunk_fts_vec", "fts_vec", postgresql_using="gin"),
         Index(
