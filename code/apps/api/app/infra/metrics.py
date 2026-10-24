@@ -114,6 +114,67 @@ def _series_key(sample_name: str, labels: dict[str, str]) -> str:
     return f"{sample_name}|{label_part}" if label_part else sample_name
 
 
+def _matches_tags(sample_labels: dict[str, str], tags: dict[str, str]) -> bool:
+    """样本标签是否包含全部查询标签（`le` 等分桶标签不参与匹配）。"""
+    return all(sample_labels.get(k) == v for k, v in tags.items())
+
+
+def _buckets_of(collector: Histogram, tags: dict[str, str]) -> list[tuple[float, float]]:
+    """取指定标签组合的 (桶上界秒, 累积计数) 序列，按上界升序。"""
+    buckets: dict[float, float] = {}
+    for metric in collector.collect():
+        for sample in metric.samples:
+            if not sample.name.endswith("_bucket"):
+                continue
+            if not _matches_tags(sample.labels, tags):
+                continue
+            buckets[float(sample.labels["le"])] = float(sample.value)
+    return sorted(buckets.items())
+
+
+def _quantile_from_buckets(buckets: list[tuple[float, float]], q: float) -> float | None:
+    """按 Prometheus histogram_quantile 的口径做线性插值，返回秒。
+
+    桶只保留累积计数，分位数只能是近似值；`+Inf` 桶内无法插值，
+    落到 `+Inf` 时返回上一个有限上界（与官方实现一致）。
+    """
+    if not buckets:
+        return None
+    total = buckets[-1][1]
+    if total <= 0:
+        return None
+    rank = q * total
+    prev_le = 0.0
+    prev_count = 0.0
+    for le, cumulative in buckets:
+        if cumulative < rank:
+            prev_le, prev_count = le, cumulative
+            continue
+        if le == float("inf"):
+            return prev_le
+        span = cumulative - prev_count
+        if span <= 0:
+            return le
+        return prev_le + (rank - prev_count) / span * (le - prev_le)
+    return buckets[-1][0] if buckets[-1][0] != float("inf") else prev_le
+
+
+def quantile_ms(name: str, q: float, **tags: str) -> float | None:
+    """读取某指标某标签组合的近似分位数（毫秒）；无样本返回 None。
+
+    分位数用于判断“哪一段耗时主导 p95”——直方图桶是唯一保留下来的分布信息，
+    因此必须与 `observe_ms` 使用同一个规范化名称。
+    """
+    key = _normalize(name)
+    if not key.endswith("_seconds"):
+        key = f"{key}_seconds"
+    collector = _histograms.get(key)
+    if collector is None:
+        return None
+    seconds = _quantile_from_buckets(_buckets_of(collector, tags), q)
+    return None if seconds is None else round(seconds * 1000.0, 3)
+
+
 def snapshot() -> dict[str, object]:
     """导出当前快照（JSON 友好）。供管理端接口 / 测试断言使用。
 
@@ -148,6 +209,24 @@ def snapshot() -> dict[str, object]:
     for slot in histograms.values():
         count = slot["count"]
         slot["avg_ms"] = round(slot["sum_ms"] / count, 3) if count else 0.0
+
+    # 分位数：直方图桶按 le 累积，插值口径与 Prometheus histogram_quantile 一致。
+    # 只给已存在的序列补 p50/p95，避免重复构造键。
+    for collector in _histograms.values():
+        for metric in collector.collect():
+            for sample in metric.samples:
+                if not sample.name.endswith("_count"):
+                    continue
+                base = sample.name[: -len("_count")]
+                slot = histograms.get(_series_key(base, sample.labels))
+                if slot is None:
+                    continue
+                buckets = _buckets_of(collector, sample.labels)
+                for q in (0.5, 0.95):
+                    value = _quantile_from_buckets(buckets, q)
+                    slot[f"p{int(q * 100)}_ms"] = (
+                        0.0 if value is None else round(value * 1000.0, 3)
+                    )
 
     return {"counters": counters, "histograms": histograms}
 

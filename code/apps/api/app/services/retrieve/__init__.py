@@ -186,15 +186,18 @@ class RetrievalService:
             "user_subjects": user_subjects,
         }
 
-        # ① 向量召回
+        # ① 向量召回（embedding 调用与向量 SQL 分段计时：两者成本量级不同，
+        #    合并成一个 retrieving 无法判断瓶颈究竟是模型往返还是 HNSW 查询）
         t0 = time.perf_counter()
         embedding_service = get_embedding_service()
         query_vec = await embedding_service.embed_query(query)
+        embed_ms = (time.perf_counter() - t0) * 1000
         # pgvector 输入格式："[0.1,0.2,...]" 字符串，直接嵌入 SQL
         query_vec_str = "[" + ",".join(repr(float(x)) for x in query_vec) + "]"
         vector_sql = text(_VECTOR_SQL_TEMPLATE.format(query_vec=query_vec_str))
         # 按当前索引口径过滤：只召回与本查询向量同构（同模型 + 同文本公式）的 chunk
         profile = current_index_profile()
+        t_vec = time.perf_counter()
         vector_result = await session.execute(
             vector_sql,
             {
@@ -205,9 +208,16 @@ class RetrievalService:
             },
         )
         vector_rows = vector_result.fetchall()
-        stages["retrieving"] = int((time.perf_counter() - t0) * 1000)
+        vector_ms = (time.perf_counter() - t_vec) * 1000
+        stages["embed"] = int(embed_ms)
+        stages["vector_sql"] = int(vector_ms)
+        stages["retrieving"] = int(embed_ms + vector_ms)
+        metrics.observe_ms("rag.retrieve.embed", embed_ms)
+        metrics.observe_ms("rag.retrieve.vector_sql", vector_ms)
 
         # ② 关键词召回（双路径：tsquery 走全文索引 + ILIKE 兜中文）
+        #    两路分开计时：ILIKE 是顺序扫描（随数据量线性变差），
+        #    tsquery 走 GIN 索引，混在一起会把扩展前后的差异互相掩盖。
         t0 = time.perf_counter()
         # 转义 ILIKE 通配符 % 和 _，避免用户输入改变匹配语义
         # （如查询 "100% 完成" 不应把 % 当任意字符通配）
@@ -223,11 +233,16 @@ class RetrievalService:
             {**pushdown, "pattern": pattern, "limit": decisions.TOP_K_RECALL},
         )
         keyword_rows = list(keyword_result.fetchall())
+        ilike_ms = (time.perf_counter() - t0) * 1000
+        stages["keyword_ilike"] = int(ilike_ms)
+        metrics.observe_ms("rag.retrieve.keyword_ilike", ilike_ms)
 
         # ★ tsquery 路径：走 idx_chunk_fts 索引，只用 ASCII/数字词元
         fts_rows = []
+        fts_ms = 0.0
         tsquery = build_tsquery(query) if decisions.KEYWORD_TSQUERY_ENABLED else None
         if tsquery:
+            t_fts = time.perf_counter()
             try:
                 fts_result = await session.execute(
                     _KEYWORD_FTS_SQL,
@@ -238,7 +253,12 @@ class RetrievalService:
                 # FTS 路径失败不应拖垮检索 —— 记录后继续用 ILIKE 结果
                 logger.warning("tsquery 召回失败，仅用 ILIKE 路径", exc_info=True)
                 metrics.incr("rag.keyword.fts_failed")
-        stages["keyword"] = int((time.perf_counter() - t0) * 1000)
+            finally:
+                fts_ms = (time.perf_counter() - t_fts) * 1000
+                stages["keyword_fts"] = int(fts_ms)
+                # 采集到的失败耗时同样计入：失败路径的耗时也是真实成本
+                metrics.observe_ms("rag.retrieve.keyword_fts", fts_ms)
+        stages["keyword"] = int(ilike_ms + fts_ms)
 
         # 合并所有 chunk（去重）
         # 注意：FTS 路径排在 ILIKE 之前入 map，让 keyword_score 字段来自 FTS（ILIRE 行无该字段）
@@ -454,7 +474,9 @@ class RetrievalService:
                     chunks=len(recall_chunks),
                     groups=len(hit_group_ids),
                 )
-            stages["table_recall"] = int((time.perf_counter() - t_recall) * 1000)
+            recall_ms = (time.perf_counter() - t_recall) * 1000
+            stages["table_recall"] = int(recall_ms)
+            metrics.observe_ms("rag.retrieve.table_recall", recall_ms)
 
         # ⑦ 三路召回贡献打点
         #    covered = 最终 top-K 中该路召回到的条数（多路可重叠）
