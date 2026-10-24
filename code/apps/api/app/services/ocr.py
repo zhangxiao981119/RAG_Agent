@@ -1,15 +1,17 @@
-"""本地 OCR 客户端 —— 扫描件 / 图片入库转录（B'，数据不出域）。
+"""本地 OCR 客户端 —— 扫描件 PDF 页转录（B'，数据不出域）。
 
 职责：把图片字节送本地 apps/ocr 服务（GOT-OCR2.0）转录为文本，
-产出既有 ParsedBlock 契约，供 pdf_parser / image_parser 复用。
+产出既有 ParsedBlock 契约，供 pdf_parser 的扫描页复用（用户直传的图片文件
+已改走视觉链路，见 image_parser）。
 
 ★ 单引擎 fail-closed：OCR 服务不可达 / 返回错误 / 空结果一律抛 OcrError，
   由解析层改型为 ParseError —— 任务走 arq 重试 → 死信 → 恢复后重跑。
   **MUST NOT** 在此做第二引擎兜底或纯文本降级（会掩盖故障 + 污染数据口径）。
 ★ 低置信仅告警（OCR_LOW_CONF）：低于阈值打 warning 进审计日志，仍正常入库；
   数据不出域约束下禁止升级外部 LLM 重转录。
-★ 与视觉链路（multimodal/vision.py）的边界：聊天带图走 LLM 视觉转录
-  （理解型提问），入库解析走本地 OCR（逐字转录保真）—— 两条链路独立。
+★ 与视觉链路（multimodal/vision.py）的边界：聊天带图、图片文件直传、文档内嵌图
+  都走 LLM 视觉转录（能拿到表格结构）；扫描件 PDF 页走本地 OCR（逐字转录保真）。
+  两条链路各自 fail-closed，**不互相兜底**。
 """
 from __future__ import annotations
 
