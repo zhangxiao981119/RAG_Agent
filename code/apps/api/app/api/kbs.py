@@ -357,15 +357,18 @@ async def _upload_single(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail=f"UNSUPPORTED_FILE_TYPE: 支持的类型 {', '.join(settings.allowed_ext)}",
         )
-    # ★ 图片联动：扩展名放行不等于能解析 —— 图片必须经本地 OCR 转录。
+    # ★ 图片联动：扩展名放行不等于能解析 —— 图片必须经视觉链路转录。
+    #   OCR_ENABLED 是总开关；图片文件与文档内嵌图走视觉 LLM（需多模态模型），
+    #   扫描件 PDF 才需要 OCR_BASE_URL 指向本地 OCR 服务。
     #   OCR 关闭时在这里拦下并给出「怎么开」，而不是让 job 落 last_error
     #   （解析层的 fail-closed 仍在，这里是更早、更可读的一道）。
     if ext in IMAGE_EXTS and not settings.ocr_enabled:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail=(
-                f"IMAGE_REQUIRES_OCR: {ext} 属图片，需置 OCR_ENABLED=true 并注入 "
-                f"OCR_BASE_URL（本地 OCR 服务）后才能入库。"
+                f"IMAGE_REQUIRES_OCR: {ext} 属图片，需置 OCR_ENABLED=true 并保证 "
+                f"LLM_MODEL 支持图片输入（图片经视觉链路转录入库）后才能入库；"
+                f"扫描件 PDF 另需注入 OCR_BASE_URL。"
             ),
         )
 
