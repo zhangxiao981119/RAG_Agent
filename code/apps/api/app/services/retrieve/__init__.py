@@ -82,16 +82,22 @@ LIMIT :limit
 # ★ 关键词召回（tsquery 路径）—— 走 entities.py 里已建但此前未使用的 idx_chunk_fts
 #   收益：索引可用 + 词元级匹配（不再只靠子串），且 ts_rank 提供真实排序分。
 #   限制：PostgreSQL 'simple' 配置不做中文分词，中文仍靠上面的 ILIKE 路径。
-#   ★ 别名必须写成 AS q(query)：to_tsquery 是标量函数，不给列别名时它的输出列
-#     名是函数名本身，`q.query` 会直接报 column does not exist。
+#   ★ to_tsquery 必须**内联**写两遍，不能写成 `FROM chunks c, to_tsquery(...) AS q(query)`：
+#     @@ 右侧一旦是函数扫描产出的列变量，planner 无法把它当常量去匹配 GIN
+#     表达式索引 idx_chunk_fts，索引条件会退化为每行 Filter（逐行重算 to_tsvector）。
+#   ★ 另需连接级 plan_cache_mode=force_custom_plan（见 database.py）：generic plan
+#     估不出 tsquery 的选择性，会改用 idx_chunk_filter/idx_chunk_acl 的 BitmapAnd
+#     并把 @@ 降级成 Filter —— 实测从约 5ms 劣化到 45ms 量级。
 _KEYWORD_FTS_SQL = text(f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
        c.level_rank, c.acl_tags, c.table_group_id,
        COALESCE(c.governance_weight, 0) AS governance_weight,
-       ts_rank(to_tsvector('simple', c.content), q.query) AS keyword_score
-FROM chunks c, to_tsquery('simple', :tsquery) AS q(query)
+       ts_rank(
+           to_tsvector('simple', c.content), to_tsquery('simple', :tsquery)
+       ) AS keyword_score
+FROM chunks c
 {_WHERE_BASE}
-  AND to_tsvector('simple', c.content) @@ q.query
+  AND to_tsvector('simple', c.content) @@ to_tsquery('simple', :tsquery)
 ORDER BY keyword_score DESC
 LIMIT :limit
 """)
