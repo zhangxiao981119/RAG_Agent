@@ -186,7 +186,7 @@ code/
 │   │   │   ├── models/       SQLAlchemy ORM
 │   │   │   ├── schemas/      Pydantic schema (严格遵循 §5.2)
 │   │   │   ├── config/       settings.py, decisions.py
-│   │   │   └── migrations/   alembic (0001~0019)
+│   │   │   └── migrations/   alembic (0001~0021)
 │   │   ├── scripts/          eval 链 (precheck_cases / import_eval_cases / run_eval / calibrate_threshold / loadtest_chat)
 │   │   └── Dockerfile
 │   ├── ocr/              GOT-OCR2.0 本地 OCR 服务 (独立容器, 单引擎串行)
