@@ -441,7 +441,10 @@ def blocks_from_page_texts(page_texts: list[str]) -> list[ParsedBlock]:
 
 async def parse_pdf_async(data: bytes) -> list[ParsedBlock]:
     """异步入口 —— **仅文本层**。扫描件 MUST 经 worker 的分段 OCR 流水线
-    （run_parse_segment），此处 fail-closed 拒绝，避免整份一次 OCR 越过任务超时。"""
+    （run_parse_segment），此处 fail-closed 拒绝，避免整份一次 OCR 越过任务超时。
+
+    ocr_enabled=true 时追加**页内内嵌图**转录（视觉 LLM，与 docx 内嵌图同口径）；
+    false 时维持原行为 —— 纯文本层，内嵌图跳过。"""
     page_texts = extract_pdf_page_texts(data)
 
     if is_scanned_text_layer(page_texts):
@@ -450,4 +453,77 @@ async def parse_pdf_async(data: bytes) -> list[ParsedBlock]:
             "（run_parse_segment）处理，此处不承载扫描件。"
         )
 
-    return _text_layer_pipeline(page_texts, data)
+    blocks = _text_layer_pipeline(page_texts, data)
+
+    from app.config.settings import get_settings
+
+    if get_settings().ocr_enabled:
+        blocks = await _transcribe_embedded_images(data, blocks)
+    return blocks
+
+
+async def _transcribe_embedded_images(
+    data: bytes, blocks: list[ParsedBlock]
+) -> list[ParsedBlock]:
+    """文本层 PDF 的页内内嵌图 → 视觉 LLM 转录 → 插在该页最后一个块之后。
+
+    · pymupdf page.get_images(full=True) 拿 xref，extract_image(xref) 出原始
+      字节与 ext（内嵌 JPEG 不解码重编码，直接送转录）
+    · heading_path 跟随该页最后一个块的标题路径，page_no 即所在页 ——
+      图的知识长在它出现的页上（INV-M-05 可回链）
+    · 小图过滤 / xref 内容去重 / 文档级上限 / 失败语义全部收在
+      EmbeddedImageRunner（口径单点，与 docx 完全一致）
+    """
+    try:
+        import pymupdf
+    except ImportError as exc:  # pragma: no cover - 依赖必装（requirements.lock）
+        raise ParseError(f"内嵌图提取依赖 PyMuPDF 不可用: {exc}") from exc
+    from app.services.parse.embedded_images import EmbeddedImageRunner
+
+    collected: list[tuple[int, bytes, str, str]] = []  # (page_no, blob, mime, heading)
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as exc:
+        raise ParseError(f"PDF 打开失败（内嵌图提取）: {exc}") from exc
+    with doc:
+        for page_index, page in enumerate(doc, start=1):
+            heading = ""
+            for b in reversed(blocks):
+                if b.page_no == page_index:
+                    heading = b.heading_path
+                    break
+            try:
+                images = page.get_images(full=True)
+            except Exception:
+                continue
+            for img in images:
+                xref = img[0]
+                try:
+                    info = doc.extract_image(xref)
+                except Exception:
+                    continue
+                blob = info.get("image") or b""
+                if not blob:
+                    continue
+                ext = (info.get("ext") or "png").lower()
+                mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+                collected.append((page_index, blob, mime, heading))
+
+    runner = EmbeddedImageRunner()
+    transcribed: list[tuple[int, ParsedBlock]] = []
+    for page_no, blob, mime, heading in collected:
+        block = await runner.process(blob, mime, heading_path=heading, page_no=page_no)
+        if block is not None:
+            transcribed.append((page_no, block))
+
+    # 插入点 = 该页最后一个块之后；倒序插入互不漂移
+    for page_no, block in reversed(transcribed):
+        insert_at = len(blocks)
+        for i in range(len(blocks) - 1, -1, -1):
+            if blocks[i].page_no == page_no:
+                insert_at = i + 1
+                break
+        blocks.insert(insert_at, block)
+
+    runner.log_summary("pdf")
+    return blocks

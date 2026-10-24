@@ -4,6 +4,8 @@ Word 文档结构：
   · Heading 1-9 → heading_path 累积（层级路径）
   · 普通段落 → 跟随当前 heading_path
   · 表格 → is_table=True，table_header=首行，chunk 整表不切
+  · 段落内嵌图 → 视觉 LLM 转录为「[图片转录]」块插回文档流
+    （仅 parse_docx_async + ocr_enabled=true；同步入口维持纯文本）
 
 注意：
   · 只支持 .docx（python-docx 不支持旧格式 .doc）
@@ -134,4 +136,112 @@ def parse_docx(data: bytes) -> list[ParsedBlock]:
         if block.text:
             blocks.append(block)
 
+    return blocks
+
+
+def _extract_paragraph_images(para) -> list[tuple[bytes, str]]:
+    """取一个段落里的内嵌图（inline 图片，非外链）。
+
+    结构路径：w:p → w:r → w:drawing → … → a:blip，@r:embed 是图片部件的
+    relationship id，经 para.part.related_parts[rid] 拿到原始字节与 MIME。
+    ★ 只认 r:embed（内联）：r:link 是外链引用，Word 里图不在文档包内，
+      字节无从取得 —— 外链图跳过（不做网络抓取，数据不出域约束同样适用）。
+    """
+    out: list[tuple[bytes, str]] = []
+    for blip in para._p.findall(".//" + qn("a:blip")):  # noqa: SLF001
+        rid = blip.get(qn("r:embed"))
+        if not rid:
+            continue
+        try:
+            part = para.part.related_parts[rid]  # noqa: SLF001
+        except KeyError:
+            continue
+        content_type = getattr(part, "content_type", "") or ""
+        if not content_type.startswith("image/"):
+            continue
+        out.append((part.blob, content_type))
+    return out
+
+
+async def parse_docx_async(data: bytes) -> list[ParsedBlock]:
+    """DOCX 异步入口：正文结构与 parse_docx 一致，另把段落内嵌图转录插回文档流。
+
+    ★ ocr_enabled=false → 等价 parse_docx（内嵌图整体跳过，只入文本，D1a 口径）；
+    ★ 转录块插在**所属段落块之后**，heading_path 跟随当前标题栈 ——
+      图的知识长在它出现的位置上，不是文档尾巴上；
+    ★ 表格单元格内图不在 v1 范围：多为装饰性缩略图，且插块会破坏整表块
+      的边界契约（chunk 层"整表不切"）；
+    ★ 过滤/去重/上限/失败语义全部收在 EmbeddedImageRunner（口径单点）。
+    """
+    from app.config.settings import get_settings
+    from app.services.parse.embedded_images import EmbeddedImageRunner
+
+    if not get_settings().ocr_enabled:
+        return parse_docx(data)
+
+    try:
+        doc = Document(BytesIO(data))
+    except Exception as exc:
+        raise ParseError(f"DOCX 打开失败: {exc}") from exc
+
+    blocks: list[ParsedBlock] = []
+    heading_stack: list[str] = []
+    # (插入位置=当时的 len(blocks), 该位置的图列表, 采集时的标题路径)；
+    # 倒序插入避免索引漂移
+    slots: list[tuple[int, list[tuple[bytes, str]], str]] = []
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        images = _extract_paragraph_images(para)
+
+        style_name = (para.style.name or "").lower() if para.style else ""
+
+        if style_name.startswith("heading"):
+            try:
+                level = int(style_name.replace("heading", "").strip())
+            except ValueError:
+                level = 1
+            heading_stack = heading_stack[: level - 1]
+            heading_stack.append(text)
+            if text:
+                blocks.append(
+                    ParsedBlock(
+                        text=text,
+                        heading_path="/".join(heading_stack),
+                    )
+                )
+        elif text:
+            blocks.append(
+                ParsedBlock(
+                    text=text,
+                    heading_path="/".join(heading_stack),
+                )
+            )
+
+        if images:
+            # 纯图空段落也是合法图位：插在当前位置之后即可
+            slots.append((len(blocks), images, "/".join(heading_stack)))
+
+    # 表格与同步入口同口径：跟随最终 heading_stack、追加在段落之后
+    for table in doc.tables:
+        heading_path = "/".join(heading_stack)
+        block = _table_to_block(table, heading_path)
+        if block.text:
+            blocks.append(block)
+
+    runner = EmbeddedImageRunner()
+    # 正序转录（文档序串行，成本护栏计数正确），倒序插入（保持记录位置有效）
+    transcribed: list[tuple[int, ParsedBlock]] = []
+    for idx, images, heading_path in slots:
+        for blob, mime in images:
+            block = await runner.process(
+                blob, mime, heading_path=heading_path, page_no=None
+            )
+            if block is not None:
+                transcribed.append((idx, block))
+    # slot 的 idx 是"当时的 len(blocks)"，即紧随其后的插入位；倒序插入互不漂移
+    for idx, block in reversed(transcribed):
+        blocks.insert(idx, block)
+
+    runner.log_summary("docx")
     return blocks
