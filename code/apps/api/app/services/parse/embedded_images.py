@@ -14,6 +14,8 @@
   · 转录链路本身失败（LLM 不可用 / 超时 / VisionError）
     → ParseError，fail-closed —— 不做"只入文本"降级，
       与「视觉抽取不可用不得降级为纯文本」的全局口径一致。
+★ 预算分两类且分开计：段落内嵌图（inline）与表格单元格图（table_cell）；
+  去重集则**跨类共享**（同一张 logo 可能出现两处，只该转录一次）。
 ★ 开发期接多模态 API 代理即可验证；生产部署 MUST 把 LLM_BASE_URL /
   LLM_MODEL 切换为**本地部署的视觉模型**（数据不出域硬约束）。
 """
@@ -42,14 +44,22 @@ def _image_size(data: bytes) -> tuple[int, int] | None:
 
 
 class EmbeddedImageRunner:
-    """单份文档的内嵌图转录编排器：去重、过滤、上限护栏、串行转录、计数。
+    """单份文档的内嵌图转录编排器：去重、过滤、分类预算、串行转录、计数。
 
-    每份解析任务实例化一个 —— 去重集与上限计数都是**文档级**状态。
+    每份解析任务实例化一个 —— 去重集与预算计数都是**文档级**状态。
+    ★ 去重集**跨类别共享**：同一张 logo 既可能出现在段落也可能出现在表格里，
+      按类别分开去重等于让同一张图烧两次算力、入库两段相同文本。
     """
+
+    # 类别 → 预算。两类图的单文档上限分开计（理由见 decisions 对应常量）
+    _CAPS: dict[str, int] = {
+        "inline": decisions.EMBEDDED_IMAGE_MAX_PER_DOC,
+        "table_cell": decisions.TABLE_EMBEDDED_IMAGE_MAX_PER_DOC,
+    }
 
     def __init__(self) -> None:
         self._seen: set[str] = set()  # 已处理图片的 sha1（重复图不烧转录算力）
-        self._transcribed = 0
+        self._transcribed: dict[str, int] = {}  # 类别 → 已转录张数
         self._skipped_small = 0
         self._skipped_dup = 0
         self._skipped_no_content = 0
@@ -61,11 +71,12 @@ class EmbeddedImageRunner:
         mime: str,
         heading_path: str,
         page_no: int | None,
+        category: str = "inline",
     ) -> ParsedBlock | None:
         """一张内嵌图 → 转录块或 None（被过滤/跳过）。
 
         ★ 过滤顺序即成本顺序：先字节/面积（零成本）→ sha1 去重（零成本）
-          → 上限护栏，最后才发起转录。
+          → 本类别预算护栏，最后才发起转录。
         """
         size = _image_size(data)
         if (
@@ -82,7 +93,7 @@ class EmbeddedImageRunner:
             return None
         self._seen.add(digest)
 
-        if self._transcribed >= decisions.EMBEDDED_IMAGE_MAX_PER_DOC:
+        if self._transcribed.get(category, 0) >= self._CAPS.get(category, 0):
             self._skipped_over_cap += 1
             return None
 
@@ -101,7 +112,7 @@ class EmbeddedImageRunner:
         except vision.VisionError as exc:
             raise ParseError(f"内嵌图转录失败（视觉链路不可用，fail-closed）：{exc}") from exc
 
-        self._transcribed += 1
+        self._transcribed[category] = self._transcribed.get(category, 0) + 1
         block.heading_path = heading_path
         block.page_no = page_no
         block.text = f"[图片转录] {block.text}"
@@ -109,13 +120,17 @@ class EmbeddedImageRunner:
 
     def log_summary(self, source: str) -> None:
         """收尾计数日志：让运维能看到「有图但没变成知识」的规模。"""
-        if not (self._transcribed or self._skipped_small or self._skipped_dup
+        total = sum(self._transcribed.values())
+        if not (total or self._skipped_small or self._skipped_dup
                 or self._skipped_no_content or self._skipped_over_cap):
             return
         logger.info(
-            "内嵌图转录汇总（%s）：转录 %d 张；跳过 —— 小图 %d / 重复 %d / 无字 %d / 超上限 %d",
+            "内嵌图转录汇总（%s）：转录 %d 张（段落 %d / 单元格 %d）；"
+            "跳过 —— 小图 %d / 重复 %d / 无字 %d / 超上限 %d",
             source,
-            self._transcribed,
+            total,
+            self._transcribed.get("inline", 0),
+            self._transcribed.get("table_cell", 0),
             self._skipped_small,
             self._skipped_dup,
             self._skipped_no_content,
