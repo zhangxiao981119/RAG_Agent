@@ -166,3 +166,58 @@ def test_pre_inside_table_not_duplicated():
     assert not any(b.verbatim for b in blocks)
     assert len(blocks) == 1  # 只有表格块
     assert "code" in blocks[0].text
+
+
+# ── M8-P3 图片 alt 卫生 ────────────────────────────────────────────
+
+
+def test_img_alt_joins_paragraph():
+    html = '<html><body><p>外观 <img src="a.png" alt="AX3000 白色"> 如上</p></body></html>'
+    blocks = parse_html(html.encode("utf-8"))
+    assert len(blocks) == 1
+    assert blocks[0].text == "外观 [图片] AX3000 白色 如上"
+
+
+def test_standalone_img_becomes_block():
+    html = '<html><body><div><img src="b.png" alt="网络拓扑"></div></body></html>'
+    assert [b.text for b in parse_html(html.encode("utf-8"))] == ["[图片] 网络拓扑"]
+
+
+def test_img_without_alt_dropped():
+    html = (
+        '<html><body><p>正文<img src="icon.png"></p>'
+        '<div><img src="x.png" alt=""></div></body></html>'
+    )
+    assert [b.text for b in parse_html(html.encode("utf-8"))] == ["正文"]
+
+
+def test_img_in_table_cell_kept():
+    html = (
+        "<html><body><table>"
+        "<tr><th>型号</th><th>外观</th></tr>"
+        '<tr><td>AX3000</td><td><img src="a.png" alt="白色"> 备注</td></tr>'
+        "<tr><td>AX6000</td><td>黑色</td></tr>"
+        "</table></body></html>"
+    )
+    table = parse_html(html.encode("utf-8"))[0]
+    assert table.is_table is True
+    assert "[图片] 白色" in table.text and "a.png" not in table.text
+
+
+def test_img_in_pre_not_replaced():
+    """<pre> 里的 <img> 是代码样例内容，不注入 alt 文本。"""
+    html = '<html><body><pre>before <img src="a.png" alt="x"> after</pre></body></html>'
+    blocks = parse_html(html.encode("utf-8"))
+    assert "[图片]" not in blocks[0].text
+
+
+def test_figcaption_becomes_text_block():
+    html = (
+        "<html><body><figure>"
+        '<img src="a.png" alt="拓扑">'
+        "<figcaption>图 1 网络拓扑示意</figcaption>"
+        "</figure></body></html>"
+    )
+    texts = [b.text for b in parse_html(html.encode("utf-8"))]
+    assert "[图片] 拓扑" in texts
+    assert "图 1 网络拓扑示意" in texts

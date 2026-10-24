@@ -1,7 +1,8 @@
 r"""markdown 管道表识别测试（表格决策 B1' 窄口版）。
 
 覆盖：标准管道表 → is_table 契约（TSV + table_header）、\| 转义、
-cell_to_text 消毒、伪表格/低可信度回退、块序与标题归属。
+cell_to_text 消毒、伪表格/低可信度回退、块序与标题归属；
+M8-P3 图片语法卫生（alt 保留 / URL 与 data URI 丢弃 / 围栏块保真）。
 """
 from __future__ import annotations
 
@@ -265,3 +266,57 @@ def test_mermaid_fence_is_verbatim():
     assert len(blocks) == 1
     assert blocks[0].verbatim is True
     assert "graph TD" in blocks[0].text
+
+# ── M8-P3 图片语法卫生 ────────────────────────────────────────────
+
+
+def test_inline_image_keeps_alt_drops_url():
+    blocks = parse_markdown("# 外观\n\n![AX3000 白色外观](./img/a.png)\n".encode())
+    assert blocks[0].text == "[图片] AX3000 白色外观"
+
+
+def test_badge_image_replaced_once():
+    """徽章写法整段替换：不能留下 `[图片] x](link)` 半个链接。"""
+    md = "看这个 [![版本徽章](https://img.shields.io/badge/v1-2.0.png)](https://x.io)\n"
+    blocks = parse_markdown(md.encode())
+    assert blocks[0].text == "看这个 [图片] 版本徽章"
+    assert "](" not in blocks[0].text
+
+
+def test_reference_image_keeps_alt():
+    blocks = parse_markdown("![拓扑图][arch]\n".encode())
+    assert blocks[0].text == "[图片] 拓扑图"
+
+
+def test_raw_html_img_alt_extracted():
+    md = '示意图：<img src="./a.png" alt="接口定义">\n'
+    blocks = parse_markdown(md.encode())
+    assert blocks[0].text == "示意图：[图片] 接口定义"
+
+
+def test_empty_alt_image_dropped():
+    blocks = parse_markdown("正文之前\n\n![](./blank.png)\n\n正文之后\n".encode())
+    text = "\n".join(b.text for b in blocks)
+    assert "[图片]" not in text
+    assert "正文之前" in text and "正文之后" in text
+
+
+def test_data_uri_image_not_inlined():
+    payload = "data:image/png;base64," + "A" * 5000
+    blocks = parse_markdown(f"截图：![拓扑]({payload})\n".encode())
+    assert "base64" not in blocks[0].text
+    assert blocks[0].text == "截图：[图片] 拓扑"
+
+
+def test_table_cell_image_cleaned():
+    md = "| 型号 | 外观 |\n| --- | --- |\n| AX3000 | ![白色](a.png) |\n"
+    table = parse_markdown(md.encode())[0]
+    assert table.is_table is True
+    assert "[图片] 白色" in table.text and "a.png" not in table.text
+
+
+def test_fenced_code_image_markup_preserved():
+    """围栏代码块里的 ![](...) 是代码内容，不参与清洗。"""
+    blocks = parse_markdown("```\n![x](y.png)\n```\n".encode())
+    assert blocks[0].verbatim is True
+    assert blocks[0].text == "![x](y.png)"

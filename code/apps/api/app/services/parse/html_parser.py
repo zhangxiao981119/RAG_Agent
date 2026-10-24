@@ -6,6 +6,11 @@
   3. 表格识别 → 既有 is_table 契约：rowspan/colspan 网格法展开（与
      xlsx/xls/docx 的合并展开口径一致）→ cell_to_text 消毒 → TSV 序列化，
      保证 chunk 层"整表不切 / 行组切分带表头"契约原样适用
+  4. 图片 alt 卫生（M8-P3）：`<img alt="...">` 的 alt 是知识（src 是噪声），
+     就地替换为「[图片] alt」文本节点 —— 段落 / 列表 / 引用 / 图注 / 表格
+     单元格内的图片保持原位（图注与同行文字同块）；独立图片包成 <p> 收进
+     正文；alt 为空则整图丢弃（不产无知识占位）；<pre> 内的 <img> 是代码
+     样例内容，保真不替换
 
 调用方：worker 的 parse_bytes 分派（WU-M-14 注册 ext=html）—— web 抓取产物
 存 MinIO 后走标准 ParseJob 链路（重试/状态机/审计全部复用）；
@@ -26,7 +31,8 @@ _HEADING_LEVELS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
 # 承担正文的块级文本标签。
 # <pre> 不在此列：M8-P1 要求代码块逐行保真（get_text(" ") 会把换行压成空格，
 # 代码结构全丢），单独走 verbatim 分支
-_TEXT_TAGS = ("p", "li", "blockquote")
+# figcaption 在此列：图注是对图片的说明文本，与正文同等可检索
+_TEXT_TAGS = ("p", "li", "blockquote", "figcaption")
 
 
 def _expand_table(table: Tag) -> list[list[str]]:
@@ -87,6 +93,41 @@ def _table_block(table: Tag, heading_path: str) -> ParsedBlock | None:
     )
 
 
+def _image_note(alt: object) -> str:
+    """alt → 「[图片] alt」；空 alt 返回空串（无知识的占位不留）。"""
+    text = " ".join(str(alt or "").split())
+    return f"[图片] {text}" if text else ""
+
+
+def _in_inline_parent(img: Tag) -> bool:
+    """图片是否落在正文块或表格单元格内（决定原位替换还是包成段落）。"""
+    for parent in img.parents:
+        if parent.name in _TEXT_TAGS or parent.name == "table":
+            return True
+    return False
+
+
+def _replace_images(root: Tag, soup: BeautifulSoup) -> None:
+    """<img> → 「[图片] alt」文本节点（M8-P3 图片卫生，遍历前一次性完成）。
+
+    ★ 必须先于正文遍历执行：替换成文本节点后，段落 / 列表 / 引用 / 图注 /
+      表格单元格的 get_text 自然带上 alt，且位置不变（图注与同行文字同块）。
+    """
+    for img in root.find_all("img"):
+        if img.find_parent("pre") is not None:
+            continue  # 代码样例里的 <img> 是内容，保真不替换
+        note = _image_note(img.get("alt"))
+        if not note:
+            img.decompose()  # 无 alt 的装饰图（图标 / 空白位）不留占位
+            continue
+        if _in_inline_parent(img):
+            img.replace_with(note)
+            continue
+        para = soup.new_tag("p")
+        para.string = note
+        img.replace_with(para)  # 独立图片：包成段落，让正文遍历能收走
+
+
 def parse_html(data: bytes) -> list[ParsedBlock]:
     """HTML 字节 → ParsedBlock 列表（正文与表格按文档顺序交错）。
 
@@ -101,6 +142,7 @@ def parse_html(data: bytes) -> list[ParsedBlock]:
     root = soup.body or soup
     for noise in root.find_all(_NOISE_TAGS):
         noise.decompose()
+    _replace_images(root, soup)
 
     blocks: list[ParsedBlock] = []
     heading_stack: list[str] = []  # 与 docx_parser 同口径的标题栈
