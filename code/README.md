@@ -57,7 +57,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 
 首次启动自动完成三件事：
 
-1. `migrate` 一次性服务执行数据库迁移（`0001 ~ 0014`），完成后 api/worker 才启动
+1. `migrate` 一次性服务执行数据库迁移（`0001 ~ 0019`），完成后 api/worker 才启动
 2. 初始化默认租户 + admin 角色 + admin 账号 + 公开知识库（幂等）
 3. 下载 bge-m3（约 2GB）与 bge-reranker-v2-m3（约 1GB）到本地缓存
 

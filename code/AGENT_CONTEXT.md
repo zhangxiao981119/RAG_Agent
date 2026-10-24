@@ -1,22 +1,22 @@
 # AGENT_CONTEXT - 给 Agent 的上下文恢复文件
 
 > 这个文件是给 Trae Agent 读的，不是给人看的 README。如果你是新接手的 Agent，读完这个文件你应该能瞬间知道：这是什么项目、改了哪些坑、什么不能动、接下来做什么。
-> 生成时间: 2026-09-22
+> 生成时间: 2026-09-22 ｜ 最近更新: 2026-10-24（对齐 M7 之后的现状：10 容器、v2-m3、阈值 0.50、迁移到 0019、两段式 OCR 流水线）
 
 ---
 
 ## 1. 项目定位
 
-**企业知识库 RAG 问答 Agent**。FastAPI 后端 + React18 前端，Docker Compose 8 容器编排。
+**企业知识库 RAG 问答 Agent**。FastAPI 后端 + React18 前端，Docker Compose 10 容器编排。
 
-核心链路：文档上传 -> MinIO 存储 -> 解析+分块 -> bge-m3 embedding -> pgvector -> vector+ILIKE 混合召回 -> RRF(k=60) 融合 -> bge-reranker-base 重排(阈值 0.35) -> LLM(SSE 流式) -> grounding 归因检查 -> 拒答/输出。
+核心链路：文档上传 -> MinIO 存储 -> 解析+分块 -> bge-m3 embedding -> pgvector -> vector+tsquery+ILIKE 三路召回 -> RRF(k=60) 融合 -> bge-reranker-v2-m3 重排(阈值 0.50，`RERANK_ENABLED` 默认 false，CPU 环境实测开启反而劣化) -> LLM(SSE 流式) -> grounding 归因检查 -> 拒答/输出。
 
 技术栈：
 - 后端: Python 3.11 + FastAPI + SQLAlchemy + asyncpg + arq
 - 前端: React 18 + TypeScript + Vite + Antd 5
 - 数据: PostgreSQL(+pgvector) + Redis + MinIO
-- 模型: bge-m3(embedding, 1024维) + bge-reranker-base(重排) + qwen3-plus(LLM)
-- 编排: Docker Compose 8 容器 (postgres/redis/minio/embedding/reranker/worker/api/web)
+- 模型: bge-m3(embedding, 1024维) + bge-reranker-v2-m3(重排, `RERANK_ENABLED` 默认 false) + qwen3-plus(LLM, 内网 OpenAI 兼容接口)
+- 编排: Docker Compose 10 容器 (postgres/redis/minio/embedding/reranker/ocr/migrate/api/worker/web)
 
 ---
 
@@ -27,7 +27,7 @@
 2. 路由文件在 middleware 重构时不能改
 3. API 响应严格遵循 §5.2 schema ({"code":0, "data":..., "msg":""})
 4. LLM 流式序列: meta→stage→citations→delta...→done / refused
-5. 文档解析覆盖 PDF/xlsx/md/txt/docx/xls/pptx，扫描版 PDF 抛错
+5. 文档解析覆盖 PDF/xlsx/md/txt/docx/xls/pptx；扫描版 PDF 走本地 GOT-OCR2.0 通道（两段式分段流水线，见 migration 0019），OCR 服务不可用时 fail-closed 报错
 6. 表格整表作为一个chunk；超 CHUNK_MAX_TOKENS 时按行组切，**每组重复注入表头**
 7. PDF 表格由 pdfplumber 识别（pypdf 只出文本层，会把列关系拍平）；
    同页正文用词坐标排除表格区域，避免同一数据入块两次
@@ -48,7 +48,7 @@
 
 | 决策 | 选项 | 为什么 |
 |---|---|---|
-| 重排模型 | bge-reranker-base (200MB) | v2-m3 在 2GB mem_limit 下 OOM |
+| 重排模型 | bge-reranker-v2-m3 (reranker mem_limit 提到 4g) | base 版召回质量不足；v2-m3 在 2g 下 OOM，提内存后换回；CPU 环境默认 `RERANK_ENABLED=false` |
 | 前端加密 | jsencrypt@3.3.2 (PKCS1-v1_5) | Web Crypto 在 LAN http 下 `crypto.subtle` undefined |
 | RSA 密钥持久化 | Redis SETNX 单例 | 多 worker 各自生成不同密钥会解密失败 |
 | Worker 队列 | arq + Redis | parse→chunk→embed→write 四步流水线 |
@@ -70,6 +70,8 @@
 | M5 | 2026-09-18 | 部署包: docker-compose.prod.yml + seed_prod.py + DEPLOY.md + OnboardingModal |
 | M6 | 2026-09-18 | 安全加固: 配额管理 + 敏感词 + 灰度开关(FeatureFlagPanel) + JsonFormatter |
 | 深度审查 | 2026-09-21 | P0~P3 约 49 项修复 (见第 5 节) |
+| M7 | 2026-09 下旬 | 多模态与知识治理: 文档治理四维分 + web 增量同步 + 治理加权（见 M7 实施规范）|
+| M8 | 2026-10 | 评估与标定体系: eval_runs / 预检脚本链 / 阈值标定(先置零防循环论证) / 两段式 OCR 流水线(0019) / 脏页门禁 / 并发压测报告 |
 
 ---
 
@@ -162,7 +164,7 @@ cd code
 docker compose up -d --build
 
 # 验证
-docker compose ps  # 8 容器 healthy
+docker compose ps  # 10 容器 healthy
 curl http://localhost:8000/api/health  # {"db":"ok", "redis":"ok", "vector":"ok", "llm":"ok", "embedding":"ok", "rerank":"ok"}
 
 # 前端 http://localhost:5173
@@ -178,14 +180,16 @@ code/
 ├── apps/
 │   ├── api/              FastAPI 后端
 │   │   ├── app/
-│   │   │   ├── api/          路由 (auth, chat, docs, jobs, kbs, admin, groups)
-│   │   │   ├── services/     业务层 (auth, chat, retrieve, generate, grounding, crypto, quota, sensitive, feature_flag)
-│   │   │   ├── workers/      arq 任务 (parse_job)
+│   │   │   ├── api/          路由 20+ 模块 (auth, chat, documents, kbs, messages, eval, audit, metrics, jobs, sync, prompts, quota, rate_limit, sensitive_words, feature_flags, finetune, departments/groups/roles/users, me, health)
+│   │   │   ├── services/     业务层 (parse, chunk, retrieve, generate, grounding, guard, memory, multimodal, governance, router, sync, acl, embedding, rerank, ocr ...)
+│   │   │   ├── workers/      arq 任务 (parse_job: 两段式 run_parse_segment / run_parse_finalize + sync + governance)
 │   │   │   ├── models/       SQLAlchemy ORM
 │   │   │   ├── schemas/      Pydantic schema (严格遵循 §5.2)
 │   │   │   ├── config/       settings.py, decisions.py
-│   │   │   └── migrations/   alembic (0001~0008)
+│   │   │   └── migrations/   alembic (0001~0019)
+│   │   ├── scripts/          eval 链 (precheck_cases / import_eval_cases / run_eval / calibrate_threshold / loadtest_chat)
 │   │   └── Dockerfile
+│   ├── ocr/              GOT-OCR2.0 本地 OCR 服务 (独立容器, 单引擎串行)
 │   └── web/              React18 前端
 │       ├── src/
 │       │   ├── pages/        ChatPage, DocumentsPage, KnowledgeBasesPage, AdminPage, LoginPage
@@ -207,7 +211,7 @@ code/
 读完本文件 + memory/projects/*/ 下的 topics.md 后，请按以下顺序行动：
 
 1. **用当前文件 + topics.md 回答自己**: 这个项目的检索链是什么？为什么 reranker 用 base 版？SSE 断网怎么处理？
-2. **启动环境验证**: `docker compose up -d --build`，确认 8 容器 healthy，跑一遍完整问答流程
+2. **启动环境验证**: `docker compose up -d --build`，确认 10 容器 healthy，跑一遍完整问答流程
 3. **git init + 推 GitHub**: `git init` → `git add .` → `git commit -m "feat: init RAG Agent"` → `git remote add origin <你的仓库>` → `git push -u origin main`
 4. **告诉我**: 你对项目的理解，以及你想接下来做什么（部署上线？还是加新功能？）
 
