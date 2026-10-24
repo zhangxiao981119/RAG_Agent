@@ -143,21 +143,30 @@ def test_empty_query_returns_none():
 # ── 查询侧：ILIKE 子串词元 ────────────────────────────
 
 
-def test_ilike_terms_keep_long_chinese_run():
-    """中文段按子串匹配，超过 8 字截断（尾部多为语气/修饰）。"""
-    assert build_ilike_terms("差旅费报销需要提供哪些凭证") == ["差旅费报销需要提"]
+def test_ilike_terms_split_chinese_by_question_words():
+    """中文段按疑问/功能词切成语义单元，而不是截成任意前缀。
+
+    「整段截前 8 字」得到「差旅费报销需要提供哪些凭证」，要求文档原样含有这串
+    字，实测 81.6% 用例都落在这种前缀上、几乎不命中；切段后是三个独立词元。
+    """
+    assert build_ilike_terms("差旅费报销需要提供哪些凭证") == [
+        "差旅费报销",
+        "提供",
+        "凭证",
+    ]
 
 
-def test_ilike_terms_drop_short_chinese_run():
-    """2 字段不进 ILIKE：这类词会命中全库，交给 3 字窗口的 FTS 路。"""
-    assert build_ilike_terms("报销 标准") == []
+def test_ilike_terms_drop_single_char_run():
+    """单字段丢弃：这类词会命中全库，交给 3 字窗口的 FTS 路。"""
+    assert build_ilike_terms("一 和 与") == []
 
 
-def test_ilike_terms_keep_identifier_and_long_ascii():
+def test_ilike_terms_keep_identifier_and_ascii():
     """标识符按子串语义保留（`get_retrieval` 命中 `get_retrieval_service`）。"""
     assert build_ilike_terms("调用 get_retrieval 和 kafka") == [
         "get_retrieval",
         "kafka",
+        "调用",
     ]
 
 

@@ -70,8 +70,11 @@ FTS_QUERY_MAX_CJK_RUNS: Final[int] = 2
 FTS_QUERY_MAX_TERMS: Final[int] = 24
 """单条 tsquery 的词元上限（中文 3 字窗口 + ASCII 词元各自计数），超出截断。"""
 
-ILIKE_MAX_TERMS: Final[int] = 6
-"""ILIKE 子串路的词元上限。每个词元都是正则的一个分支，过多会拖慢单次全表扫描。"""
+ILIKE_MAX_TERMS: Final[int] = 3
+"""ILIKE 子串路的词元上限（按长度降序取）。
+
+实测 206 条评测用例：上限 2/3/4 的期望文档覆盖为 77/88/89，3 处饱和；
+再增大只增加命中行（9.7→13.2→14.7 行）并压低精度（61%→54%→51%）。"""
 
 GENERATION_TEMPERATURE: Final[float] = 0.0      # L2
 # 生成温度固定 0：RAG 问答要的是"同一份上下文给出同一个答案"，评测门禁与线上

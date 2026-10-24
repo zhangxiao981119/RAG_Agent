@@ -71,8 +71,8 @@ LIMIT :limit
 # 关键词召回（ILIKE / 正则子串匹配）
 # ★ 此前是「整句子串」：自然问句整句几乎不可能原样出现在 chunk 里，实测 206 条评测
 #   用例 0 命中，还白花约 11ms 全表扫描。改为「合格词元的正则 OR」（keyword_text.
-#   build_ilike_terms）：中文 >= 3 字的连续段、ASCII 标识符/长词，单次扫描同时覆盖
-#   content 与 heading_path，实测 63/206 命中、平均 5.2 行、耗时与原来持平。
+#   build_ilike_terms）：中文按疑问/功能词切成语义单元（>= 2 字，取最长 3 个）、
+#   ASCII 标识符/长词，单次扫描同时覆盖 content 与 heading_path。
 # ★ 用 ~* 而非 ILIKE：多词元 OR 若用多条 ILIKE 要写成 N 个分支（每支一次匹配），
 #   正则一条即可；词元经 Python re.escape，不存在通配/正则注入。
 # ★ ORDER BY：LIMIT 50 若不带排序，取的是堆表顺序 —— 命中集里哪 50 条进 RRF 完全

@@ -24,6 +24,19 @@ _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
 # 与 tsquery 的操作符字符集天然不相交，故不存在注入面。
 _ASCII_RE = re.compile(r"[A-Za-z0-9_]{2,}")
 
+# ILIKE 路的中文切段词：疑问词与虚词。
+# 按「疑问/功能词」切开，才能把语义单元取出来 —— 整段截前 8 字得到的是
+# 「差旅费报销需要提」这种任意前缀，要求文档里原样出现，实测 81.6% 的用例
+# 词元都是这种前缀，几乎不可能命中。
+# ★ 必须长词在前：正则分支同起点取第一个匹配项（「为什么」要先于「什么」）。
+# ★ 只在这些词处切，「的/吗/呢」单字切分会把「目的」这类词切碎，但残段
+#   长度不足 2 会被丢弃，不会污染词元。
+_ILIKE_SPLIT_WORDS = (
+    "为什么", "怎么样", "什么样", "是不是", "有没有", "什么", "怎么", "如何",
+    "哪些", "多少", "是否", "需要", "请问", "可以", "的", "吗", "呢",
+)
+_ILIKE_SPLIT_RE = re.compile("|".join(_ILIKE_SPLIT_WORDS))
+
 
 def _normalize(text: str) -> str:
     """NFKC 归一化 + 小写：统一全角字母数字与大小写，保证两侧切分结果一致。"""
@@ -113,13 +126,23 @@ def build_ilike_terms(query: str) -> list[str]:
 
     ★ 此前是「整句子串」：自然问句整句几乎不可能原样出现在 chunk 里，实测 206 条
       评测用例 0 命中、纯耗 11ms。改为按词元做子串匹配，才真正覆盖两类 FTS 抓不到
-      的情形：3 字以下的短词元，以及 ASCII 标识符的子串（`get_retrieval` 命中
+      的情形：短词元，以及 ASCII 标识符的子串（`get_retrieval` 命中
       `get_retrieval_service`）。
-    ★ 只取够长的词元（中文 >= 3 字、ASCII 标识符/>= 4 字符），否则「什么」「如何」
-      这类词会把全库拉进来。
+    ★ 中文段 MUST 先按疑问/功能词切成语义单元：直接截前 N 字得到的是任意前缀
+      （「差旅费报销需要提供哪些凭证」→「差旅费报销需要提」），要求文档原样含有
+      这串字，206 条用例里 81.6% 都落在这种前缀上、几乎不命中。切段后取
+      「差旅费报销／提供／凭证」，期望文档覆盖从 52/102 升到 88/102。
+    ★ 词元上限取 3：实测覆盖在此处饱和（3→4 只多 1 条，4→6 不再增长），
+      而上限越高噪声行越多（精度 66%→54%→49%）。这是全局常数，与知识库无关 ——
+      决定词元好坏的是「该词元在文档里是否有区分度」，不是它来自哪个库。
     """
     text = _normalize(query[:400])
-    cjk_terms = [run[:8] for run in _CJK_RE.findall(text) if len(run) >= 3]
+    cjk_terms = [
+        segment[:8]
+        for run in _CJK_RE.findall(text)
+        for segment in _ILIKE_SPLIT_RE.split(run)
+        if len(segment) >= 2
+    ]
     ascii_terms = [
         token for token in _ASCII_RE.findall(text) if "_" in token or len(token) >= 4
     ]
