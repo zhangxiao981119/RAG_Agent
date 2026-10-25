@@ -94,6 +94,29 @@ GENERATION_TEMPERATURE: Final[float] = 0.0      # L2
 # 回答必须可复现。0.1 下实测同一问题两次跑会一次拒答、一次自编 Python 实现，
 # 导致评估结果无法复算，也无法用基线做回归比对。
 GROUNDING_CHECK_ENABLED: Final[bool] = True     # L3；MUST NOT 置 False
+
+GENERATION_REFUSAL_RETRY_ENABLED: Final[bool] = True
+"""检索充足却输出拒答文案时重试一次生成。
+
+依据：2026-10-25 评测里 Netty 那条用例，同一批 8 条上下文（全命中 JAVA PDF）
+连跑 3 次，1 次输出契约拒答句、2 次正常作答 —— temperature=0 下上游仍不稳定。
+一次误判就让可答问题变成漏答，代价远大于多花一次 token。"""
+GENERATION_REFUSAL_RETRY_MIN_CHUNKS: Final[int] = 3
+"""触发重试的最低上下文条数：少于该值说明检索本身没货，重试没有意义。"""
+GENERATION_REFUSAL_RETRY_MIN_SCORE: Final[float] = 0.70
+"""触发重试的最低 top1 分（display_score 口径）。
+
+只用条数不够：不可答问题里也有 27 条能捞到 8 条相邻上下文（top1 0.60~0.70），
+按条数重试等于给"本就不该答"的问题第二次编造机会。实测 217 条用例的 top1 分布：
+阈值 0.70 时 可答 45 条 / 不可答 6 条；降到 0.65 就变成 75 / 12。取 0.70。"""
+
+GENERATION_ANSWER_LOW_OVERLAP: Final[float] = 0.20
+"""答案引用分片与问题的中文二元组重合率下限（观测用，不改变行为）。
+
+低于该值 = 答非所问的嫌疑：检索捞到的是话题相邻的分片（例如问"服务器访问与
+变更的安全要求"，捞回 HTTPS 科普段），模型照着它作答、引用编号全合法。
+该指标只打点，不做拦截 —— 语义级判定还没做，先量化发生率。"""
+
 TOP_K_RECALL: Final[int] = 50                   # 每路召回条数
 TOP_K_RERANK: Final[int] = 8                    # 重排后取用条数
 RRF_K: Final[int] = 60

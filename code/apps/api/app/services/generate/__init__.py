@@ -22,6 +22,7 @@ from app.config.prompts import NO_ANSWER_TEXT
 from app.infra import metrics
 from app.services import prompt_registry as prompt_registry_service
 from app.services.grounding import check_grounding, check_line
+from app.services.keyword_text import to_fts_text
 from app.services.llm import LLMError, LLMTimeout, get_llm_service
 from app.services.mask import mask_pii
 from app.services.retrieve.base import RetrievedChunk
@@ -163,6 +164,32 @@ def is_no_answer_output(text: str) -> bool:
         or _PARTIAL_REFUSAL_RE.search(head)
         or _TOPIC_FRAMED_REFUSAL_RE.match(head)
     )
+
+
+_SENTENCE_END_RE = re.compile(r"[。！？；\n]")
+_TOPIC_OPEN_RE = re.compile(r"^(?:关于|对于|就|针对)")
+
+
+def is_possible_refusal_prefix(text: str) -> bool:
+    """首段正文是否仍可能演变成拒答文案（流式拒答守卫用）。
+
+    正常回答一旦出现完整句子就返回 False，正文立刻放行，首字延迟不受影响；
+    只有以契约句前缀开头、或以「关于 X，…」话题前置开头的文本会被继续扣住。
+    扣住的意义：模型偶发误拒时，正文一个字都没发出去，可以直接重试，
+    前端不会看到"先拒答、再冒出答案"的拼接。
+    """
+    body = _strip_leading_headings(text)
+    normalized = _normalize_for_refusal(body)
+    if not normalized:
+        return True  # 只有标题行/空白，还判断不了
+    if NO_ANSWER_TEXT.startswith(normalized):
+        return True
+    # 话题前置式拒答（「关于 X，知识库中未找到…」）前半句短且以介词开头
+    if _TOPIC_OPEN_RE.match(normalized) and len(normalized) <= 40:
+        return True
+    if not _SENTENCE_END_RE.search(text) and len(normalized) <= 12:
+        return True
+    return False
 
 
 # 零引用时的容差阈值：答案的 3-gram 有多大比例能在上下文里找到。
@@ -572,6 +599,83 @@ class StreamGenerationService(GenerationService):
         tenant_id: uuid.UUID | None = None,
         rewrite_score: int | None = None,
     ):
+        """流式生成入口：零外发的契约拒答会重试一次（GENERATION_REFUSAL_RETRY_*）。
+
+        守卫（is_possible_refusal_prefix）保证拒答文案在判定成立前不外发，因此
+        重试对前端是透明的 —— 不会出现"先吐拒答、再吐答案"的拼接。
+        已经外发过正文的拒答不重试：两段互相矛盾的正文拼在一起比拒答更糟。
+        """
+        # 条数与 top1 分双门槛：只按条数会把"捞到 8 条相邻上下文但都不相关"的
+        # 不可答问题也重试一遍，等于给它第二次编造机会。
+        can_retry = (
+            decisions.GENERATION_REFUSAL_RETRY_ENABLED
+            and len(chunks) >= decisions.GENERATION_REFUSAL_RETRY_MIN_CHUNKS
+            and max((c.display_score for c in chunks), default=0.0)
+            >= decisions.GENERATION_REFUSAL_RETRY_MIN_SCORE
+        )
+        attempts = 2 if can_retry else 1
+        for attempt in range(1, attempts + 1):
+            emitted = False
+            refused: StreamDelta | None = None
+            async for evt in self._stream_once(
+                query, chunks, history, memory_prompt, tenant_id, rewrite_score
+            ):
+                # 拒答且一个字都没外发 → 记下来，可以安全重试
+                if evt.type == "refused" and not emitted:
+                    refused = evt
+                    break
+                if evt.type == "delta":
+                    emitted = True
+                if evt.type == "done":
+                    if attempt > 1:
+                        metrics.incr("rag.generate.refusal_retry_recovered")
+                    self._observe_answer_overlap(query, chunks)
+                yield evt
+                if evt.type in ("done", "refused"):
+                    return
+            if refused is None:
+                return
+            if (
+                attempt == 1
+                and refused.refuse_reason == "NO_RELEVANT_CONTENT"
+                and len(chunks) >= decisions.GENERATION_REFUSAL_RETRY_MIN_CHUNKS
+            ):
+                # 上下文充足却拒答：记发生率（只记首次尝试，重试也拒答不再重复计数）
+                metrics.incr("rag.generate.refusal_with_context")
+            if refused.refuse_reason != "NO_RELEVANT_CONTENT" or attempt == attempts:
+                if attempt > 1:
+                    metrics.incr("rag.generate.refusal_after_retry")
+                yield refused
+                return
+            logger.warning(
+                "生成层误拒：检索 %d 条上下文仍输出拒答文案，重试一次", len(chunks)
+            )
+            metrics.incr("rag.generate.refusal_retry")
+
+    @staticmethod
+    def _observe_answer_overlap(query: str, chunks: list[RetrievedChunk]) -> None:
+        """观测：答案分片与问题的中文词元重合率过低 = 答非所问嫌疑。
+
+        只打点不拦截。语义级判定成本高，先量化发生率，再决定要不要上校验。
+        """
+        q_terms = set(to_fts_text(query).split())
+        if not q_terms:
+            return
+        ctx_terms: set[str] = set()
+        for chunk in chunks:
+            ctx_terms.update(to_fts_text(chunk.content).split())
+        if len(q_terms & ctx_terms) / len(q_terms) < decisions.GENERATION_ANSWER_LOW_OVERLAP:
+            metrics.incr("rag.answer.low_query_overlap")
+
+    async def _stream_once(
+        self,
+        query: str,
+        chunks: list[RetrievedChunk],
+        history: list[dict] | None = None,
+        memory_prompt: str = "",
+        tenant_id: uuid.UUID | None = None,
+        rewrite_score: int | None = None,
+    ):
         # 引用映射（同 generate）
         valid_ns: set[int] = set()
         citations: list[Citation] = []
@@ -608,6 +712,24 @@ class StreamGenerationService(GenerationService):
         llm_failed = False
         llm_fail_reason = ""
         aborted = False        # 敏感词命中后置 True，中止流
+
+        # ── 拒答守卫：首段正文先不外发，确认不是拒答文案后再放行 ──────
+        # 正常回答出现完整句子即放行，首字延迟不受影响；契约拒答句会被扣住，
+        # 于是「零外发拒答」成为可重试的前提（见 stream_generate）。
+        guard_buf = ""
+        guard_open = False
+
+        def _gate(fragment: str) -> str:
+            """暂存仍可能演变成拒答的文本；确认不是拒答时一次性放行。"""
+            nonlocal guard_buf, guard_open
+            if guard_open:
+                return fragment
+            guard_buf += fragment
+            if is_possible_refusal_prefix(guard_buf):
+                return ""
+            guard_open = True
+            out, guard_buf = guard_buf, ""
+            return out
 
         async def _flush_lines(buf: str, is_final: bool = False):
             """把 buf 按行切分，完整行逐行校验并 yield delta。直接修改外层 line_buf。"""
@@ -658,7 +780,9 @@ class StreamGenerationService(GenerationService):
                                 return
                             to_emit = out_pre + "\n"
                             full_text += to_emit
-                            yield StreamDelta(type="delta", text=to_emit)
+                            guarded = _gate(to_emit)
+                            if guarded:
+                                yield StreamDelta(type="delta", text=guarded)
                     in_reasoning = True
                     if _REASONING_CLOSE in rest:
                         idx = rest.index(_REASONING_CLOSE)
@@ -696,7 +820,9 @@ class StreamGenerationService(GenerationService):
                                 aborted = True
                                 return
                             full_text += out
-                            yield StreamDelta(type="delta", text=out)
+                            guarded = _gate(out)
+                            if guarded:
+                                yield StreamDelta(type="delta", text=guarded)
                     in_followups = True
                     if "</followups>" in after:
                         idx = after.index("</followups>")
@@ -719,7 +845,9 @@ class StreamGenerationService(GenerationService):
                     return
                 to_emit = out + "\n"
                 full_text += to_emit
-                yield StreamDelta(type="delta", text=to_emit)
+                guarded = _gate(to_emit)
+                if guarded:
+                    yield StreamDelta(type="delta", text=guarded)
 
         try:
             async for delta in llm.stream_chat(messages, decisions.GENERATION_TEMPERATURE):
@@ -767,7 +895,9 @@ class StreamGenerationService(GenerationService):
             fallback = reasoning_buf.strip()
             full_text += fallback + "\n"
             in_reasoning = False
-            yield StreamDelta(type="delta", text=fallback + "\n")
+            guarded = _gate(fallback + "\n")
+            if guarded:
+                yield StreamDelta(type="delta", text=guarded)
 
         # 解析 followups
         suggestions = [ln.strip() for ln in followups_buf.splitlines() if ln.strip()]
@@ -804,6 +934,12 @@ class StreamGenerationService(GenerationService):
                 stripped_sentences=stripped, full_text="",
             )
             return
+
+        # 守卫里还留着首段正文（短答案/无句末标点）→ 确认不是拒答后一次放行
+        if guard_buf:
+            tail, guard_buf = guard_buf, ""
+            guard_open = True
+            yield StreamDelta(type="delta", text=tail)
 
         yield StreamDelta(
             type="done",
