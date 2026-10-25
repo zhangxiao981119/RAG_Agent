@@ -85,6 +85,8 @@ class FakeSession:
             return FakeResult([])
         if "filename" in sql:
             return FakeResult([])
+        if "FROM kb_terms" in sql:
+            return FakeResult([])
         if "v(document_id, heading_path)" in sql:
             return FakeResult([])
         if "table_group_id = :group_id" in sql:

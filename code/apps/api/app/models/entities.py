@@ -289,6 +289,38 @@ class Chunk(Base):
     )
 
 
+class KbTerm(Base):
+    """知识库领域词表（迁移 0023）—— 查询扩展的依据。
+
+    由 scripts/build_kb_terms.py 离线从 chunks 抽取，不依赖大模型：
+      · model     型号/料号（XYZ-1000），aliases 是它的写法变体
+      · acronym   文档里成对出现的缩写与全称（`访问令牌（AccessToken）`）
+    检索期只做「term / aliases 命中查询词 → 补充另一侧写法」，词元总量仍受
+    ILIKE_MAX_TERMS 与 FTS_QUERY_MAX_TERMS 约束。
+    """
+
+    __tablename__ = "kb_terms"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False
+    )
+    # 归一后的词条（NFKC + 小写），查询侧按同一规则归一后精确匹配
+    term: Mapped[str] = mapped_column(Text, nullable=False)
+    # 写法变体 / 对照词（JSONB 数组），如型号的三种分隔写法、缩写与全称互指
+    aliases: Mapped[list[str]] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    # 在知识库原文中的出现次数：抽取时用于过滤低频噪声
+    freq: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("kb_id", "term", name="uq_kb_terms_kb_term"),
+        Index("idx_kb_terms_lookup", "kb_id"),
+    )
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 

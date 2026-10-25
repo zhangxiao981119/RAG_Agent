@@ -92,6 +92,8 @@ class FakeSession:
             return FakeResult([])
         if "filename" in sql:
             return FakeResult([])
+        if "FROM kb_terms" in sql:
+            return FakeResult([])
         if "v(document_id, heading_path)" in sql:
             self.section_calls.append(dict(params or {}))
             return FakeResult(self._h.section_rows)

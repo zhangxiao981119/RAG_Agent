@@ -112,6 +112,28 @@ NEW_UNANSWERABLE_QUESTIONS = [
     "最新一期双色球开奖号码是什么？",
 ]
 
+# 2026-10-25 新增 8 条可答：型号别名形态（P-B 型号/标识符归一化）
+# 文档里固定写 `XYZ-1000` / `M-1002`，提问改成无连字符、空格分隔、大小写混排三种形态，
+# 覆盖「同一型号多种写法」的长尾召回。入库前必须过 precheck_cases.py（阈值 0）：
+# 只有 top1 命中期望文档的用例才允许进集。
+MODEL_ALIAS_ANSWERABLE_QUESTIONS: list[tuple[str, str]] = [
+    ("xyz1000 智能终端的处理器是什么配置？", "产品规格说明.txt"),
+    ("XYZ 1000 整机保修几年？", "产品规格说明.txt"),
+    ("Xyz1000 配备了哪些接口？", "产品规格说明.txt"),
+    ("xyz1000 待机和满载功耗分别是多少？", "产品规格说明.txt"),
+    ("xyz1000 的销售单价是多少？", "销售数据.xlsx"),
+    ("xyz2000 的销售单价是多少？", "销售数据.xlsx"),
+    ("m1001 主板组件在上海仓有多少库存？", "库存清单.xls"),
+    ("M 1002 物料是什么、库存状态如何？", "库存清单.xls"),
+]
+
+# 2026-10-25 新增 3 条不可答：型号本身不存在，用于验证归一化没有把「相似型号」误连
+MODEL_ALIAS_UNANSWERABLE_QUESTIONS = [
+    "XYZ-9000 的销售单价是多少？",
+    "M-9999 物料在深圳仓有多少库存？",
+    "abc9999 的保修政策是什么？",
+]
+
 
 async def seed_eval() -> None:
     settings = get_settings()
@@ -184,7 +206,9 @@ async def seed_eval() -> None:
         # ── 2026-10-07 新增可答：按文件名反查全部 indexed 文档 id 作为期望命中集合。
         #   库内存在同名重复文档（如企业知识库.md 两份），任一命中即算命中。
         filename_to_doc_ids: dict[str, list[uuid.UUID]] = {}
-        for _question, expected_filename in NEW_ANSWERABLE_QUESTIONS:
+        for _question, expected_filename in (
+            NEW_ANSWERABLE_QUESTIONS + MODEL_ALIAS_ANSWERABLE_QUESTIONS
+        ):
             if expected_filename in filename_to_doc_ids:
                 continue
             docs = (
@@ -239,9 +263,56 @@ async def seed_eval() -> None:
                 )
                 inserted += 1
 
+        # ── 2026-10-25 新增：型号别名形态（P-B 型号归一化）──
+        for question, expected_filename in MODEL_ALIAS_ANSWERABLE_QUESTIONS:
+            existing = await session.scalar(
+                select(EvalCase).where(
+                    EvalCase.tenant_id == tenant.id, EvalCase.question == question
+                )
+            )
+            if existing is None:
+                session.add(
+                    EvalCase(
+                        tenant_id=tenant.id,
+                        kb_id=kb_id,
+                        question=question,
+                        expected_answerable=True,
+                        expected_doc_ids=filename_to_doc_ids[expected_filename],
+                        note=f"可答（2026-10-25 型号别名，期望 {expected_filename}）",
+                    )
+                )
+                inserted += 1
+
+        for question in MODEL_ALIAS_UNANSWERABLE_QUESTIONS:
+            existing = await session.scalar(
+                select(EvalCase).where(
+                    EvalCase.tenant_id == tenant.id, EvalCase.question == question
+                )
+            )
+            if existing is None:
+                session.add(
+                    EvalCase(
+                        tenant_id=tenant.id,
+                        kb_id=kb_id,
+                        question=question,
+                        expected_answerable=False,
+                        expected_doc_ids=[],
+                        note="不可答（2026-10-25 型号不存在，MUST 拒答）",
+                    )
+                )
+                inserted += 1
+
         await session.commit()
-        total_answerable = len(ANSWERABLE_QUESTIONS) + len(NEW_ANSWERABLE_QUESTIONS)
-        total_unanswerable = len(UNANSWERABLE_QUESTIONS) + len(NEW_UNANSWERABLE_QUESTIONS)
+        total_answerable = (
+            len(ANSWERABLE_QUESTIONS)
+            + len(NEW_ANSWERABLE_QUESTIONS)
+            + len(MODEL_ALIAS_ANSWERABLE_QUESTIONS)
+        )
+        total_unanswerable = (
+            len(UNANSWERABLE_QUESTIONS)
+            + len(NEW_UNANSWERABLE_QUESTIONS)
+            + len(MODEL_ALIAS_UNANSWERABLE_QUESTIONS)
+        )
         print(
             f"eval_cases 插入 {inserted} 条；当前用例集合计 "
             f"{total_answerable + total_unanswerable} 条"

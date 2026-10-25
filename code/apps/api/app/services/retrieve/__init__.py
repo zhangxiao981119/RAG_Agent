@@ -12,7 +12,6 @@ M4 任务 5：权限下推过滤（H7）。向量 / 关键词 SQL 都接进四�
 from __future__ import annotations
 
 import logging
-import re
 import time
 import uuid
 
@@ -25,7 +24,12 @@ from app.config.settings import get_settings
 from app.infra import metrics, trace
 from app.services.acl.visibility import pushdown_params  # noqa: F401  (外部引用，保留导出)
 from app.services.embedding import get_embedding_service
-from app.services.keyword_text import build_fts_query, build_ilike_terms
+from app.services.keyword_text import (
+    build_fts_query,
+    build_ilike_pattern,
+    build_ilike_terms,
+)
+from app.services.lexicon import alias_index_tokens, load_alias_map
 from app.services.retrieve.base import RetrievalResult, RetrievedChunk
 from app.services.retrieve.chain import (
     ChainDecomposeError,
@@ -91,7 +95,7 @@ ORDER BY LEAST(
          THEN strpos(lower(c.content), :needle) ELSE 2147483647 END,
     CASE WHEN strpos(lower(c.heading_path), :needle) > 0
          THEN strpos(lower(c.heading_path), :needle) ELSE 2147483647 END
-)
+), c.id
 LIMIT :limit
 """)
 
@@ -241,6 +245,19 @@ class RetrievalService:
         #    tsquery 走 GIN 索引，混在一起会把两路的成本差异互相掩盖。
         t0 = time.perf_counter()
         ilike_terms = build_ilike_terms(query)
+        # 领域词表扩展（kb_terms）：命中词元补另一侧写法，ILIKE 正则与 tsquery 共用。
+        # 一次精确键查询（jsonb ?|），词表再大也只回命中行。
+        alias_map: dict[str, list[str]] = {}
+        if ilike_terms and decisions.ALIAS_EXPANSION_ENABLED:
+            t_lex = time.perf_counter()
+            alias_map = await load_alias_map(session, authorized_kb_ids, ilike_terms)
+            lexicon_ms = (time.perf_counter() - t_lex) * 1000
+            stages["lexicon"] = int(lexicon_ms)
+            metrics.observe_ms("rag.retrieve.lexicon", lexicon_ms)
+            if alias_map:
+                metrics.incr("rag.lexicon.expand", len(alias_map))
+        # 词表查询单独计时，ILIKE 段只算自身 SQL —— 否则词表往返会被算进子串扫
+        t0 = time.perf_counter()
         keyword_rows: list = []
         if ilike_terms:
             # 词元已按长度降序，第一个即最长词元，用作排序 needle
@@ -248,8 +265,10 @@ class RetrievalService:
                 _KEYWORD_SQL,
                 {
                     **pushdown,
-                    # re.escape 后做正则分支：词元里的 . * + ? 等不会被当元字符
-                    "pattern": "|".join(re.escape(term) for term in ilike_terms),
+                    # 型号词元由 build_ilike_pattern 展开可选分隔符
+                    # （`xyz[-_ ]?1000`），其余词元只做 re.escape；
+                    # 词表别名作为同一逻辑词元的分支并列 OR
+                    "pattern": build_ilike_pattern(ilike_terms, alias_map),
                     "needle": ilike_terms[0].lower(),
                     "limit": decisions.TOP_K_RECALL,
                 },
@@ -262,7 +281,11 @@ class RetrievalService:
         # ★ tsquery 路径：走 idx_chunk_fts_vec，中文按 3 字窗口、ASCII 按整词
         fts_rows = []
         fts_ms = 0.0
-        tsquery = build_fts_query(query) if decisions.KEYWORD_TSQUERY_ENABLED else None
+        tsquery = (
+            build_fts_query(query, alias_index_tokens(alias_map))
+            if decisions.KEYWORD_TSQUERY_ENABLED
+            else None
+        )
         if tsquery:
             t_fts = time.perf_counter()
             try:

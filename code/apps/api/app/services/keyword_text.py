@@ -24,6 +24,15 @@ _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
 # 与 tsquery 的操作符字符集天然不相交，故不存在注入面。
 _ASCII_RE = re.compile(r"[A-Za-z0-9_]{2,}")
 
+# 型号/料号：1~6 个字母 + 可选分隔符 + 2~6 位数字，例如 XYZ-1000 / xyz1000 / M-1002。
+# ★ 前后都要卡边界：否则「java 1000」会被拆出「a 1000」、「xyz1000abc」会被当成型号。
+# ★ 分隔符允许 - _ 空格三种 —— 同一型号在文档与提问里的写法各不相同，这是长尾
+#   召回失败的主要来源之一（doc 写 XYZ-1000，用户输入 xyz1000）。
+_MODEL_CODE_RE = re.compile(r"(?<![a-z0-9])([a-z]{1,6})[-_ ]?(\d{2,6})(?![a-z0-9])")
+
+# 归一后的型号词元（字母-数字）。ILIKE 正则据此展开可选分隔符。
+_MODEL_TERM_RE = re.compile(r"^([a-z]{1,6})-(\d{2,6})$")
+
 # ILIKE 路的中文切段词：疑问词与虚词。
 # 按「疑问/功能词」切开，才能把语义单元取出来 —— 整段截前 8 字得到的是
 # 「差旅费报销需要提」这种任意前缀，要求文档里原样出现，实测 81.6% 的用例
@@ -76,7 +85,15 @@ def _dedupe(tokens: list[str]) -> list[str]:
     return list(seen)
 
 
-def build_fts_query(query: str) -> str | None:
+def _model_codes(text: str) -> list[tuple[str, str]]:
+    """抽取型号并对 (字母, 数字) 去重，输入须已 `_normalize`。"""
+    seen: dict[tuple[str, str], None] = {}
+    for letters, digits in _MODEL_CODE_RE.findall(text):
+        seen.setdefault((letters, digits), None)
+    return list(seen)
+
+
+def build_fts_query(query: str, alias_tokens: list[str] | None = None) -> str | None:
     """把查询构造成 tsquery 文本；无可索引词元时返回 None（调用方跳过 FTS 路径）。
 
     连接口径：**3 字窗口 OR**
@@ -109,13 +126,30 @@ def build_fts_query(query: str) -> str | None:
                 f"({grams[i]} & {grams[i + 1]})" for i in range(len(grams) - 1)
             )
     windows = _dedupe(windows)[: decisions.FTS_QUERY_MAX_TERMS]
-    ascii_tokens = _dedupe(_ASCII_RE.findall(text))[: decisions.FTS_QUERY_MAX_TERMS]
+    # ASCII 组：整词 + 型号的 AND 词对。
+    # ★ 型号词对解决「索引里只有两个碎片」的问题：doc 写 `XYZ-1000` 时入库侧
+    #   `_ASCII_RE` 存的是 `xyz` 与 `1000` 两个独立 token，查询侧整词 `xyz1000`
+    #   在索引里不存在 —— 不补词对就是静默 0 召回。
+    # ★ 单字母前缀（`M-1002`）不补：入库侧长度 >= 2 已丢弃 `m`，词对永远匹配不上，
+    #   这类型号交给 ILIKE 路（扫原文，分隔符写法都能命中）。
+    ascii_items = _dedupe(
+        _ASCII_RE.findall(text)
+        + [f"({letters} & {digits})" for letters, digits in _model_codes(text) if len(letters) >= 2]
+    )[: decisions.FTS_QUERY_MAX_TERMS]
+
+    # 词表扩展的别名（已由 lexicon 转成索引词元）：并入对应组做 OR，
+    # 不新增 AND 组 —— 扩的是「同一语义的另一种写法」，不是额外的必要条件。
+    if alias_tokens:
+        cjk_aliases = [tok for tok in alias_tokens if _CJK_RE.fullmatch(tok)]
+        ascii_aliases = [tok for tok in alias_tokens if not _CJK_RE.fullmatch(tok)]
+        windows = _dedupe(windows + cjk_aliases)[: decisions.FTS_QUERY_MAX_TERMS]
+        ascii_items = _dedupe(ascii_items + ascii_aliases)[: decisions.FTS_QUERY_MAX_TERMS]
 
     groups: list[str] = []
     if windows:
         groups.append("(" + " | ".join(windows) + ")")
-    if ascii_tokens:
-        groups.append("(" + " | ".join(ascii_tokens) + ")")
+    if ascii_items:
+        groups.append("(" + " | ".join(ascii_items) + ")")
     if not groups:
         return None
     return " & ".join(groups)
@@ -137,6 +171,14 @@ def build_ilike_terms(query: str) -> list[str]:
       决定词元好坏的是「该词元在文档里是否有区分度」，不是它来自哪个库。
     """
     text = _normalize(query[:400])
+    codes = _model_codes(text)
+    # 型号覆盖整段：数字碎片（`1000`）与拆开的字母前缀（`xyz`）不再单独成词元 ——
+    # 前者命中全库，后者在文档里几乎总与型号一起出现，占额度没有增量。
+    covered = {
+        part
+        for letters, digits in codes
+        for part in (letters, digits, letters + digits)
+    }
     cjk_terms = [
         segment[:8]
         for run in _CJK_RE.findall(text)
@@ -144,7 +186,51 @@ def build_ilike_terms(query: str) -> list[str]:
         if len(segment) >= 2
     ]
     ascii_terms = [
-        token for token in _ASCII_RE.findall(text) if "_" in token or len(token) >= 4
+        token
+        for token in _ASCII_RE.findall(text)
+        if token not in covered and ("_" in token or len(token) >= 4)
     ]
-    terms = _dedupe(cjk_terms + ascii_terms)
+    model_terms = [f"{letters}-{digits}" for letters, digits in codes]
+    terms = _dedupe(model_terms + cjk_terms + ascii_terms)
     return sorted(terms, key=len, reverse=True)[: decisions.ILIKE_MAX_TERMS]
+
+
+def extract_model_terms(text: str) -> list[tuple[str, list[str]]]:
+    """抽取型号词条：(归一形式, 三种写法)，供词表构建脚本使用。
+
+    归一形式统一用连字符（文档里最常见），写法变体覆盖无分隔与空格两种。
+    """
+    return [
+        (
+            f"{letters}-{digits}",
+            [f"{letters}{digits}", f"{letters} {digits}"],
+        )
+        for letters, digits in _model_codes(_normalize(text))
+    ]
+
+
+def build_ilike_pattern(
+    terms: list[str],
+    aliases: dict[str, list[str]] | None = None,
+) -> str:
+    """把词元拼成正则分支；型号词元展开为「可选分隔符」以容忍三种写法。
+
+    `xyz-1000` -> `xyz[-_ ]?1000`，一条分支同时命中 `XYZ-1000` / `xyz1000` /
+    `XYZ 1000`。非型号词元只做 re.escape，不引入任何通配语义。
+
+    aliases 是词表扩展结果（键为词元、值为其它写法）：同义词作为**同一逻辑词元**
+    的分支并列 OR，不占用 ILIKE_MAX_TERMS 的名额 —— 否则「访问令牌」与
+    「accesstoken」会互相挤掉本该保留的中文语义单元。
+    """
+    aliases = aliases or {}
+    parts: list[str] = []
+    for term in terms:
+        for alt in (term, *aliases.get(term, [])):
+            match = _MODEL_TERM_RE.match(alt)
+            if match:
+                parts.append(
+                    f"{re.escape(match.group(1))}[-_ ]?{re.escape(match.group(2))}"
+                )
+            else:
+                parts.append(re.escape(alt))
+    return "|".join(parts)
