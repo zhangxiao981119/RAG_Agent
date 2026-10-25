@@ -591,11 +591,8 @@ class RetrievalService:
                     break
 
             if section_chunks:
-                metrics.incr(
-                    "rag.section_recall.hit",
-                    chunks=len(section_chunks),
-                    sections=len(hit_sections),
-                )
+                # 不带 tags：补回片数/小节数是连续量，做标签会让时序基数无界
+                metrics.incr("rag.section_recall.hit")
             section_ms = (time.perf_counter() - t_section) * 1000
             stages["section_recall"] = int(section_ms)
             metrics.observe_ms("rag.retrieve.section_recall", section_ms)
