@@ -248,3 +248,52 @@ async def test_unexpected_error_falls_back_to_original(monkeypatch):
     query, status, _ = await qr.rewrite_query("异常的问题")
 
     assert (query, status) == ("异常的问题", "error")
+
+
+# ── 澄清判定（反问用户的前置闸门）──────────────────────────────────
+# 回归场景：2026-10-25 评测里有 8 条可答问题（改写分 85/86/88、状态
+# rewrite_no_change）被 90 分阈值判成「不够明确」而直接反问，检索根本没跑。
+# 澄清阈值必须独立于改写阈值，且 70-89 一律放行检索。
+
+
+def test_clarify_threshold_lower_than_rewrite_threshold():
+    """两个阈值职责不同：改写用 90，澄清用 70，不能被合并成一个常量。"""
+    assert decisions.QUERY_CLARIFY_SCORE_THRESHOLD < decisions.QUERY_REWRITE_SCORE_THRESHOLD
+
+
+def test_score_85_no_change_no_history_does_not_clarify():
+    """回归：85 分 + 无改写 + 无历史 → 照常检索，不反问。"""
+    assert not decisions.should_clarify(85, "rewrite_no_change", has_history=False)
+
+
+def test_score_88_no_change_no_history_does_not_clarify():
+    """回归：88 分（距旧阈值 90 仅 2 分）同样不得反问。"""
+    assert not decisions.should_clarify(88, "rewrite_no_change", has_history=False)
+
+
+def test_score_at_clarify_threshold_does_not_clarify():
+    """边界：等于 70 分时不反问（严格小于才触发）。"""
+    assert not decisions.should_clarify(
+        decisions.QUERY_CLARIFY_SCORE_THRESHOLD, "rewrite_no_change", has_history=False
+    )
+
+
+def test_score_69_no_change_no_history_clarifies():
+    """低于阈值仍要反问，闸门不能被完全放开。"""
+    assert decisions.should_clarify(69, "rewrite_no_change", has_history=False)
+
+
+def test_score_50_rewritten_does_not_clarify():
+    """改写已产出可用 query → 有东西可检索，不反问。"""
+    assert not decisions.should_clarify(50, "rewritten", has_history=False)
+
+
+def test_clarify_false_when_history_exists():
+    """有历史可消解指代 → 不反问。"""
+    assert not decisions.should_clarify(60, "rewrite_no_change", has_history=True)
+
+
+def test_clarify_false_when_score_unknown():
+    """改写超时/失败时 score 未知，不能因此拦在检索之前。"""
+    assert not decisions.should_clarify(None, "timeout", has_history=False)
+

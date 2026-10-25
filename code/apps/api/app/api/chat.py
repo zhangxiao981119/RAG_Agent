@@ -336,14 +336,12 @@ async def chat_ask(
                             rewrite_score, rewrite_status)
 
             # ── 澄清判定（反问用户，不消耗检索）─────────────────────
-            # 三条件同时成立才触发：改写分低于阈值（问题不自包含）、改写未
-            # 产出可用 query、会话无历史可消解。此时带模糊问题去检索只会换来
-            # NO_RELEVANT_CONTENT 拒答，不如直接反问。
+            # 用独立的澄清阈值（QUERY_CLARIFY_SCORE_THRESHOLD=70），不是改写阈值 90：
+            # 70-89 是「有小瑕疵但基本可检索」，照常检索；只有 < 70（指代无法消解
+            # / 缺主语）才反问。三条件同时成立才触发，判定逻辑见 decisions.should_clarify。
             # 超时/LLM 失败路径 score 恒回 100（复杂度未知）→ 不触发，维持原行为。
-            if (
-                rewrite_score < decisions.QUERY_REWRITE_SCORE_THRESHOLD
-                and rewrite_status != "rewritten"
-                and not rewrite_history
+            if decisions.should_clarify(
+                rewrite_score, rewrite_status, bool(rewrite_history)
             ):
                 logger.info("chat.clarify: score=%d, status=%s, 无历史可消解，反问用户",
                             rewrite_score, rewrite_status)

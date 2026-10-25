@@ -200,6 +200,37 @@ QUERY_REWRITE_SCORE_THRESHOLD: Final[int] = 90
 """百分制改写阈值：score >= 阈值 直接跳过改写；score < 阈值 执行改写。
 打分维度 = 明确度 + 检索友好度 - 指代依赖度/2，clamp 到 [0, 100]。"""
 
+QUERY_CLARIFY_SCORE_THRESHOLD: Final[int] = 70
+"""澄清判定阈值：只有改写分 < 70（明确度/检索友好度严重不足）才反问用户。
+
+★ 单独一个阈值，不与 QUERY_REWRITE_SCORE_THRESHOLD 共用。90 分是「要不要
+  改写」的边界；prompt 的评分标定把 70-89 定义为「有小瑕疵但基本可检索」。
+  沿用 90 做澄清判定等于把「基本可检索」判成「不够明确」：
+  2026-10-25 评测 111 条可答用例中 8 条被误杀，改写分 85/86/88、状态全为
+  rewrite_no_change，而它们单趟检索 top1 均 >= 0.59（阈值 0.50），本可回答。
+  70 分以下才对应「指代无法消解 / 缺主语」这类检索必然失败的问题。"""
+
+
+def should_clarify(
+    rewrite_score: int | None,
+    rewrite_status: str,
+    has_history: bool,
+) -> bool:
+    """是否需要反问用户（澄清前置，不消耗检索）。
+
+    三条件同时成立才反问：改写分低于澄清阈值（问题不自包含）、改写未产出
+    可用 query、会话无历史可消解。
+    rewrite_score 为 None（改写超时/失败，复杂度未知）时不触发，维持原行为
+    —— 不能因为上游抖动就把用户问题拦在检索之前。
+    """
+    if rewrite_score is None or has_history:
+        return False
+    return (
+        rewrite_score < QUERY_CLARIFY_SCORE_THRESHOLD
+        and rewrite_status != "rewritten"
+    )
+
+
 # ── 思维链（Chain-of-Thought）分级 ──────────────────────
 COT_MODE: Final[str] = "adaptive"
 """思维链开关策略：
