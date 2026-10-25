@@ -158,6 +158,32 @@ async def test_refusal_after_retry_returns_refused(monkeypatch, counters) -> Non
 
 
 @pytest.mark.asyncio
+async def test_ungrounded_empty_output_retried(monkeypatch, counters) -> None:
+    """上游吐空输出（全文被剥空）⇒ 零外发 UNGROUNDED，可安全重试并捞回。"""
+    llm = FakeLLM([[], [ANSWER_OK]])
+    events = await _collect(_service(monkeypatch, llm), _chunks(3))
+
+    assert llm.calls == 2
+    assert events[-1].type == "done"
+    assert "Channel" in events[-1].full_text
+    assert "rag.generate.refusal_retry" in counters
+    assert "rag.generate.refusal_retry_recovered" in counters
+    assert all(e.type != "refused" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_ungrounded_after_emission_not_retried(monkeypatch, counters) -> None:
+    """有正文但零引用（已外发）⇒ 不重试，避免拼出两段矛盾正文。"""
+    llm = FakeLLM([["快速排序采用分治策略，选取基准元素后分区递归处理。"]])
+    events = await _collect(_service(monkeypatch, llm), _chunks(3))
+
+    assert llm.calls == 1
+    assert events[-1].type == "refused"
+    assert events[-1].refuse_reason == "UNGROUNDED"
+    assert "rag.generate.refusal_retry" not in counters
+
+
+@pytest.mark.asyncio
 async def test_normal_answer_not_retried(monkeypatch, counters) -> None:
     llm = FakeLLM([[ANSWER_OK]])
     events = await _collect(_service(monkeypatch, llm), _chunks(3))

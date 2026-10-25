@@ -604,6 +604,11 @@ class StreamGenerationService(GenerationService):
         守卫（is_possible_refusal_prefix）保证拒答文案在判定成立前不外发，因此
         重试对前端是透明的 —— 不会出现"先吐拒答、再吐答案"的拼接。
         已经外发过正文的拒答不重试：两段互相矛盾的正文拼在一起比拒答更糟。
+
+        可重试原因 = 契约拒答文案 + 零外发的 UNGROUNDED。后者覆盖上游偶发
+        空输出（全文被剥空）—— 那一个字都没发出去，重试代价只是多一次调用；
+        而"有正文但零引用/绕道作答"的 UNGROUNDED 在到这里之前已经外发过正文，
+        外层循环拿不到 refused 事件，自然不会重试。
         """
         # 条数与 top1 分双门槛：只按条数会把"捞到 8 条相邻上下文但都不相关"的
         # 不可答问题也重试一遍，等于给它第二次编造机会。
@@ -613,6 +618,7 @@ class StreamGenerationService(GenerationService):
             and max((c.display_score for c in chunks), default=0.0)
             >= decisions.GENERATION_REFUSAL_RETRY_MIN_SCORE
         )
+        retryable_reasons = ("NO_RELEVANT_CONTENT", "UNGROUNDED")
         attempts = 2 if can_retry else 1
         for attempt in range(1, attempts + 1):
             emitted = False
@@ -642,13 +648,18 @@ class StreamGenerationService(GenerationService):
             ):
                 # 上下文充足却拒答：记发生率（只记首次尝试，重试也拒答不再重复计数）
                 metrics.incr("rag.generate.refusal_with_context")
-            if refused.refuse_reason != "NO_RELEVANT_CONTENT" or attempt == attempts:
+            if (
+                refused.refuse_reason not in retryable_reasons
+                or attempt == attempts
+            ):
                 if attempt > 1:
                     metrics.incr("rag.generate.refusal_after_retry")
                 yield refused
                 return
             logger.warning(
-                "生成层误拒：检索 %d 条上下文仍输出拒答文案，重试一次", len(chunks)
+                "生成层误拒（%s）：检索 %d 条上下文仍拒绝输出，重试一次",
+                refused.refuse_reason,
+                len(chunks),
             )
             metrics.incr("rag.generate.refusal_retry")
 
