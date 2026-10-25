@@ -149,7 +149,7 @@ def test_section_sql_acl_and_key() -> None:
     """补全 SQL MUST 复用四闸门，且按 (document_id, heading_path) 行值匹配。"""
     sql = retrieve_mod._SECTION_RECALL_SQL_TEMPLATE.format(
         where_base=retrieve_mod._WHERE_BASE,
-        values="(:doc_0::uuid, :heading_0::text)",
+        values="(CAST(:doc_0 AS uuid), CAST(:heading_0 AS text))",
     )
     assert "c.is_latest = true" in sql
     assert "c.tenant_id = :tenant_id" in sql
@@ -159,6 +159,12 @@ def test_section_sql_acl_and_key() -> None:
     assert "c.acl_tags && :user_subjects" in sql
     assert "(c.document_id, c.heading_path) IN" in sql
     assert "ORDER BY c.document_id, c.heading_path, c.chunk_index" in sql
+
+    # ★ 绑定参数必须真被 SQLAlchemy 识别：`:p::type` 写法的参数名后紧跟 `::`，
+    #   会被解析正则的 (?!:) 负向断言排除，原样发给 asyncpg → syntax error at or near ":"。
+    #   这里用 text() 真实解析一次，把「测试通过但线上 500」的口子堵住。
+    bindparams = retrieve_mod.text(sql)._bindparams  # noqa: SLF001  (测试专用断言)
+    assert {"doc_0", "heading_0"} <= set(bindparams)
 
 
 # ── 补全行为 ─────────────────────────────────────────────

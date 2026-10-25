@@ -533,8 +533,12 @@ class RetrievalService:
             for i, (doc_id, heading) in enumerate(hit_sections):
                 recall_params[f"doc_{i}"] = doc_id
                 recall_params[f"heading_{i}"] = heading
+            # ★ 用 CAST(...) 而不是 :param::type 写法：SQLAlchemy 解析绑定参数的正则
+            #   带 (?!:) 负向断言，`:doc_0::uuid` 这种「参数名后紧跟 ::」不会被识别成
+            #   绑定参数，会原样发给 asyncpg 报 syntax error at or near ":"。
             values_sql = ", ".join(
-                f"(:doc_{i}::uuid, :heading_{i}::text)" for i in range(len(hit_sections))
+                f"(CAST(:doc_{i} AS uuid), CAST(:heading_{i} AS text))"
+                for i in range(len(hit_sections))
             )
             section_result = await session.execute(
                 text(
