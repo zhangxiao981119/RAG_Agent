@@ -120,7 +120,8 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
       · 合并后条数上限 = TOP_K_RERANK（与单趟一致，下游窗口估算/配额/编号零改动）
       · 闸门：合并集 max(final_score) < active_threshold(use_rerank) → 拒答
       · use_rerank 任一轮为 False → 整体按降级口径（vector 阈值）判定（保守）
-      · table_recall_chunks 按 chunk_id 去重合并，仍排命中片之后、分数为 0
+      · table_recall_chunks / section_recall_chunks 按 chunk_id 去重合并，
+        仍排命中片之后、分数为 0；两张表并集内也互斥（同一片不进两次）
       · stage_ms / path_stats 按轮累加；chain_decompose 由调用方注入，不在此处
     """
     # 延迟导入：_build_rrf_scores 定义在包 __init__，而本模块被该 __init__ 导入，
@@ -131,6 +132,7 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
     path_stats: dict[str, int] = {}
     merged: dict[uuid.UUID, RetrievedChunk] = {}
     recall: dict[uuid.UUID, RetrievedChunk] = {}
+    section_recall: dict[uuid.UUID, RetrievedChunk] = {}
     rank_lists: list[list[uuid.UUID]] = []
     use_rerank = True
 
@@ -149,6 +151,11 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
                 prev.final_score = chunk.final_score
         for chunk in result.table_recall_chunks:
             recall.setdefault(chunk.chunk_id, chunk)
+        for chunk in result.section_recall_chunks:
+            # 与命中片、表格回捞片互斥：同一片进两次会让上下文编号重复
+            if chunk.chunk_id in merged or chunk.chunk_id in recall:
+                continue
+            section_recall.setdefault(chunk.chunk_id, chunk)
         if not result.use_rerank:
             use_rerank = False
 
@@ -178,4 +185,5 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
         use_rerank=use_rerank,
         path_stats=path_stats,
         table_recall_chunks=list(recall.values()),
+        section_recall_chunks=list(section_recall.values()),
     )

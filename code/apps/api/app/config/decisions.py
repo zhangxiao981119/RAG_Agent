@@ -694,6 +694,22 @@ TABLE_RECALL_TOKEN_BUDGET: Final[int] = 2_048
 与限流双保险：即便分片很小，也不允许无限捞。"""
 
 
+# ── 章节上下文补全（长文档 RAG：召回后补全所属语义单元）──────────
+SECTION_RECALL_MAX_CHUNKS: Final[int] = 3
+"""单个小节最多补入的分片数（不含命中片本身）。
+小节通常 1~3 片；上限只为拦住超长章节，避免整节挤占上下文。"""
+
+SECTION_RECALL_TOKEN_BUDGET: Final[int] = 1_200
+"""所有小节合计的补全 token 预算（按 chunks.token_count 累计）。
+按命中片顺序（分数降序）依次分配，预算耗尽即停 —— 高分小节先补全。
+约等于 3 片 CHUNK_TARGET_TOKENS，上下文增长可控。"""
+
+SECTION_RECALL_MIN_HEADING_CHARS: Final[int] = 2
+"""heading_path 长度低于该值的命中片不触发章节补全。
+无标题（空）或只有单字目录名的文档不存在"小节"语义，按它补全等于把
+整篇无结构文档拖进上下文。"""
+
+
 # ── 脱敏（M5 任务 2）──────────────────────────────────
 MASK_PII_ENABLED: Final[bool] = True
 """输出层 PII 脱敏。命中手机号/身份证/银行卡的片段打码。

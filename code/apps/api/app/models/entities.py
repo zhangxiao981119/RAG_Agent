@@ -277,6 +277,15 @@ class Chunk(Base):
             "table_group_id",
             postgresql_where=text("table_group_id IS NOT NULL"),
         ),
+        # 章节补全（迁移 0022）：按 (document_id, heading_path) 取同节分片。
+        # 同样走部分索引 —— 无标题分片永远不会被章节补全选中。
+        Index(
+            "idx_chunk_section",
+            "document_id",
+            "heading_path",
+            "chunk_index",
+            postgresql_where=text("heading_path IS NOT NULL"),
+        ),
     )
 
 

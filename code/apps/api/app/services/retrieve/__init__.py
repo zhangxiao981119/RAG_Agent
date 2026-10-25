@@ -138,6 +138,28 @@ ORDER BY c.chunk_index
 LIMIT :recall_limit
 """)
 
+# 章节上下文补全（长文档 RAG）：按 (document_id, heading_path) 取同节全部分片。
+# 定位精准靠细粒度分片，逻辑完整靠把命中片所在的整节补回上下文 —— 只切碎不补全，
+# 模型看到的是"半句话条款"。
+# ★ 一条 SQL 覆盖所有命中小节：用 VALUES 拼出 (document_id, heading_path) 集合，
+#   行值 IN 子查询命中 idx_chunk_section；不按小节发 N 次查询（最多 8 条往返）。
+# ★ 模板里 where_base 复用 _WHERE_BASE（别名同为 c），四闸门与主召回逐字一致 ——
+#   补全片和命中片必须同权限，否则缺口子给越权内容开了后门。
+# ★ 排序固定为 (document_id, heading_path, chunk_index) 只为分组稳定；
+#   真正的选取顺序在 Python 侧按命中片分数顺序逐节分配预算。
+_SECTION_RECALL_SQL_TEMPLATE = """
+SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
+       c.level_rank, c.chunk_index, c.token_count
+FROM chunks c
+{where_base}
+  AND (c.document_id, c.heading_path) IN (
+      SELECT v.document_id, v.heading_path
+      FROM (VALUES {values}) AS v(document_id, heading_path)
+  )
+ORDER BY c.document_id, c.heading_path, c.chunk_index
+LIMIT :recall_limit
+"""
+
 # 查询侧的 tsquery 构造在 keyword_text 模块 —— 与入库侧的 to_fts_text 共用切分规则，
 # 中文 bigram 才能与索引里的 token 对上（各写一份必然静默 0 召回）。
 
@@ -419,6 +441,8 @@ class RetrievalService:
         #    限流双保险：每组最多 TABLE_RECALL_MAX_CHUNKS 片、累计 token 不得超过
         #    TABLE_RECALL_TOKEN_BUDGET（超预算即停，保行序完整，不跳片拼残表）。
         recall_chunks: list[RetrievedChunk] = []
+        # 已入选片集合：表格回捞与章节补全都用它排除重复（两处共用，故在块外构造）
+        final_id_set = {c.chunk_id for c in retrieved}
         hit_group_ids = {
             g
             for g in (
@@ -428,7 +452,6 @@ class RetrievalService:
         }
         if hit_group_ids:
             t_recall = time.perf_counter()
-            final_id_set = {c.chunk_id for c in retrieved}
             for gid in hit_group_ids:
                 recall_result = await session.execute(
                     _TABLE_RECALL_SQL,
@@ -466,6 +489,8 @@ class RetrievalService:
                             is_table_recall=True,
                         )
                     )
+                    # 进集合：后面的章节补全不得再把同一片补一次
+                    final_id_set.add(row.id)
                     picked += 1
                     picked_tokens += row_tokens
             if recall_chunks:
@@ -478,7 +503,100 @@ class RetrievalService:
             stages["table_recall"] = int(recall_ms)
             metrics.observe_ms("rag.retrieve.table_recall", recall_ms)
 
-        # ⑦ 三路召回贡献打点
+        # ⑦ 章节上下文补全（长文档 RAG）：命中片所在小节的其他分片补进上下文，
+        #    保证条款前后逻辑完整（只切片不补全 = 模型拿到半句话）。
+        #    与表格回捞同款 —— 单独存放，不进排序 / 阈值 / 三路贡献统计；
+        #    调用方把它追加进上下文拼装序列，编号与 citations 沿用既有机制。
+        #    ★ 表格分片跳过：它已走组回捞，再按小节补一次会让同一片进上下文两遍。
+        section_chunks: list[RetrievedChunk] = []
+        hit_sections: list[tuple[uuid.UUID, str]] = []
+        seen_sections: set[tuple[uuid.UUID, str]] = set()
+        for chunk in retrieved:
+            heading = (chunk.heading_path or "").strip()
+            if len(heading) < decisions.SECTION_RECALL_MIN_HEADING_CHARS:
+                continue
+            if all_chunks[chunk.chunk_id].get("table_group_id"):
+                continue
+            key = (chunk.document_id, heading)
+            if key in seen_sections:
+                continue
+            seen_sections.add(key)
+            hit_sections.append(key)
+
+        if hit_sections:
+            t_section = time.perf_counter()
+            recall_params: dict = {
+                **pushdown,
+                # 每节上限 + 余量：超限行由 Python 侧按预算截断
+                "recall_limit": decisions.SECTION_RECALL_MAX_CHUNKS * len(hit_sections) + 50,
+            }
+            for i, (doc_id, heading) in enumerate(hit_sections):
+                recall_params[f"doc_{i}"] = doc_id
+                recall_params[f"heading_{i}"] = heading
+            values_sql = ", ".join(
+                f"(:doc_{i}::uuid, :heading_{i}::text)" for i in range(len(hit_sections))
+            )
+            section_result = await session.execute(
+                text(
+                    _SECTION_RECALL_SQL_TEMPLATE.format(
+                        where_base=_WHERE_BASE, values=values_sql
+                    )
+                ),
+                recall_params,
+            )
+            rows_by_section: dict[tuple[uuid.UUID, str], list] = {}
+            for row in section_result.fetchall():
+                rows_by_section.setdefault(
+                    (row.document_id, row.heading_path), []
+                ).append(row)
+
+            # 按命中片分数顺序逐节分配预算：高分小节先补全，预算耗尽即停
+            budget_left = decisions.SECTION_RECALL_TOKEN_BUDGET
+            for key in hit_sections:
+                picked = 0
+                for row in rows_by_section.get(key, []):
+                    if row.id in final_id_set:
+                        continue
+                    if picked >= decisions.SECTION_RECALL_MAX_CHUNKS:
+                        break
+                    row_tokens = int(row.token_count or 0)
+                    if row_tokens > budget_left:
+                        break
+                    section_chunks.append(
+                        RetrievedChunk(
+                            chunk_id=row.id,
+                            document_id=row.document_id,
+                            kb_id=row.kb_id,
+                            filename=filenames.get(row.document_id, ""),
+                            content=row.content,
+                            heading_path=row.heading_path or "",
+                            page_no=row.page_no,
+                            level_rank=row.level_rank,
+                            vector_score=0.0,
+                            keyword_score=None,
+                            rrf_score=0.0,
+                            rerank_score=None,
+                            final_score=0.0,
+                            is_section_recall=True,
+                        )
+                    )
+                    final_id_set.add(row.id)
+                    picked += 1
+                    budget_left -= row_tokens
+                if budget_left <= 0:
+                    break
+
+            if section_chunks:
+                metrics.incr(
+                    "rag.section_recall.hit",
+                    chunks=len(section_chunks),
+                    sections=len(hit_sections),
+                )
+            section_ms = (time.perf_counter() - t_section) * 1000
+            stages["section_recall"] = int(section_ms)
+            metrics.observe_ms("rag.retrieve.section_recall", section_ms)
+
+        # ⑧ 三路召回贡献打点
         #    covered = 最终 top-K 中该路召回到的条数（多路可重叠）
         #    unique  = 最终 top-K 中**只有**该路能召回到的条数
         #    口径以最终 top-K 为准，而不是各路原始候选数 —— 后者只说明"捞了多少"，
@@ -506,6 +624,7 @@ class RetrievalService:
             use_rerank=use_rerank,
             path_stats=path_stats,
             table_recall_chunks=recall_chunks,
+            section_recall_chunks=section_chunks,
         )
 
     async def retrieve_chain(

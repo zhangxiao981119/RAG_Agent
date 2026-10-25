@@ -497,9 +497,14 @@ async def chat_ask(
             # system prompt = qa_system（注册表生效版本）+ memory_prompt，
             # 与实际生成阶段拼装口径保持一致
             system_for_estimate = await build_system_prompt(memory_prompt, False, user.tenant_id)
-            # 表格决策 A1'：回捞片追加在命中片尾部 —— 编号 / citations / 配额裁剪
-            # 沿用既有机制（L4 按位置裁，超限时回捞片先于命中片被裁，优先级正确）
-            current_chunks = list(result.chunks) + list(result.table_recall_chunks)
+            # 表格决策 A1' + 长文档章节补全：回捞 / 补全片追加在命中片尾部 ——
+            # 编号 / citations / 配额裁剪沿用既有机制（L4 按位置裁，超限时补全片
+            # 先于命中片被裁，优先级正确）
+            current_chunks = (
+                list(result.chunks)
+                + list(result.table_recall_chunks)
+                + list(result.section_recall_chunks)
+            )
 
             # 先估算总 token 数，超限则逐轮压缩 history + 裁剪 chunks
             limit_cap = decisions.CONTEXT_WINDOW_LIMIT_TOKENS - decisions.CONTEXT_OUTPUT_RESERVE_TOKENS

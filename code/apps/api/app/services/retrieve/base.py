@@ -27,6 +27,10 @@ class RetrievedChunk:
     # 仅作上下文补充，MUST NOT 参与排序 / 阈值 / 三路贡献统计 ——
     # 分数一律 0 / None，回捞片单独放在 RetrievalResult.table_recall_chunks。
     is_table_recall: bool = False
+    # 长文档 RAG：章节补全片 = 命中片所在小节（同 document_id + heading_path）
+    # 的其余分片。与表格回捞同款 —— 仅补上下文，MUST NOT 参与排序 / 阈值，
+    # 分数一律 0 / None，单独放在 RetrievalResult.section_recall_chunks。
+    is_section_recall: bool = False
 
     @property
     def display_score(self) -> float:
@@ -57,6 +61,10 @@ class RetrievalResult:
     # 预算 TABLE_RECALL_TOKEN_BUDGET）。调用方把它追加进上下文拼装序列即可 ——
     # 编号 / citations / 配额裁剪沿用既有机制，不设特殊分支。
     table_recall_chunks: list[RetrievedChunk] = field(default_factory=list)
+    # 长文档 RAG 章节补全结果（每节上限 SECTION_RECALL_MAX_CHUNKS /
+    # 全局预算 SECTION_RECALL_TOKEN_BUDGET）。调用方与 table_recall_chunks
+    # 一样追加进上下文拼装序列，编号与 citations 沿用既有机制。
+    section_recall_chunks: list[RetrievedChunk] = field(default_factory=list)
     # 检索侧链式推理：本次走的是哪种模式。
     # "off"（开关关闭）/ "single"（信号不满足或拆解降级）/ "multi:N"（N 个子问题）。
     # 仅作审计与口径留痕，不参与任何判定。

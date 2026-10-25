@@ -85,6 +85,8 @@ class FakeSession:
             return FakeResult([])
         if "filename" in sql:
             return FakeResult([])
+        if "v(document_id, heading_path)" in sql:
+            return FakeResult([])
         if "table_group_id = :group_id" in sql:
             self.recall_calls.append(dict(params or {}))
             return FakeResult(self._h.recall_rows.get((params or {}).get("group_id"), []))

@@ -73,6 +73,8 @@ class FakeSession:
             return FakeResult([])
         if "filename" in sql:
             return FakeResult([])
+        if "v(document_id, heading_path)" in sql:
+            return FakeResult([])
         raise AssertionError(f"未识别的 SQL: {sql[:80]}")
 
 
