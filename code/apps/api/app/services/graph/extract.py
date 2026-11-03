@@ -403,6 +403,14 @@ async def extract_document(
     relations: dict[tuple[str, str, str], ExtractedRelation] = {}
     llm_calls = 0
 
+    # ★ 事务必须在这里结束：往下全是 LLM 网络调用，而本函数**不写库**。
+    #   带着事务去等网络 = 连接长期 idle in transaction（实测一次冻结把它挂了 11 分钟）：
+    #   它阻塞 VACUUM、占住连接池，并发请求会被一起拖死，且 who-is-blocking 里看到的
+    #   只是一条停在 SELECT chunks 上的会话，完全看不出真凶是 LLM。
+    #   chunks 已是纯 dataclass（不持有 ORM 对象），document 也只用过判空 ——
+    #   rollback 后不再访问其属性，不会触发懒加载（也就不会有 MissingGreenlet）。
+    await session.rollback()
+
     batch_size = decisions.GRAPH_EXTRACT_BATCH_CHUNKS
     for offset in range(0, len(chunks), batch_size):
         batch = chunks[offset : offset + batch_size]

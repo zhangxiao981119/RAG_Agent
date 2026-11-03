@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -50,6 +51,7 @@ class LLMService:
         model: str | None = None,
         timeout_seconds: float | None = None,
         max_tokens: int | None = None,
+        require_content: bool = False,
     ) -> AsyncIterator[str]:
         """流式生成。yield 每个 delta 文本片段。
 
@@ -66,6 +68,16 @@ class LLMService:
             所以只能按调用覆盖，不能改全局。
           · 覆盖值只影响本次调用，不写回 settings —— 口径真源仍在 config 层，
             这里只是「按调用方给的口径发一次请求」。
+
+        ★ timeout_seconds 在**本方法**里是 httpx 的**每次 I/O 超时**，不是总墙钟：
+          用户对话要能长流，只要还有字节在流就不该掐断。批量离线接口要的是总预算，
+          那层语义在 chat()（见其 docstring）。
+
+        require_content=True：流正常结束后若一个 content 字符都没产出 → LLMError。
+          推理模型（如 qwen3.5-plus）会把预算全烧在 reasoning_content 上，content 一直
+          为空；此时对上层而言"拿到了结果"，但拿到的是空串 —— 图抽取会把它误报成
+          「输出非法 JSON」，而两者修法完全不同（换非推理模型 / 改 prompt）。
+          默认 False，保证所有既有调用方行为逐字节不变。
         """
         settings = get_settings()
         if not settings.llm_base_url:
@@ -87,6 +99,10 @@ class LLMService:
         total_timeout = timeout_seconds or settings.llm_total_timeout_seconds
 
         first_token_seen = False
+        # 只计数、不 yield：reasoning_content 是模型的思考过程，不该进答案，
+        # 但它的字符数是「为什么 content 为空」的唯一证据（见 require_content）。
+        content_chars = 0
+        reasoning_chars = 0
         try:
             async with httpx.AsyncClient(timeout=total_timeout) as client:
                 async with client.stream(
@@ -116,9 +132,14 @@ class LLMService:
                             choices = chunk.get("choices", [])
                             if not choices:
                                 continue
-                            delta = choices[0].get("delta", {}).get("content")
+                            delta_obj = choices[0].get("delta", {})
+                            reasoning = delta_obj.get("reasoning_content")
+                            if reasoning:
+                                reasoning_chars += len(reasoning)
+                            delta = delta_obj.get("content")
                             if delta:
                                 first_token_seen = True
+                                content_chars += len(delta)
                                 yield delta
                     except (httpx.TimeoutException, asyncio.TimeoutError) as exc:
                         if not first_token_seen:
@@ -126,6 +147,14 @@ class LLMService:
                             raise LLMTimeout(f"首 token 超时: {exc}") from exc
                         logger.warning("LLM 中途超时，已输出部分内容: %s", exc)
                         return
+                    # 走到这里说明流正常结束（含 [DONE] 提前 break）
+                    if require_content and content_chars == 0:
+                        metrics.incr("rag.llm.error", kind="reasoning_only")
+                        raise LLMError(
+                            f"LLM 只产出了推理内容（reasoning_content {reasoning_chars} 字符），"
+                            "content 为空：该模型是推理模型，不适合结构化抽取，"
+                            "请换非推理模型或降低思考预算"
+                        )
         except (httpx.TimeoutException, asyncio.TimeoutError) as exc:
             if not first_token_seen:
                 metrics.incr("rag.llm.first_token_timeout")
@@ -145,17 +174,53 @@ class LLMService:
         timeout_seconds: float | None = None,
         max_tokens: int | None = None,
     ) -> str:
-        """非流式调用（用于 L3 grounding / 治理审查 / 图抽取等需要完整输出的场景）。"""
+        """非流式调用（L3 grounding / 治理审查 / 图抽取等需要完整输出的场景）。
+
+        ★ timeout_seconds 在本方法是**总墙钟预算**，与 stream_chat 的「每次 I/O 超时」
+          是两个语义，别混：
+          · stream_chat：只要还有字节在流就不掐断 —— 用户对话要能长流；
+          · chat：`asyncio.timeout` 包住整条流 —— 它是批量离线调用
+            （grounding / 审查 / 抽取），拿到半截结果没有意义，MUST 有上限。
+          这个区别不是洁癖：qwen3.5-plus 这类推理模型会持续吐 reasoning_content，
+          字节一直在流 → httpx 的 per-IO 超时永远不触发 → 进程无限等待
+          （实测冻结 16 分钟，数据库连接 idle in transaction 11 分钟）。
+
+        ★ 固定 require_content=True：批量接口拿到空串一定是失败，没有例外。
+        """
+        budget = timeout_seconds or get_settings().llm_total_timeout_seconds
         result: list[str] = []
-        async for delta in self.stream_chat(
-            messages,
-            temperature,
-            model=model,
-            timeout_seconds=timeout_seconds,
-            max_tokens=max_tokens,
-        ):
-            result.append(delta)
-        return "".join(result)
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(budget):
+                async for delta in self.stream_chat(
+                    messages,
+                    temperature,
+                    model=model,
+                    timeout_seconds=timeout_seconds,
+                    max_tokens=max_tokens,
+                    require_content=True,
+                ):
+                    result.append(delta)
+        except TimeoutError as exc:
+            elapsed = time.monotonic() - started
+            metrics.incr("rag.llm.error", kind="chat_wall_clock_timeout")
+            raise LLMTimeout(
+                f"LLM 调用超出总墙钟预算（已耗时 {elapsed:.1f}s，预算 {budget:g}s，"
+                f"已收到 {sum(len(part) for part in result)} 字符）："
+                "批量接口不接受无限流 —— 若模型是推理模型，它可能把预算全烧在 "
+                "reasoning_content 上，建议换非推理模型或降低思考预算"
+            ) from exc
+        text = "".join(result)
+        if not text:
+            # 兜住「流在吐字前就结束」的路径（例如 read 超时后走了 stream_chat 的
+            # early return）：require_content 的检查只在流正常结束时生效。
+            metrics.incr("rag.llm.error", kind="empty_content")
+            raise LLMError(
+                "LLM 未产出任何 content（收到 0 字符）："
+                "若模型是推理模型，它可能把预算全烧在 reasoning_content 上，"
+                "请换非推理模型或降低思考预算"
+            )
+        return text
 
 
 def get_llm_service() -> LLMService:
