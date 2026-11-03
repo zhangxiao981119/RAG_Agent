@@ -111,3 +111,42 @@ def test_snapshot_exposes_runtime_constants(env):
     assert graph["caliber"]["prompt_version"] == "gprompt-v1"
     # 部署期固定的能力 MUST 在快照里明示，避免管理端把它画成可切换开关
     assert graph["deployment_fixed"] is True
+
+
+def test_extract_output_upper_bound_is_visible_everywhere(env):
+    """抽取输出上限 MUST 在「横幅 / 能力快照 / 启动配置日志」三处都可见。
+
+    ★ 为什么单独钉：这个值曾经只进了 config_fingerprint，横幅与快照都没有 ——
+      指纹变化能说明「配置变了」，但看不出「变的是哪个值、该调哪个变量」。
+      而截断类故障（输出是合法 JSON 的前缀 → 报成「非法 JSON」）的唯一线索
+      就是这个数。看不见它，运维只能猜。
+      取值故意用非默认的 9000：断言的是「读配置」，不是「写死的常量」。
+    """
+    env.setenv("GRAPH_ENABLED", "true")
+    env.setenv("GRAPH_EXTRACT_MAX_OUTPUT_TOKENS", "9000")
+    get_settings.cache_clear()
+
+    # ① 人可读横幅（docker logs 第一屏）
+    text = capabilities._render_text(
+        role="api",
+        app_env="prod",
+        fingerprint="a1b2c3d4e5f6",
+        graph_enabled=True,
+        wiki_enabled=False,
+        stats=None,
+    )
+    assert "离线 = timeout 120s" in text
+    assert "输出 ≤9000 tokens" in text
+
+    # ② 能力快照（/api/system/capabilities 的数据源）
+    snapshot = capabilities.capability_snapshot("fingerprint00", None)
+    graph = next(c for c in snapshot["capabilities"] if c["key"] == "graph")
+    assert graph["runtime"]["extract_max_output_tokens"] == 9000
+
+    # ③ 启动配置口径日志（main.py 打的那个 dict，即 runtime_config_snapshot）
+    from app.config.config_profile import CROSS_ROLE_FIELDS, runtime_config_snapshot
+
+    runtime_config = runtime_config_snapshot()
+    assert runtime_config["graph_extract_max_output_tokens"] == 9000
+    # 且两侧必须一致（api 与 worker 都会跑抽取）
+    assert "graph_extract_max_output_tokens" in CROSS_ROLE_FIELDS

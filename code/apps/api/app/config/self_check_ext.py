@@ -62,6 +62,13 @@ def _check_scalar_ranges() -> None:
     """标量配置范围校验（§7.1 的自检规则表，与开关无关）。"""
     settings = get_settings()
 
+    # ── 图召回 / 抽取的数值参数：一组「配错不报错、只会静默变味」的量 ──
+    # ★ 为什么这三个放在一起：它们下游都有兜底（`or 全局值` / 立刻超时 / 恒超时走
+    #   0 路），兜底在运行期是对的（不该因为一个环境变量把服务打崩），代价是
+    #   「配置写错」这件事再也不会浮上来 —— 踩过的坑就是输出上限配 0 后静默回落
+    #   全局 4K，抽取被截断，最后报出来的是「LLM 输出非法 JSON」，方向全错。
+    #   所以 MUST 在启动时，把兜底能悄悄吃掉的那几种值先拦掉。
+
     # 下限防「必然超时的假配置」（< 50ms 的图查询在真实库上等于恒超时），
     # 上限防「挂着不动的长尾」（> 5s 会让一次问答的首字节被图路拖住）。
     if not (50 <= settings.graph_retrieve_timeout_ms <= 5000):
@@ -76,6 +83,17 @@ def _check_scalar_ranges() -> None:
             f"[GRAPH_TIMEOUT] GRAPH_EXTRACT_TIMEOUT_SECONDS="
             f"{settings.graph_extract_timeout_seconds} MUST > 0。\n"
             "  ★ 拒绝启动 —— 0 或负值会让每次抽取立刻超时，图永远为空。"
+        )
+    # 0 / 负数会被 extract 侧的 `max_tokens or settings.llm_max_output_tokens`
+    # 静默吃掉并回落全局 4K —— 而那正是「输出被硬截断、却报成非法 JSON」的成因。
+    if settings.graph_extract_max_output_tokens < 1:
+        _fail(
+            f"[GRAPH_OUTPUT] GRAPH_EXTRACT_MAX_OUTPUT_TOKENS="
+            f"{settings.graph_extract_max_output_tokens} MUST >= 1。\n"
+            "  0 或负值会被按调用覆盖的逻辑静默吃成全局 4K（LLM_MAX_OUTPUT_TOKENS），\n"
+            "  抽取随即在实体列表中途被截断，症状是「LLM 输出非法 JSON」—— 与配置错无关，\n"
+            "  运维只会去改 prompt / 换模型。\n"
+            "  ★ 拒绝启动 —— 关闭是合法终态：置 GRAPH_ENABLED=false，或改成 8000。"
         )
     if settings.wiki_generate_timeout_seconds <= 0:
         _fail(

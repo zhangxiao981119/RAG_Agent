@@ -154,6 +154,10 @@ def capability_snapshot(
                     "top_k": decisions.GRAPH_RETRIEVE_TOP_K,
                     "max_hops": decisions.GRAPH_MAX_HOPS,
                     "max_recall_chunks": decisions.GRAPH_RECALL_MAX_CHUNKS,
+                    # 离线抽取口径：换过这两个值，已抽的图可能不完整/不成立，
+                    # 管理端「系统能力」页要把它们显示出来才解释得清覆盖率为啥不是 100%
+                    "extract_timeout_seconds": settings.graph_extract_timeout_seconds,
+                    "extract_max_output_tokens": settings.graph_extract_max_output_tokens,
                 },
                 "data": {
                     "documents_total": _pick("documents_total"),
@@ -213,6 +217,15 @@ def _render_text(
             f" · top_k {decisions.GRAPH_RETRIEVE_TOP_K}"
             f" · max_hops {decisions.GRAPH_MAX_HOPS}"
             f" · 入上下文 ≤{decisions.GRAPH_RECALL_MAX_CHUNKS} 片"
+        )
+        # ★ 离线抽取的两个上限也必须露出来：截断类故障的唯一有效线索就是
+        #   「输出 ≤N tokens」这个数。不显示时，抓到的错误只有「LLM 输出非法 JSON」，
+        #   运维会去改 prompt / 换模型，而真正要动的是这个环境变量。
+        lines.append(
+            f"                          离线 = timeout"
+            f" {settings.graph_extract_timeout_seconds:g}s"
+            f" · 输出 ≤{settings.graph_extract_max_output_tokens} tokens"
+            f" · {decisions.GRAPH_EXTRACT_BATCH_CHUNKS} 片/请求"
         )
     else:
         lines.append(f"{_GRAPH_LABEL}未启用（GRAPH_ENABLED=false）")
@@ -331,6 +344,10 @@ async def log_capability_banner(role: str | None = None) -> dict:
                 "timeout_ms": settings.graph_retrieve_timeout_ms,
                 "top_k": decisions.GRAPH_RETRIEVE_TOP_K,
                 "max_hops": decisions.GRAPH_MAX_HOPS,
+                # 离线抽取的两个上限：出现「抽取失败但文档可检索」时，
+                # 先看这两个数对不对得上语料规模（4 片/请求 × 8K 是默认口径）
+                "extract_timeout_seconds": settings.graph_extract_timeout_seconds,
+                "extract_max_output_tokens": settings.graph_extract_max_output_tokens,
                 "docs_total": None if stats is None else stats["documents_total"],
                 "docs_done": None if stats is None else stats["documents_done"],
                 "docs_pending": None if stats is None else stats["documents_pending"],

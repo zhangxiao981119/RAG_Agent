@@ -103,6 +103,26 @@ async def test_extract_timeout_must_be_positive(env, no_db):
 
 
 @pytest.mark.asyncio
+async def test_extract_max_output_tokens_must_be_positive(env, no_db):
+    """GRAPH_EXTRACT_MAX_OUTPUT_TOKENS=0 MUST 拒绝启动，而不是静默回落全局 4K。
+
+    ★ 这条堵的是「兜底吃掉配置错」：extract 侧写的是
+      `max_tokens or settings.llm_max_output_tokens`，配 0 就悄悄用 4K，
+      于是抽取在实体列表中途被截断，最终报出来的是「LLM 输出非法 JSON」——
+      真正的错因（一个环境变量）在日志里看不到任何痕迹。
+    """
+    env.setenv("GRAPH_ENABLED", "false")  # 关闭态也要校验：配错的值不会因为关着就变对
+    env.setenv("GRAPH_EXTRACT_MAX_OUTPUT_TOKENS", "0")
+    get_settings.cache_clear()
+    with pytest.raises(RuntimeError) as exc:
+        await self_check_ext.check_capabilities()
+    message = str(exc.value)
+    assert "[GRAPH_OUTPUT]" in message
+    assert "GRAPH_EXTRACT_MAX_OUTPUT_TOKENS" in message
+    assert "拒绝启动" in message
+
+
+@pytest.mark.asyncio
 async def test_wiki_scope_kb_is_rejected(env):
     """WIKI_SCOPE=kb MUST 拒绝启动（不是「悄悄按 doc 处理」）。
 
