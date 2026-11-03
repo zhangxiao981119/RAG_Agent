@@ -163,6 +163,15 @@ class Settings(BaseSettings):
     graph_retrieve_timeout_ms: int = 800
     # 单次抽取 LLM 调用超时（秒）。抽取是批量同步调用，与在线生成的 60s 总超时无关。
     graph_extract_timeout_seconds: float = 120.0
+    # ★ 单次抽取调用的**输出**上限（token），按调用覆盖 llm_max_output_tokens。
+    #   为什么不能直接改全局 llm_max_output_tokens：decisions 的启动校验
+    #   （llm_max_output_tokens <= CONTEXT_OUTPUT_RESERVE_TOKENS = 4K）把它锁死在 4K，
+    #   因为生成链路必须与「从窗口里预留的那部分」名实相符。
+    #   而图抽取是**批量长输出**（GRAPH_EXTRACT_BATCH_CHUNKS=4 片/请求，每片最多
+    #   GRAPH_MAX_ENTITIES_PER_CHUNK 个实体 + 提及 + 关系），4K 会在 entities 列表
+    #   中途被硬截断 —— 输出是「合法 JSON 的前缀」，解析必然失败，
+    #   于是被误报成「模型输出非法 JSON」。故只能按调用覆盖。
+    graph_extract_max_output_tokens: int = 8_000
     wiki_enabled: bool = False
     # 生成范围。本版仅 doc（一文档一页，可见性 = 该文档的文档级 ACL，天然同构）；
     # kb 是保留值，配了拒绝启动 —— KB 级页要把多篇不同密级的文档摘要合成一个对象，

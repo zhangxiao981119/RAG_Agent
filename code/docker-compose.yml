@@ -166,6 +166,10 @@ services:
       GRAPH_EXTRACTOR_MODEL: ${GRAPH_EXTRACTOR_MODEL:-}
       GRAPH_RETRIEVE_TIMEOUT_MS: ${GRAPH_RETRIEVE_TIMEOUT_MS:-800}
       GRAPH_EXTRACT_TIMEOUT_SECONDS: ${GRAPH_EXTRACT_TIMEOUT_SECONDS:-120}
+      # ★ 单次抽取的**输出**上限（token）。全局 LLM_MAX_OUTPUT_TOKENS=4000 被
+      #   decisions 的预留校验锁死，而 4 片/请求的批量长输出会在实体列表中途被截断 ——
+      #   截断后是「合法 JSON 的前缀」，会被误报成「模型输出非法 JSON」。故按调用覆盖。
+      GRAPH_EXTRACT_MAX_OUTPUT_TOKENS: ${GRAPH_EXTRACT_MAX_OUTPUT_TOKENS:-8000}
       WIKI_ENABLED: ${WIKI_ENABLED:-false}
       WIKI_SCOPE: ${WIKI_SCOPE:-doc}
       WIKI_GENERATOR_MODEL: ${WIKI_GENERATOR_MODEL:-}
@@ -251,6 +255,10 @@ services:
       GRAPH_EXTRACTOR_MODEL: ${GRAPH_EXTRACTOR_MODEL:-}
       GRAPH_RETRIEVE_TIMEOUT_MS: ${GRAPH_RETRIEVE_TIMEOUT_MS:-800}
       GRAPH_EXTRACT_TIMEOUT_SECONDS: ${GRAPH_EXTRACT_TIMEOUT_SECONDS:-120}
+      # ★ 单次抽取的**输出**上限（token）。全局 LLM_MAX_OUTPUT_TOKENS=4000 被
+      #   decisions 的预留校验锁死，而 4 片/请求的批量长输出会在实体列表中途被截断 ——
+      #   截断后是「合法 JSON 的前缀」，会被误报成「模型输出非法 JSON」。故按调用覆盖。
+      GRAPH_EXTRACT_MAX_OUTPUT_TOKENS: ${GRAPH_EXTRACT_MAX_OUTPUT_TOKENS:-8000}
       WIKI_ENABLED: ${WIKI_ENABLED:-false}
       WIKI_SCOPE: ${WIKI_SCOPE:-doc}
       WIKI_GENERATOR_MODEL: ${WIKI_GENERATOR_MODEL:-}

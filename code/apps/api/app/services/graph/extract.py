@@ -16,8 +16,12 @@
 
 ★ 失败语义（离线 fail-visible，见设计文档 §2 的失败语义三档）：
   · 内容为空 / 超护栏 → GraphExtractSkip（job 置 graph_status='skipped'，不重试）
-  · LLM 输出非法 → 重试一次 → 仍非法 → GraphExtractError（job 置 'failed' 并按
-    arq 重试，但**不重新解析文档** —— 文档已 indexed，抽取失败只影响图路）
+  · LLM 输出非法 → 二分重试（把批拆小再要一次）→ 单分片仍非法 → GraphExtractError
+    （job 置 'failed' 并按 arq 重试，但**不重新解析文档** —— 文档已 indexed，
+    抽取失败只影响图路）
+  · 输出被 max_tokens 硬截断 → GraphExtractTruncated（GraphExtractError 的子类）。
+    单独一个类型，是为了让日志与 message 直接指向「调大
+    GRAPH_EXTRACT_MAX_OUTPUT_TOKENS」，而不是让人以为模型不听话去改 prompt。
 """
 from __future__ import annotations
 
@@ -55,6 +59,18 @@ _WS_RE = re.compile(r"\s+")
 
 class GraphExtractError(Exception):
     """抽取失败（LLM 输出契约违反 / 文档缺失）—— 可重试，由 job 层置 failed。"""
+
+
+class GraphExtractTruncated(GraphExtractError):
+    """输出长度撞到 max_tokens 上限（**不是**模型输出格式错误）。
+
+    ★ 为什么必须与「非法 JSON」分开：
+      截断后的输出是**合法 JSON 的前缀** —— `json.loads` 失败，症状与「模型乱写」
+      一模一样。若不区分，运维会去改 prompt、换模型、加温度，而真正的修法是
+      调大 GRAPH_EXTRACT_MAX_OUTPUT_TOKENS（一个环境变量）。
+      继承 GraphExtractError：调用方的 `except GraphExtractError` 无需改动，
+      重试/置 failed 的语义也不变（重试用尽仍是人工介入，但日志里能一眼看出方向）。
+    """
 
 
 class GraphExtractSkip(Exception):
@@ -271,13 +287,34 @@ def _collect(
     return entities, mentions, relations
 
 
+def _as_list(parsed: dict, key: str) -> list:
+    """取合并用的列表字段；缺失或类型不对一律按空列表（二分后某侧可能返回 {}）。"""
+    value = parsed.get(key)
+    return value if isinstance(value, list) else []
+
+
 async def _extract_batch(
     batch: list[_ChunkRow],
     *,
     model: str,
     timeout_seconds: float,
+    max_tokens: int,
 ) -> dict:
-    """调一次 LLM 并解析 JSON；非法输出重试一次，仍非法 → GraphExtractError。"""
+    """调 LLM 抽一批，输出解析失败时**二分拆批**重试。
+
+    ★ 为什么按「批」二分，而不是原地再问一次：
+      解析失败的真正原因是**输出太长被 max_tokens 硬截断**（截断后的文本是合法
+      JSON 的前缀，`json.loads` 必然失败），重复同一个请求只会得到同一个前缀。
+      把批拆小 → 每侧输出减半 → 落到上限以内就成功了。
+      二分到单分片仍失败，才是真的没救（或单分片本身超上限）。
+
+    ★ 合并语义：左右两侧各自 `_collect` 归一，所以同实体合并 / 提及去重 / 关系
+      去重都在调用方（_collect 与本函数之外）按既有规则完成 —— 这里只做列表拼接，
+      不引入第二套合并规则。
+    """
+    if not batch:  # 二分边界兜底：空批不该发生，但也不该让调用方处理 None
+        return {}
+
     prompt = render_extract_prompt(
         [(str(chunk.id), chunk.heading_path, chunk.content) for chunk in batch]
     )
@@ -289,15 +326,51 @@ async def _extract_batch(
             temperature=0.1,
             model=model,
             timeout_seconds=timeout_seconds,
+            max_tokens=max_tokens,
         )
         parsed = _extract_json(last_raw)
         if parsed is not None:
             return parsed
-        logger.warning(
-            "图抽取输出非法 JSON，重试一次",
-            extra={"raw_head": last_raw[:200]},
+
+    if len(batch) > 1:
+        mid = len(batch) // 2
+        logger.info(
+            "图抽取输出解析失败，二分重试：%d 分片 → %d + %d",
+            len(batch),
+            mid,
+            len(batch) - mid,
         )
-    raise GraphExtractError(f"LLM 输出非法 JSON（重试后仍失败）: {last_raw[:200]}")
+        left = await _extract_batch(
+            batch[:mid],
+            model=model,
+            timeout_seconds=timeout_seconds,
+            max_tokens=max_tokens,
+        )
+        right = await _extract_batch(
+            batch[mid:],
+            model=model,
+            timeout_seconds=timeout_seconds,
+            max_tokens=max_tokens,
+        )
+        return {
+            "entities": _as_list(left, "entities") + _as_list(right, "entities"),
+            "mentions": _as_list(left, "mentions") + _as_list(right, "mentions"),
+            "relations": _as_list(left, "relations") + _as_list(right, "relations"),
+        }
+
+    # 单分片仍失败：区分「撞上限」与「模型乱写」，让日志直接指向修法
+    chunk_id = batch[0].id
+    # 中文场景下 1 token ≈ 1.5~2 字符，取 2 作为保守下界：
+    # 输出字符数达到上限两倍以上，只可能是把输出预算用光了，而不是输出格式有问题。
+    if len(last_raw) >= max_tokens * 2:
+        raise GraphExtractTruncated(
+            f"图抽取输出疑似被截断（chunk {chunk_id}，输出 {len(last_raw)} 字符，"
+            f"上限 {max_tokens} tokens）：建议调大 GRAPH_EXTRACT_MAX_OUTPUT_TOKENS"
+        )
+    raise GraphExtractError(
+        f"图抽取输出非法 JSON（chunk {chunk_id}，输出 {len(last_raw)} 字符）："
+        f"{last_raw[:200]}"
+    )
 
 
 async def extract_document(
@@ -337,7 +410,12 @@ async def extract_document(
             batch,
             model=profile.extractor_model,
             timeout_seconds=settings.graph_extract_timeout_seconds,
+            # 按调用覆盖输出上限：全局 4K 被 decisions 的预留校验锁死，
+            # 而 4 片/请求的批量长输出会在列表中途被截断（见 settings 的说明）。
+            max_tokens=settings.graph_extract_max_output_tokens,
         )
+        # llm_calls 按「批」计数（不是按 HTTP 请求）：它进 ExtractionResult 做成本估算，
+        # 二分产生的额外调用由日志的「二分重试」行体现，这里的口径不变。
         llm_calls += 1
         batch_entities, batch_mentions, batch_relations = _collect(
             parsed, batch_ids={chunk.id for chunk in batch}

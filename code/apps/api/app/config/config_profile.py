@@ -63,6 +63,10 @@ CROSS_ROLE_FIELDS: Final[tuple[str, ...]] = (
     "graph_extractor_model",
     "graph_retrieve_timeout_ms",
     "graph_extract_timeout_seconds",
+    # 输出上限直接影响抽取**完整度**：两侧不一致时，同一次补建在 api 侧触发二分
+    # （多花调用、结果可能少边）而 worker 侧一次成功 —— 同一篇文档抽出不同的图，
+    # 属于「数据不可解释」，故必须两侧一致。
+    "graph_extract_max_output_tokens",
     "wiki_enabled",
     "wiki_scope",
     "wiki_generator_model",
@@ -127,6 +131,7 @@ def runtime_config_snapshot() -> dict:
         "graph_extractor_model": s.graph_extractor_model,
         "graph_retrieve_timeout_ms": s.graph_retrieve_timeout_ms,
         "graph_extract_timeout_seconds": s.graph_extract_timeout_seconds,
+        "graph_extract_max_output_tokens": s.graph_extract_max_output_tokens,
         "wiki_enabled": s.wiki_enabled,
         "wiki_scope": s.wiki_scope,
         "wiki_generator_model": s.wiki_generator_model,

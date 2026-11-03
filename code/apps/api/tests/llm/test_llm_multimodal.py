@@ -56,9 +56,9 @@ def _install_transport(monkeypatch, captured: dict) -> None:
     monkeypatch.setattr(llm_mod.httpx, "AsyncClient", factory)
 
 
-async def _drain(messages):
+async def _drain(messages, **overrides):
     """消费流式输出，返回 delta 列表。"""
-    return [delta async for delta in LLMService().stream_chat(messages, 0.1)]
+    return [delta async for delta in LLMService().stream_chat(messages, 0.1, **overrides)]
 
 
 @pytest.mark.asyncio
@@ -104,3 +104,31 @@ async def test_multimodal_content_array_passthrough(monkeypatch):
 
     assert "".join(deltas) == "你好，世界"
     assert captured["body"]["messages"] == messages
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_override_only_affects_this_call(monkeypatch):
+    """max_tokens 覆盖只影响本次请求体，且不写回 settings（下一次调用回到 4K）。
+
+    图抽取用它绕开「全局 4K 被 CONTEXT_OUTPUT_RESERVE_TOKENS 锁死」的限制：
+    批量长输出（4 分片/请求）在 4K 下会在实体列表中途被硬截断，
+    截断后是合法 JSON 的前缀 → 被误报成「模型输出非法 JSON」。
+    """
+    captured: dict = {}
+    _install_transport(monkeypatch, captured)
+    messages = [{"role": "user", "content": "抽取实体"}]
+
+    await _drain(messages, max_tokens=8000)
+    assert captured["body"]["max_tokens"] == 8000
+    # 请求体键集不变 —— 覆盖值只换值，不引入新字段
+    assert set(captured["body"].keys()) == {
+        "model",
+        "messages",
+        "temperature",
+        "stream",
+        "max_tokens",
+    }
+
+    # 同进程内紧接着的普通调用必须回到全局值：证明覆盖没有泄漏成「新默认」
+    await _drain(messages)
+    assert captured["body"]["max_tokens"] == 4000

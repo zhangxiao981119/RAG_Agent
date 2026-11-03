@@ -49,16 +49,21 @@ class LLMService:
         *,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
         """流式生成。yield 每个 delta 文本片段。
 
         首 token 超时 → LLMTimeout；中途报错 → LLMError。
         messages 支持纯文本与多模态 content 数组（WU-M-05），请求体原样透传。
 
-        model / timeout_seconds 是**可选覆盖**，默认 None = 用 settings 的口径：
+        model / timeout_seconds / max_tokens 是**可选覆盖**，默认 None = 用 settings 的口径：
           · 图抽取（离线）要能用与主模型不同的模型（GRAPH_EXTRACTOR_MODEL），
             且它是批量长输出，用生成链路的 60s 总超时必然不够（见
             GRAPH_EXTRACT_TIMEOUT_SECONDS）。
+          · 同理输出上限：生成链路按 4K 预留（decisions.CONTEXT_OUTPUT_RESERVE_TOKENS），
+            而图抽取一次要吐一批实体+提及+关系，4K 会在列表中途被硬截断
+            （见 GRAPH_EXTRACT_MAX_OUTPUT_TOKENS）。启动校验把**全局**值锁在 4K，
+            所以只能按调用覆盖，不能改全局。
           · 覆盖值只影响本次调用，不写回 settings —— 口径真源仍在 config 层，
             这里只是「按调用方给的口径发一次请求」。
         """
@@ -75,7 +80,9 @@ class LLMService:
             # ★ 显式设输出上限。不设时长度完全由服务端默认值决定，
             #   而 decisions.CONTEXT_OUTPUT_RESERVE_TOKENS 已按 4K 扣过预算 ——
             #   不显式限制，那部分"预留"就是空的（启动时校验两者关系）。
-            "max_tokens": settings.llm_max_output_tokens,
+            #   传了 max_tokens 就用调用方口径（图抽取的批量长输出），
+            #   不传时仍取 settings 全局值 —— 请求体与引入覆盖前逐字节相同。
+            "max_tokens": max_tokens or settings.llm_max_output_tokens,
         }
         total_timeout = timeout_seconds or settings.llm_total_timeout_seconds
 
@@ -136,11 +143,16 @@ class LLMService:
         *,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """非流式调用（用于 L3 grounding / 治理审查 / 图抽取等需要完整输出的场景）。"""
         result: list[str] = []
         async for delta in self.stream_chat(
-            messages, temperature, model=model, timeout_seconds=timeout_seconds
+            messages,
+            temperature,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            max_tokens=max_tokens,
         ):
             result.append(delta)
         return "".join(result)
