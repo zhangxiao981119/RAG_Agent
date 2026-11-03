@@ -127,6 +127,108 @@ curl -fsSk https://<站点地址>/api/health
 # 返回数据库、Redis、模型服务的可达状态，全部为 ok 即正常
 ```
 
+### 3.5 能力开关与重跑口径（图召回 / LLM wiki 导航）
+
+> **这一节必须在部署前读完。** 图召回（GraphRAG）与 LLM wiki 导航是**部署期能力**：
+> 只由环境变量决定，运行期不可切换、没有请求级开关、不按用户或部门放量。
+> 私有化交付要的是「少一个运行时组件、少一份排障面、可审计」——
+> 代价就是**能力档位在部署那一刻就定下来了**。
+
+#### 3.5.1 开关清单（本版实际生效范围）
+
+| 变量 | 默认 | 作用 | 说明 |
+|---|---|---|---|
+| `GRAPH_ENABLED` | `false` | 图能力总开关（离线抽取 + 在线图召回） | 需要 LLM 凭据；需要迁移到 `0025`；开启后 MUST 补建抽取。**本版只写不读**：图数据会建好，但检索链路尚未接入（第 2 步） |
+| `GRAPH_STORE_BACKEND` | `postgres` | 图存储后端 | 当前仅支持 `postgres`；填 `neo4j` 等保留位 → 服务**拒绝启动**（静默回落会让你以为在跑 Neo4j，而数据在 PG 里） |
+| `GRAPH_EXTRACTOR_MODEL` | 空（跟随 `LLM_MODEL`） | 抽取模型 | 留空即用主模型；换它 = 口径变更，旧口径数据会被检索直接排除，MUST `--recaliber` 重抽 |
+| `GRAPH_RETRIEVE_TIMEOUT_MS` | `800` | 在线图召回硬超时（毫秒） | 取值须在 `[50, 5000]`，否则拒绝启动；第 2 步接入后生效 |
+| `GRAPH_EXTRACT_TIMEOUT_SECONDS` | `120` | 单次抽取 LLM 调用超时（秒） | 必须 `> 0` |
+| `GRAPH_EXTRACT_MAX_OUTPUT_TOKENS` | `8000` | 单次抽取调用的**输出**上限（token） | 必须 `>= 1`。**不要**和全局 `LLM_MAX_OUTPUT_TOKENS=4000` 混：后者受 `CONTEXT_OUTPUT_RESERVE_TOKENS` 约束不能改大，图抽取只能按调用覆盖。配 `0` 会被静默回落成 4K，抽取随即在实体列表中途被截断（症状是「LLM 输出非法 JSON」），所以启动自检直接拒绝 |
+| `WIKI_ENABLED` | `false` | LLM wiki 导航 | **本版未实现**：置 `true` 会因 `wiki_pages` 表不存在（迁移 0026 尚未提供）在自检阶段拒绝启动。第 2 步接入 |
+
+★ 上表 7 个 + wiki 的 4 个（`WIKI_SCOPE` / `WIKI_GENERATOR_MODEL` / `WIKI_GENERATE_TIMEOUT_SECONDS` /
+`WIKI_INPUT_MAX_CHARS`，本版未实现）共 11 个变量，在 `docker-compose.yml` / `docker-compose.prod.yml`
+的 **api 与 worker 两段**都已注入，且 11 个全部进了 `config_fingerprint`（api 与 worker 取值不一致
+→ 指纹不同，这是唯一的发现手段）。
+
+#### 3.5.2 三条硬规则
+
+1. **部署前定好。** 这两项能力决定「数据要不要重跑」。上线后再改，等于对一笔已经在产的知识库做一次数据迁移 —— 请在部署评审时就定下来，写进交付单。
+2. **fail-closed：开了但没有依赖 → 服务直接起不来，不会静默降级。**
+   - 开了图但没配 `LLM_API_KEY` → 拒绝启动
+   - 开了图但没跑迁移（`graph_entities` 等表不存在）→ 拒绝启动
+   - 开了图但 `GRAPH_STORE_BACKEND` 填了未实现的后端 → 拒绝启动
+   这是刻意的：**「配了却不生效」比「起不来」危险得多**。
+3. **api 与 worker 必须同时重建、读到同一份能力配置。** 抽取在 worker、召回在 api。只重建一侧会导致「一侧开、一侧关」，而它们在运行期不通信，**不会互相报错**。校验方法：比对两个容器启动日志里 `event=capability.banner` 的 `config_fingerprint`，必须相同。
+
+#### 3.5.3 重建命令 MUST 带 `--build`（血泪条）
+
+改「部署期配置 + 配套代码」时必须：
+
+```bash
+docker compose -p kagent -f docker-compose.prod.yml up -d --build api worker
+# 开发栈：docker compose up -d --build api worker
+```
+
+**只 `--force-recreate` 不 `--build`，容器会带着旧镜像起来。** 后果分两层：
+
+- 环境变量是新的（来自 `.env`），所以「看起来配置生效了」；
+- 消费这些变量的代码没进镜像 → 新增的配置项根本不存在，表现为 `AttributeError`，
+  或更隐蔽的「设了值但不生效」。
+
+2026-11 就踩过：`up -d --force-recreate api worker` 重建后跑补建，10/22 篇失败；
+排查发现镜像里 `Settings` 没有 `graph_extract_max_output_tokens`，而 **指纹变化只是因为
+`GRAPH_EXTRACTOR_MODEL` 改了 —— 把「代码没进镜像」这件事完全掩盖了**。
+
+★ 记住：`config_fingerprint` 只对**配置**求哈希，**不包含代码/镜像版本**。
+指纹变了 ≠ 新代码在跑。
+
+自检办法（输出与 `.env` 不一致 = 镜像没重建）：
+
+```bash
+docker compose -p kagent exec -T api    python -c "from app.config.settings import get_settings as g; print('api', g().graph_extract_max_output_tokens)"
+docker compose -p kagent exec -T worker python -c "from app.config.settings import get_settings as g; print('worker', g().graph_extract_max_output_tokens)"
+```
+
+#### 3.5.4 变更后果矩阵（要重跑什么 / 不用重跑什么）
+
+| 变更 | 要重跑 | 不用重跑 |
+|---|---|---|
+| 开图 `GRAPH_ENABLED=true` | 补建抽取：`python -m scripts.backfill_graph --all` | 解析、分块、嵌入 |
+| 关图 `GRAPH_ENABLED=false` | 不用重跑（已抽数据保留，便于快速回滚） | 全部 |
+| 换抽取模型 / 抽取 prompt 版本 | 重抽：`python -m scripts.backfill_graph --recaliber` | 解析、分块、嵌入 |
+| 调 `GRAPH_EXTRACT_MAX_OUTPUT_TOKENS` | **不用重跑数据**；但之前因截断记为 `failed` 的文档要用 `--all` 重新补（`--pending` 不会选中 failed） | 解析、分块、嵌入 |
+| 换分块器（`CHUNK_*` 变动） | **全链重跑**：解析 → 分块 → 嵌入 → 抽取 | —— |
+| 换嵌入口径（模型 / 向量文本公式） | 只重算向量：`python -m scripts.reindex_embeddings` | 图抽取、解析 |
+
+**为什么「换分块器」必须全链重跑**：重解析会 `DELETE chunks` 再 INSERT（分片是新 uuid）。图数据的证据都挂在 `chunk_id` 上 —— 分片一换，旧证据全部失效。系统在重解析的**同一事务**里主动清理派生数据（`purge_derived`），但**清理不等于重建**：抽取仍需重跑。
+
+**为什么「换嵌入口径」不用重抽图**：`scripts/reindex_embeddings.py` 是原地 `UPDATE chunks SET embedding=...`，`chunk_id` 不变 → 实体与关系仍然有效。
+
+#### 3.5.5 开启图能力后的上线验收（本版可做的部分）
+
+```bash
+# 1. 两侧指纹必须相同，且 graph.enabled=true
+docker compose -p kagent logs api    | grep capability.banner
+docker compose -p kagent logs worker | grep capability.banner
+
+# 2. 看要补多少篇（只列不写）、并做就绪度体检（未就绪退出码 1）
+docker compose -p kagent exec -T worker python -m scripts.backfill_graph --dry-run --all
+docker compose -p kagent exec -T worker python -m scripts.backfill_graph --check
+
+# 3. 补建（长任务，放 worker 侧跑；幂等，可断点续跑）
+docker compose -p kagent exec -T worker python -m scripts.backfill_graph --all
+```
+
+验收判据：`--check` 输出 `failed=0`、`skipped` 只包含「内容为空 / 超分片上限」的文档，
+且 `entities`、`relations` 均大于 0。
+
+★ 脚本自身也 fail-closed：`GRAPH_ENABLED=false` 时直接退出（退出码 2），不会「照抽不误」——
+抽了也没人读（在线召回未启用），只会白花 LLM 成本并让图数据与开关状态不一致。
+
+> 本版**只写不读**：以上只验证「图数据建对了」。在线图召回（`graph_unique_total > 0`、
+> 越权邻居零命中）属于第 2 步的验收范围，在此之前不要把图路算进检索收益。
+
 ---
 
 ## 4. 上线验收清单（对应手册 F1–F5）
