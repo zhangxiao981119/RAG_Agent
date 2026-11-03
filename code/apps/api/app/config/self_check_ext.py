@@ -242,7 +242,14 @@ async def _check_wiki_dependencies() -> None:
 
 
 async def _warn_readiness() -> None:
-    """C7：图数据就绪度**只告警不阻断**（数据未就绪 ≠ 依赖缺失）。"""
+    """C7：图数据就绪度**只告警不阻断**（数据未就绪 ≠ 依赖缺失）。
+
+    ★ 判定口径与补建脚本的选取条件一致：只算 `status='indexed'` 的文档
+      （见 collect_graph_data_stats）。否则一篇解析失败的文档会让这条告警
+      永远响着 —— 而「永远响的告警」等于没有告警。
+    ★ 未索引的文档单独报一条，MUST NOT 混进「图未就绪」：前者是解析链路的问题，
+      跑 backfill 修不了，混在一起就会把人引到错误的修法上。
+    """
     from app.config.capabilities import collect_graph_data_stats
 
     try:
@@ -251,16 +258,31 @@ async def _warn_readiness() -> None:
     except Exception:
         logger.warning("图就绪度统计失败（不阻断启动）", exc_info=True)
         return
+
+    if stats["documents_not_indexed"] > 0:
+        logger.info(
+            "%d 篇文档解析未完成（status<>indexed），不参与图抽取："
+            "这是解析链路的问题，补建脚本不会选中它们",
+            stats["documents_not_indexed"],
+            extra={
+                "documents_not_indexed": stats["documents_not_indexed"],
+                "hint": "先修解析（查看该文档的 parse 任务日志），再重跑 backfill",
+            },
+        )
+
     not_ready = stats["documents_pending"] + stats["documents_failed"]
     if not_ready <= 0:
         logger.info(
-            "图数据就绪：全部文档已按当前口径抽取",
-            extra={"documents_total": stats["documents_total"]},
+            "图数据就绪：全部已索引文档已按当前口径抽取",
+            extra={
+                "documents_total": stats["documents_total"],
+                "documents_skipped": stats["documents_skipped"],
+            },
         )
         return
     metrics.incr("graph.data.not_ready", not_ready)
     logger.warning(
-        "图数据未就绪：%d 篇文档待补建/失败（图召回对它们暂不生效，三路照常）",
+        "图数据未就绪：%d 篇已索引文档待补建/失败（图召回对它们暂不生效，三路照常）",
         not_ready,
         extra={
             "documents_total": stats["documents_total"],

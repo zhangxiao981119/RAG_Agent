@@ -46,6 +46,12 @@ _CALIBER_MATCH = """(graph_status = 'done'
     AND graph_extractor_model IS NOT DISTINCT FROM :m
     AND graph_prompt_version  IS NOT DISTINCT FROM :pv)"""
 
+# 「标了 done 却零提及」的巡检下限（chunk 内容总字符数）。
+# 低于这个长度的文档本来就可能一个实体都抽不出来（例如一句 "hello p1 verify" 的
+# 测试夹具、只有图没有文字的文档）—— 那种情况报出来只会训练运维忽略这条告警。
+# 200 字符 ≈ 一个真正的段落；低于它仍标 done 是**正确行为**，不该反复提示人工排查。
+_EMPTY_DONE_MIN_CHARS = 200
+
 
 def _params() -> dict[str, Any]:
     profile = current_graph_profile()
@@ -77,7 +83,14 @@ def _base_select(mode: str):
 
 
 async def _check() -> int:
-    """就绪度体检。返回退出码（0 = 就绪）。"""
+    """就绪度体检。返回退出码（0 = 就绪）。
+
+    ★ 分母 MUST 与 `_base_select()` 的选取条件同一批文档（`status='indexed'`）：
+      图抽取的输入是 chunks，没解析完的文档永远抽不出东西、脚本也永远不选它。
+      曾用「全部未删除文档」当分母，一篇解析失败的 e2e 夹具（0 分片）就把就绪度
+      永久钉在 20/21 —— 一个**永远红**的闸门，运维很快就会学会无视它。
+      那类文档单独计数（`未索引(不参与)`），它们属于解析链路的账。
+    """
     params = _params()
     async with SessionLocal() as session:
         row = (
@@ -92,11 +105,25 @@ async def _check() -> int:
                     "  count(*) FILTER (WHERE graph_status = 'skipped') AS skipped, "
                     "  count(*) FILTER (WHERE graph_status = 'done' "
                     f"       AND NOT {_CALIBER_MATCH}) AS caliber_mismatch "
-                    "FROM documents WHERE is_latest = true AND deleted_at IS NULL"
+                    "FROM documents WHERE is_latest = true AND deleted_at IS NULL "
+                    "  AND status = 'indexed'"
                 ),
                 params,
             )
         ).one()
+        # 解析未完成的文档：单独计数，**不进** not_ready（修法完全不同）
+        not_indexed = int(
+            (
+                await session.scalar(
+                    text(
+                        "SELECT count(*) FROM documents "
+                        "WHERE is_latest = true AND deleted_at IS NULL "
+                        "  AND status <> 'indexed'"
+                    )
+                )
+            )
+            or 0
+        )
         entities = int((await session.scalar(text("SELECT count(*) FROM graph_entities"))) or 0)
         relations = int(
             (
@@ -112,17 +139,24 @@ async def _check() -> int:
         )
         # 一致性巡检（设计文档 §20 U4）：标了 done 却一条提及都没有的文档。
         # 典型成因是「关图期间重解析」（chunk 级联删掉了提及，状态却还是 done）。
+        # 加内容长度下限：短到抽不出实体的文档标 done 是正确行为，不该报警
+        #（见 _EMPTY_DONE_MIN_CHARS）。
         empty_done = int(
             (
                 await session.scalar(
                     text(
                         "SELECT count(*) FROM documents d "
                         "WHERE d.is_latest = true AND d.deleted_at IS NULL "
+                        "  AND d.status = 'indexed' "
                         "  AND d.graph_status = 'done' "
                         f"  AND {_CALIBER_MATCH} "
                         "  AND NOT EXISTS ("
                         "    SELECT 1 FROM graph_entity_mentions m "
-                        "    WHERE m.document_id = d.id)"
+                        "    WHERE m.document_id = d.id) "
+                        "  AND (SELECT coalesce(sum(char_length(c.content)), 0) "
+                        "       FROM chunks c "
+                        "       WHERE c.document_id = d.id AND c.is_latest = true) "
+                        f"      >= {_EMPTY_DONE_MIN_CHARS}"
                     ),
                     params,
                 )
@@ -131,7 +165,7 @@ async def _check() -> int:
         )
 
     not_ready = int(row.pending) + int(row.running) + int(row.failed) + int(row.caliber_mismatch)
-    print(f"文档总数      : {row.total}")
+    print(f"已索引文档总数 : {row.total}")
     print(f"已按当前口径完成: {row.done}")
     print(f"待补建(pending): {row.pending}")
     print(f"抽取中(running): {row.running}")
@@ -139,6 +173,11 @@ async def _check() -> int:
     print(f"跳过(skipped)  : {row.skipped}")
     print(f"口径不匹配     : {row.caliber_mismatch}")
     print(f"实体 / 关系    : {entities} / {relations}")
+    if not_indexed:
+        print(
+            f"未索引(不参与) : {not_indexed} 篇 —— 解析未完成（status<>indexed），"
+            "图抽取无从下手；先修解析链路"
+        )
     if empty_done:
         print(
             f"⚠ 标 done 但零提及: {empty_done} 篇 —— 常见成因是「关图期间重解析」"

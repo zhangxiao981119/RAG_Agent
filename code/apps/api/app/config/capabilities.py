@@ -62,14 +62,22 @@ async def collect_graph_data_stats(session: AsyncSession) -> dict[str, int]:
       换抽取模型 / 改 prompt 后，旧口径的 done 会被检索直接排除（fail-closed），
       若横幅仍把它算作「已完成」，就会显示 100% 覆盖而图路实际全空 ——
       这正是「配了却不生效」的静默降级。所以口径不匹配的 done 计入「待补建」。
+
+    ★ 分母 MUST 与**补建脚本的选取条件**同一批文档（`status='indexed'`）：
+      图抽取的输入是 chunks，没有 chunks 的文档永远抽不出东西，脚本也永远不选它。
+      曾用「全部未删除文档」当分母，结果一篇解析失败的 `e2e_spec.png`
+      （status='failed'，0 分片）让就绪度永远停在 20/21 —— 闸门永远红，
+      运维很快就学会无视它，这道门就白设了。
+      未索引的文档单独计数（`documents_not_indexed`）：那是解析链路的问题，
+      不该记在图抽取的账上，两者的修法也不同。
     """
     profile = current_graph_profile()
     params = {
         "m": profile.extractor_model,
         "pv": profile.prompt_version,
     }
-    # 只统计「最新版本且未软删」的文档：历史版本与已删除文档不该进就绪度分母
-    # （它们本来就不会被检索到，也不会被补建脚本选中）。
+    # 只统计「最新版本、未软删、且已解析完成」的文档：历史版本与已删除文档不该进
+    # 就绪度分母（它们本来就不会被检索到，也不会被补建脚本选中）。
     rows = (
         await session.execute(
             text(
@@ -81,7 +89,8 @@ async def collect_graph_data_stats(session: AsyncSession) -> dict[str, int]:
                 "  count(*) FILTER (WHERE graph_status = 'failed') AS failed, "
                 "  count(*) FILTER (WHERE graph_status = 'skipped') AS skipped "
                 "FROM documents "
-                "WHERE is_latest = true AND deleted_at IS NULL"
+                "WHERE is_latest = true AND deleted_at IS NULL "
+                "  AND status = 'indexed'"
             ),
             params,
         )
@@ -90,6 +99,19 @@ async def collect_graph_data_stats(session: AsyncSession) -> dict[str, int]:
     done = int(rows.done or 0)
     failed = int(rows.failed or 0)
     skipped = int(rows.skipped or 0)
+    # 未索引 = 解析还没成功（pending / parsing / failed）。单独取，不进上面的分母。
+    not_indexed = int(
+        (
+            await session.scalar(
+                text(
+                    "SELECT count(*) FROM documents "
+                    "WHERE is_latest = true AND deleted_at IS NULL "
+                    "  AND status <> 'indexed'"
+                )
+            )
+        )
+        or 0
+    )
     entities = int(
         (await session.scalar(text("SELECT count(*) FROM graph_entities"))) or 0
     )
@@ -113,6 +135,7 @@ async def collect_graph_data_stats(session: AsyncSession) -> dict[str, int]:
         "documents_pending": max(0, total - done - failed - skipped),
         "documents_failed": failed,
         "documents_skipped": skipped,
+        "documents_not_indexed": not_indexed,
         "entities": entities,
         "relations": relations,
     }
@@ -164,6 +187,9 @@ def capability_snapshot(
                     "documents_done": _pick("documents_done"),
                     "documents_pending": _pick("documents_pending"),
                     "documents_failed": _pick("documents_failed"),
+                    # 解析未完成的文档不参与图抽取（见 collect_graph_data_stats），
+                    # 前端要能把它们和「待补建」区分开，否则运维会去跑补建脚本修解析问题
+                    "documents_not_indexed": _pick("documents_not_indexed"),
                     "entities": _pick("entities"),
                     "relations": _pick("relations"),
                 },
@@ -247,12 +273,23 @@ def _render_text(
     elif stats is not None:
         total = stats["documents_total"]
         done = stats["documents_done"]
-        coverage = f"{(done * 100.0 / total):.1f}% 覆盖" if total else "0% 覆盖"
+        skipped = stats["documents_skipped"]
+        # 覆盖率分母 = 已索引 − 跳过：skipped 是「明确不该抽」（零分片 / 超分片上限），
+        # 算作**已处理**。把它留在分母里会让就绪度永远差那几个百分点，
+        # 于是没人再去看这个数字。
+        effective = total - skipped
+        coverage = f"{(done * 100.0 / effective):.1f}% 覆盖" if effective > 0 else "0% 覆盖"
         lines.append(
             f" 图数据就绪度           : {done}/{total} 篇已抽取"
             f" · 待补建 {stats['documents_pending']}"
             f" · 失败 {stats['documents_failed']}（{coverage}）"
         )
+        if stats.get("documents_not_indexed"):
+            # 单独一行，且写明「不参与」：这是解析链路的问题，跑补建脚本修不了它。
+            lines.append(
+                f"                          另 {stats['documents_not_indexed']} 篇未索引，"
+                "不参与图抽取（解析未完成，先修解析链路）"
+            )
         lines.append(
             f" 图规模                : 实体 {stats['entities']}"
             f" · 关系 {stats['relations']}"
@@ -352,6 +389,9 @@ async def log_capability_banner(role: str | None = None) -> dict:
                 "docs_done": None if stats is None else stats["documents_done"],
                 "docs_pending": None if stats is None else stats["documents_pending"],
                 "docs_failed": None if stats is None else stats["documents_failed"],
+                "docs_not_indexed": (
+                    None if stats is None else stats["documents_not_indexed"]
+                ),
             },
             "wiki": {
                 "enabled": settings.wiki_enabled,
