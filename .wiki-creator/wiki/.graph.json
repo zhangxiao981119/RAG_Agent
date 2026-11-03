@@ -1,0 +1,249 @@
+{
+  "entities": {
+    "capability-failure-semantics": {
+      "title": "能力失败三档语义",
+      "topic": "deployment-capability",
+      "aliases": [
+        "fail-closed",
+        "fail-open",
+        "fail-visible",
+        "失败语义"
+      ],
+      "page": "pages/deployment-capability/capability-failure-semantics.md"
+    },
+    "config-change-reprocess-matrix": {
+      "title": "配置变更与重跑口径矩阵",
+      "topic": "deployment-capability",
+      "aliases": [
+        "重跑口径",
+        "变更后果矩阵"
+      ],
+      "page": "pages/deployment-capability/config-change-reprocess-matrix.md"
+    },
+    "deployment-capability-switch": {
+      "title": "部署期能力开关",
+      "topic": "deployment-capability",
+      "aliases": [
+        "能力开关",
+        "capability switch",
+        "部署期开关"
+      ],
+      "page": "pages/deployment-capability/deployment-capability-switch.md"
+    },
+    "concurrency-capacity-check": {
+      "title": "并发容量双校验",
+      "topic": "engineering-lessons",
+      "aliases": [
+        "连接池账",
+        "容量校验",
+        "AsyncSession 并发"
+      ],
+      "page": "pages/engineering-lessons/concurrency-capacity-check.md"
+    },
+    "cross-role-config-fingerprint": {
+      "title": "跨角色配置指纹",
+      "topic": "engineering-lessons",
+      "aliases": [
+        "config fingerprint",
+        "配置指纹",
+        "一致性比对"
+      ],
+      "page": "pages/engineering-lessons/cross-role-config-fingerprint.md"
+    },
+    "closed-state-equivalence": {
+      "title": "关闭态等价验证",
+      "topic": "evaluation-gate",
+      "aliases": [
+        "关闭态等价",
+        "逐字节等价"
+      ],
+      "page": "pages/evaluation-gate/closed-state-equivalence.md"
+    },
+    "eval-gate": {
+      "title": "评测门禁",
+      "topic": "evaluation-gate",
+      "aliases": [
+        "评估门禁",
+        "eval gate",
+        "217 条"
+      ],
+      "page": "pages/evaluation-gate/eval-gate.md"
+    },
+    "entity-graph-store": {
+      "title": "实体图存储",
+      "topic": "graphrag-integration",
+      "aliases": [
+        "实体图",
+        "knowledge graph",
+        "图三表"
+      ],
+      "page": "pages/graphrag-integration/entity-graph-store.md"
+    },
+    "graph-acl-pushdown": {
+      "title": "图扩展的权限下推",
+      "topic": "graphrag-integration",
+      "aliases": [
+        "图权限",
+        "ACL 下推",
+        "四闸门"
+      ],
+      "page": "pages/graphrag-integration/graph-acl-pushdown.md"
+    },
+    "hybrid-recall": {
+      "title": "三路混合召回",
+      "topic": "retrieval-architecture",
+      "aliases": [
+        "混合召回",
+        "hybrid recall",
+        "三路召回"
+      ],
+      "page": "pages/retrieval-architecture/hybrid-recall.md"
+    },
+    "rrf-fusion": {
+      "title": "RRF 倒数排名融合",
+      "topic": "retrieval-architecture",
+      "aliases": [
+        "RRF",
+        "Reciprocal Rank Fusion",
+        "倒数排名融合"
+      ],
+      "page": "pages/retrieval-architecture/rrf-fusion.md"
+    },
+    "side-channel-recall": {
+      "title": "旁路召回",
+      "topic": "retrieval-architecture",
+      "aliases": [
+        "side channel",
+        "上下文补充片",
+        "旁路模式"
+      ],
+      "page": "pages/retrieval-architecture/side-channel-recall.md"
+    }
+  },
+  "alias_redirects": {
+    "fail-closed": "capability-failure-semantics",
+    "fail-open": "capability-failure-semantics",
+    "fail-visible": "capability-failure-semantics",
+    "失败语义": "capability-failure-semantics",
+    "重跑口径": "config-change-reprocess-matrix",
+    "变更后果矩阵": "config-change-reprocess-matrix",
+    "能力开关": "deployment-capability-switch",
+    "capability switch": "deployment-capability-switch",
+    "部署期开关": "deployment-capability-switch",
+    "连接池账": "concurrency-capacity-check",
+    "容量校验": "concurrency-capacity-check",
+    "asyncsession 并发": "concurrency-capacity-check",
+    "config fingerprint": "cross-role-config-fingerprint",
+    "配置指纹": "cross-role-config-fingerprint",
+    "一致性比对": "cross-role-config-fingerprint",
+    "关闭态等价": "closed-state-equivalence",
+    "逐字节等价": "closed-state-equivalence",
+    "评估门禁": "eval-gate",
+    "eval gate": "eval-gate",
+    "217 条": "eval-gate",
+    "实体图": "entity-graph-store",
+    "knowledge graph": "entity-graph-store",
+    "图三表": "entity-graph-store",
+    "图权限": "graph-acl-pushdown",
+    "acl 下推": "graph-acl-pushdown",
+    "四闸门": "graph-acl-pushdown",
+    "混合召回": "hybrid-recall",
+    "hybrid recall": "hybrid-recall",
+    "三路召回": "hybrid-recall",
+    "rrf": "rrf-fusion",
+    "reciprocal rank fusion": "rrf-fusion",
+    "倒数排名融合": "rrf-fusion",
+    "side channel": "side-channel-recall",
+    "上下文补充片": "side-channel-recall",
+    "旁路模式": "side-channel-recall",
+    "能力失败三档语义": "capability-failure-semantics",
+    "配置变更与重跑口径矩阵": "config-change-reprocess-matrix",
+    "部署期能力开关": "deployment-capability-switch",
+    "并发容量双校验": "concurrency-capacity-check",
+    "跨角色配置指纹": "cross-role-config-fingerprint",
+    "关闭态等价验证": "closed-state-equivalence",
+    "评测门禁": "eval-gate",
+    "实体图存储": "entity-graph-store",
+    "图扩展的权限下推": "graph-acl-pushdown",
+    "三路混合召回": "hybrid-recall",
+    "rrf 倒数排名融合": "rrf-fusion",
+    "旁路召回": "side-channel-recall"
+  },
+  "page_to_sources": {
+    "pages/deployment-capability/capability-failure-semantics.md": [
+      "raw/2026-11-04-架构知识条目.md",
+      "raw/2026-11-03-架构设计文档.md"
+    ],
+    "pages/deployment-capability/config-change-reprocess-matrix.md": [
+      "raw/2026-11-03-架构设计文档.md",
+      "raw/2026-11-04-架构知识条目.md"
+    ],
+    "pages/deployment-capability/deployment-capability-switch.md": [
+      "raw/2026-11-03-架构设计文档.md",
+      "raw/2026-11-03-测试报告.md"
+    ],
+    "pages/engineering-lessons/concurrency-capacity-check.md": [
+      "raw/2026-11-04-架构知识条目.md",
+      "raw/2026-11-03-架构设计文档.md"
+    ],
+    "pages/engineering-lessons/cross-role-config-fingerprint.md": [
+      "raw/2026-11-04-架构知识条目.md",
+      "raw/2026-11-03-测试报告.md"
+    ],
+    "pages/evaluation-gate/closed-state-equivalence.md": [
+      "raw/2026-11-04-架构知识条目.md",
+      "raw/2026-11-03-测试报告.md"
+    ],
+    "pages/evaluation-gate/eval-gate.md": [
+      "raw/2026-11-03-架构设计文档.md",
+      "raw/2026-11-03-测试报告.md"
+    ],
+    "pages/graphrag-integration/entity-graph-store.md": [
+      "raw/2026-11-03-架构设计文档.md"
+    ],
+    "pages/graphrag-integration/graph-acl-pushdown.md": [
+      "raw/2026-11-03-架构设计文档.md",
+      "raw/2026-11-03-测试报告.md"
+    ],
+    "pages/retrieval-architecture/hybrid-recall.md": [
+      "raw/2026-11-03-架构设计文档.md"
+    ],
+    "pages/retrieval-architecture/rrf-fusion.md": [
+      "raw/2026-11-03-架构设计文档.md"
+    ],
+    "pages/retrieval-architecture/side-channel-recall.md": [
+      "raw/2026-11-04-架构知识条目.md",
+      "raw/2026-11-03-架构设计文档.md"
+    ]
+  },
+  "source_to_pages": {
+    "raw/2026-11-04-架构知识条目.md": [
+      "pages/deployment-capability/capability-failure-semantics.md",
+      "pages/deployment-capability/config-change-reprocess-matrix.md",
+      "pages/engineering-lessons/concurrency-capacity-check.md",
+      "pages/engineering-lessons/cross-role-config-fingerprint.md",
+      "pages/evaluation-gate/closed-state-equivalence.md",
+      "pages/retrieval-architecture/side-channel-recall.md"
+    ],
+    "raw/2026-11-03-架构设计文档.md": [
+      "pages/deployment-capability/capability-failure-semantics.md",
+      "pages/deployment-capability/config-change-reprocess-matrix.md",
+      "pages/deployment-capability/deployment-capability-switch.md",
+      "pages/engineering-lessons/concurrency-capacity-check.md",
+      "pages/evaluation-gate/eval-gate.md",
+      "pages/graphrag-integration/entity-graph-store.md",
+      "pages/graphrag-integration/graph-acl-pushdown.md",
+      "pages/retrieval-architecture/hybrid-recall.md",
+      "pages/retrieval-architecture/rrf-fusion.md",
+      "pages/retrieval-architecture/side-channel-recall.md"
+    ],
+    "raw/2026-11-03-测试报告.md": [
+      "pages/deployment-capability/deployment-capability-switch.md",
+      "pages/engineering-lessons/cross-role-config-fingerprint.md",
+      "pages/evaluation-gate/closed-state-equivalence.md",
+      "pages/evaluation-gate/eval-gate.md",
+      "pages/graphrag-integration/graph-acl-pushdown.md"
+    ]
+  },
+  "duplicate_slugs": {}
+}

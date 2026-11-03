@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "schema_version": "v1",
+  "files": {
+    "raw/2026-11-03-架构设计文档.md": {
+      "sha256": "e9e0a1dc924be8d94495fe914debee7bbb1f351e90d11d9a7e8c232ab55d3672",
+      "compiled_at": null,
+      "compiled": true
+    },
+    "raw/2026-11-03-测试报告.md": {
+      "sha256": "de6cd08fc6a51aabe980d929ba58d94fc724bcfb62929722d3fd3444d87f179c",
+      "compiled_at": null,
+      "compiled": true
+    },
+    "raw/2026-11-04-架构知识条目.md": {
+      "sha256": "71347e4be6271fb49db6e62c295c20b02be4232ce6832f7c5fc896ba11a43eff",
+      "compiled_at": null,
+      "compiled": true
+    }
+  },
+  "page_count": 12
+}

@@ -1,0 +1,57 @@
+{
+  "deployment-capability-switch": [
+    "capability-failure-semantics",
+    "config-change-reprocess-matrix",
+    "cross-role-config-fingerprint"
+  ],
+  "closed-state-equivalence": [
+    "capability-failure-semantics",
+    "deployment-capability-switch",
+    "eval-gate",
+    "rrf-fusion"
+  ],
+  "entity-graph-store": [
+    "capability-failure-semantics",
+    "config-change-reprocess-matrix",
+    "graph-acl-pushdown",
+    "side-channel-recall"
+  ],
+  "config-change-reprocess-matrix": [
+    "deployment-capability-switch"
+  ],
+  "capability-failure-semantics": [
+    "closed-state-equivalence",
+    "cross-role-config-fingerprint",
+    "deployment-capability-switch"
+  ],
+  "cross-role-config-fingerprint": [
+    "deployment-capability-switch"
+  ],
+  "side-channel-recall": [
+    "concurrency-capacity-check",
+    "entity-graph-store",
+    "eval-gate",
+    "hybrid-recall",
+    "rrf-fusion"
+  ],
+  "graph-acl-pushdown": [
+    "concurrency-capacity-check",
+    "entity-graph-store",
+    "hybrid-recall"
+  ],
+  "eval-gate": [
+    "closed-state-equivalence"
+  ],
+  "hybrid-recall": [
+    "graph-acl-pushdown",
+    "rrf-fusion",
+    "side-channel-recall"
+  ],
+  "rrf-fusion": [
+    "hybrid-recall",
+    "side-channel-recall"
+  ],
+  "concurrency-capacity-check": [
+    "side-channel-recall"
+  ]
+}
