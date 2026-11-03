@@ -39,6 +39,7 @@ from app.models import Chunk, Document, ParseJob, ParseSegment
 from app.services.chunk import chunk_blocks, to_embedding_text
 from app.services.embedding import get_embedding_service
 from app.services.governance import execute_governance_job, scan_and_enqueue
+from app.services.graph.purge import purge_derived
 from app.services.keyword_text import to_fts_text
 from app.services.parse import ParseError, parse_bytes_async
 from app.services.parse.pdf_parser import (
@@ -50,6 +51,9 @@ from app.services.parse.pdf_parser import (
     ocr_scanned_pages,
 )
 from app.services.storage import get_storage
+# 图抽取的入队入口（worker 内部投递，不经 API）：关闭图能力时该函数直接返回 False，
+# 不产生任何队列写入，因此关闭态与未引入本能力时逐字节等价。
+from app.workers.graph_job import enqueue_graph_extract, run_graph_extract
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +181,12 @@ async def _index_document(
         return await _mark_document_failure(parse_job_id, exc, settings)
 
     async with SessionLocal() as session:
+        # ★ 图派生数据清理 MUST 与下面的 chunks 写入在**同一事务**内，且必须在
+        #   `DELETE chunks` **之前**：chunk 一删，提及就被级联带走，affected 实体集合
+        #   变成空集 → 孤儿实体与 doc_freq 再也算不出来（图里留着边、一条提及都没有，
+        #   图路静默 0 结果）。关闭图能力时 purge_derived 直接 return 0（不碰表）。
+        await purge_derived(session, document_id=doc_ext["id"])
+
         # 删除旧版本 chunks（重新索引时清理）
         await session.execute(delete(Chunk).where(Chunk.document_id == doc_ext["id"]))
 
@@ -215,7 +225,11 @@ async def _index_document(
         job.status = "succeeded"
         job.finished_at = _now()
         await session.commit()
-        return "succeeded"
+
+    # ★ 入队在**提交成功之后**：先入队再提交会出现「任务已跑、chunks 还看不见」，
+    #   worker 抽到一个空文档并把它标成 skipped（此后永远不重抽）。
+    await enqueue_graph_extract(doc_ext["id"])
+    return "succeeded"
 
 
 async def _advance_segment_chain(
@@ -480,6 +494,8 @@ async def run_parse_finalize(
 
     # ── 第三段：写 chunks + 更新状态 ──────────────────────
     async with SessionLocal() as session:
+        # ★ 同 _index_document：purge 与 chunks 写入同事务，且必须在 DELETE chunks 之前
+        await purge_derived(session, document_id=doc_ext["id"])
         await session.execute(delete(Chunk).where(Chunk.document_id == doc_ext["id"]))
         profile = current_index_profile()
         for index, (chunk, vec) in enumerate(zip(chunks, vectors, strict=True)):
@@ -513,7 +529,10 @@ async def run_parse_finalize(
         job.status = "succeeded"
         job.finished_at = _now()
         await session.commit()
-        return "succeeded"
+
+    # ★ 同 _index_document：提交成功后才入队（先入队会抽到看不见的 chunks）
+    await enqueue_graph_extract(doc_ext["id"])
+    return "succeeded"
 
 
 async def run_sync_all(ctx: dict[str, Any]) -> int:
@@ -559,6 +578,8 @@ class WorkerSettings:
     # 取代旧的整份 run_parse_job。治理任务（INV-M-10）：execute_governance_job /
     # scan_and_enqueue 独立注册，逻辑全在 services/governance，
     # 解析主路径零治理调用。
+    # 图抽取（GraphRAG）：run_graph_extract 独立注册，逻辑全在 workers/graph_job.py；
+    # 解析主路径只做「提交后入队」，不等待抽取结果。
     functions = [
         run_parse_segment,
         run_parse_finalize,
@@ -566,6 +587,7 @@ class WorkerSettings:
         run_sync_source,
         execute_governance_job,
         scan_and_enqueue,
+        run_graph_extract,
     ]
     queue_name = get_settings().arq_queue_name
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
@@ -582,3 +604,24 @@ class WorkerSettings:
             minute=set(range(0, 60, decisions.GOVERNANCE_SCAN_CRON_MINUTES)),
         ),
     ]
+
+    @staticmethod
+    async def on_startup(ctx: dict[str, Any]) -> None:
+        """worker 启动自检（fail-closed）+ 能力横幅。
+
+        ★ 为什么 worker 也要自检（api 已经检过一遍）：
+          抽取在 worker、召回在 api，两者运行期**不通信**。只检 api 时，「worker
+          一侧没配 LLM 密钥」表现为「任务全部 failed、图永远为空、而服务看着正常」——
+          正是本项目吃过的那种静默失败。arq 的 on_startup 抛异常会让 worker 启动
+          失败，这正是我们要的语义（配了却不可用 → 起不来，而不是跑起来空转）。
+
+        ★ 横幅 MUST 与 api 打同一份内容（含 config_fingerprint）：
+          两侧指纹不同 = 配置不一致（只重建了一侧容器 / .env 没同步），
+          而这是运行期唯一的可发现机制。
+        """
+        from app.config.capabilities import log_capability_banner
+        from app.config.self_check_ext import check_capabilities
+
+        decisions.self_check()
+        await check_capabilities()
+        await log_capability_banner(role="worker")

@@ -141,6 +141,39 @@ class Settings(BaseSettings):
     #   arq 自带默认值是 300s，对长文档不够：实测一本 283 页 PDF（482 chunks）按批 8
     #   需要 61 批 ≈ 12 分钟纯嵌入，300s 会在中途把任务杀掉。取 1800s 覆盖该规模。
     parse_job_timeout_seconds: int = 1800
+    # ── 图召回（GraphRAG）与 LLM wiki 导航 ────────────────────
+    # ★ 这两组是**部署期**能力：只由环境变量决定，进程启动时读一次，运行期不再读。
+    #   没有运行时开关、没有请求级开关、不按用户/部门放量（已确认决策）。
+    #   改了 MUST 同时重启 api 与 worker 两个容器 —— 抽取在 worker、召回在 api，
+    #   两侧读到不同值时**运行期不会有任何报错**（见 config/capabilities.py 的
+    #   config_fingerprint 比对机制）。
+    # ★ 关闭（false）是合法终态：代码路径完全不执行，与未引入本能力时逐字节等价。
+    # ★ 开了但依赖缺失（LLM 密钥 / 迁移未跑 / 后端未实现）→ 拒绝启动（fail-closed），
+    #   不会静默降级成「配了不生效」—— 后者的危害远大于服务起不来。
+    graph_enabled: bool = False
+    # 图存储后端。当前唯一实现 postgres；neo4j 等其它值是「保留位」，
+    # 配了会拒绝启动 —— 静默回落到 postgres 会让你以为在跑 Neo4j，而数据在 PG 里。
+    graph_store_backend: str = "postgres"
+    # 抽取模型。空 = 跟随 llm_model（解析成**实际值**落库，不落空串）。
+    # ★ 换它 = 口径变更：旧口径的行不是被覆盖，而是被检索直接排除 → 必须重抽。
+    graph_extractor_model: str = ""
+    # 在线图召回硬超时（毫秒）。默认 800 = 兜底上限（实测目标 p95 ≤ 80ms）。
+    # 取值范围由启动自检卡住 [50, 5000]：下限防「必然超时的假配置」，
+    # 上限防「挂着不动的长尾」。
+    graph_retrieve_timeout_ms: int = 800
+    # 单次抽取 LLM 调用超时（秒）。抽取是批量同步调用，与在线生成的 60s 总超时无关。
+    graph_extract_timeout_seconds: float = 120.0
+    wiki_enabled: bool = False
+    # 生成范围。本版仅 doc（一文档一页，可见性 = 该文档的文档级 ACL，天然同构）；
+    # kb 是保留值，配了拒绝启动 —— KB 级页要把多篇不同密级的文档摘要合成一个对象，
+    # 按生成者权限生成是越权、按读者权限裁剪则每次请求都要重建（见设计文档 §7.5）。
+    wiki_scope: str = "doc"
+    # 生成模型。空 = 跟随 llm_model，同 graph_extractor_model。
+    wiki_generator_model: str = ""
+    wiki_generate_timeout_seconds: float = 120.0
+    # 送生成器的拼接文本上限（字符）。与 GOVERNANCE_PROMPT_MAX_CHARS 同口径：
+    # 不截断则超长文档会打出 LLM 超时风暴。
+    wiki_input_max_chars: int = 12_000
     # ── M6 安全加固 ──────────────────────────────────────────
     chat_rate_limit_per_minute: int = 20  # 单用户每分钟最多提问次数，超过返回 429
     # ── M6 续篇：配额管理（手册第 14 步 — 双层速率+总量）─────

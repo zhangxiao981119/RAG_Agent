@@ -158,6 +158,19 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:?必须在 .env 设置}
       LLM_API_KEY: ${LLM_API_KEY:?必须在 .env 设置}
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+      # ── 图召回 / LLM wiki 导航（部署期能力，api 与 worker 必须取同一组值）──
+      # ★ 默认全关 = 与未引入本能力时逐字节等价。开启前 MUST 读 DEPLOY.md §3.5：
+      #   开启后要补建图数据，不是「改个变量就自动生效」。
+      GRAPH_ENABLED: ${GRAPH_ENABLED:-false}
+      GRAPH_STORE_BACKEND: ${GRAPH_STORE_BACKEND:-postgres}
+      GRAPH_EXTRACTOR_MODEL: ${GRAPH_EXTRACTOR_MODEL:-}
+      GRAPH_RETRIEVE_TIMEOUT_MS: ${GRAPH_RETRIEVE_TIMEOUT_MS:-800}
+      GRAPH_EXTRACT_TIMEOUT_SECONDS: ${GRAPH_EXTRACT_TIMEOUT_SECONDS:-120}
+      WIKI_ENABLED: ${WIKI_ENABLED:-false}
+      WIKI_SCOPE: ${WIKI_SCOPE:-doc}
+      WIKI_GENERATOR_MODEL: ${WIKI_GENERATOR_MODEL:-}
+      WIKI_GENERATE_TIMEOUT_SECONDS: ${WIKI_GENERATE_TIMEOUT_SECONDS:-120}
+      WIKI_INPUT_MAX_CHARS: ${WIKI_INPUT_MAX_CHARS:-12000}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://embedding:8000/v1}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
@@ -222,6 +235,26 @@ services:
       S3_ACCESS_KEY: ${MINIO_ROOT_USER}
       S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       S3_BUCKET: ${S3_BUCKET:-kagent-docs}
+      # ★ 这三行**必须**与 api 段一致（原先 worker 段缺失，见设计文档 §7.4）：
+      #   图抽取在 worker 侧调 LLM，缺凭据时抽取 100% 失败，而 api 一切正常 ——
+      #   表现为「任务全部 failed、图永远为空、服务看着正常」。启动自检 C2 会兜底
+      #   （GRAPH_ENABLED=true 且密钥为空 → worker 拒绝启动），但根治要靠这里补齐。
+      LLM_BASE_URL: ${LLM_BASE_URL:?必须在 .env 设置}
+      LLM_API_KEY: ${LLM_API_KEY:?必须在 .env 设置}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+      # ── 图召回 / LLM wiki 导航（部署期能力，api 与 worker 必须取同一组值）──
+      # ★ 两侧只重建一侧 → 运行期不通信、不会互相报错；唯一发现手段是比对启动横幅的
+      #   config_fingerprint（见 code/docs/DEPLOY.md §3.5）。
+      GRAPH_ENABLED: ${GRAPH_ENABLED:-false}
+      GRAPH_STORE_BACKEND: ${GRAPH_STORE_BACKEND:-postgres}
+      GRAPH_EXTRACTOR_MODEL: ${GRAPH_EXTRACTOR_MODEL:-}
+      GRAPH_RETRIEVE_TIMEOUT_MS: ${GRAPH_RETRIEVE_TIMEOUT_MS:-800}
+      GRAPH_EXTRACT_TIMEOUT_SECONDS: ${GRAPH_EXTRACT_TIMEOUT_SECONDS:-120}
+      WIKI_ENABLED: ${WIKI_ENABLED:-false}
+      WIKI_SCOPE: ${WIKI_SCOPE:-doc}
+      WIKI_GENERATOR_MODEL: ${WIKI_GENERATOR_MODEL:-}
+      WIKI_GENERATE_TIMEOUT_SECONDS: ${WIKI_GENERATE_TIMEOUT_SECONDS:-120}
+      WIKI_INPUT_MAX_CHARS: ${WIKI_INPUT_MAX_CHARS:-12000}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://embedding:8000/v1}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}

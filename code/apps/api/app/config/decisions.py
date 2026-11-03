@@ -804,6 +804,97 @@ SENSITIVE_FEATURE_KEY: Final[str] = "sensitive_filter"
 """敏感词过滤的 feature flag key，关闭即放行。"""
 
 
+
+
+
+# ── 图召回（GraphRAG）· 判定与口径常量 ─────────────────────
+# ★ 为什么这些值不放环境变量（判据见下方每一条的注释，也是本项目的统一判据）：
+#   影响**判定语义或口径**的值（跳数、条数上限、预算、类型闭集）改动后会让评测基线
+#   失去可比性，必须走代码评审；**开关 / 模型名 / 端点 / 超时 / 批量**这类「不同部署
+#   取不同值是正常预期」的项才进 settings。同一个值两处都有 = 两个真源，比没有更糟。
+
+GRAPH_MAX_HOPS: Final[int] = 2
+"""图扩展跳数上限。与 TOP_K_RECALL 同类：改它 = 评测基线不可比。
+
+1 跳 = 直接共现的实体（同段提及），2 跳 = 跨概念桥接；3 跳起噪声超过信号，
+且递归深度把查询打成秒级。"""
+
+GRAPH_MAX_HOPS_HARD_LIMIT: Final[int] = 2
+"""GRAPH_MAX_HOPS 的硬上限（self_check 校验）。
+
+存在的理由只有一条：防有人为了「多跳更全」把 GRAPH_MAX_HOPS 调到 5。
+硬上限与默认值同值 —— 想放宽必须先改这里并重跑基线，不是改一个数就生效。"""
+
+GRAPH_LINK_MAX_ENTITIES: Final[int] = 8
+"""单次查询最多取几个种子实体。
+
+太多 → 噪声种子引入无关子图（且每个种子都要扩跳，成本线性涨）；
+与 ILIKE_MAX_TERMS=3 同量级思路：宁可少而准。"""
+
+GRAPH_LINK_MAX_TERMS: Final[int] = 3
+"""实体链接用的查询词元上限（复用 build_fts_query 后截断）。
+
+沿用 ILIKE_MAX_TERMS 的实测结论（3 处饱和）：词元再多只增命中行、降精度。"""
+
+GRAPH_RETRIEVE_TOP_K: Final[int] = 10
+"""图扩展返回的候选 chunk 上限（去重后）。
+
+★ 不是最终进上下文的条数 —— 后者由 GRAPH_RECALL_MAX_CHUNKS 与 token 预算共同约束。
+候选留一点余量，是为了让预算裁剪能在「路径强度」排序之后做。"""
+
+GRAPH_RECALL_MAX_CHUNKS: Final[int] = 3
+"""进入上下文的图召回片上限。
+
+与 TABLE_RECALL_MAX_CHUNKS / SECTION_RECALL_MAX_CHUNKS 取同值（3）：
+三类「上下文补充片」的量级必须一致，否则图路会单方面挤占窗口。"""
+
+GRAPH_RECALL_TOKEN_BUDGET: Final[int] = 1_200
+"""图召回片总 token 预算（按 chunks.token_count 累计）。
+
+与 SECTION_RECALL_TOKEN_BUDGET 同值：两者都是「锦上添花的上下文」，
+不该比章节补全更贵。"""
+
+GRAPH_EXTRACT_BATCH_CHUNKS: Final[int] = 4
+"""单次抽取 LLM 调用送几个 chunk。
+
+太少 → 调用次数爆炸（一篇 200 片就是 50 次）；太多 → 单次超时，
+且实体跨段错配（同一实体在两段里写法不同时模型会当成两个）。
+4 ≈ 2K token 输入，稳落在 GRAPH_EXTRACT_TIMEOUT_SECONDS 内。"""
+
+GRAPH_EXTRACT_MAX_CHUNKS_PER_DOC: Final[int] = 200
+"""单文档抽取分片上限（资源护栏，同 EMBEDDED_IMAGE_MAX_PER_DOC 的思路）。
+
+超限不静默截断 → documents.graph_status='skipped' + 日志，让「这篇没抽」可见。"""
+
+GRAPH_ENTITY_NAME_MAX_CHARS: Final[int] = 40
+"""实体名长度上限，超长丢弃。
+
+LLM 会把整句当实体名输出（「根据文档第三段所述，报销流程」就是典型形态），
+这类名字进图只会污染邻居扩展。"""
+
+GRAPH_MAX_ENTITIES_PER_CHUNK: Final[int] = 12
+"""单 chunk 抽取的实体数上限，超限截断。
+
+防一篇 prompt 里塞进 200 个实体把落库打成写风暴。"""
+
+GRAPH_MAX_RELATIONS_PER_CHUNK: Final[int] = 12
+"""单 chunk 抽取的关系数上限，超限截断（同 GRAPH_MAX_ENTITIES_PER_CHUNK）。"""
+
+GRAPH_ENTITY_TYPES: Final[tuple[str, ...]] = (
+    "PERSON", "ORG", "PRODUCT", "TERM", "POLICY", "PROCESS", "SYSTEM", "OTHER",
+)
+"""实体类型闭集，与迁移 0024 的 ck_graph_entities_type CHECK **必须一一对应**。
+
+self_check 只校验「非空且无重复」；与 DDL 的一致性由 DDL 的 CHECK 兜底
+（写不进非法类型 = 立即报错，而不是悄悄落一个怪类型）。"""
+
+GRAPH_RELATION_MAX_CHARS: Final[int] = 20
+"""关系谓词长度上限（归一后），超长丢弃。
+
+谓词是「遍历线索」不是「可读句子」：`负责` / `包含` / `审批` 这类短语足够，
+写成整句既不进 prompt 也无法归一（同一语义的两种写法会被当成两条边）。"""
+
+
 def check_llm_budget(llm_model: str, max_output_tokens: int) -> None:
     """校验 LLM 的两项预算配置（启动期执行，fail-closed）。
 
@@ -1077,6 +1168,38 @@ def self_check() -> None:
         )
     if TABLE_RECALL_MAX_CHUNKS <= 0 or TABLE_RECALL_TOKEN_BUDGET <= 0:
         raise RuntimeError("TABLE_RECALL_* MUST 为正数 —— 回捞限流常量失守会让大表淹没上下文")
+
+
+    # 这些是**代码常量**，两侧镜像同一份代码 → 同一版本必然一致；此处只防「改代码时
+    # 只改了一半」（如把 GRAPH_MAX_HOPS 调到 5 却忘了硬上限、或把 CHUNKS 上限改到
+    # 比候选上限还大）。凡失守都是「静默劣化」型故障：不报错，只是答不准。
+    if GRAPH_MAX_HOPS < 1 or GRAPH_MAX_HOPS > GRAPH_MAX_HOPS_HARD_LIMIT:
+        raise RuntimeError("GRAPH_MAX_HOPS MUST ∈ [1, GRAPH_MAX_HOPS_HARD_LIMIT]")
+    if GRAPH_RETRIEVE_TOP_K < 1 or GRAPH_RECALL_MAX_CHUNKS < 1 or GRAPH_RECALL_TOKEN_BUDGET <= 0:
+        raise RuntimeError("GRAPH_* 限流常量 MUST 为正 —— 失守会让图邻居淹没上下文")
+    if GRAPH_RECALL_MAX_CHUNKS > GRAPH_RETRIEVE_TOP_K:
+        raise RuntimeError("GRAPH_RECALL_MAX_CHUNKS MUST <= GRAPH_RETRIEVE_TOP_K（进上下文的不能多于候选）")
+    if len(set(GRAPH_ENTITY_TYPES)) != len(GRAPH_ENTITY_TYPES) or not GRAPH_ENTITY_TYPES:
+        raise RuntimeError("GRAPH_ENTITY_TYPES MUST 非空且无重复")
+    # 抽取批量与资源护栏：批量 0 会让循环空转，护栏 0 会让所有文档被 skipped。
+    if (
+        GRAPH_EXTRACT_BATCH_CHUNKS < 1
+        or GRAPH_EXTRACT_MAX_CHUNKS_PER_DOC < 1
+        or GRAPH_MAX_ENTITIES_PER_CHUNK < 1
+        or GRAPH_MAX_RELATIONS_PER_CHUNK < 1
+        or GRAPH_ENTITY_NAME_MAX_CHARS < 1
+        or GRAPH_RELATION_MAX_CHARS < 1
+        or GRAPH_LINK_MAX_ENTITIES < 1
+        or GRAPH_LINK_MAX_TERMS < 1
+    ):
+        raise RuntimeError("GRAPH_* 抽取/链接护栏 MUST 为正 —— 0 值会让抽取与链接整体失效")
+    # prompt 版本与正文同源（正文在 services/graph/prompts.py）：空版本 = 口径过滤失效
+    # —— 检索侧 `prompt_version = :pv` 会匹配到所有历史的空串行。
+    from app.config.graph_profile import GRAPH_PROMPT_VERSION
+    from app.config.wiki_profile import WIKI_PROMPT_VERSION
+
+    if not GRAPH_PROMPT_VERSION.strip() or not WIKI_PROMPT_VERSION.strip():
+        raise RuntimeError("图/wiki prompt 版本 MUST NOT 为空（空版本 = 口径过滤失效）")
 
     # ── 索引口径（方案一：索引/模型版本）──
     # 维度是 schema 契约：chunks.embedding 是 vector(1024)，改维度必须配套迁移表结构。

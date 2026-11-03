@@ -13,6 +13,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    REAL,
     Text,
     UniqueConstraint,
     event,
@@ -197,6 +198,16 @@ class Document(Base):
     effective_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     content_hash: Mapped[str | None] = mapped_column(Text)
+    # ── 图抽取状态（迁移 0025，GraphRAG）──
+    # 「哪篇没抽、按什么口径抽的、什么时候抽的」三问的答案都在这里，
+    # 使图就绪度退化成 documents 上的一个 WHERE（无需 JOIN 第四张状态表）。
+    # ★ 检索侧 MUST NOT 读这几列：文档可检索性与图抽取解耦，抽取失败只影响图路。
+    graph_status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    # 口径列：与 graph_entities 的 (extractor_model, prompt_version) 同源（graph_profile）。
+    # 换模型 / 改 prompt 后这两列与当前口径不符 → backfill --recaliber 选中它重抽。
+    graph_extractor_model: Mapped[str | None] = mapped_column(Text)
+    graph_prompt_version: Mapped[str | None] = mapped_column(Text)
+    graph_extracted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         CheckConstraint("status IN ('pending','parsing','indexed','failed')", name="ck_documents_status"),
@@ -208,9 +219,14 @@ class Document(Base):
             "source_kind IN ('upload','sync_local','sync_git','sync_web')",
             name="ck_documents_source_kind",
         ),
+        CheckConstraint(
+            "graph_status IN ('pending','running','done','failed','skipped')",
+            name="ck_documents_graph_status",
+        ),
         Index("idx_doc_kb", "tenant_id", "kb_id", "is_latest"),
         Index("idx_doc_grp", "doc_group_id", text("version DESC")),
         Index("idx_doc_governance", "tenant_id", "kb_id", "governance_status"),
+        Index("idx_doc_graph_status", "tenant_id", "is_latest", "graph_status"),
     )
 
 
@@ -318,6 +334,132 @@ class KbTerm(Base):
     __table_args__ = (
         UniqueConstraint("kb_id", "term", name="uq_kb_terms_kb_term"),
         Index("idx_kb_terms_lookup", "kb_id"),
+    )
+
+
+class GraphEntity(Base):
+    """图实体（迁移 0024）—— KB 内合一。
+
+    「跨文档合并」是图的全部意义：同一实体在 A 文档与 B 文档的提及指向**同一行**，
+    于是「从实体出发找相邻 chunk」才能跨越文档边界（这正是向量路做不到的事）。
+    name_key（NFKC + 折叠空白 + lower）是合并键，MUST 由
+    app/services/graph/extract.py::normalize_name_key 的同一函数产出 ——
+    抽取侧（写实体）与链接侧（查询 → 种子实体）各写一份必然漂移，
+    而漂移的表现是「实体明明在库里，却一条也链不上」，不报错。
+    """
+
+    __tablename__ = "graph_entities"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    name_key: Mapped[str] = mapped_column(Text, nullable=False)
+    # 关键词式实体链接的检索列：写入侧由 keyword_text.to_fts_text(name, "") 生成，
+    # 查询侧由同一模块的 build_fts_query 生成（与 chunks.fts_text 同款单一真源）。
+    name_fts: Mapped[str] = mapped_column(Text, nullable=False)
+    # 生成列，应用侧 MUST NOT 写入
+    name_vec = mapped_column(
+        TSVECTOR, Computed("to_tsvector('simple', name_fts)", persisted=True)
+    )
+    entity_type: Mapped[str] = mapped_column(Text, nullable=False)
+    aliases: Mapped[list[str]] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    doc_freq: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "entity_type IN ('PERSON','ORG','PRODUCT','TERM','POLICY','PROCESS','SYSTEM','OTHER')",
+            name="ck_graph_entities_type",
+        ),
+        UniqueConstraint("kb_id", "name_key", name="uq_graph_entities_kb_key"),
+        Index("idx_graph_entities_kb", "tenant_id", "kb_id"),
+        Index("idx_graph_entities_name_vec", "name_vec", postgresql_using="gin"),
+    )
+
+
+class GraphEntityMention(Base):
+    """实体提及（迁移 0024）—— 图 → 原文的唯一回链，也是 ACL 的落点。
+
+    ★ 提及表里**没有** acl_tags / level_rank（设计文档 §8.4）：可见性一律 JOIN 回
+      chunks 用四闸门判定。冗余存一份权限副本，文档改密级时副本不会跟着变，
+      而漂移的表现是「越权或漏召回」，都不报错。
+    """
+
+    __tablename__ = "graph_entity_mentions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    chunk_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chunks.id", ondelete="CASCADE"), nullable=False
+    )
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("graph_entities.id", ondelete="CASCADE"), nullable=False
+    )
+    surface: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float | None] = mapped_column(REAL)
+    # 口径章：检索 MUST 按这两列过滤（旧口径 = 查不到，不混算）
+    extractor_model: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_version: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("chunk_id", "entity_id", name="uq_graph_mentions_chunk_entity"),
+        Index("idx_graph_mentions_entity", "entity_id"),
+        Index("idx_graph_mentions_document", "document_id"),
+        Index("idx_graph_mentions_chunk", "chunk_id"),
+        Index("idx_graph_mentions_caliber", "extractor_model", "prompt_version"),
+    )
+
+
+class GraphRelation(Base):
+    """实体关系（迁移 0024）—— 边只在**文档**维度记账。
+
+    边永不被引用，只是遍历线索，所以不需要 chunk 级证据；support_count 是
+    「同文档内该三元组被表述的次数」，用作扩展时的路径强度权重。
+    """
+
+    __tablename__ = "graph_relations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False
+    )
+    src_entity_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("graph_entities.id", ondelete="CASCADE"), nullable=False
+    )
+    dst_entity_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("graph_entities.id", ondelete="CASCADE"), nullable=False
+    )
+    relation: Mapped[str] = mapped_column(Text, nullable=False)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    support_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    extractor_model: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_version: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("src_entity_id <> dst_entity_id", name="ck_graph_relations_not_self"),
+        UniqueConstraint(
+            "src_entity_id", "dst_entity_id", "relation", "document_id",
+            name="uq_graph_relations_triple",
+        ),
+        Index("idx_graph_rel_src", "src_entity_id"),
+        Index("idx_graph_rel_dst", "dst_entity_id"),
+        Index("idx_graph_rel_doc", "document_id"),
+        Index("idx_graph_rel_caliber", "tenant_id", "kb_id", "extractor_model", "prompt_version"),
     )
 
 

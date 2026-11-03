@@ -43,12 +43,24 @@ class LLMError(Exception):
 
 class LLMService:
     async def stream_chat(
-        self, messages: list[ChatMessage], temperature: float
+        self,
+        messages: list[ChatMessage],
+        temperature: float,
+        *,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> AsyncIterator[str]:
         """流式生成。yield 每个 delta 文本片段。
 
         首 token 超时 → LLMTimeout；中途报错 → LLMError。
         messages 支持纯文本与多模态 content 数组（WU-M-05），请求体原样透传。
+
+        model / timeout_seconds 是**可选覆盖**，默认 None = 用 settings 的口径：
+          · 图抽取（离线）要能用与主模型不同的模型（GRAPH_EXTRACTOR_MODEL），
+            且它是批量长输出，用生成链路的 60s 总超时必然不够（见
+            GRAPH_EXTRACT_TIMEOUT_SECONDS）。
+          · 覆盖值只影响本次调用，不写回 settings —— 口径真源仍在 config 层，
+            这里只是「按调用方给的口径发一次请求」。
         """
         settings = get_settings()
         if not settings.llm_base_url:
@@ -56,7 +68,7 @@ class LLMService:
             raise LLMError("LLM_BASE_URL 未配置")
         headers = {"Authorization": f"Bearer {settings.llm_api_key}"} if settings.llm_api_key else {}
         body = {
-            "model": settings.llm_model,
+            "model": model or settings.llm_model,
             "messages": messages,
             "temperature": temperature,
             "stream": True,
@@ -65,10 +77,11 @@ class LLMService:
             #   不显式限制，那部分"预留"就是空的（启动时校验两者关系）。
             "max_tokens": settings.llm_max_output_tokens,
         }
+        total_timeout = timeout_seconds or settings.llm_total_timeout_seconds
 
         first_token_seen = False
         try:
-            async with httpx.AsyncClient(timeout=settings.llm_total_timeout_seconds) as client:
+            async with httpx.AsyncClient(timeout=total_timeout) as client:
                 async with client.stream(
                     "POST",
                     f"{settings.llm_base_url.rstrip('/').removesuffix('/v1')}/v1/chat/completions",
@@ -116,10 +129,19 @@ class LLMService:
             metrics.incr("rag.llm.error", kind="transport")
             raise LLMError(f"LLM 调用失败: {exc}") from exc
 
-    async def chat(self, messages: list[ChatMessage], temperature: float) -> str:
-        """非流式调用（用于 L3 grounding 等需要完整输出的场景）。"""
+    async def chat(
+        self,
+        messages: list[ChatMessage],
+        temperature: float,
+        *,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        """非流式调用（用于 L3 grounding / 治理审查 / 图抽取等需要完整输出的场景）。"""
         result: list[str] = []
-        async for delta in self.stream_chat(messages, temperature):
+        async for delta in self.stream_chat(
+            messages, temperature, model=model, timeout_seconds=timeout_seconds
+        ):
             result.append(delta)
         return "".join(result)
 

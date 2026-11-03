@@ -109,6 +109,17 @@ async def lifespan(_: FastAPI):
         },
     )
 
+    # ── 能力自检 + 启动横幅（GraphRAG 图召回 / LLM wiki 导航）──
+    # 与 worker 的 on_startup 调**同一个函数**：抽取在 worker、召回在 api，
+    # 只检一侧等于不检（另一侧的缺失只在「用户提问后什么都没发生」时才被发现）。
+    # ★ fail-closed：开了能力却依赖缺失 → 这里抛错，进程启动失败（不静默降级）。
+    # ★ 能力全关时本函数直接返回，**不查库**、不打任何图相关日志。
+    from app.config.capabilities import log_capability_banner
+    from app.config.self_check_ext import check_capabilities
+
+    await check_capabilities()
+    await log_capability_banner(role="api")
+
     # ── crypto 私钥预热 ────────────────────────────────────
     # 见 app/services/crypto.py::warm_up —— 该模块用同步 Redis 客户端，
     # 首次调用若发生在请求期会阻塞整个事件循环。提前到启动阶段执行。

@@ -156,6 +156,21 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+      # ── 图召回 / LLM wiki 导航（部署期能力，api 与 worker 必须取同一组值）──
+      # ★ 默认全关 = 与未引入本能力时逐字节等价。开启前 MUST 读 docs/DEPLOY.md §3.5：
+      #   开启后要补建图数据（python -m scripts.backfill_graph --all），不是改个变量就生效。
+      # ★ dev 编排同样要注入：只写在 prod 里的话，开发栈里设了 GRAPH_ENABLED=true 也不会
+      #   生效 —— 「配了却不生效」正是本方案要堵的坑（见设计文档 §11.2）。
+      GRAPH_ENABLED: ${GRAPH_ENABLED:-false}
+      GRAPH_STORE_BACKEND: ${GRAPH_STORE_BACKEND:-postgres}
+      GRAPH_EXTRACTOR_MODEL: ${GRAPH_EXTRACTOR_MODEL:-}
+      GRAPH_RETRIEVE_TIMEOUT_MS: ${GRAPH_RETRIEVE_TIMEOUT_MS:-800}
+      GRAPH_EXTRACT_TIMEOUT_SECONDS: ${GRAPH_EXTRACT_TIMEOUT_SECONDS:-120}
+      WIKI_ENABLED: ${WIKI_ENABLED:-false}
+      WIKI_SCOPE: ${WIKI_SCOPE:-doc}
+      WIKI_GENERATOR_MODEL: ${WIKI_GENERATOR_MODEL:-}
+      WIKI_GENERATE_TIMEOUT_SECONDS: ${WIKI_GENERATE_TIMEOUT_SECONDS:-120}
+      WIKI_INPUT_MAX_CHARS: ${WIKI_INPUT_MAX_CHARS:-12000}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://embedding:8000/v1}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
@@ -228,6 +243,19 @@ services:
       S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       S3_BUCKET: ${S3_BUCKET:-kagent-docs}
+      # ── 图召回 / LLM wiki 导航（与 api 段同源注入，缺一侧就是静默不一致）──
+      # ★ 抽取在 worker、召回在 api，两侧运行期不通信：只改一侧不会报错，唯一发现
+      #   手段是比对两条启动横幅的 config_fingerprint（见 docs/DEPLOY.md §3.5）。
+      GRAPH_ENABLED: ${GRAPH_ENABLED:-false}
+      GRAPH_STORE_BACKEND: ${GRAPH_STORE_BACKEND:-postgres}
+      GRAPH_EXTRACTOR_MODEL: ${GRAPH_EXTRACTOR_MODEL:-}
+      GRAPH_RETRIEVE_TIMEOUT_MS: ${GRAPH_RETRIEVE_TIMEOUT_MS:-800}
+      GRAPH_EXTRACT_TIMEOUT_SECONDS: ${GRAPH_EXTRACT_TIMEOUT_SECONDS:-120}
+      WIKI_ENABLED: ${WIKI_ENABLED:-false}
+      WIKI_SCOPE: ${WIKI_SCOPE:-doc}
+      WIKI_GENERATOR_MODEL: ${WIKI_GENERATOR_MODEL:-}
+      WIKI_GENERATE_TIMEOUT_SECONDS: ${WIKI_GENERATE_TIMEOUT_SECONDS:-120}
+      WIKI_INPUT_MAX_CHARS: ${WIKI_INPUT_MAX_CHARS:-12000}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://embedding:8000/v1}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
