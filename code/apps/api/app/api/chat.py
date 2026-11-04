@@ -40,6 +40,7 @@ from app.services import sensitive as sensitive_service
 from app.services.caliber import snapshot_for_message
 from app.services.generate import build_system_prompt, get_stream_generation_service
 from app.services.guard import injection as injection_guard
+from app.services.keyword_text import hit_snippet
 from app.services.mask import mask_pii
 from app.services.memory import (
     build_memory_prompt,
@@ -636,7 +637,7 @@ async def chat_ask(
                     "heading_path": c.heading_path,
                     "page_no": c.page_no,
                     "score": c.display_score,
-                    "snippet": c.content[:200],
+                    "snippet": hit_snippet(c.content, question_for_pipeline),
                     # M8-P3b 附件：原始文件下载链接（WU-M-19 鉴权代理端点，
                     # 相对路径满足 INV-M-16 —— 禁止直出 MinIO 地址）
                     "raw_url": f"/api/documents/{c.document_id}/raw",

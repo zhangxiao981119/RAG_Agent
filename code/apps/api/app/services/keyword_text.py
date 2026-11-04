@@ -234,3 +234,72 @@ def build_ilike_pattern(
             else:
                 parts.append(re.escape(alt))
     return "|".join(parts)
+
+
+_SNIPPET_LOOKBACK: int = 30
+"""命中点向左回看的字符数：窗口起点 = max(0, 命中点 - 30)。
+
+30 字约一到两个短句 —— 足够带上「主语 + 谓语」让片段可独立阅读，
+又不会把回看区撑大到吞掉证据词。纯展示调优值，不参与任何检索判定。
+"""
+
+
+def hit_snippet(content: str, query: str, width: int = 200) -> str:
+    """按**命中位置**开窗的引用片段 —— citations.snippet 的构造函数。
+
+    ★ 这是**纯展示字段**：只影响 citations 事件里的 snippet（用户引用面板看到的
+      预览文本），不影响 [n] 编号、不影响喂给生成的 prompt、不参与任何检索判定
+      —— 编号与上下文仍由 `assemble_context_chunks` 的顺序决定，两边互不知晓。
+
+    背景：固定取 `content[:200]` 时，长 chunk 的前 200 字常常是开场白（如「报销
+    流程概述」），真正的证据（「上班时间为 9:00-12:00」）在同一条 chunk 的中段，
+    引用面板看起来像「没引用到」。把窗口挪到命中点附近，片段才与用户的问题对得上。
+
+    语义（词元与检索的 ILIKE / FTS 路同源 —— 都来自本模块的切分规则，口径一致）：
+      1. 取 `build_ilike_terms(query)` 的词元，按序（长词元优先，最有区分度）
+         找**第一个能在 content 里命中**的词元（大小写不敏感）；
+      2. 词元全不命中 → 退一级用问句的 **CJK 2-gram**（与 `to_fts_text` / FTS 路
+         同一套切分）继续探测。★ 这一层不是可选优化：像「公司几点上班」这种
+         不含疑问切分词的问句，整段会成一个词元、几乎不可能原样出现在文档里 ——
+         而 FTS 路恰恰是靠 2-gram 把这条 chunk 召回的，检索能命中、开窗探不到
+         等于白修。gram 命中点可能落在低区分度词上，但只影响展示起点，无正确性风险；
+      3. 仍不命中 / query 无词元 / content ≤ width → 返回 `content[:width]`，
+         与旧版 `content[:200]` **逐字节一致**（回退即现行为）；
+      4. 命中 → 窗口起点 = max(0, 命中点 - 30)，并向左对齐到最近的换行或句号
+         边界（让片段从一句完整的话开始）；找不到边界就用 max(0, 命中点 - 30)；
+         窗口切片长度 ≤ width；起点 > 0 开头加「…」，未达片尾结尾加「…」，
+         省略号占用的字符计入 width（返回串总长 ≤ width，与回退行为同界）。
+
+    ★ 为什么遍历词元而不是只用第一个词元：词元按长度降序，第一个词元是问句里
+      最长的语义单元，它缺席而短词元（「上班时间」）命中的情况很常见 —— 只试
+      第一个会把本任务要修的问题原样退回来。
+    ★ 为什么用 `lower()` 而不是 `_normalize` 对齐：NFKC 可能改变字符串长度
+      （如「ﬁ」→「fi」），归一化后按索引回切原文会错位。大小写折叠是长度不变的，
+      对展示窗口足够。
+    """
+    if len(content) <= width:
+        return content[:width]
+    text = _normalize(query[:400])
+    # 探测序列：完整词元在前（最有区分度），问句 CJK 2-gram 兜底（与 FTS 路同源）
+    probes = _dedupe(
+        build_ilike_terms(query)
+        + [g for run in _CJK_RE.findall(text) for g in _bigrams(run)]
+    )
+    for term in probes:
+        pos = content.lower().find(term)
+        if pos >= 0:
+            break
+    else:
+        return content[:width]
+
+    start = max(0, pos - _SNIPPET_LOOKBACK)
+    lookback = content[start:pos]
+    boundary = max(lookback.rfind("\n"), lookback.rfind("。"))
+    if boundary != -1:
+        start += boundary + 1
+
+    prefix = "…" if start > 0 else ""
+    end = min(len(content), start + width)
+    suffix = "…" if end < len(content) else ""
+    body = content[start:end][: width - len(prefix) - len(suffix)]
+    return f"{prefix}{body}{suffix}"
