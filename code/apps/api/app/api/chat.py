@@ -52,6 +52,7 @@ from app.services.multimodal import (
 )
 from app.services.query_rewrite import rewrite_query
 from app.services.retrieve import get_retrieval_service
+from app.services.retrieve.base import assemble_context_chunks
 from app.services.router.modality import Modality, detect
 
 logger = logging.getLogger(__name__)
@@ -498,14 +499,10 @@ async def chat_ask(
             # 表格决策 A1' + 长文档章节补全 + 图召回：补充片追加在命中片尾部 ——
             # 编号 / citations / 配额裁剪沿用既有机制（L4 按位置裁，超限时补全片
             # 先于命中片被裁，优先级正确）。
-            # 图召回片放**最后**：它是四路里最弱的一路（无分数、只补上下文），
-            # 上下文超限时应当第一个被裁掉，而不是挤掉命中片。
-            current_chunks = (
-                list(result.chunks)
-                + list(result.table_recall_chunks)
-                + list(result.section_recall_chunks)
-                + list(result.graph_recall_chunks)
-            )
+            # ★ 拼装顺序的唯一真源在 `assemble_context_chunks`：评测门禁
+            #   （eval_service）调用它、这里也调用它 —— 两处各写一份必然漂移，
+            #   而漂移的表现是「评测测的不是生产行为」，不会报错。
+            current_chunks = assemble_context_chunks(result)
 
             # 先估算总 token 数，超限则逐轮压缩 history + 裁剪 chunks
             limit_cap = decisions.CONTEXT_WINDOW_LIMIT_TOKENS - decisions.CONTEXT_OUTPUT_RESERVE_TOKENS

@@ -83,3 +83,36 @@ class RetrievalResult:
     chain_mode: str = ""
     # multi 模式下实际检索用的子问题列表（原始问题恒在首位）；供审计与打点。
     subquestions: list[str] = field(default_factory=list)
+
+
+def assemble_context_chunks(result: RetrievalResult) -> list[RetrievedChunk]:
+    """上下文拼装的**唯一真源**：四类来源按「裁剪优先级」排序（尾部先被裁）。
+
+    顺序 MUST 是 `chunks → table → section → graph`：
+      · 命中片是证据本体，必须最先、也最后才被裁；
+      · 表格回捞 / 章节补全 / 图召回都只是「补上下文」，越靠后越弱，超限时先掉。
+    这个顺序同时决定 L4 配额裁剪的结果（按位置裁）与 citations 的编号顺序。
+
+    ★ 为什么必须是函数而不是各处各写一遍：
+      `chat.py`（生产）与 `eval_service.py`（评测门禁）都要拼这段。两处各写一份，
+      某天只改了生产那份 —— 评测测的就不是生产行为了，而且**不会报错**，
+      只是分数慢慢失去意义。这类漂移只能靠「只有一处实现」来杜绝。
+
+    ★ 只做「四类来源的收集」，不掺任何调用方特有的逻辑：
+      token 估算、历史压缩、配额降级都在调用方，塞进来就会变成两个都想要的胶水。
+    """
+    return (
+        list(result.chunks)
+        + list(result.table_recall_chunks)
+        + list(result.section_recall_chunks)
+        + list(result.graph_recall_chunks)
+    )
+
+
+def recall_chunks_count(result: RetrievalResult) -> int:
+    """四类里「补充片」的条数（不含命中片）—— 报告里要能分清是哪一类变多了。"""
+    return (
+        len(result.table_recall_chunks)
+        + len(result.section_recall_chunks)
+        + len(result.graph_recall_chunks)
+    )

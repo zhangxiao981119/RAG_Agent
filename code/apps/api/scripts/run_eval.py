@@ -14,6 +14,15 @@
 项2（评估基线版本）：每次运行都会落一条 eval_runs 记录（指标 + 用例集指纹 + 运行口径）。
   --baseline 与最近一次**同用例集指纹**的运行比对，任一指标回退超过 --max-regression
   即以非零退出码阻断发布。用例集指纹变化（增删改用例）时自动跳过对比。
+
+★ 本脚本的上下文口径（与 admin 门禁 `POST /api/admin/eval/run` 不同，别搞混）：
+  它走的是 `/api/chat/ask` **生产链路**，因此四类上下文（命中片 + 表格回捞 +
+  章节补全 + 图召回）本来就已经注入，且走的是 `retrieve_chain()`。
+  换句话说「评测只喂命中片」那个断层**不存在于本脚本**，所以这里**不提供**
+  `--with-recall-chunks` 开关 —— 提供了也只会是个骗人的空开关（生产链路没有
+  请求级的上下文裁剪开关，设计上也不允许有）。
+  需要「只喂命中片」的旧口径来自 admin 门禁（`EvalService.run_eval` 的
+  `with_recall_chunks=False`），两条链路的口径不能混比，报告里会打印口径。
 """
 from __future__ import annotations
 
@@ -238,6 +247,26 @@ async def run_eval(
         f"rerank:{decisions.RELEVANCE_THRESHOLD_RERANK}"
     )
 
+    # ── 上下文口径（必须能从报告本身看出来，不能只留在命令行历史里）──
+    context_caliber = "production_chat_path"
+    print("\n=== 上下文口径 ===")
+    print("来源: /api/chat/ask 生产链路（命中片 + 表格回捞 + 章节补全 + 图召回，"
+          "检索走 retrieve_chain）")
+    print(f"图能力: GRAPH_ENABLED={settings.graph_enabled}")
+    if settings.graph_enabled:
+        print(
+            "声明: 本次评测已启用图能力且四类上下文全部注入，"
+            "报告覆盖图召回对答案质量的影响；"
+            "图召回片的条数/独有量见审计 chat.ask.metric 的 "
+            "graph_covered / graph_unique（SSE 不回传 path_stats）。"
+        )
+    else:
+        print(
+            "声明: 本次评测未启用图能力（GRAPH_ENABLED=false），图召回为 0 路，"
+            "故本报告**不覆盖**图召回对答案质量的影响；"
+            "禁止用分数未变化来宣称「图无副作用」。"
+        )
+
     metrics = {
         "refusal_rate": round(refusal_rate, 4),
         "miss_rate": round(miss_rate, 4),
@@ -265,6 +294,9 @@ async def run_eval(
                 failed |= _compare_baseline(base_row.metrics, metrics, max_regression)
         # 口径快照：记录本批指标是在什么口径下得到的（含配置指纹，见项3）
         caliber = await snapshot_for_message(tenant_id)
+        # 上下文口径是本批次特有的（同一份代码可能跑两套口径），必须单独留痕 ——
+        # 否则事后看 eval_runs 只看到两行不同的分数，无法判断能不能比
+        caliber["context_caliber"] = context_caliber
         await save_eval_run(
             session,
             tenant_id=tenant_id,
