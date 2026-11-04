@@ -284,3 +284,57 @@ docstring「已知退化」段只写了 **2-gram 层**的窗口偏移，没写**
 P1-1 / P2-1 / P2-4 三项整改**全部成立**，实现质量好于我上轮的建议（独立函数 + 分钉测试 +
 变异自检）；`0e04472`/`6f9c3f5` 的既有契约（回退逐字节、SSE 事件序）无回归。
 唯一增量发现 P2-5（多词元最左语义未写进 docstring），不阻断。**0814d98 可合入。**
+
+---
+
+## 交付快扫 `5970018`（2026-11-04 UTC 07:0x）
+
+被测：`5970018 fix(chat): hit_snippet 多词元探测改回逐词元 search（长词元优先）`
+（+45/-16，`git show --stat` + `--name-only` 过滤确认**只含** `keyword_text.py` +
+`test_hit_snippet.py`，无夹带）。窄范围三点核对：
+
+### 1. 逐词元循环确实保留长词元优先 —— **通过（探针回放）**
+
+实现：`for term in build_ilike_terms(query):  m = re.search(build_ilike_pattern([term]), content, re.IGNORECASE)`
+—— `build_ilike_terms` 长度降序 + 首个命中即返回；每词元仍走 `build_ilike_pattern([term])`
+容错正则（P1 的型号探测未回退到精确 find）。
+
+```
+[✔] AX3000 / ax-3000 / ax_3000 / ax 3000 四写法全部命中且开窗（P1 未回退）
+[✔] 上轮 P2-5 实证用例回放：content='报销流程。'*60+'上班时间为 9:00。'，
+    query「上班时间 报销」→ snippet 前 20 字 = '…上班时间为 9:00。'（不再锚 pos 0 的「报销」）
+[✔] 单词元 '上班时间' 行为不变
+[✔] 反向构造（content len=391，报销在 0、上班时间在 350）→ 长词元靠后仍胜
+[✔] 回退契约未破坏：未命中逐字节 content[:200]、width=1 钳 4
+```
+
+### 2. 两条新测试构造合理性 —— **通过（OR 变异实证排假）**
+
+- `test_multi_term_prefers_longer_term_not_leftmost` 的前置断言
+  `"报销" in content[:200] and "上班时间" not in content[:200]`：
+  它保证「若实现退回 content[:200] 或 OR 最左命中，窗口起点必然以「报销」开头」——
+  两种假通过路径都被前置条件堵死。
+- **OR 变异实证**（把逐词元循环改回单正则 `build_ilike_pattern(terms)`）：
+
+```
+FAILED test_multi_term_prefers_longer_term_not_leftmost
+FAILED test_multi_term_longer_term_later_in_content_wins
+2 failed, 14 passed      ← 两条新测试在 OR 实现下同时变红（coder 的变异自检可复现）
+（git checkout 还原，git status 干净）
+```
+
+### 3. 纯度与容器复跑 —— **通过**
+
+```
+镜像含修复确认：grep -c 'for term in build_ilike_terms' app/services/keyword_text.py → 1
+$ docker compose run --rm --no-deps --entrypoint sh api -c "pip install -q '.[dev]' && pytest tests/services && ruff check ."
+156 passed（tests/services）；ruff All checks passed!
+对账 coder 自报 210：pytest tests/services tests/chat → 210 passed（210 = 156 + 54 chat）✔
+```
+
+（运行中的 api 未动；变异后工作区 `git status --porcelain` 为空自证。）
+
+### 快扫结论
+
+三点全部核对通过，无 P0/P1。P2-5 修复方向与上轮建议一致（逐词元 search 保长词元优先），
+两条新测试对 OR 最左与回退两条假通过路径均有排除力（变异实证）。**5970018 可交付。**
