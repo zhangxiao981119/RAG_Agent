@@ -105,3 +105,28 @@ def test_chunk_fetch_sql_has_no_order_by():
     """顺序由存储层给定；这里再排一次，两处口径迟早分叉。"""
     sql = _norm(recall_mod._CHUNK_SQL_TEMPLATE.format(where_base=_WHERE_BASE)).upper()
     assert "ORDER BY" not in sql
+
+
+# ── statement_timeout 的还原点（事务级设置会溢出到后续 SQL）──────
+def test_restore_timeout_is_single_call_site():
+    """还原点 MUST 只有一处（成功路径出口），否则早晚有一支 return 忘了收尾。"""
+    source = inspect.getsource(recall_mod.recall_by_graph)
+    assert source.count("_restore_statement_timeout(") == 1
+
+
+def test_restore_timeout_runs_after_last_recall_sql():
+    """还原必须排在取片 SQL **之后**、return 之前 —— 顺序错了等于没还原。"""
+    source = inspect.getsource(recall_mod.recall_by_graph)
+    chunk_sql_at = source.index("_CHUNK_SQL_TEMPLATE.format")
+    restore_at = source.index("_restore_statement_timeout(")
+    assert restore_at > chunk_sql_at
+    # 且它在 try/except 之外：失败路径已 rollback，不该再发 SQL 开新事务
+    assert "await _restore_statement_timeout" in source.split("except Exception")[-1]
+
+
+def test_restore_target_is_captured_not_hardcoded():
+    """还原成**调用前的值**：写死 '0' 会悄悄放宽服务端配的全局 statement_timeout。"""
+    source = inspect.getsource(recall_mod._restore_statement_timeout)
+    assert ":prev" in source, "还原语句必须绑定调用前读到的值"
+    body = inspect.getsource(recall_mod.recall_by_graph)
+    assert "_read_statement_timeout" in body

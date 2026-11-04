@@ -836,6 +836,23 @@ GRAPH_LINK_MAX_TERMS: Final[int] = 3
 
 沿用 ILIKE_MAX_TERMS 的实测结论（3 处饱和）：词元再多只增命中行、降精度。"""
 
+GRAPH_LINK_SUBSTR_MAX_ENTITIES: Final[int] = 20_000
+"""第三层（子串兜底）的规模护栏：范围内实体数超过它就不发那条正则查询。
+
+★ 为什么单给第三层设护栏，而不是给三层都设：
+  前两层走索引（`(kb_id, name_key)` 唯一索引 / `name_vec` GIN），成本随实体数近似对数；
+  第三层是未锚定正则（`name_key ~* '...'`），**用不上 name_key 的 B-tree**，成本是
+  O(该 KB 的实体数)。风险不在单次耗时（432 个实体实测亚毫秒），在**触发频率**：
+  它只在「前两层凑不满 8 个种子」时才跑，而「这句话没提到库里任何实体」恰恰是最常见
+  的情形 —— 否定路径付最贵的账。
+
+★ 20_000 的由来：单 KB 实体数 × 单行正则代价。以实测 432 实体 ≈ 0.2ms 外推，
+  2 万实体约 10ms 量级，仍在 GRAPH_RETRIEVE_TIMEOUT_MS（800ms 兜底上限）之内；
+  再往上就该换方案（前缀索引 / pg_trgm），而不是放宽这个数。
+
+★ 超阈值只是**跳过第三层**，不是失败：前两层的结果照常返回，另计
+  `rag.graph_link.substr_skipped`。"""
+
 GRAPH_RETRIEVE_TOP_K: Final[int] = 10
 """图扩展返回的候选 chunk 上限（去重后）。
 
@@ -1191,6 +1208,7 @@ def self_check() -> None:
         or GRAPH_RELATION_MAX_CHARS < 1
         or GRAPH_LINK_MAX_ENTITIES < 1
         or GRAPH_LINK_MAX_TERMS < 1
+        or GRAPH_LINK_SUBSTR_MAX_ENTITIES < 1
     ):
         raise RuntimeError("GRAPH_* 抽取/链接护栏 MUST 为正 —— 0 值会让抽取与链接整体失效")
     # prompt 版本与正文同源（正文在 services/graph/prompts.py）：空版本 = 口径过滤失效

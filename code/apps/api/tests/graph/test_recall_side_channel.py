@@ -59,12 +59,26 @@ class _Result:
 
 
 class FakeSession:
-    """记录执行过哪些 SQL；`rollback_calls` 用于断言失败路径的清理动作。"""
+    """记录执行过哪些 SQL；`rollback_calls` 用于断言失败路径的清理动作。
 
-    def __init__(self, rows: list | None = None, *, rollback_raises: bool = False) -> None:
+    `current_setting` 由 `current_timeout` 模拟（默认 "0"，与真实 PG 默认一致）；
+    `restore_raises=True` 模拟收尾失败（连接已断），用于验证「收尾失败不掩盖结果」。
+    """
+
+    def __init__(
+        self,
+        rows: list | None = None,
+        *,
+        rollback_raises: bool = False,
+        current_timeout: str = "0",
+        restore_raises: bool = False,
+    ) -> None:
         self._rows = rows or []
         self._rollback_raises = rollback_raises
+        self._current_timeout = current_timeout
+        self._restore_raises = restore_raises
         self.sql: list[str] = []
+        self.scalar_sql: list[str] = []
         self.params: list[dict] = []
         self.rollback_calls = 0
 
@@ -72,11 +86,22 @@ class FakeSession:
         sql = stmt.text if hasattr(stmt, "text") else str(stmt)
         self.sql.append(sql)
         self.params.append(dict(params or {}))
-        if "set_config" in sql or "statement_timeout" in sql:
+        if "set_config" in sql:
+            # 还原语句：prev 取默认值 "0" 时视为「还原」，否则视为「设置预算」
+            if self._restore_raises and (params or {}).get("prev") is not None:
+                raise ConnectionError("连接已断（收尾失败）")
+            return _Result([])
+        if "current_setting" in sql:
             return _Result([])
         if "c.id = ANY(:chunk_ids)" in sql:
             return _Result(self._rows)
         raise AssertionError(f"未识别的 SQL: {sql[:100]}")
+
+    async def scalar(self, stmt, params=None):  # noqa: ANN001
+        sql = stmt.text if hasattr(stmt, "text") else str(stmt)
+        assert "current_setting" in sql, f"scalar 只该用于读当前设置：{sql[:80]}"
+        self.scalar_sql.append(sql)
+        return self._current_timeout
 
     async def rollback(self) -> None:
         self.rollback_calls += 1
@@ -315,12 +340,97 @@ async def test_sets_db_side_statement_timeout(monkeypatch):
     _patch(monkeypatch, seeds=[], store=FakeStore([]))
     await _recall(session, timeout_ms=800)
 
-    assert session.sql, "第一步必须是设置 DB 侧超时"
-    assert "set_config" in session.sql[0]
-    assert session.params[0]["ms"] == "800"
+    # 先读当前值（作为稍后还原的目标），再把预算设上去
+    assert "current_setting" in session.scalar_sql[0]
+    set_idx = next(i for i, sql in enumerate(session.sql) if "set_config" in sql)
+    assert session.params[set_idx]["ms"] == "800"
     # SET 语句不接受绑定参数（asyncpg 走扩展协议会报 syntax error at or near "$1"），
     # 所以 MUST 用 set_config 函数形式
-    assert "SET LOCAL" not in session.sql[0].upper()
+    assert "SET LOCAL" not in session.sql[set_idx].upper()
+
+
+@pytest.mark.asyncio
+async def test_restores_statement_timeout_as_last_sql(monkeypatch):
+    """★ 事务级设置的泄漏防护：成功路径的最后一条 SQL 必须是还原。
+
+    不还原 = 800ms 的图召回预算继续套在同一事务里的大表回捞 / 章节补全上，
+    「慢一点但能成功」的回捞变成 QueryCanceled，章节补全（无 try 包裹）直接冒泡成
+    VECTOR_STORE_DOWN —— 把本来会成功的请求变成失败。
+    """
+    cid = uuid.uuid4()
+    session = FakeSession([_ChunkRow(cid)], current_timeout="30s")
+    _patch(
+        monkeypatch,
+        seeds=[_Seed(uuid.uuid4(), "差旅费", 1.0)],
+        store=FakeStore([GraphNeighbor(chunk_id=cid, hop=1, weight=1)]),
+    )
+    out = await _recall(session)
+
+    assert out.degraded_reason == ""
+    last_sql, last_params = session.sql[-1], session.params[-1]
+    assert "set_config" in last_sql and "statement_timeout" in last_sql
+    # 还原成**调用前的值**，不是硬编码 "0"：否则会悄悄放宽服务端配的全局超时
+    assert last_params["prev"] == "30s"
+
+
+@pytest.mark.parametrize("seed_kind", ["no_entities", "no_neighbors", "hit"])
+@pytest.mark.asyncio
+async def test_every_success_path_restores(monkeypatch, seed_kind):
+    """空种子 / 空邻居也是成功路径 —— 它们最常见（否定路径），更该还原。
+
+    若只在大功告成那条 return 里还原，最常见的两种情况恰恰把最短的超时留给后续 SQL。
+    """
+    cid = uuid.uuid4()
+    if seed_kind == "no_entities":
+        session = FakeSession(current_timeout="30s")
+        _patch(monkeypatch, seeds=[], store=FakeStore([]))
+    elif seed_kind == "no_neighbors":
+        session = FakeSession(current_timeout="30s")
+        _patch(monkeypatch, seeds=[_Seed(uuid.uuid4(), "孤立", 1.0)], store=FakeStore([]))
+    else:
+        session = FakeSession([_ChunkRow(cid)], current_timeout="30s")
+        _patch(
+            monkeypatch,
+            seeds=[_Seed(uuid.uuid4(), "种子", 1.0)],
+            store=FakeStore([GraphNeighbor(chunk_id=cid, hop=1, weight=1)]),
+        )
+
+    out = await _recall(session)
+    assert out.degraded_reason in ("", "no_entities", "no_neighbors")
+    assert session.params[-1].get("prev") == "30s", "成功路径最后一条 SQL 必须是还原"
+
+
+@pytest.mark.asyncio
+async def test_restore_failure_does_not_mask_success(monkeypatch):
+    """收尾失败（连接已断）不许把一次成功召回判成 degraded。"""
+    cid = uuid.uuid4()
+    session = FakeSession([_ChunkRow(cid)], restore_raises=True)
+    _patch(
+        monkeypatch,
+        seeds=[_Seed(uuid.uuid4(), "种子", 1.0)],
+        store=FakeStore([GraphNeighbor(chunk_id=cid, hop=1, weight=1)]),
+    )
+    out = await _recall(session)
+
+    assert out.degraded_reason == "", "还原失败是收尾问题，不是召回失败"
+    assert [c.chunk_id for c in out.chunks] == [cid]
+    assert session.rollback_calls == 0, "成功路径不该 rollback（那会丢掉已读到的结果）"
+
+
+@pytest.mark.asyncio
+async def test_failure_path_does_not_restore(monkeypatch):
+    """失败路径已 rollback（事务级设置随事务消失），MUST NOT 再发还原 SQL。"""
+    session = FakeSession()
+    _patch(
+        monkeypatch,
+        seeds=[_Seed(uuid.uuid4(), "种子", 1.0)],
+        store=FakeStore([], raises=RuntimeError("图库抖动")),
+    )
+    out = await _recall(session)
+
+    assert out.degraded_reason == "error"
+    assert session.rollback_calls == 1
+    assert not [p for p in session.params if "prev" in p], "rollback 后再发 SQL 会开新事务"
 
 
 def test_outcome_is_graph_recall_result():

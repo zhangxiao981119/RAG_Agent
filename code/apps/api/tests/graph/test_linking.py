@@ -10,12 +10,14 @@
 """
 from __future__ import annotations
 
+import inspect
 import uuid
 from dataclasses import dataclass
 
 import pytest
 
 from app.config import decisions
+from app.infra import metrics
 from app.services.graph import linking as linking_mod
 from app.services.graph.extract import normalize_name_key
 from app.services.graph.linking import LinkedEntity, link_entities, query_keys
@@ -32,25 +34,38 @@ class _Row:
 
 
 class _Result:
-    def __init__(self, rows: list[_Row]) -> None:
-        self._rows = rows
+    def __init__(self, rows: list | None = None, *, count: int | None = None) -> None:
+        self._rows = rows or []
+        self._count = count
 
-    def all(self) -> list[_Row]:
+    def all(self) -> list:
         return list(self._rows)
+
+    def scalar(self) -> int:
+        assert self._count is not None, "scalar() 只该用于 count(*) 查询"
+        return self._count
 
 
 class FakeSession:
     """按 SQL 特征分发；记录每次调用的 (类别, 参数)，用于断言「少发一次」。"""
 
-    def __init__(self, exact=None, fts=None, like=None) -> None:
+    def __init__(self, exact=None, fts=None, like=None, *, entity_count: int = 5,
+                 count_raises: bool = False) -> None:
         self._exact = exact or []
         self._fts = fts or []
         self._like = like or []
+        self._entity_count = entity_count
+        self._count_raises = count_raises
         self.calls: list[tuple[str, dict]] = []
 
     async def execute(self, stmt, params=None):  # noqa: ANN001
         sql = stmt.text if hasattr(stmt, "text") else str(stmt)
         params = dict(params or {})
+        if "count(*) AS cnt" in sql:
+            self.calls.append(("count", params))
+            if self._count_raises:
+                raise RuntimeError("计数查询失败")
+            return _Result(count=self._entity_count)
         if "e.name_key = ANY(:keys)" in sql:
             self.calls.append(("exact", params))
             return _Result(self._exact)
@@ -123,7 +138,8 @@ async def test_layers_fall_through_to_fts_then_like():
         fts=[_Row(uuid.uuid4(), "差旅费报销标准说明", "差旅费报销标准说明")],
     )
     got = await _link(session, limit=8)
-    assert [kind for kind, _ in session.calls] == ["exact", "fts", "like"]
+    # count 是第三层的规模护栏（先数一次再决定要不要发那条最贵的正则查询）
+    assert [kind for kind, _ in session.calls] == ["exact", "fts", "count", "like"]
     assert len(got) == 2
     # 精确命中的分必须高于 FTS 命中（同一实体被两层命中时取高分）
     assert got[0].score == 1.0
@@ -183,9 +199,13 @@ async def test_every_layer_carries_scope_params():
     session = FakeSession()
     await _link(session, limit=8)
     assert session.calls, "应当至少发了精确层"
-    for _kind, params in session.calls:
+    for kind, params in session.calls:
         assert params["tenant_id"] == TENANT
         assert params["kb_ids"] == [KB]
+        if kind == "count":
+            # 计数故意只按 (tenant, kb)：它要的是「正则层候选集的上界」，且必须便宜到
+            # 能走 index-only scan —— 带上口径 EXISTS 就变成逐行子查询了。
+            continue
         assert params["extractor_model"] == "qwen-test"
         assert params["prompt_version"] == "gprompt-v1"
 
@@ -210,3 +230,75 @@ def test_like_layer_uses_regex_not_like_underscore_wildcard():
     sql = linking_mod._LIKE_SQL.text
     assert "~*" in sql
     assert " LIKE " not in sql.upper()
+
+
+# ── 第三层规模护栏 ──────────────────────────────────────────
+@pytest.fixture
+def metrics_isolated():
+    """指标是进程级单例：不隔离的话上一个用例的 +1 会让断言永远 ≥1。"""
+    metrics.reset()
+    yield
+    metrics.reset()
+
+
+@pytest.mark.asyncio
+async def test_substr_layer_skipped_when_entities_exceed_guard(monkeypatch, metrics_isolated):
+    """超阈值 → 正则 SQL **根本不发**，前两层结果照常返回，指标 +1。"""
+    monkeypatch.setattr(decisions, "GRAPH_LINK_SUBSTR_MAX_ENTITIES", 10)
+    session = FakeSession(
+        fts=[_Row(uuid.uuid4(), "差旅费报销标准说明", "差旅费报销标准说明")],
+        entity_count=10_001,
+        like=[_Row(uuid.uuid4(), "不该出现", "不该出现")],
+    )
+    got = await _link(session, limit=8)
+
+    kinds = [kind for kind, _ in session.calls]
+    assert "like" not in kinds, "超护栏时第三层的正则 SQL MUST NOT 发出"
+    assert kinds == ["exact", "fts", "count"]
+    assert len(got) == 1, "跳过第三层不等于失败：前两层的种子照常返回"
+    assert metrics.get("rag.graph_link.substr_skipped", reason="too_many") == 1
+
+
+@pytest.mark.asyncio
+async def test_substr_layer_runs_below_guard(metrics_isolated):
+    session = FakeSession(entity_count=10)
+    await _link(session, limit=8)
+    assert "like" in [kind for kind, _ in session.calls]
+    assert metrics.get("rag.graph_link.substr_skipped", reason="too_many") == 0
+
+
+@pytest.mark.asyncio
+async def test_guard_boundary_is_strictly_greater(monkeypatch, metrics_isolated):
+    """恰等于阈值仍然执行（护栏是「超过才跳过」，否则 20_000 这个数字名不副实）。"""
+    monkeypatch.setattr(decisions, "GRAPH_LINK_SUBSTR_MAX_ENTITIES", 999)
+    session = FakeSession(entity_count=999)
+    await _link(session, limit=8)
+    assert "like" in [kind for kind, _ in session.calls]
+
+
+@pytest.mark.asyncio
+async def test_count_failure_allows_substr_layer(monkeypatch, metrics_isolated):
+    """计数失败 → 放行第三层。计数是优化手段，不是正确性闸门：
+    因为「数不出来」就让图召回静默 0 种子（no_entities）反而更难排查。"""
+    session = FakeSession(count_raises=True)
+    got = await _link(session, limit=8)
+    assert "like" in [kind for kind, _ in session.calls]
+    assert got == [] or isinstance(got, list)
+
+
+def test_count_sql_is_scoped_and_cheap():
+    """计数 SQL 只按 (tenant, kb)：走 idx_graph_entities_kb，不带口径 EXISTS、不带正则。"""
+    sql = linking_mod._COUNT_SQL.text
+    assert "count(*)" in sql
+    assert "e.tenant_id = :tenant_id" in sql
+    assert "e.kb_id = ANY(:kb_ids)" in sql
+    assert "EXISTS" not in sql.upper(), "带上口径 EXISTS 就不再是 index-only 的廉价计数"
+    assert "~*" not in sql
+
+
+def test_guard_constant_declared_in_decisions():
+    """护栏 MUST 是 decisions 里的具名常量，不许在 linking 里写魔数。"""
+    assert decisions.GRAPH_LINK_SUBSTR_MAX_ENTITIES == 20_000
+    source = inspect.getsource(linking_mod)
+    assert "GRAPH_LINK_SUBSTR_MAX_ENTITIES" in source
+    assert "20_000" not in source

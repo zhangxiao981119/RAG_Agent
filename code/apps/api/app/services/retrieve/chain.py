@@ -122,8 +122,11 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
       · use_rerank 任一轮为 False → 整体按降级口径（vector 阈值）判定（保守）
       · table_recall_chunks / section_recall_chunks 按 chunk_id 去重合并，
         仍排命中片之后、分数为 0；两张表并集内也互斥（同一片不进两次）
-      · graph_recall_chunks 同款合并，且与上面三处**全部**互斥；graph_degraded_reason
-        取首个非空（各轮同口径，原因无需拼接）
+      · graph_recall_chunks 同款合并，且与上面三处**全部**互斥；
+        graph_degraded_reason 的合并规则是**取首个非空**（MUST NOT 拼接或覆盖）：
+        与其他字段不同，它是「原因」不是「量」—— 多轮按轮求和/拼接会得到
+        「timeout + no_entities」这种不存在的状态；而"先到者优先"里先到的通常是
+        首个失败的轮次，最接近根因。改这条规则前先想清楚：这个字段的读者是排障的人。
       · stage_ms / path_stats 按轮累加；chain_decompose 由调用方注入，不在此处
     """
     # 延迟导入：_build_rrf_scores 定义在包 __init__，而本模块被该 __init__ 导入，
@@ -171,7 +174,8 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
                 continue
             graph_recall.setdefault(chunk.chunk_id, chunk)
         if result.graph_degraded_reason and not graph_degraded:
-            # 各轮同口径，「为什么降级」不需要拼接：取首个非空即可（越早越接近根因）
+            # 合并规则：取**首个非空**。MUST NOT 拼接（"timeout + no_entities" 不是
+            # 一个真实状态），MUST NOT 覆盖（后到的轮次会盖掉首个根因）。
             graph_degraded = result.graph_degraded_reason
         if not result.use_rerank:
             use_rerank = False
