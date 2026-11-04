@@ -14,6 +14,11 @@
 ★ 即使 True 也不等于「与生产完全同构」，剩一处差异必须写在报告里：
   生产在检索前做 **query 改写**（`chat.py` 传的是 `retrieve_query` = 改写后的问句），
   评测直接用原问题。改写会显著影响召回，所以「对齐了拼装」只解决上下文那一半。
+
+★ 与 `scripts/run_eval.py` 的口径不同，两者结果**禁止横向比较**（见 `CROSS_PATH_NOTE`）：
+  那条链路打的是 `/api/chat/ask` 生产端点（`retrieve_chain()` + 四类上下文全注入），
+  本服务是单趟 `retrieve()` + 按 `with_recall_chunks` 决定拼不拼补充片。
+  「两条链路混比」比「没有开关」危险得多 —— 分数差异会被归因到某个开关上，而真相是口径。
 """
 from __future__ import annotations
 
@@ -42,18 +47,30 @@ logger = logging.getLogger(__name__)
 CONTEXT_CALIBER_CHUNKS_ONLY = "chunks_only"
 CONTEXT_CALIBER_WITH_RECALL = "with_recall_chunks"
 
+CROSS_PATH_NOTE = (
+    "两条评测链路的口径不同，结果禁止横向比较："
+    "admin 门禁（本服务 EvalService）单趟 retrieve()，是否注入补充片由 with_recall_chunks 决定；"
+    "scripts/run_eval.py 走 /api/chat/ask 生产链路，retrieve_chain() + 四类上下文全注入。"
+)
+"""跨链路口径禁令 —— **公开常量**，`scripts/run_eval.py` 直接 import 同一份文本。
+
+★ 为什么必须是单一常量而不是各写一句：这句禁令要同时出现在三处
+  （门禁报告的 context_note、CLI 评测的 stdout、eval_runs.caliber），
+  三份措辞一旦漂移，就等于「两份报告引用的是不同规则」，读者只会按宽松的那份理解。
+"""
+
 # 报告自带的声明句 —— 措辞随口径翻转。
 # ★ 为什么必须写进报告而不是只写在命令行历史里：报告会被人单独转发、被存档、
 #   被拿去和另一份报告比。口径与限制不在报告里，就等于没记录。
 _NOTE_CHUNKS_ONLY = (
     "本次评测未将图召回片注入生成上下文（with_recall_chunks=False），"
     "故本报告不覆盖图召回对答案质量的影响；graph_covered / graph_unique 只是召回侧计数，"
-    "不能据此宣称「图无副作用」。"
+    "不能据此宣称「图无副作用」。" + CROSS_PATH_NOTE
 )
 _NOTE_WITH_RECALL = (
     "本次评测已将表格回捞 / 章节补全 / 图召回片一并注入生成上下文"
     "（with_recall_chunks=True），拼装口径与生产 chat 一致；"
-    "仍有一处差异：评测不做 query 改写，直接用原问题检索。"
+    "仍有一处差异：评测不做 query 改写，直接用原问题检索。" + CROSS_PATH_NOTE
 )
 
 

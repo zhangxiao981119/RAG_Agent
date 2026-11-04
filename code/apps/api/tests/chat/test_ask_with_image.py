@@ -232,10 +232,17 @@ def harness(monkeypatch):
 
     monkeypatch.setattr(chat_mod.quota_service, "_incr_usage", _noop_incr)
 
-    with TestClient(app) as client:
-        h.client = client
+    # ★ 不用 `with TestClient(app)`（不触发 lifespan）：
+    #   lifespan 会真连一次 DB，asyncpg 连接池绑定到第一个事件循环；
+    #   后续用例换了事件循环，池里残留连接报「attached to a different loop」。
+    #   本文件全部依赖已打桩，lifespan 初始化的东西一样都不需要。
+    #   （这就是它此前在容器/宿主上表现为 3~6 条环境依赖 error 的根因。）
+    client = TestClient(app)
+    h.client = client
+    try:
         yield h
-    app.dependency_overrides.clear()
+    finally:
+        app.dependency_overrides.clear()
 
 
 # ── 工具 ────────────────────────────────────────────────────────

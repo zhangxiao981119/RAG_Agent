@@ -8,6 +8,8 @@ MUST 遵守（手册 §5.2 约束）：
   2. citations MUST 在 delta 之前
   3. 拒答 MUST 发 refused 事件，MUST NOT 用 delta 发拒答文案
   4. delta 是增量文本，前端累加
+  5. 载荷只许**追加**不许改名/删除：`done` 与「检索之后」的 `refused` 额外带
+     `path_stats` / `graph_degraded_reason`（§14.6 可测化），既有键与事件顺序不变
 """
 from __future__ import annotations
 
@@ -52,7 +54,7 @@ from app.services.multimodal import (
 )
 from app.services.query_rewrite import rewrite_query
 from app.services.retrieve import get_retrieval_service
-from app.services.retrieve.base import assemble_context_chunks
+from app.services.retrieve.base import RetrievalResult, assemble_context_chunks
 from app.services.router.modality import Modality, detect
 
 logger = logging.getLogger(__name__)
@@ -91,6 +93,33 @@ def _validate_images(images: list[ImageRef]) -> None:
 def _sse(event: str, data: dict) -> str:
     """构造 SSE 事件块。data 用 JSON 序列化。"""
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
+def _retrieval_observation(result: RetrievalResult) -> dict:
+    """检索侧观测字段 —— SSE 追加字段的**唯一构造点**（§14.6 可测化）。
+
+    追加 `path_stats`（三路 + 图路的 covered/unique 计数）与 `graph_degraded_reason`
+    （图路降级原因，"" = 正常），让「这一轮图到底补了多少、有没有降级」成为
+    SSE 上的**可查询事实**而不是只躺在审计表里 —— 评测脚本（scripts/run_eval.py）
+    拿不到审计表，只能从流里读。
+
+    ★ 为什么追加在 `done` / `refused`，不追加在 `meta`：
+      `meta` 在检索**之前**下发（`stage="retrieving"` 就是那一刻），那时
+      `path_stats` 还不存在。要把它塞进 meta 只能「先检索、再发 meta」，
+      首字节延迟会从「立刻」变成「等完整个检索」—— 为一个统计字段牺牲 TTFB 不划算。
+
+    ★ 纯追加：不改既有键名、不删键、不动事件顺序
+      （meta → stage → citations → delta → done/refused 是契约，前端依赖它）。
+      前端未声明的键会被忽略，多这两个字段不改变渲染。
+
+    ★ 为什么连拒答轮也带，而不是只给成功轮：能拒答说明检索已经跑完，
+      图路观测同样有效。只统计成功轮会让 `graph_degraded_reason` 漏掉一部分，
+      而「降级发生在哪些轮」恰恰是排障最需要的那部分。
+    """
+    return {
+        "path_stats": dict(result.path_stats),
+        "graph_degraded_reason": result.graph_degraded_reason,
+    }
 
 
 # 历史答案中的旧引用编号标记，如 [1]、[12]
@@ -427,6 +456,9 @@ async def chat_ask(
                 yield _sse("refused", {
                     "reason": result.refuse_reason,
                     "message": "知识库中未找到相关内容",
+                    # 检索已跑完 → 图路观测有效，与成功轮同口径追加（见
+                    # _retrieval_observation 的说明：只统计成功轮会漏掉降级的那部分）
+                    **_retrieval_observation(result),
                 })
                 # 持久化拒答 assistant message
                 await _persist_assistant(
@@ -681,7 +713,11 @@ async def chat_ask(
                     "LLM_ERROR": "生成服务异常，请稍后重试",
                     "SENSITIVE_OUTPUT": "回答内容包含敏感词，已被拦截",
                 }.get(reason, "知识库中未找到相关内容")
-                yield _sse("refused", {"reason": reason, "message": user_message})
+                yield _sse("refused", {
+                    "reason": reason,
+                    "message": user_message,
+                    **_retrieval_observation(result),
+                })
                 await _persist_assistant(
                     conversation_id, user, message_id,
                     text="", refused=True, citations=citations_payload,
@@ -735,6 +771,9 @@ async def chat_ask(
                 "grounding": {"stripped_sentences": final_stripped},
                 "usage": final_usage,
                 "suggestions": final_suggestions,
+                # 检索侧观测（§14.6）：纯追加，既有四个键一字不动。
+                # 落在 done 而不是 meta：meta 发在检索之前，那时还没有 path_stats。
+                **_retrieval_observation(result),
             })
 
             # M6 可观测：记录端到端指标

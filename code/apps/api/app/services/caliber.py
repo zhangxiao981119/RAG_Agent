@@ -1,7 +1,8 @@
 """答案口径快照 —— 记录「这条答案按什么口径产生」。
 
 用于合规申诉与问题回溯：给定一条答案，能回答「它是哪个 contract 版本 / 哪个 LLM 模型 /
-哪个 embedding 模型 / 哪个提示词版本 / 哪些阈值与参数下产出的」。
+哪个 embedding 模型 / 哪个提示词版本 / 哪些阈值与参数下产出的」，以及
+「**图召回当时是开还是关、按哪个抽取口径**」（§14.6：开/关图的两条基线必须可区分）。
 
 两个入口：
   · build_caliber_snapshot()          纯代码/配置口径（无 IO），同步可用，便于测试
@@ -17,6 +18,7 @@ from datetime import UTC, datetime
 
 from app.config import decisions
 from app.config.config_profile import config_fingerprint
+from app.config.graph_profile import current_graph_profile
 from app.config.index_profile import current_index_profile
 from app.config.settings import get_settings
 from app.services import prompt_registry
@@ -30,6 +32,7 @@ def build_caliber_snapshot() -> dict:
     """
     settings = get_settings()
     profile = current_index_profile()
+    graph_profile = current_graph_profile()
     return {
         "contract_version": decisions.CONTRACT_VERSION,
         # ── 运行时配置指纹（项3：配置版本）──
@@ -43,6 +46,19 @@ def build_caliber_snapshot() -> dict:
         # ── 索引口径（方案一）──
         "embedding_text_version": profile.embedding_text_version,
         "chunker_version": profile.chunker_version,
+        # ── 图召回口径（§14.6 可测化）──
+        # ★ 三个键必须是**显式**的、可查询的事实，不能只靠 config_fingerprint 间接表达：
+        #   指纹回答的是「两次运行是否同一套配置」，回答不了「这条基线是开图还是关图」。
+        #   而 eval_runs 恰恰需要后者 —— 一条开了图的基线与一条关了图的基线，
+        #   事后必须能在 SQL 里被区分开，不能只靠 note 里写的人话（人话会忘、会写错）。
+        # ★ graph_extractor_model 取 current_graph_profile() 的**解析后实际值**
+        #   （空配置时为 llm_model 的实际名），不落空串：空串会让「换主模型」这件事
+        #   在口径里看不出来。
+        # ★ 关闭态照样写这三个键（graph_enabled=False）。"图没开"本身就是要留痕的事实：
+        #   缺键会让「没开图」和「老版本代码没这个字段」变得无法区分。
+        "graph_enabled": settings.graph_enabled,
+        "graph_extractor_model": graph_profile.extractor_model,
+        "graph_prompt_version": graph_profile.prompt_version,
         # ── 检索 / 生成口径 ──
         "relevance_threshold_vector": decisions.RELEVANCE_THRESHOLD_VECTOR,
         "relevance_threshold_rerank": decisions.RELEVANCE_THRESHOLD_RERANK,
