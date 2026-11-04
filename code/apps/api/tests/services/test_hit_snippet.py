@@ -48,22 +48,81 @@ def test_output_never_exceeds_width():
     assert len(snippet) <= 200, "总长（含省略号）MUST ≤ width，与回退行为同界"
 
 
-def test_window_aligns_to_sentence_boundary():
-    # 命中点前 30 字回看区内有一个句号 → 窗口应从句号后（句子开头）起，
-    # 而不是把上一句的尾巴切一半。
-    # 两个填充块用不同词，才能分辨「对齐后从哪块开始」。
+def test_width_override_respected():
+    snippet = hit_snippet(_LONG_CHUNK, "公司几点上班", width=50)
+    assert len(snippet) <= 50
+    assert "上班时间" in snippet
+
+
+# ── P2-1：width 边界 ────────────────────────────────────────────
+
+
+def test_tiny_width_clamped_and_never_exceeds():
+    """width=1 旧实现返回 '……'（len=2 > width）：钳到 4 后不再产生负数切片。"""
+    snippet = hit_snippet(_LONG_CHUNK, "公司几点上班", width=1)
+    assert len(snippet) == 4  # 左省略号 + 2 字符 + 右省略号
+    assert snippet.startswith("…")
+
+
+def test_nonpositive_width_falls_back():
+    """width 非正直接走回退（content[:负数] 是从尾部去字符的错误切片，必须挡住）。"""
+    assert hit_snippet(_LONG_CHUNK, "公司几点上班", width=0) == ""
+    assert hit_snippet(_LONG_CHUNK, "公司几点上班", width=-5) == ""
+
+
+# ── P1：型号词元探测（与检索路 ILIKE 同源同语义）────────────────
+
+
+_MODEL_CHUNK = "产品说明书。" * 60 + "AX3000 路由器支持 Mesh 组网。" + "附则。" * 30
+
+
+def test_model_code_hit_in_middle():
+    """型号在 300 字处：窗口必须落在型号附近，而不是回退到片头。"""
+    assert "AX3000" not in _MODEL_CHUNK[:200]  # 旧口径根本看不到型号
+    snippet = hit_snippet(_MODEL_CHUNK, "AX3000")
+    assert snippet != _MODEL_CHUNK[:200], "型号词元探测失败，整体回退了旧行为"
+    assert snippet.startswith("…")
+    assert "AX3000" in snippet
+
+
+def test_model_code_spelling_variants_all_probe():
+    """ax-3000 / ax_3000 / ax 3000 三种写法都要能探测到 AX3000
+    —— 检索路 ILIKE 容错正则能命中，开窗探测必须同样能命中（P1 缺口的判据）。"""
+    for q in ("ax-3000", "ax_3000", "ax 3000"):
+        snippet = hit_snippet(_MODEL_CHUNK, q)
+        assert "AX3000" in snippet, f"query={q!r} 探测不到型号"
+
+
+def test_model_code_lowercase_content_case_insensitive():
+    """content 里是小写、query 里是大写（或反之）也要命中 —— IGNORECASE 契约。"""
+    chunk = "产品说明书。" * 60 + "ax3000 路由器。" + "附则。" * 30
+    assert "ax3000" in hit_snippet(chunk, "AX3000")
+
+
+# ── P2-4：回看与对齐两个契约分开各钉一条 ────────────────────────
+
+
+def test_lookback_window_starts_exactly_30_before_hit():
+    """回看契约：命中点前 30 字内**无**换行/句号边界时，
+    窗口起点必须恰为 max(0, 命中点 - 30)（不被对齐挪动）。"""
+    content = "片" * 300 + "上班时间为 9:00。" + "尾" * 50
+    hit = content.find("上班")
+    assert hit == 300
+    snippet = hit_snippet(content, "几点上班")
+    # 无边界 → start = 300 - 30 = 270，开头省略号后紧跟 content[270:]
+    assert snippet == "…" + content[270:]
+
+
+def test_alignment_snaps_to_sentence_boundary():
+    """对齐契约：回看区内有句号时，窗口必须从句号后（句子开头）起，
+    而不是把上一句的尾巴切一半（与回看契约分开钉，删一条不失另一条）。"""
+    # 两个填充块用不同词，才能分辨「对齐后从哪块开始」
     content = "第一句话。" + "补充" * 110 + "长期铺垫。" + "铺垫" * 10 + "上班时间为 9:00。" + "尾" * 30
     snippet = hit_snippet(content, "几点上班")
     assert "上班时间为 9:00" in snippet
     # 回看区内的句号在「长期铺垫。」之后 → 对齐后窗口从「铺垫」块开始；
     # 不对齐时起点落在「补充」块中部（max(0, 命中-30)）
     assert snippet.startswith("…铺垫"), f"窗口没有对齐到句号边界: {snippet[:12]}"
-
-
-def test_width_override_respected():
-    snippet = hit_snippet(_LONG_CHUNK, "公司几点上班", width=50)
-    assert len(snippet) <= 50
-    assert "上班时间" in snippet
 
 
 def test_pure_display_not_in_retrieval_path():

@@ -244,6 +244,31 @@ _SNIPPET_LOOKBACK: int = 30
 """
 
 
+def _find_probe_hit(content: str, query: str) -> int:
+    """找 query 在 content 里的首个命中点；无命中返回 -1（hit_snippet 专用）。
+
+    两层探测，与检索路同源：
+      1. 词元层：`build_ilike_terms` → `build_ilike_pattern` 的容错正则，
+         `re.search(..., IGNORECASE)` 取 `m.start()`。★ 必须用 pattern 而不是
+         `find(term)`：型号词元 `ax-3000` 在检索路被展开成 `ax[-_ ]?3000`，
+         能匹配 `AX3000` / `ax-3000` / `ax_3000` / `ax 3000` 四种写法 ——
+         精确探测 `ax-3000` 会对 `AX3000` 永不命中，长 chunk 含型号就复现
+         「snippet 停在片头」的用户投诉同款问题。pattern 全 re.escape，无注入面。
+      2. CJK 2-gram 层：与 FTS 路同一套切分（见 hit_snippet docstring）。
+    """
+    terms = build_ilike_terms(query)
+    if terms:
+        match = re.search(build_ilike_pattern(terms), content, re.IGNORECASE)
+        if match:
+            return match.start()
+    text = _normalize(query[:400])
+    for gram in _dedupe(g for run in _CJK_RE.findall(text) for g in _bigrams(run)):
+        pos = content.lower().find(gram)
+        if pos >= 0:
+            return pos
+    return -1
+
+
 def hit_snippet(content: str, query: str, width: int = 200) -> str:
     """按**命中位置**开窗的引用片段 —— citations.snippet 的构造函数。
 
@@ -256,40 +281,45 @@ def hit_snippet(content: str, query: str, width: int = 200) -> str:
     引用面板看起来像「没引用到」。把窗口挪到命中点附近，片段才与用户的问题对得上。
 
     语义（词元与检索的 ILIKE / FTS 路同源 —— 都来自本模块的切分规则，口径一致）：
-      1. 取 `build_ilike_terms(query)` 的词元，按序（长词元优先，最有区分度）
-         找**第一个能在 content 里命中**的词元（大小写不敏感）；
-      2. 词元全不命中 → 退一级用问句的 **CJK 2-gram**（与 `to_fts_text` / FTS 路
-         同一套切分）继续探测。★ 这一层不是可选优化：像「公司几点上班」这种
-         不含疑问切分词的问句，整段会成一个词元、几乎不可能原样出现在文档里 ——
-         而 FTS 路恰恰是靠 2-gram 把这条 chunk 召回的，检索能命中、开窗探不到
-         等于白修。gram 命中点可能落在低区分度词上，但只影响展示起点，无正确性风险；
+      1. 词元层：`build_ilike_terms(query)` 的词元拼成 `build_ilike_pattern`
+         的容错正则（型号词元展开为 `ax[-_ ]?3000`），`re.search(..., IGNORECASE)`
+         取 `m.start()` 为命中点 —— 与检索路 ILIKE **同源同语义**：检索能命中的
+         chunk（`AX3000` 能被 `ax[-_ ]?3000` 匹配），开窗探测必须同样能命中，
+         否则「检索明明召回了、snippet 却停在片头」。pattern 全 re.escape，无注入面；
+         取 start 而不是整段 match：分隔符写法（`ax 3000`）匹配到的是含分隔符的
+         整段，证据的开头是 start。
+      2. CJK 2-gram 兜底（与 `to_fts_text` / FTS 路同一套切分）。★ 这一层不是
+         可选优化：像「公司几点上班」这种不含疑问切分词的问句，整段会成一个词元、
+         几乎不可能原样出现在文档里 —— 而 FTS 路恰恰是靠 2-gram 把这条 chunk
+         召回的，检索能命中、开窗探不到等于白修。gram 命中点可能落在低区分度词上，
+         但只影响展示起点，无正确性风险。
       3. 仍不命中 / query 无词元 / content ≤ width → 返回 `content[:width]`，
          与旧版 `content[:200]` **逐字节一致**（回退即现行为）；
       4. 命中 → 窗口起点 = max(0, 命中点 - 30)，并向左对齐到最近的换行或句号
          边界（让片段从一句完整的话开始）；找不到边界就用 max(0, 命中点 - 30)；
          窗口切片长度 ≤ width；起点 > 0 开头加「…」，未达片尾结尾加「…」，
          省略号占用的字符计入 width（返回串总长 ≤ width，与回退行为同界）。
+         width < 4 时钳到 4（左右省略号 + 至少 2 字符，再小开窗没有意义）；
+         width 非正直接走回退。
 
-    ★ 为什么遍历词元而不是只用第一个词元：词元按长度降序，第一个词元是问句里
-      最长的语义单元，它缺席而短词元（「上班时间」）命中的情况很常见 —— 只试
-      第一个会把本任务要修的问题原样退回来。
-    ★ 为什么用 `lower()` 而不是 `_normalize` 对齐：NFKC 可能改变字符串长度
-      （如「ﬁ」→「fi」），归一化后按索引回切原文会错位。大小写折叠是长度不变的，
-      对展示窗口足够。
+    ★ 已知退化（是特性边界，不是保证）：2-gram 兜底层的命中点可能落在**常见词**
+      上（如「公司」在证据之前先出现），窗口会偏向那个位置而不是证据 —— 这是
+      「纯展示起点」的已知退化。本函数不承诺「窗口一定框住证据」，只承诺
+      「比固定取片头更可能对得上」。要真正的证据定位，得靠语义匹配，不是开窗。
+    ★ 为什么用 `lower()` / IGNORECASE 而不是 `_normalize` 对齐：NFKC 可能改变
+      字符串长度（如「ﬁ」→「fi」），归一化后按索引回切原文会错位。大小写折叠
+      是长度不变的，对展示窗口足够。
     """
+    if width <= 0:
+        # width 非正没有可展示的窗口，直接走回退（content[:负数] 会变成
+        # 「从尾部去字符」的错误切片，必须显式挡住）
+        return ""
     if len(content) <= width:
         return content[:width]
-    text = _normalize(query[:400])
-    # 探测序列：完整词元在前（最有区分度），问句 CJK 2-gram 兜底（与 FTS 路同源）
-    probes = _dedupe(
-        build_ilike_terms(query)
-        + [g for run in _CJK_RE.findall(text) for g in _bigrams(run)]
-    )
-    for term in probes:
-        pos = content.lower().find(term)
-        if pos >= 0:
-            break
-    else:
+    width = max(width, 4)  # 左右省略号 + 至少 2 字符：再小开窗没有意义
+
+    pos = _find_probe_hit(content, query)
+    if pos < 0:
         return content[:width]
 
     start = max(0, pos - _SNIPPET_LOOKBACK)
