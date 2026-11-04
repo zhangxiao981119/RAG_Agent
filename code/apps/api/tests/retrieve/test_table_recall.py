@@ -125,7 +125,14 @@ def svc(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(retrieve_mod, "get_rerank_service", lambda: FakeRerank(h))
         # ★ 重排默认关闭（settings.rerank_enabled=false）—— 本文件含 rerank 降级回捞用例，
         #   必须显式打开开关，否则 get_rerank_service 根本不会被调用。
-        monkeypatch.setattr(retrieve_mod, "get_settings", lambda: SimpleNamespace(rerank_enabled=True))
+        # ★ 图召回关闭：本文件用 FakeSession 按顺序脚本化响应，开图会多出一条图 SQL，
+        #   把这些用例从"测表格回捞时序"变成"测图召回时序"。关图同时也是
+        #   「GRAPH_ENABLED=false 时不发任何图 SQL」的天然覆盖。
+        monkeypatch.setattr(
+            retrieve_mod,
+            "get_settings",
+            lambda: SimpleNamespace(rerank_enabled=True, graph_enabled=False),
+        )
         monkeypatch.setattr(decisions, "KEYWORD_TSQUERY_ENABLED", False)
         return RetrievalService(), lambda: FakeSession(h)
 

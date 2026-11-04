@@ -31,6 +31,10 @@ class RetrievedChunk:
     # 的其余分片。与表格回捞同款 —— 仅补上下文，MUST NOT 参与排序 / 阈值，
     # 分数一律 0 / None，单独放在 RetrievalResult.section_recall_chunks。
     is_section_recall: bool = False
+    # 图召回片：由实体图扩展而来的邻居 chunk（第 4 个上下文来源）。
+    # 与表格/章节补全同款 —— 仅补上下文，MUST NOT 参与排序 / 阈值 / RRF / 三路贡献统计；
+    # 分数一律 0 / None，单独放在 RetrievalResult.graph_recall_chunks。
+    is_graph_recall: bool = False
 
     @property
     def display_score(self) -> float:
@@ -65,6 +69,14 @@ class RetrievalResult:
     # 全局预算 SECTION_RECALL_TOKEN_BUDGET）。调用方与 table_recall_chunks
     # 一样追加进上下文拼装序列，编号与 citations 沿用既有机制。
     section_recall_chunks: list[RetrievedChunk] = field(default_factory=list)
+    # 图召回结果（在线 side channel）：实体图扩展得到的邻居片，上限
+    # GRAPH_RECALL_MAX_CHUNKS 条 / GRAPH_RECALL_TOKEN_BUDGET token。
+    # 调用方与 table/section 一样追加进上下文拼装序列，编号与 citations 沿用既有机制。
+    # 关闭图能力时恒为空列表 —— 上下文拼装的第四项为空，行为与未实现前逐字节等价。
+    graph_recall_chunks: list[RetrievedChunk] = field(default_factory=list)
+    # 图召回的降级原因（"" = 正常）："timeout" / "error" / "no_entities" / "no_neighbors"。
+    # 图路永不抛异常（增强项），失败必须可见 —— 这字段就是那条可见通道。
+    graph_degraded_reason: str = ""
     # 检索侧链式推理：本次走的是哪种模式。
     # "off"（开关关闭）/ "single"（信号不满足或拆解降级）/ "multi:N"（N 个子问题）。
     # 仅作审计与口径留痕，不参与任何判定。

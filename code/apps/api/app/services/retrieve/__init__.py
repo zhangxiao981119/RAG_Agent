@@ -458,14 +458,71 @@ class RetrievalService:
 
         metrics.incr("rag.gate.passed", source="rerank" if use_rerank else "vector")
 
+        # ⑤ 图召回（实体图 side channel）：第 4 个上下文来源。
+        #    位置是设计的一部分（设计文档 §9.3），不是随手放的：
+        #    · 在 L1 闸门**之后** —— 拒答请求不为图召回付费（约一半请求走拒答路径）；
+        #    · 在表格/章节回捞**之前** —— 图召回片先占 final_id_set，回捞据此排除重复
+        #      （顺序反了会让同一片进上下文两次，编号重复、白占 token）。
+        #    · 产物**不 append 进 retrieved**：分数恒 0 的片进 retrieved 会同时污染排序
+        #      与 retrieved[0] 的阈值语义，而且 TOP_K_RERANK 截断后根本进不了上下文。
+        #    · 关闭图能力时整块跳过：不发一条 SQL、不 import 图服务（见下方延迟导入）。
+        graph_chunks: list[RetrievedChunk] = []
+        graph_candidates: list[RetrievedChunk] = []
+        graph_degraded = ""
+        if get_settings().graph_enabled:
+            # 延迟导入：让「GRAPH_ENABLED=false 时图代码根本没被加载」成为可证事实，
+            # 也避免 retrieve 包与 graph 包在模块级互相 import 成环
+            # （graph.recall 反向依赖本模块的 _WHERE_BASE）。
+            from app.config.graph_profile import current_graph_profile
+            from app.services.graph.recall import recall_by_graph
+
+            t_graph = time.perf_counter()
+            graph_outcome = await recall_by_graph(
+                session,
+                query=query,
+                pushdown=pushdown,
+                timeout_ms=get_settings().graph_retrieve_timeout_ms,
+                # 口径一次请求只取一次：种子与邻居必须同一口径（见 linking 模块说明）
+                profile=current_graph_profile(),
+            )
+            graph_ms = (time.perf_counter() - t_graph) * 1000
+            stages["graph_recall"] = int(graph_ms)
+            metrics.observe_ms("rag.retrieve.graph_recall", graph_ms)
+            graph_degraded = graph_outcome.degraded_reason
+            graph_candidates = list(graph_outcome.chunks)
+            if graph_degraded:
+                # 图是增强项：失败不阻断主链路，但**必须可见** —— 否则「开了图却一直
+                # 0 召回」只能靠人去翻 SQL 才发现
+                metrics.incr("rag.graph_recall.degraded", reason=graph_degraded)
+            retrieved_ids = {c.chunk_id for c in retrieved}
+            for chunk in graph_candidates:
+                if chunk.chunk_id in retrieved_ids:
+                    continue
+                graph_chunks.append(chunk)
+            if graph_chunks:
+                metrics.incr("rag.graph_recall.hit", chunks=len(graph_chunks))
+            logger.info(
+                "图召回",
+                extra={
+                    "seeds": graph_outcome.seed_entity_count,
+                    "candidates": len(graph_candidates),
+                    "chunks": len(graph_chunks),
+                    "degraded_reason": graph_degraded,
+                    "elapsed_ms": graph_outcome.elapsed_ms,
+                    "trace_id": trace.get_trace_id(),
+                },
+            )
+
         # ⑥ 大表分片回捞（表格决策 A1'）：命中纯表格分片时补捞同组其余分片。
         #    回捞片仅作上下文补充 —— 单独存放，不进排序 / 阈值 / 三路贡献统计；
         #    调用方（chat）把它追加进上下文拼装序列，编号与 citations 沿用既有机制。
         #    限流双保险：每组最多 TABLE_RECALL_MAX_CHUNKS 片、累计 token 不得超过
         #    TABLE_RECALL_TOKEN_BUDGET（超预算即停，保行序完整，不跳片拼残表）。
         recall_chunks: list[RetrievedChunk] = []
-        # 已入选片集合：表格回捞与章节补全都用它排除重复（两处共用，故在块外构造）
-        final_id_set = {c.chunk_id for c in retrieved}
+        # 已入选片集合：表格回捞与章节补全都用它排除重复（两处共用，故在块外构造）。
+        # ★ 图召回片必须**先**并进来：漏了它，同一片会被表格回捞或章节补全再补一次，
+        #   上下文里出现两份内容不同的编号，引用指向也会错位。
+        final_id_set = {c.chunk_id for c in retrieved} | {c.chunk_id for c in graph_chunks}
         hit_group_ids = {
             g
             for g in (
@@ -641,6 +698,20 @@ class RetrievalService:
             path_stats[f"{name}_covered"] = len(covered)
             path_stats[f"{name}_unique"] = len(covered - others)
 
+        # 图路的贡献口径与三路不同：图上没有「排序」，只有「候选」。
+        #   graph_covered = 图候选里三路**也**召回到的条数（量化「只是重复」，白算的那部分）
+        #   graph_unique  = 图候选里仅图路能给的条数（量化「真的补了东西」= 存废判据）
+        # 基数取**候选**而不是最终进上下文的条数：三路命中的候选会被去重丢弃，若只统计
+        # 交付片，covered 恒为 0，这两个键就退化成常量。关闭图能力时不写这两个键 ——
+        # 保持关闭态的 path_stats 与未实现图召回时逐键相同（基线可比）。
+        if get_settings().graph_enabled:
+            graph_ids = {c.chunk_id for c in graph_candidates}
+            three_path_ids: set[uuid.UUID] = set()
+            for ids in path_sets.values():
+                three_path_ids |= ids
+            path_stats["graph_covered"] = len(graph_ids & three_path_ids)
+            path_stats["graph_unique"] = len(graph_ids - three_path_ids)
+
         return RetrievalResult(
             chunks=retrieved,
             stage_ms=stages,
@@ -649,6 +720,8 @@ class RetrievalService:
             path_stats=path_stats,
             table_recall_chunks=recall_chunks,
             section_recall_chunks=section_chunks,
+            graph_recall_chunks=graph_chunks,
+            graph_degraded_reason=graph_degraded,
         )
 
     async def retrieve_chain(

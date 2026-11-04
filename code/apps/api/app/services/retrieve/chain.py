@@ -122,6 +122,8 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
       · use_rerank 任一轮为 False → 整体按降级口径（vector 阈值）判定（保守）
       · table_recall_chunks / section_recall_chunks 按 chunk_id 去重合并，
         仍排命中片之后、分数为 0；两张表并集内也互斥（同一片不进两次）
+      · graph_recall_chunks 同款合并，且与上面三处**全部**互斥；graph_degraded_reason
+        取首个非空（各轮同口径，原因无需拼接）
       · stage_ms / path_stats 按轮累加；chain_decompose 由调用方注入，不在此处
     """
     # 延迟导入：_build_rrf_scores 定义在包 __init__，而本模块被该 __init__ 导入，
@@ -133,6 +135,8 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
     merged: dict[uuid.UUID, RetrievedChunk] = {}
     recall: dict[uuid.UUID, RetrievedChunk] = {}
     section_recall: dict[uuid.UUID, RetrievedChunk] = {}
+    graph_recall: dict[uuid.UUID, RetrievedChunk] = {}
+    graph_degraded = ""
     rank_lists: list[list[uuid.UUID]] = []
     use_rerank = True
 
@@ -156,6 +160,19 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
             if chunk.chunk_id in merged or chunk.chunk_id in recall:
                 continue
             section_recall.setdefault(chunk.chunk_id, chunk)
+        for chunk in result.graph_recall_chunks:
+            # 与命中片 / 表格回捞 / 章节补全三处互斥 —— 漏了这条，链式多轮会把同一片
+            # 既当图召回片又当章节补全片，上下文里出现两份相同内容的不同编号。
+            if (
+                chunk.chunk_id in merged
+                or chunk.chunk_id in recall
+                or chunk.chunk_id in section_recall
+            ):
+                continue
+            graph_recall.setdefault(chunk.chunk_id, chunk)
+        if result.graph_degraded_reason and not graph_degraded:
+            # 各轮同口径，「为什么降级」不需要拼接：取首个非空即可（越早越接近根因）
+            graph_degraded = result.graph_degraded_reason
         if not result.use_rerank:
             use_rerank = False
 
@@ -186,4 +203,6 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
         path_stats=path_stats,
         table_recall_chunks=list(recall.values()),
         section_recall_chunks=list(section_recall.values()),
+        graph_recall_chunks=list(graph_recall.values()),
+        graph_degraded_reason=graph_degraded,
     )
