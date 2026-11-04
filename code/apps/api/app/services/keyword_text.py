@@ -248,17 +248,22 @@ def _find_probe_hit(content: str, query: str) -> int:
     """找 query 在 content 里的首个命中点；无命中返回 -1（hit_snippet 专用）。
 
     两层探测，与检索路同源：
-      1. 词元层：`build_ilike_terms` → `build_ilike_pattern` 的容错正则，
-         `re.search(..., IGNORECASE)` 取 `m.start()`。★ 必须用 pattern 而不是
-         `find(term)`：型号词元 `ax-3000` 在检索路被展开成 `ax[-_ ]?3000`，
-         能匹配 `AX3000` / `ax-3000` / `ax_3000` / `ax 3000` 四种写法 ——
-         精确探测 `ax-3000` 会对 `AX3000` 永不命中，长 chunk 含型号就复现
-         「snippet 停在片头」的用户投诉同款问题。pattern 全 re.escape，无注入面。
+      1. 词元层：**逐词元** search（`build_ilike_terms` 已按长度降序 → 长词元
+         优先），每个词元用 `build_ilike_pattern([term])` 的容错正则 + IGNORECASE，
+         取 `m.start()`。★ 两处必须坚持的细节：
+         · 必须用 pattern 而不是 `find(term)`：型号词元 `ax-3000` 在检索路被展开成
+           `ax[-_ ]?3000`，能匹配 `AX3000` / `ax-3000` / `ax_3000` / `ax 3000`
+           四种写法 —— 精确探测 `ax-3000` 会对 `AX3000` 永不命中，长 chunk 含型号
+           就复现「snippet 停在片头」的用户投诉同款问题。pattern 全 re.escape，
+           无注入面。
+         · 必须逐词元循环，**不能**把全部词元 OR 成一条正则：`re.search` 对 OR
+           分支取**最左**命中，多词元时短词元（如「报销」）在片头先出现，窗口会
+           静默锚回片头 —— 设计意图是「长词元更具体、更可能是用户要的证据」，
+           长词元优先序必须保留。
       2. CJK 2-gram 层：与 FTS 路同一套切分（见 hit_snippet docstring）。
     """
-    terms = build_ilike_terms(query)
-    if terms:
-        match = re.search(build_ilike_pattern(terms), content, re.IGNORECASE)
+    for term in build_ilike_terms(query):
+        match = re.search(build_ilike_pattern([term]), content, re.IGNORECASE)
         if match:
             return match.start()
     text = _normalize(query[:400])
@@ -281,13 +286,16 @@ def hit_snippet(content: str, query: str, width: int = 200) -> str:
     引用面板看起来像「没引用到」。把窗口挪到命中点附近，片段才与用户的问题对得上。
 
     语义（词元与检索的 ILIKE / FTS 路同源 —— 都来自本模块的切分规则，口径一致）：
-      1. 词元层：`build_ilike_terms(query)` 的词元拼成 `build_ilike_pattern`
-         的容错正则（型号词元展开为 `ax[-_ ]?3000`），`re.search(..., IGNORECASE)`
-         取 `m.start()` 为命中点 —— 与检索路 ILIKE **同源同语义**：检索能命中的
-         chunk（`AX3000` 能被 `ax[-_ ]?3000` 匹配），开窗探测必须同样能命中，
-         否则「检索明明召回了、snippet 却停在片头」。pattern 全 re.escape，无注入面；
-         取 start 而不是整段 match：分隔符写法（`ax 3000`）匹配到的是含分隔符的
-         整段，证据的开头是 start。
+      1. 词元层：**逐词元** search（长词元优先，`build_ilike_terms` 已按长度降序），
+         每个词元走 `build_ilike_pattern([term])` 的容错正则（型号词元展开为
+         `ax[-_ ]?3000`）+ `IGNORECASE`，取 `m.start()` 为命中点 —— 与检索路
+         ILIKE **同源同语义**：检索能命中的 chunk（`AX3000` 能被 `ax[-_ ]?3000`
+         匹配），开窗探测必须同样能命中，否则「检索明明召回了、snippet 却停在片头」。
+         pattern 全 re.escape，无注入面；取 start 而不是整段 match：分隔符写法
+         （`ax 3000`）匹配到的是含分隔符的整段，证据的开头是 start。
+         ★ 逐词元而不是 OR 成一条正则：`re.search` 对 OR 分支取最左命中，
+         多词元时短词元在片头先出现会把窗口静默锚回片头（见 _find_probe_hit）。
+         长词元更具体、更可能是用户要的证据，优先序必须保留。
       2. CJK 2-gram 兜底（与 `to_fts_text` / FTS 路同一套切分）。★ 这一层不是
          可选优化：像「公司几点上班」这种不含疑问切分词的问句，整段会成一个词元、
          几乎不可能原样出现在文档里 —— 而 FTS 路恰恰是靠 2-gram 把这条 chunk

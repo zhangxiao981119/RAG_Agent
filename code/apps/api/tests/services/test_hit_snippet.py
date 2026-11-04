@@ -99,6 +99,27 @@ def test_model_code_lowercase_content_case_insensitive():
     assert "ax3000" in hit_snippet(chunk, "AX3000")
 
 
+# ── P2-5：多词元长词元优先（逐词元 search，不做 OR 最左）──────────
+
+
+def test_multi_term_prefers_longer_term_not_leftmost():
+    """query「上班时间 报销」：短词元「报销」在片头 pos 0 先出现，
+    窗口仍必须锚到长词元「上班时间」附近的证据，而不是静默退回片头
+    —— 若把词元 OR 成一条正则，re.search 取最左命中就会命中这里。"""
+    content = "报销流程。" * 60 + "上班时间为 9:00。"
+    assert "报销" in content[:200] and "上班时间" not in content[:200]
+    snippet = hit_snippet(content, "上班时间 报销")
+    assert snippet.startswith("…上班时间"), f"窗口锚到了片头: {snippet[:16]}"
+
+
+def test_multi_term_longer_term_later_in_content_wins():
+    """反向用例：两词元都在片中、长词元位置靠后 —— 仍选长词元的位置
+    （优先序按词元长度，不按出现位置先后）。"""
+    content = "报销说明。" * 30 + "补充" * 100 + "上班时间为 9:00。" + "尾" * 30
+    snippet = hit_snippet(content, "上班时间 报销")
+    assert "上班时间为 9:00" in snippet, "长词元靠后时窗口没有锚到长词元"
+
+
 # ── P2-4：回看与对齐两个契约分开各钉一条 ────────────────────────
 
 
