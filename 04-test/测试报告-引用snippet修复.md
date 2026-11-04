@@ -195,3 +195,92 @@ docker compose exec -T api python - <<'EOF'
 # → hit_snippet(content, '公司几点上班') 含 '上班时间：9:00-12:00，13:30-18:00'
 EOF
 ```
+
+---
+
+## 增量复验 `0814d98`（2026-11-04 UTC 06:3x）
+
+被测：`0814d98 fix(chat): hit_snippet 型号词元探测对齐检索路 ILIKE + width 边界钳制`
+（+124/-35，`git show --stat` 与 `--name-only` 过滤确认**只含** `app/services/keyword_text.py`
+与 `tests/services/test_hit_snippet.py`，无夹带）。只验增量，不重跑上轮全部检查点。
+
+### 1. P1-1 修法核对：`_find_probe_hit(content, query)` 取 `m.start()` —— **通过（构造用例实证）**
+
+coder 没有照抄我建议的「在 hit_snippet 里直接 search」，而是抽成独立函数 `_find_probe_hit`：
+词元层用 `re.search(build_ilike_pattern(terms), content, re.IGNORECASE)` 取 `m.start()`，
+CJK 2-gram 保留为第二层。偏离合理（职责分离 + 可单测），关键语义逐一构造验证：
+
+```
+content len=471，'AX3000' 位置=360
+[✔] query='AX3000' → 不再回退片头，snippet 前 30 字 = '…AX3000 路由器支持 Mesh 组网。附则。…'
+[✔] query='ax-3000' / 'ax_3000' / 'ax 3000' / 'AX-3000' 四种写法 → 全部命中（与检索路 ILIKE 同源）
+[✔] content 小写 'ax3000' + query 大写 → 命中（IGNORECASE）
+[✔] query='ax-3000' + content='AX 3000'（显式空格分隔符，匹配整段）：
+    pattern='ax[-_ ]?3000'，匹配段='AX 3000'，start=360（落在证据开头，不是分隔符上）
+    → 窗口带到 '…AX 3000 路由器。附则。…'
+[✔] 上轮 P1 实锤用例翻绿：hit_snippet(c_old,'AX3000') 不再等于 content[:200]
+```
+
+`m.start()` 的语义疑点（team-lead 点名）：显式分隔符写法下正则匹配的是**含分隔符的整段**，
+但 `start` 恰好是型号首字符——分隔符在词元内部、不会把窗口往后带。实测确认无问题。
+
+### 2. P2-1 修法核对：width 钳制 —— **通过（与上轮报告契约一致）**
+
+```
+[✔] width=0 / -5（未命中）→ ''（len=0）
+[✔] width=1 / 2 / 3（未命中）→ len==4（content[:4]）
+[✔] width=1/2/3/5（命中）→ len ≤ max(width,4)，返回 '…补充…' 形态
+[✔] 上轮边界用例回放（width=200 主路径契约未被破坏）：
+    len==200 未命中 → 原样；len==201 未命中 → content[:200] 逐字节；
+    len==200 有命中 → 原样（短文分支）；len==201 有命中 → 开窗 ≤200
+```
+
+coder 的「width 非正直接回退（返回 `''`）」与我报告建议的「钳制」不同：`''` 等价于 `content[:0]`，
+比 `content[:负数]`（从尾部去字符的错误切片）正确，且 width≤0 本无意义——接受该偏离。
+
+### 3. P2-4 修法核对：两条分钉测试各自独立可红 —— **通过**
+
+| 变异 | 结果 | 另一条钉子 |
+|---|---|---|
+| `_SNIPPET_LOOKBACK: 30 → 25` | `test_lookback_window_starts_exactly_30_before_hit` **1 failed**, 13 passed | `test_alignment_snaps_to_sentence_boundary` 仍绿 ✔ |
+| `boundary` 改恒 `-1`（去对齐） | `test_alignment_snaps_to_sentence_boundary` **1 failed**, 13 passed | `test_lookback_window_starts_exactly_30_before_hit` 仍绿 ✔ |
+
+两条变异后均 `git checkout` 还原，`git status --porcelain` 为空。分钉目标达成：删一条不再失守另一条。
+
+### 4. 容器内复跑 —— **通过（镜像已含 0814d98）**
+
+```
+镜像含补丁确认：docker compose run … grep -c '_find_probe_hit' app/services/keyword_text.py → 2
+$ docker compose run --rm --no-deps --entrypoint sh api \
+    -c "pip install -q '.[dev]' && python -m pytest tests/services tests/chat && ruff check ."
+208 passed, 1 warning in 2.36s          ← 与 coder 自报一致
+All checks passed!
+```
+
+（运行中的 api 容器未动；全程 `docker compose run --rm --no-deps` 一次性容器。）
+
+### 5. 增量发现
+
+**P2-5（新）多词元探测语义从「最长词元优先」变为「最左任一词元」，docstring 的退化说明没覆盖这一层。**
+
+```
+content = '报销流程。'*60 + '上班时间为 9:00。' + '附则。'*30   # '报销' 在 0，'上班时间' 在 240
+terms('上班时间 报销') = ['上班时间', '报销']                    # 长词元在前
+新实现 snippet 前 20 字 = '报销流程。报销流程。…'                 ← 左边的 '报销' 赢了
+单词元 '上班时间' 的窗口起点   = '…上班时间为 9:00。…'            ← 旧实现（6f9c3f5）就是这个结果
+```
+
+机理：`build_ilike_pattern` 把全部词元 OR 成一条正则，`re.search` 天然取**最左**匹配；
+旧实现按词元长度降序逐个 `find`，**最有区分度的长词元优先**。对「长词元后出现、短词元
+（或常见词）先出现」的多词元问句，窗口会锚到先出现的那个词，观感退回「停在片头」。
+这是纯展示边界（无正确性影响），且「最左」也是一种可辩护的选择；但 coder 新补的
+docstring「已知退化」段只写了 **2-gram 层**的窗口偏移，没写**词元层**的这条语义变化。
+建议：docstring 补一句「多词元时取最左命中（检索路同源），非最长词元优先」，或改回
+「逐词元 search、保留长词元优先」（`for t in terms: m=re.search(pattern(t),...)`）——后者与
+6f9c3f5 的设计意图一致，成本同量级。是否值得改由主理人裁决，不阻断。
+
+### 6. 增量复验结论
+
+P1-1 / P2-1 / P2-4 三项整改**全部成立**，实现质量好于我上轮的建议（独立函数 + 分钉测试 +
+变异自检）；`0e04472`/`6f9c3f5` 的既有契约（回退逐字节、SSE 事件序）无回归。
+唯一增量发现 P2-5（多词元最左语义未写进 docstring），不阻断。**0814d98 可合入。**
