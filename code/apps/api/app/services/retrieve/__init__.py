@@ -484,6 +484,10 @@ class RetrievalService:
                 timeout_ms=get_settings().graph_retrieve_timeout_ms,
                 # 口径一次请求只取一次：种子与邻居必须同一口径（见 linking 模块说明）
                 profile=current_graph_profile(),
+                # ★ 先排重后裁剪（§9.8 裁决 1）：命中片集合传给图召回，让它把
+                #   重复邻居跳过、不占预算名额 —— 否则权重最高的一跳邻居（恰恰
+                #   最可能在命中片里）会系统性挤掉真正新增的片。
+                exclude_chunk_ids=frozenset(c.chunk_id for c in retrieved),
             )
             graph_ms = (time.perf_counter() - t_graph) * 1000
             stages["graph_recall"] = int(graph_ms)
@@ -497,6 +501,9 @@ class RetrievalService:
             retrieved_ids = {c.chunk_id for c in retrieved}
             for chunk in graph_candidates:
                 if chunk.chunk_id in retrieved_ids:
+                    # 理论上到不了这里：exclude_chunk_ids 已让 recall 层跳过命中片。
+                    # 保留这道闸是防御性的 —— recall 的契约变了而这里没跟上时，
+                    # 宁可少一片也不许同一片进上下文两次（编号重复、引用错位）。
                     continue
                 graph_chunks.append(chunk)
             if graph_chunks:
@@ -698,19 +705,22 @@ class RetrievalService:
             path_stats[f"{name}_covered"] = len(covered)
             path_stats[f"{name}_unique"] = len(covered - others)
 
-        # 图路的贡献口径与三路不同：图上没有「排序」，只有「候选」。
-        #   graph_covered = 图候选里三路**也**召回到的条数（量化「只是重复」，白算的那部分）
-        #   graph_unique  = 图候选里仅图路能给的条数（量化「真的补了东西」= 存废判据）
-        # 基数取**候选**而不是最终进上下文的条数：三路命中的候选会被去重丢弃，若只统计
-        # 交付片，covered 恒为 0，这两个键就退化成常量。关闭图能力时不写这两个键 ——
-        # 保持关闭态的 path_stats 与未实现图召回时逐键相同（基线可比）。
+        # 图路的贡献口径（§9.8 裁决 1，v1.2 定稿）：两个键的参照系都必须是
+        # **交付上下文**，不能是任何「候选池」。
+        #   graph_covered = 邻居中已在最终命中片的条数（量化「重复探索」，白算的那部分）
+        #   graph_unique  = 最终进入上下文的图召回片数（== len(graph_recall_chunks)，
+        #                   存废判据 —— 图到底给上下文补没补新东西）
+        # ★ 为什么不能用「三路候选池」当分母（v1.1 的实现口径，真库实测证伪）：
+        #   三路候选池是粗召回池（每路 TOP_K_RECALL=50，合计可达 150 个 id），远大于
+        #   最终 top-K（8）。图扩展出的邻居绝大多数本来就落在池子里 —— 只是没进
+        #   最终 8 条。于是「图明明补了 2 片进上下文，graph_unique 仍为 0」，
+        #   §14.6 判据 ② 结构性永远无法达成（见设计文档 §9.9 的实测记录）。
+        # 关闭图能力时不写这两个键 —— 保持关闭态的 path_stats 与未实现图召回时
+        # 逐键相同（基线可比）。
         if get_settings().graph_enabled:
-            graph_ids = {c.chunk_id for c in graph_candidates}
-            three_path_ids: set[uuid.UUID] = set()
-            for ids in path_sets.values():
-                three_path_ids |= ids
-            path_stats["graph_covered"] = len(graph_ids & three_path_ids)
-            path_stats["graph_unique"] = len(graph_ids - three_path_ids)
+            neighbor_ids = {n.chunk_id for n in graph_outcome.neighbors}
+            path_stats["graph_covered"] = len(neighbor_ids & retrieved_ids)
+            path_stats["graph_unique"] = len(graph_chunks)
 
         return RetrievalResult(
             chunks=retrieved,

@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 
 from sqlalchemy import text
@@ -55,6 +56,10 @@ class GraphRecallOutcome(GraphRecallResult):
     """
 
     chunks: list[RetrievedChunk] = field(default_factory=list)
+    # 邻居中已存在于最终命中片的条数（§9.8 裁决 1 的等式 ②）。
+    # 在**预算裁剪之前**对全部 ≤TOP_K 个邻居统计 —— 它度量的是「图路有多少探索
+    # 是重复劳动」，裁剪后统计会被预算截断污染。
+    graph_covered: int = 0
 
 
 # 取邻居片的 SQL：四闸门**逐字复用** _WHERE_BASE（函数内延迟 import —— 图包被
@@ -149,6 +154,7 @@ async def recall_by_graph(
     pushdown: dict,
     timeout_ms: int,
     profile: GraphProfile,
+    exclude_chunk_ids: frozenset[uuid.UUID] | set[uuid.UUID] = frozenset(),
 ) -> GraphRecallOutcome:
     """在线图召回。永不抛异常；超时/异常时返回空结果并给出 degraded_reason。
 
@@ -156,6 +162,13 @@ async def recall_by_graph(
       「空种子」「空邻居」也是成功路径，同样要还原 —— 否则最常见的两种情况（问句里
       没提到任何库内实体）反而把 800ms 的超时留给后面的回捞/补全。
       为此把 8 步收进内层 `_steps()`，让还原点只有一处、不可能漏。
+
+    ★ `exclude_chunk_ids`（= 最终命中片的 id 集合，`retrieve()` 在第 5 步已知）：
+      预算裁剪**先排重、后裁剪**（§9.8 裁决 1 的契约要求，不是优化项）。
+      邻居按 `(hop, weight)` 排序，权重最高的一跳邻居恰恰最可能已在命中片里 ——
+      若不先排重，重复邻居会**系统性聚集在队首**吃掉 GRAPH_RECALL_MAX_CHUNKS
+      的名额，真正新增的片被裁掉，`graph_unique` 再次结构性偏 0（与 §9.9 记录的
+      「候选池分母恒 0」是同一类失效）。被跳过的重复邻居计入 `graph_covered`。
     """
     started = time.perf_counter()
 
@@ -214,8 +227,16 @@ async def recall_by_graph(
         ).all()
         by_id = {row.id: row for row in rows}
 
-        # ⑧ 预算裁剪：先条数、再 token（超预算即停，不跳片 —— 跳片会让上下文
-        #    出现语义断裂的片段，长度省了但可读性更差）
+        # ⑧ 预算裁剪：**先排重、后裁剪**（§9.8 裁决 1）。
+        #    · 与命中片重复的邻居先跳过、不占名额，计入 graph_covered —— 否则它们
+        #      系统性聚集在队首，把真正新增的片挤出 GRAPH_RECALL_MAX_CHUNKS。
+        #    · 再条数、再 token（超预算即停，不跳片 —— 跳片会让上下文出现语义
+        #      断裂的片段，长度省了但可读性更差）。
+        #    graph_covered 在**全部**截断后邻居上统计（判据裁剪前口径，等式 ②），
+        #    与预算是否耗尽无关 —— 它度量「重复探索量」，不该被预算截断污染。
+        exclude = exclude_chunk_ids if exclude_chunk_ids is not None else frozenset()
+        graph_covered = sum(1 for n in neighbors if n.chunk_id in exclude)
+
         chunks: list[RetrievedChunk] = []
         used_tokens = 0
         for neighbor in neighbors:
@@ -223,6 +244,8 @@ async def recall_by_graph(
             if row is None:
                 # 抽取之后被重解析 / 软删：图数据还在，chunk 行没了 —— 正常跳过
                 continue
+            if neighbor.chunk_id in exclude:
+                continue  # 已在命中片里：不占预算名额（已计入 graph_covered）
             if len(chunks) >= decisions.GRAPH_RECALL_MAX_CHUNKS:
                 break
             row_tokens = int(row.token_count or 0)
@@ -236,6 +259,7 @@ async def recall_by_graph(
             extra={
                 "seeds": len(seeds),
                 "neighbors": len(neighbors),
+                "covered": graph_covered,
                 "chunks": len(chunks),
                 "tokens": used_tokens,
             },
@@ -245,6 +269,7 @@ async def recall_by_graph(
             "seed_entity_count": len(seeds),
             "neighbors": list(neighbors),
             "chunks": chunks,
+            "graph_covered": graph_covered,
         }
 
     fields: dict = {"degraded_reason": "error"}

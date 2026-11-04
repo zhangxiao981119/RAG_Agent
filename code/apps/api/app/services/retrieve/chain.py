@@ -186,6 +186,7 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
         return RetrievalResult(
             refused=True, refuse_reason="NO_RELEVANT_CONTENT",
             stage_ms=stage_ms, score_source=score_source, use_rerank=use_rerank,
+            graph_degraded_reason=graph_degraded,
         )
 
     threshold = decisions.active_threshold(use_rerank)
@@ -193,6 +194,7 @@ def merge_rounds(rounds: list[RetrievalResult]) -> RetrievalResult:
         return RetrievalResult(
             refused=True, refuse_reason="NO_RELEVANT_CONTENT",
             stage_ms=stage_ms, score_source=score_source, use_rerank=use_rerank,
+            graph_degraded_reason=graph_degraded,
         )
 
     rrf_scores = _build_rrf_scores(*rank_lists)

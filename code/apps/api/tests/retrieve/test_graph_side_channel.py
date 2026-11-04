@@ -6,8 +6,11 @@
   2. 开图时产物**只**进 `graph_recall_chunks`，不 append 进 `chunks`
      （进了就会污染排序与 retrieved[0] 的阈值语义）
   3. 图召回片先占 `final_id_set` → 表格回捞 / 章节补全据此排除重复
-  4. `path_stats` 的 graph_covered / graph_unique 口径：基数取**候选**，
-     否则 graph_covered 恒 0，两个键退化成常量
+  4. `path_stats` 的 graph_covered / graph_unique 口径（§9.8 裁决 1，v1.2 定稿）：
+     参照系是**交付上下文**，不是候选池 —— graph_unique = 最终进上下文的图召回片数
+     （== len(graph_recall_chunks)）；graph_covered = 邻居中已在最终命中片的条数。
+     v1.1 的「三路候选池」分母已被真库实测证伪（§9.9）：候选池 150 个 id 远大于
+     最终 top-8，graph_unique 会结构性恒 0，§14.6 判据永远无法达成
   5. 降级（timeout / error / 无种子）不阻断主链路，原因透传到 `graph_degraded_reason`
 """
 from __future__ import annotations
@@ -19,6 +22,7 @@ import pytest
 
 from app.config import decisions
 from app.services import retrieve as retrieve_mod
+from app.services.graph.base import GraphNeighbor
 from app.services.graph.recall import GraphRecallOutcome
 from app.services.retrieve import RetrievalService
 from app.services.retrieve.base import RetrievedChunk
@@ -146,8 +150,12 @@ def _stub_recall(monkeypatch: pytest.MonkeyPatch, outcome: GraphRecallOutcome) -
     """打桩 recall_by_graph，并记录调用参数（用于验证「关图时不调用」）。"""
     calls: dict = {}
 
-    async def _fake(session, *, query, pushdown, timeout_ms, profile):  # noqa: ANN001, ARG001
-        calls.update(query=query, pushdown=pushdown, timeout_ms=timeout_ms, profile=profile)
+    async def _fake(session, *, query, pushdown, timeout_ms, profile,
+                    exclude_chunk_ids=frozenset()):  # noqa: ANN001, ARG001
+        calls.update(
+            query=query, pushdown=pushdown, timeout_ms=timeout_ms, profile=profile,
+            exclude_chunk_ids=exclude_chunk_ids,
+        )
         return outcome
 
     monkeypatch.setattr("app.services.graph.recall.recall_by_graph", _fake)
@@ -189,6 +197,8 @@ async def test_graph_chunks_go_to_side_channel_only(svc, monkeypatch):
         monkeypatch,
         GraphRecallOutcome(
             degraded_reason="", seed_entity_count=2, elapsed_ms=7,
+            # dup 同时也是图邻居（v1.2 口径：covered 从邻居 ∩ 命中片统计）
+            neighbors=[GraphNeighbor(chunk_id=dup, hop=1, weight=3)],
             chunks=[_graph_chunk(dup), _graph_chunk(new)],
         ),
     )
@@ -203,9 +213,42 @@ async def test_graph_chunks_go_to_side_channel_only(svc, monkeypatch):
     assert result.graph_recall_chunks[0].is_graph_recall is True
     assert result.graph_recall_chunks[0].final_score == 0.0
     assert "graph_recall" in result.stage_ms
-    # 候选 2 片：1 片三路也有（covered）、1 片独有（unique）
+    # v1.2 口径（§9.8 裁决 1）：参照系是交付上下文
+    #   covered = 邻居(dup) ∩ 最终命中片(hit, dup) = 1 —— 量化「重复探索」
+    #   unique  = 最终进上下文的图召回片数 = len(graph_recall_chunks) = 1
     assert result.path_stats["graph_covered"] == 1
     assert result.path_stats["graph_unique"] == 1
+    # ★ 存废判据的等式（§14.6）：graph_unique MUST 恒等于 len(graph_recall_chunks)
+    assert result.path_stats["graph_unique"] == len(result.graph_recall_chunks)
+
+
+@pytest.mark.asyncio
+async def test_graph_unique_is_delivered_count_not_candidate_pool(svc, monkeypatch):
+    """v1.1 口径的失效模式必须保持被证伪状态：图明明补了新片，unique 不得为 0。
+
+    场景：三路候选池里已有很多片（这里 2 片命中），图补了 2 片**全新**内容进上下文。
+    若按「三路候选池」当分母，unique 会被算成 0 —— 本用例钉死它必须等于交付数 2。
+    """
+    hit1, hit2 = uuid.UUID(int=10), uuid.UUID(int=11)
+    g1, g2 = uuid.UUID(int=12), uuid.UUID(int=13)
+    _stub_recall(
+        monkeypatch,
+        GraphRecallOutcome(
+            degraded_reason="", seed_entity_count=3, elapsed_ms=9,
+            neighbors=[GraphNeighbor(chunk_id=g1, hop=1, weight=5),
+                       GraphNeighbor(chunk_id=g2, hop=1, weight=4)],
+            chunks=[_graph_chunk(g1), _graph_chunk(g2)],
+        ),
+    )
+    result, _ = await _retrieve(
+        svc(Harness([_row(hit1), _row(hit2)]), graph_enabled=True)
+    )
+
+    assert len(result.graph_recall_chunks) == 2
+    assert result.path_stats["graph_unique"] == 2, (
+        "图补了 2 片进上下文，unique 就是 2 —— 候选池分母会把它错算成 0"
+    )
+    assert result.path_stats["graph_covered"] == 0, "邻居都不在命中片里，重复探索量为 0"
 
 
 @pytest.mark.asyncio
@@ -266,3 +309,5 @@ async def test_graph_recall_receives_pushdown_and_query(svc, monkeypatch):
     assert calls["pushdown"]["authorized_kb_ids"] == [KB]
     assert calls["pushdown"]["clearance"] == 40
     assert calls["pushdown"]["user_subjects"] == ["dept:it"]
+    # §9.8 裁决 1：命中片集合必须传给图召回（先排重后裁剪的依据）
+    assert calls["exclude_chunk_ids"] == {uuid.UUID(int=10)}

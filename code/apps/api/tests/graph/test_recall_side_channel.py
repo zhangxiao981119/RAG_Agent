@@ -9,6 +9,8 @@
      `current transaction is aborted`）
   5. rollback 自身失败不得盖住原始原因
   6. 取片 SQL 的四闸门与主召回**逐字同源**（不是副本）
+  7. **先排重后裁剪**（§9.8 裁决 1）：`exclude_chunk_ids` 里的重复邻居不占
+     GRAPH_RECALL_MAX_CHUNKS 名额，且计入 graph_covered（裁剪前口径）
 """
 from __future__ import annotations
 
@@ -270,6 +272,71 @@ async def test_missing_chunk_row_is_skipped(monkeypatch):
     )
     out = await _recall(session)
     assert [c.chunk_id for c in out.chunks] == [alive]
+
+
+# ── 先排重后裁剪（§9.8 裁决 1：exclude_chunk_ids 契约）─────────
+@pytest.mark.asyncio
+async def test_excluded_neighbors_do_not_consume_budget(monkeypatch):
+    """★ 排重在裁剪之前：与命中片重复的邻居不占 GRAPH_RECALL_MAX_CHUNKS 名额。
+
+    权重最高的一跳邻居恰恰最可能在命中片里 —— 若不先排重，重复邻居会系统性聚集
+    在队首吃掉名额，真正新增的片被裁掉，graph_unique 再次结构性偏 0。
+    本用例：2 个重复邻居权重最高，4 个新增片在后；MAX_CHUNKS=3。
+    排重正确 → 进上下文的是 3 个**新增**片；退化实现 → 只进来 1 个新增片。
+    """
+    dups = [uuid.UUID(int=i) for i in (1, 2)]
+    news = [uuid.UUID(int=i) for i in (3, 4, 5, 6)]
+    rows = [_ChunkRow(cid, token_count=1) for cid in dups + news]
+    session = FakeSession(rows)
+    _patch(
+        monkeypatch,
+        seeds=[_Seed(uuid.uuid4(), "种子", 1.0)],
+        store=FakeStore(
+            [GraphNeighbor(chunk_id=cid, hop=1, weight=9 - i) for i, cid in
+             enumerate(dups + news)]  # 重复邻居权重最高、排在队首
+        ),
+    )
+    out = await recall_by_graph(
+        session, query="差旅费报销标准", pushdown=PUSHDOWN,
+        timeout_ms=800, profile=PROFILE,
+        exclude_chunk_ids=frozenset(dups),
+    )
+
+    assert out.degraded_reason == ""
+    assert [c.chunk_id for c in out.chunks] == news[:decisions.GRAPH_RECALL_MAX_CHUNKS], (
+        "重复邻居不占名额：进上下文的 MUST 全是新增片"
+    )
+    assert out.graph_covered == 2, "被跳过的重复邻居计入 graph_covered"
+
+
+@pytest.mark.asyncio
+async def test_graph_covered_counts_before_trimming(monkeypatch):
+    """graph_covered 在**全部**截断后邻居上统计（等式 ②），不被预算截断污染。
+
+    场景：4 个重复邻居 + 2 个新增片；MAX_CHUNKS=3 裁不到第 4 个重复邻居
+    （它根本没参加名额竞争），covered 仍必须记 4。
+    """
+    dups = [uuid.UUID(int=i) for i in (1, 2, 3, 4)]
+    news = [uuid.UUID(int=5), uuid.UUID(int=6)]
+    rows = [_ChunkRow(cid, token_count=1) for cid in dups + news]
+    session = FakeSession(rows)
+    _patch(
+        monkeypatch,
+        seeds=[_Seed(uuid.uuid4(), "种子", 1.0)],
+        store=FakeStore(
+            [GraphNeighbor(chunk_id=cid, hop=1, weight=13 - i) for i, cid in
+             enumerate(dups + news)]
+        ),
+    )
+    out = await recall_by_graph(
+        session, query="差旅费报销标准", pushdown=PUSHDOWN,
+        timeout_ms=800, profile=PROFILE,
+        exclude_chunk_ids=frozenset(dups),
+    )
+
+    assert [c.chunk_id for c in out.chunks] == news
+    assert out.graph_covered == 4, "covered 统计裁剪前口径：第 4 个重复邻居虽被预算裁到也要计入"
+    assert len(out.neighbors) == 6
 
 
 # ── 故障路径 ────────────────────────────────────────────────
