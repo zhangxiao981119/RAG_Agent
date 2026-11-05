@@ -138,17 +138,17 @@ curl -fsSk https://<站点地址>/api/health
 
 | 变量 | 默认 | 作用 | 说明 |
 |---|---|---|---|
-| `GRAPH_ENABLED` | `false` | 图能力总开关（离线抽取 + 在线图召回） | 需要 LLM 凭据；需要迁移到 `0025`；开启后 MUST 补建抽取。**本版只写不读**：图数据会建好，但检索链路尚未接入（第 2 步） |
+| `GRAPH_ENABLED` | `false` | 图能力总开关（离线抽取 + 在线图召回） | 需要 LLM 凭据；需要迁移到 `0025`；开启后 MUST 补建抽取（`backfill_graph --all`）。抽取与在线图召回（side channel）**均已实现**（分步路线第 1/2 步已交付） |
 | `GRAPH_STORE_BACKEND` | `postgres` | 图存储后端 | 当前仅支持 `postgres`；填 `neo4j` 等保留位 → 服务**拒绝启动**（静默回落会让你以为在跑 Neo4j，而数据在 PG 里） |
 | `GRAPH_EXTRACTOR_MODEL` | 空（跟随 `LLM_MODEL`） | 抽取模型 | 留空即用主模型；换它 = 口径变更，旧口径数据会被检索直接排除，MUST `--recaliber` 重抽 |
-| `GRAPH_RETRIEVE_TIMEOUT_MS` | `800` | 在线图召回硬超时（毫秒） | 取值须在 `[50, 5000]`，否则拒绝启动；第 2 步接入后生效 |
+| `GRAPH_RETRIEVE_TIMEOUT_MS` | `800` | 在线图召回硬超时（毫秒） | 取值须在 `[50, 5000]`，否则拒绝启动；已生效（第 2 步已交付） |
 | `GRAPH_EXTRACT_TIMEOUT_SECONDS` | `120` | 单次抽取 LLM 调用超时（秒） | 必须 `> 0` |
 | `GRAPH_EXTRACT_MAX_OUTPUT_TOKENS` | `8000` | 单次抽取调用的**输出**上限（token） | 必须 `>= 1`。**不要**和全局 `LLM_MAX_OUTPUT_TOKENS=4000` 混：后者受 `CONTEXT_OUTPUT_RESERVE_TOKENS` 约束不能改大，图抽取只能按调用覆盖。配 `0` 会被静默回落成 4K，抽取随即在实体列表中途被截断（症状是「LLM 输出非法 JSON」），所以启动自检直接拒绝 |
-| `WIKI_ENABLED` | `false` | LLM wiki 导航 | **本版未实现**：置 `true` 会因 `wiki_pages` 表不存在（迁移 0026 尚未提供）在自检阶段拒绝启动。第 2 步接入 |
+| `WIKI_ENABLED` | `false` | LLM wiki 导航（页生成 + 导航读接口） | **已实现**（迁移 0026，分步路线第 3 步已交付）：置 `true` 前先 `alembic upgrade head`，开启后 MUST `rebuild_wiki --all` 建页；wiki 不进检索（术语扩展属第 4 步，未实现） |
 | `WIKI_GENERATOR_MODEL` | 空（跟随 `LLM_MODEL`） | 页生成模型 | 留空回落 `LLM_MODEL` —— **若那是推理模型（如 deepseek-v4-flash，只吐 reasoning_content、content 为空）wiki 生成必然失败**。生产启用 wiki MUST 显式配非推理模型；换模型 = 口径变更，旧口径页会被判为待重建（`rebuild_wiki --recaliber`） |
 
 ★ 上表 7 个 + wiki 的 4 个（`WIKI_SCOPE` / `WIKI_GENERATOR_MODEL` / `WIKI_GENERATE_TIMEOUT_SECONDS` /
-`WIKI_INPUT_MAX_CHARS`，本版未实现）共 11 个变量，在 `docker-compose.yml` / `docker-compose.prod.yml`
+`WIKI_INPUT_MAX_CHARS`）共 11 个变量，在 `docker-compose.yml` / `docker-compose.prod.yml`
 的 **api 与 worker 两段**都已注入，且 11 个全部进了 `config_fingerprint`（api 与 worker 取值不一致
 → 指纹不同，这是唯一的发现手段）。
 
@@ -227,8 +227,8 @@ docker compose -p kagent exec -T worker python -m scripts.backfill_graph --all
 ★ 脚本自身也 fail-closed：`GRAPH_ENABLED=false` 时直接退出（退出码 2），不会「照抽不误」——
 抽了也没人读（在线召回未启用），只会白花 LLM 成本并让图数据与开关状态不一致。
 
-> 本版**只写不读**：以上只验证「图数据建对了」。在线图召回（`graph_unique_total > 0`、
-> 越权邻居零命中）属于第 2 步的验收范围，在此之前不要把图路算进检索收益。
+> 第 2 步已交付：在线图召回已接入检索链路（side channel，`graph_unique` / `graph_covered`
+> 进 `path_stats` 与评测 metrics）。验收口径见设计文档 §14.6 与 `04-test/测试报告-第2步.md`。
 
 ---
 
