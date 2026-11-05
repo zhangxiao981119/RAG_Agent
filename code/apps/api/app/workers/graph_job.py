@@ -290,7 +290,9 @@ async def build_and_store(document_id: uuid.UUID) -> str:
             "wiki build: 幂等命中，跳过（不调 LLM）",
             extra={"document_id": str(document_id), "content_hash": wiki_input.content_hash},
         )
-        return "succeeded"
+        # ★ 返回可区分值（不是 "succeeded"）：rebuild_wiki 的汇总会把它计入
+        #   「跳过」—— 运维看到 成功 N / 跳过 M 才能知道哪些文档没烧 LLM。
+        return "skipped_idempotent"
 
     # ② LLM 调用（不持 session —— 见模块 docstring 的 idle-in-transaction 教训）
     try:

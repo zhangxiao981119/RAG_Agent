@@ -114,11 +114,16 @@ async def _run(args: argparse.Namespace) -> int:
         if result == "succeeded":
             ok += 1
             print(f"[{index}/{len(rows)}] OK   {filename}")
+        elif result == "skipped_idempotent":
+            # 幂等命中（hash 相同跳过，未调 LLM）—— 与「无分片」的 skip 分开计数但
+            # 都进「跳过」桶：运维看汇总才知道哪些文档零 LLM 成本
+            skipped += 1
+            print(f"[{index}/{len(rows)}] SKIP {filename}（页已按当前口径就绪，未调 LLM）")
         elif result == "skipped":
             skipped += 1
             print(f"[{index}/{len(rows)}] SKIP {filename}（无分片）")
         else:
-            # 幂等命中在 build_and_store 内部已计为 succeeded；其余非成功态按失败计
+            # 其余非成功态按失败计（"dead" 等）
             failed += 1
             print(f"[{index}/{len(rows)}] FAIL {filename}（result={result}）")
 
