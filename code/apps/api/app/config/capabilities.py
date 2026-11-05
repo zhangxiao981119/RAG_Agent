@@ -141,8 +141,45 @@ async def collect_graph_data_stats(session: AsyncSession) -> dict[str, int]:
     }
 
 
+async def collect_wiki_data_stats(session: AsyncSession) -> dict[str, int]:
+    """wiki 页统计（仅在 WIKI_ENABLED=true 时调用）。
+
+    「已完成」按**当前口径**统计（generator_model + prompt_version 双匹配）：
+    换生成模型 / bump prompt 后旧页会被 rebuild_wiki --recaliber 判为待重建，
+    若仍把它们算作就绪，管理端会显示虚高的覆盖率 —— 与图就绪度的口径同理。
+    """
+    profile = current_wiki_profile()
+    params = {"m": profile.generator_model, "pv": profile.prompt_version}
+    row = (
+        await session.execute(
+            text(
+                "SELECT "
+                "  count(*) AS pages_total, "
+                "  count(*) FILTER (WHERE generator_model = :m "
+                "        AND prompt_version = :pv AND status = 'ready') AS ready, "
+                "  count(*) FILTER (WHERE generator_model = :m "
+                "        AND prompt_version = :pv AND status = 'stale') AS stale, "
+                "  count(*) FILTER (WHERE status = 'failed') AS failed, "
+                "  count(*) FILTER (WHERE NOT (generator_model = :m "
+                "        AND prompt_version = :pv)) AS caliber_mismatch "
+                "FROM wiki_pages"
+            ),
+            params,
+        )
+    ).one()
+    return {
+        "pages_total": int(row.pages_total or 0),
+        "pages_ready": int(row.ready or 0),
+        "pages_stale": int(row.stale or 0),
+        "pages_failed": int(row.failed or 0),
+        "pages_caliber_mismatch": int(row.caliber_mismatch or 0),
+    }
+
+
 def capability_snapshot(
-    fingerprint: str, stats: dict[str, int] | None = None
+    fingerprint: str,
+    stats: dict[str, int] | None = None,
+    wiki_stats: dict[str, int] | None = None,
 ) -> dict:
     """能力快照（§9.6 的结构，数据部分由 stats 注入）。
 
@@ -209,6 +246,16 @@ def capability_snapshot(
                     "prompt_version": wiki_profile.prompt_version,
                 },
                 "runtime": {"input_max_chars": settings.wiki_input_max_chars},
+                # 页面统计（§9.6 ①）：None = 未启用 / 未统计（MUST NOT 用 0 冒充）
+                "data": {
+                    "pages_total": None if wiki_stats is None else wiki_stats.get("pages_total"),
+                    "pages_ready": None if wiki_stats is None else wiki_stats.get("pages_ready"),
+                    "pages_stale": None if wiki_stats is None else wiki_stats.get("pages_stale"),
+                    "pages_failed": None if wiki_stats is None else wiki_stats.get("pages_failed"),
+                    "pages_caliber_mismatch": (
+                        None if wiki_stats is None else wiki_stats.get("pages_caliber_mismatch")
+                    ),
+                },
                 "rebuild": {
                     "on_toggle": "重建 wiki 页：python -m scripts.rebuild_wiki --all",
                     "not_needed": "无需重跑解析、分块、嵌入、图抽取",
@@ -352,6 +399,17 @@ async def log_capability_banner(role: str | None = None) -> dict:
             # 能走到这里说明是别的原因：库抖动 / 权限）。横幅照打，数据字段留空。
             logger.warning("图数据就绪度统计失败（横幅仍输出）", exc_info=True)
 
+    wiki_stats: dict[str, int] | None = None
+    if settings.wiki_enabled:
+        # 延迟导入同上：关闭态不引入数据库模块
+        from app.database import SessionLocal
+
+        try:
+            async with SessionLocal() as session:
+                wiki_stats = await collect_wiki_data_stats(session)
+        except Exception:
+            logger.warning("wiki 页统计失败（横幅仍输出）", exc_info=True)
+
     text_block = _render_text(
         role=role,
         app_env=settings.app_env,
@@ -398,7 +456,16 @@ async def log_capability_banner(role: str | None = None) -> dict:
                 "scope": settings.wiki_scope if settings.wiki_enabled else None,
                 "generator_model": wiki_profile.generator_model,
                 "prompt_version": wiki_profile.prompt_version,
+                "pages_total": (
+                    None if wiki_stats is None else wiki_stats.get("pages_total")
+                ),
+                "pages_ready": (
+                    None if wiki_stats is None else wiki_stats.get("pages_ready")
+                ),
+                "pages_caliber_mismatch": (
+                    None if wiki_stats is None else wiki_stats.get("pages_caliber_mismatch")
+                ),
             },
         },
     )
-    return capability_snapshot(fingerprint, stats)
+    return capability_snapshot(fingerprint, stats, wiki_stats)

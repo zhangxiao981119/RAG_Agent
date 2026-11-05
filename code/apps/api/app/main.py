@@ -17,6 +17,8 @@ from app.api.chat import router as chat_router
 from app.api.departments import router as departments_router
 from app.api.documents import router as documents_router
 from app.api.eval import router as eval_router
+from app.api.system import router as system_router
+from app.api.wiki import router as wiki_router
 from app.api.feature_flags import router as feature_flags_router
 from app.api.finetune import router as finetune_router
 from app.api.groups import router as groups_router
@@ -367,6 +369,8 @@ app.include_router(finetune_router, prefix="/api")
 app.include_router(audit_router, prefix="/api")
 app.include_router(sync_router, prefix="/api")
 app.include_router(eval_router, prefix="/api")
+app.include_router(system_router, prefix="/api")
+app.include_router(wiki_router, prefix="/api")
 # ── M6 续篇：配额 / 敏感词 / 灰度开关 ─────────────────────
 app.include_router(quota_router, prefix="/api")
 app.include_router(sensitive_words_router, prefix="/api")

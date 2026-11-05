@@ -129,7 +129,7 @@ async def prepare_wiki_input(
     rows = (
         await session.execute(
             select(WikiPage.id, WikiPage.generator_model, WikiPage.prompt_version,
-                   WikiPage.content_hash)
+                   WikiPage.content_hash, WikiPage.status)
             .where(WikiPage.document_id == document_id)
         )
     ).first()
@@ -151,8 +151,11 @@ async def prepare_wiki_input(
     text = render_wiki_prompt([(c.id, c.heading_path, c.content) for c in kept])
     content_hash = compute_content_hash(text, profile.generator_model, profile.prompt_version)
 
+    # ★ status='ready' 必须参与判定：失败留痕（status='failed'）的行四元组虽然
+    #   相同，但那代表「生成没成」—— 把它当幂等命中会让失败的页永远不被重试。
     idempotent = bool(
         rows
+        and rows.status == "ready"
         and rows.generator_model == profile.generator_model
         and rows.prompt_version == profile.prompt_version
         and rows.content_hash == content_hash
@@ -329,3 +332,49 @@ async def write_wiki_page(
             status="ready",
         )
     )
+
+
+async def record_failed_page(
+    session: AsyncSession,
+    *,
+    document_id: uuid.UUID,
+    content_hash: str,
+) -> None:
+    """生成失败留痕：status='failed' 的行（仅当该文档还没有任何页时插入）。
+
+    ★ 为什么留痕：页缺失本身也是 404，但「从没生成过」与「生成了 N 次全失败」
+      在运维上是两件事 —— 后者要看日志才能发现，而 failed 行让
+      rebuild_wiki --stale-only 与管理端统计（pages_failed）直接可见。
+    ★ 为什么不动已有页：失败重建时若已有 ready 页（旧口径），把它删了换成
+      failed 行 = 读者从「看得到旧页」变成「什么都看不到」。旧页按旧口径
+      生成、内容仍然真实，保留它优于清零。
+    """
+    profile = current_wiki_profile()
+    existing = (
+        await session.execute(
+            select(WikiPage.id).where(WikiPage.document_id == document_id)
+        )
+    ).first()
+    if existing is not None:
+        return
+    document = await session.get(Document, document_id)
+    if document is None:
+        return
+    session.add(
+        WikiPage(
+            tenant_id=document.tenant_id,
+            kb_id=document.kb_id,
+            scope="doc",
+            document_id=document_id,
+            title=document.filename,
+            summary="",
+            sections=[],
+            key_terms=[],
+            source_chunk_ids=[],
+            generator_model=profile.generator_model,
+            prompt_version=profile.prompt_version,
+            content_hash=content_hash,
+            status="failed",
+        )
+    )
+    await session.commit()

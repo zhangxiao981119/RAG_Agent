@@ -270,6 +270,7 @@ async def build_and_store(document_id: uuid.UUID) -> str:
     from app.services.wiki.build import (
         prepare_wiki_input,
         generate_page_content,
+        record_failed_page,
         write_wiki_page,
     )
 
@@ -292,7 +293,15 @@ async def build_and_store(document_id: uuid.UUID) -> str:
         return "succeeded"
 
     # ② LLM 调用（不持 session —— 见模块 docstring 的 idle-in-transaction 教训）
-    generated = await generate_page_content(wiki_input)
+    try:
+        generated = await generate_page_content(wiki_input)
+    except WikiBuildError:
+        # 失败留痕（status='failed'）：rebuild_wiki --stale-only 与管理端统计
+        # 由此看见「生成了但没成」；已有 ready 页不动（旧页仍真实，优于清零）
+        async with SessionLocal() as session:
+            await record_failed_page(session, document_id=document_id,
+                                     content_hash=wiki_input.content_hash)
+        raise
 
     # ③ 落页：DELETE 旧页 + INSERT 新页，同一事务
     async with SessionLocal() as session:
