@@ -11,6 +11,8 @@
 
 上传企业文档（PDF / Word / PPT / Excel / Markdown / 纯文本 / 图片）→ 解析、**内嵌图视觉转录**、分块、向量化 → **带引用溯源的流式问答**。内置组织架构权限隔离、chunk 级密级管控、**三级记忆层**、知识治理四维审查、审计追溯、配额限流、提示注入防护与灰度开关 —— 面向**数据不允许出内网**的政企私有化场景设计。
 
+在此之上，本轮按分步路线交付了三条新能力：**GraphRAG（图检索增强，用实体关系图补充向量检索）** 的图数据地基与在线图召回**旁路（side channel，独立于主排序链路的上下文通道）**、**LLM Wiki（由大模型生成的文档级知识页）** 的生成与读接口，以及**按命中位置开窗的引用预览**。wiki 参与检索（分步路线第 4 步）尚未实现，见[十四、已知边界](#十四已知边界明确说清不做什么)。
+
 ---
 
 ## 目录
@@ -19,7 +21,7 @@
 |---|---|
 | [一、解决什么问题](#一这个项目解决什么问题) | 通用大模型在企业内的六个硬伤，以及本项目的对应解法 |
 | [二、演示](#二演示) | 流式问答、引用回跳、拒答 |
-| [三、能力全景](#三能力全景) | 检索生成 / 多模态解析 / 治理安全 / 记忆上下文 / 工程，五组能力与代码入口 |
+| [三、能力全景](#三能力全景) | 检索生成 / 多模态解析 / 治理安全 / 记忆上下文 / 工程 / 图与 LLM Wiki，六组能力与代码入口 |
 | [四、RAG 全链路](#四rag-全链路) | 端到端流程 + 检索链路四个精修 + 三级记忆 + 上下文治理 |
 | [五、十一个设计取舍](#五十一个设计取舍) | 为什么这么选，以及不这么选会怎样 |
 | [六、多模态解析](#六多模态解析图表与扫描件) | 八类格式、内嵌图转录、图片式表格、质量门禁、水印清理 |
@@ -27,7 +29,7 @@
 | [八、性能实测](#八性能实测与架构约束) | 压测数据、连接池缺陷、视觉链路吞吐天花板 |
 | [九、容器拓扑与技术栈](#九容器拓扑与技术栈) | 10 服务拓扑、技术选型 |
 | [十、快速启动](#十快速启动) | 三条命令跑起来 |
-| [十一、功能清单](#十一功能清单) | F01–F41 |
+| [十一、功能清单](#十一功能清单) | F01–F47（含 GraphRAG / LLM Wiki 增量） |
 | [十二、目录结构](#十二目录结构) | 代码地图 |
 | [十三、工程质量](#十三工程质量) | 契约驱动开发、评测门禁、自检发现的缺陷 |
 | [十四、已知边界](#十四已知边界明确说清不做什么) | 明确说清不做什么 |
@@ -131,15 +133,29 @@
 | 评估门禁 | **217 条** eval 用例集（111 可答 + 106 不可答，12 类场景）自动跑检索 + 生成，判定"该答的答了 / 不该答的拒了" | [services/eval_service.py](code/apps/api/app/services/eval_service.py) |
 | 微调样本闭环 | 用户采纳的问答自动落库，admin 分页查看 + 导出打标（增量取出），为后续微调备好数据资产 | [api/finetune.py](code/apps/api/app/api/finetune.py) |
 
+### 图与 LLM Wiki（分步路线 1–3 步已交付）
+
+| 能力 | 具体实现 | 代码入口 |
+|------|----------|----------|
+| **图数据地基**（第 1 步） | 迁移 `0024` / `0025` 建实体图与文档级状态；解析后由 LLM 抽实体与关系，历史文档用 `backfill_graph.py` 补建；抽取模型与提示词版本（`gprompt-v1`）写入答案口径快照 | [services/graph](code/apps/api/app/services/graph/) · [scripts/backfill_graph.py](code/apps/api/scripts/backfill_graph.py) |
+| **在线图召回**（第 2 步） | **side channel（旁路通道）**：独立字段 `graph_recall_chunks`，分数恒 **0**，不进 RRF 融合 / 排序 / 0.50 阈值 / 拒答判定，只追加进上下文；与命中片重复的邻居**先排重后裁剪**，不占 `GRAPH_RECALL_MAX_CHUNKS` 名额；`GRAPH_ENABLED=false` 时零 SQL | [services/graph/recall.py](code/apps/api/app/services/graph/recall.py) · [services/retrieve](code/apps/api/app/services/retrieve/__init__.py) |
+| **图召回观测与降级** | `path_stats` 输出 `graph_covered`（图邻居中已在命中片的条数）/ `graph_unique`（最终进上下文的图召回片数，v1.2 口径）；SSE（Server-Sent Events，服务端推送流）的 `done` / 检索后 `refused` 追加观测；`graph_degraded_reason` 贯穿响应、拒答与评测聚合 | [services/caliber.py](code/apps/api/app/services/caliber.py) · [scripts/run_eval.py](code/apps/api/scripts/run_eval.py) |
+| **引用预览命中开窗** | `citations.snippet` 不再固定取片头 200 字，改为按 query 词元命中位置开窗：长词元优先、中文 2-gram 兜底、左回看 30 字并对齐句号 / 换行；解决「问上班时间、预览却全是报销流程」 | [services/keyword_text.py](code/apps/api/app/services/keyword_text.py) · [api/chat.py](code/apps/api/app/api/chat.py) |
+| **LLM Wiki 生成**（第 3 步） | 迁移 `0026` 建 `wiki_pages` 单表（JSONB 存 `sections` / `key_terms`）；解析后 arq 异步任务生成文档级知识页；幂等键为「文档 + 生成模型 + 提示词版本 + 内容哈希」，重索引在**同一事务**删旧页；`rebuild_wiki.py` 支持全量 / 换口径 / 只补失败 | [services/wiki](code/apps/api/app/services/wiki/) · [scripts/rebuild_wiki.py](code/apps/api/scripts/rebuild_wiki.py) |
+| **Wiki 读接口与权限** | 列表 / 详情两端点；详情要求页对应文档存在至少一条过四闸门的 chunk；页不存在 / 生成失败 / 无可见 chunk **统一 404**（不用 403 泄露存在性）；`WIKI_ENABLED=false` 默认关闭，端点 404 且零 SQL；系统能力页展示 `ready` / `stale` / `failed` 计数 | [api/wiki.py](code/apps/api/app/api/wiki.py) · [api/system.py](code/apps/api/app/api/system.py) |
+
+> **分步路线状态**：第 1 步（图数据地基）、第 2 步（在线图召回旁路）、第 3 步（LLM Wiki 生成 + 读接口）均已交付并通过独立验证；**第 4 步（wiki 导航参与检索）只完成了增量设计，5 项决策待确认，代码未实现** —— 当前 wiki 页不进检索、不影响任何一条答案。设计见 [02-design/第4步-wiki导航增量设计.md](02-design/第4步-wiki导航增量设计.md)。
+
 ### 规模
 
 | 维度 | 数字 |
 |---|---|
 | 前端 | React 18 + TypeScript，**5 个业务页面 + 12 个管理面板** |
-| 后端 | FastAPI，**21 个 REST 路由模块 / 80 个接口 / 23 版 Alembic 迁移** |
+| 后端 | FastAPI，**23 个 REST 路由模块 / 83 个接口 / 26 版 Alembic 迁移（0001~0026）** |
 | 解析 | **8 类格式 / 13 个扩展名**，四类文档支持内嵌图转录 |
-| 测试 | **45 个测试文件 / 638 个用例**，行覆盖 **65%**（9212 行语句） |
+| 测试 | **70 个测试文件**（`tests/` 下 `test_*.py`）；第 3 步独立验证 **520 用例全过**（P0=0 / P1=0 / P2=3），见 [04-test/测试报告-第3步-wiki.md](04-test/测试报告-第3步-wiki.md) |
 | 评测 | **217 条** eval 用例（111 可答 + 106 不可答） |
+| 图与 Wiki | 迁移 0024 / 0025（实体图） + 0026（`wiki_pages`）；在线图召回旁路、文档级 LLM Wiki 生成与读接口已交付；第 4 步导航检索未实现 |
 | 容器 | 开发 10 服务、生产 12 服务（含迁移 / 网关 / 监控）一键启动 |
 
 ---
@@ -202,6 +218,8 @@
         ▼
   前端 Token 级渲染 + 引用回跳 → 密级脱敏 → 审计落库 → 配额扣减
 ```
+
+> **图召回不在这张主链图里**：它走**旁路（side channel）** —— 命中后追加进上下文，但分数恒 0、不进 RRF 融合 / 重排 / 0.50 阈值 / 拒答判定。所以打开 `GRAPH_ENABLED` 不改变任何一条命中分数，也不改变「答还是拒」的结论，只是给模型多几片相关材料；关图时零 SQL。失败时降级到 0 路并写 `graph_degraded_reason`，评测侧可见。
 
 ### 4.3 三级记忆层
 
@@ -603,7 +621,7 @@ Markdown 与 HTML 里的 `<img>` 有两种命运，取决于有没有 `alt`：
       └──────────┘  └──────────┘  └──────────┘
            │
       ┌────▼─────┐
-      │ migrate  │  ── 一次性迁移任务（0001~0023）
+      │ migrate  │  ── 一次性迁移任务（0001~0026）
       └──────────┘
 ```
 
@@ -617,6 +635,7 @@ Markdown 与 HTML 里的 `<img>` 有两种命运，取决于有没有 `alt`：
 | 后端 | FastAPI · Python 3.12 · asyncpg · SQLAlchemy · Alembic |
 | 数据/存储 | PostgreSQL 16 + pgvector 0.7 · Redis 7（缓存 + 令牌桶 + arq 队列）· MinIO |
 | AI | bge-m3（1024 维）· bge-reranker-v2-m3（本地 CPU 推理，默认关）· OpenAI 兼容 LLM / **多模态视觉模型** · OCR 服务（扫描件，可选） |
+| 图与知识组织 | GraphRAG（实体关系图 + 在线 side channel 召回）· LLM Wiki（`wiki_pages` JSONB）· Alembic 迁移 0024–0026 |
 | 文档解析 | pdfplumber · PyMuPDF · python-docx · **python-pptx** · openpyxl · xlrd · Pillow（质量门禁） |
 | 部署 | Docker Compose（开发 10 服务 / 生产 12 服务）· Nginx（web 静态与反代）· Caddy（生产 TLS 入口，内网自签） |
 | 工程 / CI | GitHub Actions（push master 与所有 PR：后端 `ruff + pytest`、前端 `tsc + vite build`）· 依赖锁定（`requirements.lock` / `package-lock.json`）· 基础镜像按 `sha256` digest 固定 |
@@ -637,7 +656,9 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 # 健康  http://localhost:8000/api/health（全绿=正常）
 ```
 
-首次启动自动执行：数据库迁移（0001~0023）→ 初始化默认租户 + admin 账号 + 公开知识库 → 下载 bge-m3 / bge-reranker 到本地缓存。
+首次启动自动执行：数据库迁移（0001~0026）→ 初始化默认租户 + admin 账号 + 公开知识库 → 下载 bge-m3 / bge-reranker 到本地缓存。
+
+> **可选能力默认关闭**：`GRAPH_ENABLED=false`（图召回）与 `WIKI_ENABLED=false`（LLM Wiki）。开启前先确认迁移 0024~0026 已执行，并阅读 [code/docs/DEPLOY.md](code/docs/DEPLOY.md)。`WIKI_GENERATOR_MODEL` 留空会回落 `LLM_MODEL`，若主模型是推理模型会导致 wiki 生成必然失败。
 
 | 内置账号 | 密码 | 角色 |
 |------|------|------|
@@ -719,6 +740,17 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 | F40 | **查询扩展** | 型号归一化（分隔符可选 + 词对）+ `kb_terms` 领域词库（缩写↔全称、型号别名），扩词并列 OR 不占词元名额 |
 | F41 | **误拒重试** | 检索充足（≥3 条且 top1 ≥0.70）却拒答、或零外发 `UNGROUNDED` 时重试一次生成；拒答文案判定前不外发 |
 
+### 图与 LLM Wiki（分步路线 1–3 步）
+
+| 编号 | 功能 | 说明 |
+|------|------|------|
+| F42 | **图数据地基** | 迁移 0024 / 0025 建实体图与文档状态；解析后 LLM 抽实体关系；`backfill_graph.py` 补建历史文档；抽取模型与 `gprompt-v1` 写入口径快照 |
+| F43 | **在线图召回（旁路）** | `graph_recall_chunks` 独立字段，分数恒 0、不进 RRF / 排序 / 阈值 / 拒答；先排重后裁剪；关图零 SQL |
+| F44 | **图召回观测与降级** | `graph_covered` / `graph_unique`（v1.2 口径）、SSE `done` / `refused` 观测、评测聚合 `graph_degraded_reasons`；启动自检拒绝带病启动（fail-closed，失败即拒绝），在线失败开放降级（fail-open）到 0 路 |
+| F45 | **引用预览命中开窗** | `hit_snippet` 按 query 词元命中位置开窗（长词元优先 + 中文 2-gram 兜底），不再固定取片头 200 字 |
+| F46 | **LLM Wiki 生成** | 迁移 0026 `wiki_pages`；解析后异步生成文档级知识页；幂等键含内容哈希；重索引同事务删页；`rebuild_wiki.py` 三种模式 |
+| F47 | **Wiki 读接口** | 列表 / 详情两端点 + 系统能力页计数；详情按四闸门过滤；404 三合一不泄露存在性；`WIKI_ENABLED` 默认关闭 |
+
 **管理面板（admin 可见，共 12 个）**：组织架构 / 用户管理 / 用户组 / 角色管理 / 审计日志 / 系统监控（P50/P95/P99 + 拒答率）/ 评估门禁 / **知识治理（四维评分 + 重跑）** / 配额管理 / 敏感词 / 灰度开关 / 提示词版本。
 
 ---
@@ -730,7 +762,7 @@ code/
 ├── apps/
 │   ├── api/                     # 后端
 │   │   ├── app/
-│   │   │   ├── api/             # REST 路由层（21 个模块 / 80 个接口）
+│   │   │   ├── api/             # REST 路由层（23 个模块 / 83 个接口）
 │   │   │   ├── services/        # 业务层
 │   │   │   │   ├── retrieve/    #   三路召回 + RRF + 章节补全 + 链式拆解
 │   │   │   │   ├── generate/    #   生成 + 拒答判定 + 引用双向校验
@@ -740,14 +772,16 @@ code/
 │   │   │   │   ├── guard/       #   提示注入检测
 │   │   │   │   ├── parse/       #   8 类解析器 + 内嵌图编排 + 图像质量门禁
 │   │   │   │   ├── chunk/       #   分块（粒度优先级 + 表格按行组带表头）
+│   │   │   │   ├── graph/       #   实体抽取 / 在线图召回（side channel）
+│   │   │   │   ├── wiki/        #   文档级 LLM Wiki 生成
 │   │   │   │   └── acl/         #   四闸门可见性判定
 │   │   │   ├── models/          # SQLAlchemy ORM（PostgreSQL + pgvector）
 │   │   │   ├── schemas/         # Pydantic 请求/响应模型
 │   │   │   ├── infra/           # 指标 / 链路追踪 / Redis 与 arq 连接池
 │   │   │   └── config/          # 配置 + 全局口径（decisions.py / index_profile.py / 启动自检）
-│   │   ├── alembic/versions/    # 23 版数据库迁移（0001~0023）
-│   │   ├── scripts/             # 评测 / 标定 / 压测 / 重算脚本
-│   │   └── tests/               # pytest（45 个文件 / 638 个用例）
+│   │   ├── alembic/versions/    # 26 版数据库迁移（0001~0026）
+│   │   ├── scripts/             # 评测 / 标定 / 压测 / 重算 / 图数据补建 / wiki 重建脚本
+│   │   └── tests/               # pytest（70 个测试文件）
 │   ├── ocr/                     # 扫描件 OCR 服务（GOT-OCR2.0）
 │   └── web/                     # 前端
 │       ├── src/pages/           # 5 个业务页面
@@ -785,23 +819,28 @@ code/
 
 ### 13.2 日常工程约束
 
-- **数据库迁移可进可退**：23 版 Alembic 迁移，支持 downgrade
+- **数据库迁移可进可退**：26 版 Alembic 迁移（0001~0026），支持 downgrade；其中 0024 / 0025 为图数据表、0026 为 `wiki_pages`
 - **三层回滚体系**：灰度开关秒级回滚（零停服）→ Alembic 迁移回滚 → 镜像回滚
 - **可观测性**：标准指标 + `/metrics`（路径标签用路由模板，避免高基数）；7 条核心 SLO 告警（存活 / 健康 / 5xx 错误率 / 重排降级 / 拒答率 / 首 token 超时 / P95 延迟）
 - **日志与链路追踪**：JSON 结构化日志（`LOG_LEVEL` 控制）+ `trace_id` 贯穿请求 → 审计 → 异步任务
 - **可复现构建**：`requirements.lock` + `package-lock.json` 锁定全部传递依赖，基础镜像按 `sha256` digest 固定
 - **CI 门禁**：push master 与所有 PR 触发，后端 `ruff + pytest`（带 Redis 服务容器）、前端 `tsc + vite build` 两个独立 job
 - **资源复用**：Redis 与 arq 连接池**进程级共享**（请求级调用点拿到的 `aclose()` 是 no-op）
-- **测试现状**：45 个测试文件 / **638 个用例**，行覆盖 **65%**（9212 行语句）。新模块覆盖已拉起来（`keyword_text` 100% / `lexicon` 96% / `retrieve` 91% / `ocr` 98%），最大缺口仍在 `workers/parse_job.py`（14%）
+- **测试现状**：**70 个测试文件**（`tests/` 下 `test_*.py`）；第 3 步独立验证 **520 用例全过**（P0=0 / P1=0 / P2=3，见 [04-test/测试报告-第3步-wiki.md](04-test/测试报告-第3步-wiki.md)）。行覆盖 **65%**（9212 行语句）是早期快照，未随本轮增量重算。新模块覆盖（`keyword_text` 100% / `lexicon` 96% / `retrieve` 91% / `ocr` 98%），最大缺口仍在 `workers/parse_job.py`（14%）
 - **连接池参数**：`db_pool_size` / `db_max_overflow` / `db_pool_timeout_s` 全部可环境覆盖，默认 20+20、超时 5s；单测锁死"参数必须来自 settings、timeout ≤10s、容量 ≤45"，防止有人把池调成 200 再去扩副本
 - **关键词切分单一真源**：入库与查询共用 `services/keyword_text.py`。两侧各写一份 bigram 逻辑必然漂移 —— 全角/半角、断点位置差一个字符，索引里的 token 与查询生成的 token 就对不上，表现为**静默 0 召回**（不报错、不告警）
 - **双镜像同步**：`api` 与 `worker` 是两个镜像，只 `build api` 会让 worker 静默跑旧代码 —— 任务照常返回 `indexed`，新解析逻辑不生效且日志无异常。部署脚本按同一 tag 同时重建两侧
+- **关图零 SQL**：`GRAPH_ENABLED=false` 时图模块不 import、不发任何图查询；在线图召回失败降级到 0 路（fail-open），主链答案不受影响；启动自检对配置 / 表结构错误 fail-closed（拒绝启动）；离线评测必须显式暴露 `graph_degraded_reason`，不许静默吞掉
+- **评测双口径禁令**：`scripts/run_eval.py` 走 `/api/chat/ask` 生产链路（四类上下文全注入 + 链式检索 `retrieve_chain`），admin 门禁 `EvalService` 默认走 `retrieve()` 且只喂命中片；两条链路的结果**禁止横向比较**，落库用 `context_caliber` / `context_note` 标清口径
+- **先排重后裁剪**：图召回把「已在最终命中片里的邻居」先跳过，不占 `GRAPH_RECALL_MAX_CHUNKS` 名额；否则权重最高的一跳邻居（往往已在命中片中）会把真正新增的片挤掉
 
 ### 13.3 评测门禁与评测集构建
 
 **当前评测集：217 条（111 可答 + 106 不可答，12 类场景）**
 
 > 口径说明：仓库里 `scripts/seed_eval.py` 内置的是 **63 条种子**（43 可答 + 20 不可答），首次启动的兜底数据；实际评测集经 `import_eval_cases.py` 导入。seed 脚本已改为**表非空即整体跳过**，重启不会覆盖回 63 条。判断规模看 `eval_cases` 表，不看 seed 文件头。
+
+> **双口径禁令（本轮新增）**：`run_eval.py` 走生产链路（四类上下文全注入 + `retrieve_chain`），admin 门禁 `EvalService` 默认走 `retrieve()` 且只喂命中片，两者产出的通过率**不可横向比较**。`run_eval.py` 现落库 `context_caliber` / `context_note`，并聚合 `graph_covered` / `graph_unique` / `graph_degraded_reasons`；跨链路比对前必须先看这两个口径字段。
 
 最近一轮全量实测（2026-10-25，取自 `eval_runs` 最新一条）：
 
@@ -870,6 +909,10 @@ code/
 | P2 | 高并发隐患：Redis 客户端与 arq 池**逐请求新建/关闭** | 改为进程级共享连接池（32 处调用点 + 后台任务模块） |
 | P3 | 硬编码密钥、CORS 过宽、连接池参数不合理 | 全部外置到环境变量，收紧默认值 |
 | P3 | 审计日志 LIKE 转义、时间边界、embedding 条数校验 | 逐项补齐边界处理 |
+| P1 | **`statement_timeout` 作用域是整个事务**：图召回用 `set_config(..., true)` 设超时后，同一事务后续的表格回捞 / 章节补全也被限死，且成功路径不还原会污染连接 | 改为成功路径末尾还原成**调用前读到的值**（不是硬编码 `0`）；失败路径 rollback 后不再发还原 SQL；补时序测试钉住最后一条 SQL |
+| P1 | **引用预览永远停在片头**：`snippet = content[:200]`，答案在 400+ 字长片中段时，右侧预览全是无关段落（真实投诉：问「上班时间」显示报销流程） | `hit_snippet` 按命中位置开窗；后续又修掉「型号词元探测不到」「多词元 OR 正则取最左命中导致退回片头」两处，共 16 条契约测试 |
+| P1 | **TestClient 触发 lifespan 真连库**：`with TestClient(app)` 让 asyncpg 连接池绑定第一个事件循环，后续用例换循环直接报 `attached to a different loop` | 测试不进 lifespan 上下文管理器；同法清零该套件里长期存在的 6 条「已知坏用例」 |
+| P2 | **wiki 生成的两个隐性失败**：推理模型只吐 `reasoning_content` 导致 content 为空且异常穿透不留痕；`sections[].chunk_ids` 直塞 UUID 进 JSONB 不可序列化 | LLM 层失败统一转 `WikiBuildError` 并落 `status=failed`；chunk id 以字符串入 JSONB；幂等测试重写为走真实函数（原测试复制生产判定式，变异生产代码不变红） |
 
 ---
 
@@ -898,6 +941,9 @@ code/
 | 章节补全有固定预算 | 每节 ≤3 片、全局 1200 token；超预算只补前面的高分节，后面的不补 | 提高前先评估上下文里"补全片 vs 答案片"的比例，别把答案挤出去 |
 | `kb_terms` 靠规则抽取 | 只抽「字母-数字型号」与「缩写(全称)」两种形态，同义词、口语别名叫不出来 | 加人工维护的词表界面，或离线小模型扩词 |
 | 记忆写入过滤是启发式的 | 正则能挡住大部分片段泄漏，但挡不住"换个说法的绕过" | 已用 `kind` 字段做读取侧白名单兜底；后续可加小模型做写入侧分类 |
+| 第 4 步 wiki 导航未实现 | wiki 页当前**只生成与阅读，不参与检索、不扩词元、不改变任何答案**；增量设计已完成，但归一落点 / 超时值 / 未标定阈值 / 合成评测夹具 / 是否独立开关这 5 项决策未确认，代码未动 | 见 [02-design/第4步-wiki导航增量设计.md](02-design/第4步-wiki导航增量设计.md)；裁决后按「独立预算、不截断主词元」实现，并用 217 条基线回归 |
+| 图召回刻意不参与排序 | side channel 的分数恒 0、不进 RRF / 阈值 / 拒答，所以它**不会**改善命中率指标，只提供额外上下文 | 若要它影响排序，需重新定契约并重跑 217 条基线，不能悄悄改 |
+| wiki 与图能力默认关闭 | `WIKI_ENABLED=false` / `GRAPH_ENABLED=false`；开启时启动自检 fail-closed。`WIKI_GENERATOR_MODEL` 留空回落 `LLM_MODEL`，若主模型是推理模型则生成必然失败 | 显式指定普通对话模型；详见 [code/docs/DEPLOY.md](code/docs/DEPLOY.md) |
 
 ---
 
@@ -911,6 +957,8 @@ code/
 | 云服务器生产 | 详见 [code/docs/DEPLOY.md](code/docs/DEPLOY.md) | 4 核 8GB 起；嵌入/重排走外部 API 可压到 4-8GB 内存 |
 
 生产验收清单（F1-F5）、升级与回滚决策树、双镜像重建注意事项见 [code/docs/DEPLOY.md](code/docs/DEPLOY.md)。
+
+**可选能力开关**：`GRAPH_ENABLED`（图召回旁路）与 `WIKI_ENABLED`（LLM Wiki）默认 `false`。开启前先确认迁移 0024~0026 已执行，历史文档用 `python -m scripts.backfill_graph --all` 补建图数据、用 `python -m scripts.rebuild_wiki --all` 生成 wiki 页。两者开启时启动自检为 fail-closed，缺表 / 缺 LLM Key / 模型解析为空会直接拒绝启动。配置清单见 [code/docs/DEPLOY.md](code/docs/DEPLOY.md)。
 
 ---
 
@@ -977,6 +1025,18 @@ M6 安全加固功能默认关闭，到「灰度开关」面板手动创建规�
 
 **Q: 想临时停掉？**
 `docker compose down`（不删数据），数据卷独立于容器生命周期。
+
+**Q: 打开 `GRAPH_ENABLED` 后，命中分数和答案为什么没变？**
+设计如此。图召回走**旁路（side channel）**：结果放在独立字段 `graph_recall_chunks`，分数恒 0，不进 RRF 融合 / 重排 / 0.50 阈值 / 拒答判定，只作为额外上下文追加。看它有没有生效请查 SSE `done` 事件里的 `path_stats.graph_unique` 与 `graph_degraded_reason`，不要盯分数。
+
+**Q: 问「公司几点上班」，右侧引用预览为什么全是报销流程？**
+旧行为是 `snippet = content[:200]`：一条 447 字的 chunk 里同时有报销、上班时间、入职流程，答案在中段，片头 200 字全是报销。现已改为按命中位置开窗（`hit_snippet`）。注意这是**纯展示字段**，中文 2-gram 兜底时窗口仍可能偏向常见词，不保证一定框住证据；引用片本身才是有依据的原文。
+
+**Q: 怎么启用 LLM Wiki？wiki 页会影响检索吗？**
+设 `WIKI_ENABLED=true` 并**显式**设置 `WIKI_GENERATOR_MODEL` 为普通对话模型（留空会回落 `LLM_MODEL`，推理模型会让生成必然失败），确认迁移 0026 已执行，再跑 `rebuild_wiki.py --all`。当前 wiki 页**不参与检索** —— 第 4 步只完成增量设计，未实现。
+
+**Q: wiki 读接口为什么返回 404 而不是 403？**
+页不存在、生成失败、无可见 chunk 三种情况统一 404，避免用 403 泄露「这个文档存在但你不能看」。详情端点还会要求该文档至少有一条过四闸门权限的 chunk。
 
 </details>
 

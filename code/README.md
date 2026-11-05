@@ -57,7 +57,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 
 首次启动自动完成三件事：
 
-1. `migrate` 一次性服务执行数据库迁移（`0001 ~ 0023`），完成后 api/worker 才启动
+1. `migrate` 一次性服务执行数据库迁移（`0001 ~ 0026`），完成后 api/worker 才启动
 2. 初始化默认租户 + admin 角色 + admin 账号 + 公开知识库（幂等）
 3. 下载 bge-m3（约 2GB）与 bge-reranker-v2-m3（约 1GB）到本地缓存
 
@@ -75,6 +75,20 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 2. 上传 PDF 或 Markdown 文档 → 等待状态变为「已索引」
 3. 回到首页 → 勾选刚建的知识库 → 提问 → 流式返回答案 + 右侧引用原文
 4. 切换到「公开知识库」提问 → 对比权限差异
+
+### 可选能力：GraphRAG 与 LLM Wiki（默认关闭）
+
+迁移 `0001 ~ 0026` 已包含图数据表（0024 / 0025）与 `wiki_pages`（0026），但两个能力**默认关闭**，开关见 `.env.example`：
+
+| 能力 | 开启方式 | 说明 |
+|------|----------|------|
+| GraphRAG（图检索增强） | `GRAPH_ENABLED=true`；历史文档补建图数据：`docker compose exec api python -m scripts.backfill_graph --all` | 实体 / 关系由 `GRAPH_EXTRACTOR_MODEL` 指定的模型抽取（留空回落 `LLM_MODEL`），口径版本 `gprompt-v1`；在线图召回走 **side channel（旁路通道）**，只追加进上下文，不参与排序与阈值 |
+| LLM Wiki（文档级知识页） | `WIKI_ENABLED=true`，并显式设置 `WIKI_GENERATOR_MODEL`；全量生成：`docker compose exec api python -m scripts.rebuild_wiki --all` | 幂等键为「文档 + 生成模型 + 提示词版本 + 内容哈希」；重索引在同事务删掉旧页；读端点 `GET /api/kbs/{kb_id}/wiki/pages` 与 `GET /api/wiki/pages/{page_id}` |
+
+两个开关打开时**启动自检是 fail-closed（失败即拒绝启动）**：缺表、缺 LLM Key、抽取 / 生成模型解析为空都会直接拦下，不会带病运行。
+`WIKI_GENERATOR_MODEL` 留空会回落 `LLM_MODEL` —— 若主模型是只吐 `reasoning_content` 的推理模型，wiki 生成会必然失败，必须显式指定普通对话模型。
+
+> 当前 wiki 页**只生成与阅读，不参与检索**（分步路线第 4 步尚未实现）。完整配置说明见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 
 ---
 
@@ -272,6 +286,8 @@ $COMPOSE up -d                    # 重新启动
 | 上传文档后一直解析中 | `logs worker`；失败自动重试 3 次后进死信队列。也检查格式是否在白名单内 |
 | 需要定位某次问答的完整链路 | 复制该回答的「追踪 ID」，按 trace 过滤 api/worker 日志并查 `audit_logs.trace_id`，见 §10.5 |
 | 端口被占用 | gateway 固定监听 80/443，需停掉占用进程 |
+| wiki 页生成失败 / 读端点 404 | `WIKI_ENABLED` 是否为 `true`、迁移 0026 是否执行、`WIKI_GENERATOR_MODEL` 是否为非推理模型；看「系统能力」页的 `wiki.data` 计数 |
+| 开图后答案分数没变化 | 设计如此：图召回是 side channel，分数恒 0、不进 RRF / 排序 / 阈值，只追加进上下文 |
 
 更多排查项见 [docs/DEPLOY.md §8](docs/DEPLOY.md)。
 
