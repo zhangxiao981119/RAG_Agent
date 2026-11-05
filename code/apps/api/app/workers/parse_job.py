@@ -53,7 +53,12 @@ from app.services.parse.pdf_parser import (
 from app.services.storage import get_storage
 # 图抽取的入队入口（worker 内部投递，不经 API）：关闭图能力时该函数直接返回 False，
 # 不产生任何队列写入，因此关闭态与未引入本能力时逐字节等价。
-from app.workers.graph_job import enqueue_graph_extract, run_graph_extract
+from app.workers.graph_job import (
+    enqueue_graph_extract,
+    enqueue_wiki_build,
+    run_graph_extract,
+    run_wiki_build,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +234,8 @@ async def _index_document(
     # ★ 入队在**提交成功之后**：先入队再提交会出现「任务已跑、chunks 还看不见」，
     #   worker 抽到一个空文档并把它标成 skipped（此后永远不重抽）。
     await enqueue_graph_extract(doc_ext["id"])
+    # wiki 页（第 3 步）：与图抽取同款「提交后入队」；关闭能力时内部直接返回 False
+    await enqueue_wiki_build(doc_ext["id"])
     return "succeeded"
 
 
@@ -532,6 +539,7 @@ async def run_parse_finalize(
 
     # ★ 同 _index_document：提交成功后才入队（先入队会抽到看不见的 chunks）
     await enqueue_graph_extract(doc_ext["id"])
+    await enqueue_wiki_build(doc_ext["id"])
     return "succeeded"
 
 
@@ -588,6 +596,7 @@ class WorkerSettings:
         execute_governance_job,
         scan_and_enqueue,
         run_graph_extract,
+        run_wiki_build,
     ]
     queue_name = get_settings().arq_queue_name
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)

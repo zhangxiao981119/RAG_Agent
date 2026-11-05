@@ -36,6 +36,7 @@ from app.services.graph.extract import (
     extract_document,
 )
 from app.services.graph.postgres_store import get_graph_store
+from app.services.wiki.build import WikiBuildError, WikiBuildSkip
 
 logger = logging.getLogger(__name__)
 
@@ -219,3 +220,148 @@ async def _mark_failed(
         extra={"document_id": document_id},
     )
     return "failed"
+
+
+# ══ wiki 导航页（第 3 步）══════════════════════════════════════════
+
+
+async def enqueue_wiki_build(
+    document_id: uuid.UUID | str, trace_id: str | None = None
+) -> bool:
+    """把一篇文档的 wiki 页生成入队。返回是否真的入队（关闭能力时返回 False）。
+
+    ★ 与 enqueue_graph_extract 同款纪律：入队失败**不能**让解析任务失败 ——
+      文档已经 indexed 且可检索，wiki 只是附加能力。入队失败打点 + 告警，
+      由 rebuild_wiki 脚本兜底。
+    ★ 注意 wiki 页清理在 purge_derived 里是**无条件**的（守卫是表存在）：
+      重解析后页已被删掉，这里不入队 = 这篇文档的页消失直到 rebuild_wiki 重跑。
+      所以 WIKI_ENABLED=true 时这条路径 MUST 被走到。
+    """
+    if not get_settings().wiki_enabled:
+        return False
+    try:
+        pool = await get_arq_pool()
+        await pool.enqueue_job(
+            "run_wiki_build",
+            str(document_id),
+            trace_id or trace.get_trace_id(),
+            _queue_name=get_settings().arq_queue_name,
+        )
+        return True
+    except Exception:
+        metrics.incr("wiki.build.enqueue_failed")
+        logger.warning(
+            "wiki 生成入队失败（文档仍可检索，将由 rebuild_wiki 兜底）",
+            extra={"document_id": str(document_id)},
+            exc_info=True,
+        )
+        return False
+
+
+async def build_and_store(document_id: uuid.UUID) -> str:
+    """生成一篇文档的 wiki 页并落库（**不含**幂等判定与重试口径）。
+
+    单独抽出来的理由与 extract_and_store 相同：arq 任务与 rebuild_wiki 脚本
+    MUST 走同一条写入路径 —— 两处各写一遍「DELETE + INSERT」必然漂移。
+
+    ★ 三段 session（与图抽取同款原因）：① 读输入 + 幂等判定（短事务）；
+      ② LLM 调用（**不持 session**）；③ DELETE 旧页 + INSERT 新页（单事务提交）。
+    """
+    from app.services.wiki.build import (
+        prepare_wiki_input,
+        generate_page_content,
+        write_wiki_page,
+    )
+
+    # ① 读输入 + 幂等判定（§9.4：四元组相同 → 跳过，不调 LLM）
+    async with SessionLocal() as session:
+        document = await session.get(Document, document_id)
+        if document is None:
+            logger.warning(
+                "wiki build: document not found", extra={"document_id": str(document_id)}
+            )
+            return "dead"
+        wiki_input, idempotent = await prepare_wiki_input(session, document_id=document_id)
+
+    if idempotent:
+        metrics.incr("wiki.build.skipped_idempotent")
+        logger.info(
+            "wiki build: 幂等命中，跳过（不调 LLM）",
+            extra={"document_id": str(document_id), "content_hash": wiki_input.content_hash},
+        )
+        return "succeeded"
+
+    # ② LLM 调用（不持 session —— 见模块 docstring 的 idle-in-transaction 教训）
+    generated = await generate_page_content(wiki_input)
+
+    # ③ 落页：DELETE 旧页 + INSERT 新页，同一事务
+    async with SessionLocal() as session:
+        document = await session.get(Document, document_id)
+        if document is None:
+            logger.warning(
+                "wiki build: document 在生成期间被删除",
+                extra={"document_id": str(document_id)},
+            )
+            return "dead"
+        await write_wiki_page(session, document=document, wiki_input=wiki_input,
+                              generated=generated)
+        await session.commit()
+
+    metrics.incr("wiki.build.done")
+    logger.info(
+        "wiki.build.done",
+        extra={
+            "document_id": str(document_id),
+            "sections": len(generated.sections),
+            "key_terms": len(generated.key_terms),
+            "llm_calls": generated.llm_calls,
+        },
+    )
+    return "succeeded"
+
+
+async def run_wiki_build(
+    ctx: dict[str, Any], document_id: str, trace_id: str | None = None
+) -> str:
+    """arq 任务入口。document_id 是 documents.id 字符串。
+
+    ★ 关闭能力时**一行代码都不执行**（连 session 都不开）：
+      关闭态必须与未引入本能力时逐字节等价。
+    ★ 重试语义与图抽取对齐：LLM 瞬时失败按 arq 重试（只重试生成本身，
+      文档已 indexed，与解析解耦）；无分片（skip）重试无意义，直接返回。
+    """
+    if not get_settings().wiki_enabled:
+        return "disabled"
+
+    trace.set_trace_id(trace_id or trace.new_trace_id())
+    doc_id = uuid.UUID(document_id)
+    settings = get_settings()
+
+    try:
+        return await build_and_store(doc_id)
+    except WikiBuildSkip as exc:
+        metrics.incr("wiki.build.skipped")
+        logger.warning(
+            "wiki 生成已跳过",
+            extra={"document_id": document_id, "reason": str(exc)},
+        )
+        return "skipped"
+    except Exception as exc:
+        job_try = int(ctx.get("job_try", 1) or 1)
+        metrics.incr("wiki.build.failed")
+        logger.warning(
+            "wiki 生成失败",
+            extra={
+                "document_id": document_id,
+                "attempt": job_try,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+            exc_info=not isinstance(exc, WikiBuildError),
+        )
+        if job_try < int(settings.arq_max_attempts):
+            raise Retry(defer=2**job_try) from exc
+        logger.error(
+            "wiki 生成重试用尽，转人工处理（rebuild_wiki 可重跑；文档仍可检索）",
+            extra={"document_id": document_id},
+        )
+        return "failed"
