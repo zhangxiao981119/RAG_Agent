@@ -278,3 +278,56 @@ async def test_generate_page_content_rejects_missing_title(wiki_env, monkeypatch
         await generate_page_content(
             WikiInput(text="p", content_hash="a" * 12, chunks=[_chunk(1)])
         )
+
+
+@pytest.mark.asyncio
+async def test_generate_llm_error_becomes_wiki_build_error(wiki_env, monkeypatch):
+    """LLM 层失败（超时/限流/推理模型空响应）统一转 WikiBuildError：
+
+    调用方 build_and_store 按「生成失败」留痕（record_failed_page）+ 重试，
+    不该看到 LLM 客户端的异常面 —— 若 LLMError 穿透，失败行永远不落库
+    （真库联调实证：推理模型空响应 → FAIL 但 wiki_pages 没有留痕）。
+    """
+    from app.services.llm import LLMError
+
+    class _FailingLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, temperature, *, model=None,
+                       timeout_seconds=None, max_tokens=None):
+            self.calls += 1
+            raise LLMError("LLM 只产出了推理内容，content 为空")
+
+    fake = _FailingLLM()
+    monkeypatch.setattr(build_module, "get_llm_service", lambda: fake)
+
+    with pytest.raises(WikiBuildError, match="LLM 调用两次失败"):
+        await generate_page_content(
+            WikiInput(text="p", content_hash="a" * 12, chunks=[_chunk(1)])
+        )
+    assert fake.calls == 2, "LLM 层失败也应原地重试一次"
+
+
+@pytest.mark.asyncio
+async def test_generate_llm_error_recovered_on_second_attempt(wiki_env, monkeypatch):
+    """第一次 LLM 失败、第二次成功 → 正常产页（瞬时故障被原地重试吸收）。"""
+    from app.services.llm import LLMError
+
+    class _FlakyLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, temperature, *, model=None,
+                       timeout_seconds=None, max_tokens=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise LLMError("timeout")
+            return f"```json{_VALID_JSON}```"
+
+    monkeypatch.setattr(build_module, "get_llm_service", lambda: _FlakyLLM())
+
+    generated = await generate_page_content(
+        WikiInput(text="p", content_hash="a" * 12, chunks=[_chunk(1)])
+    )
+    assert generated.title

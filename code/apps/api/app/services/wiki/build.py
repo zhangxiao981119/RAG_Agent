@@ -39,7 +39,7 @@ from app.services.wiki.prompts import (
     WIKI_TERM_MAX_CHARS,
     render_wiki_prompt,
 )
-from app.services.llm import get_llm_service
+from app.services.llm import LLMError, get_llm_service
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +243,10 @@ async def generate_page_content(wiki_input: WikiInput) -> GeneratedPage:
     输出解析失败时原地重试一次（截断问题在 wiki 不存在 —— 输入已被
     WIKI_INPUT_MAX_CHARS 截断，输出是页不是全文，4K 预算足够；重试一次
     是给「模型偶发走神」留的余量，两次都失败才是真的没救）。
+
+    ★ LLM 层失败（超时 / 限流 / 推理模型空响应）同样纳入原地重试并统一转成
+      WikiBuildError 抛出：调用方（build_and_store）按「生成失败」留痕 + 重试，
+      不需要知道 LLM 客户端的异常面 —— 两次都失败才是真的没救。
     """
     profile: WikiProfile = current_wiki_profile()
     settings = get_settings()
@@ -251,17 +255,25 @@ async def generate_page_content(wiki_input: WikiInput) -> GeneratedPage:
     parsed: dict | None = None
     llm_calls = 0
     last_raw = ""
+    llm_error: Exception | None = None
     for _attempt in range(2):
-        last_raw = await llm.chat(
-            [{"role": "user", "content": wiki_input.text}],
-            temperature=0.2,
-            model=profile.generator_model,
-            timeout_seconds=settings.wiki_generate_timeout_seconds,
-        )
         llm_calls += 1
+        try:
+            last_raw = await llm.chat(
+                [{"role": "user", "content": wiki_input.text}],
+                temperature=0.2,
+                model=profile.generator_model,
+                timeout_seconds=settings.wiki_generate_timeout_seconds,
+            )
+        except LLMError as exc:
+            llm_error = exc
+            continue
+        llm_error = None
         parsed = _extract_json(last_raw)
         if parsed is not None:
             break
+    if llm_error is not None:
+        raise WikiBuildError(f"LLM 调用两次失败：{llm_error}") from llm_error
     if parsed is None:
         raise WikiBuildError(
             f"wiki 生成输出非法 JSON（输出 {len(last_raw)} 字符）：{last_raw[:200]}"

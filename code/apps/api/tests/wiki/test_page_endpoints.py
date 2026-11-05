@@ -51,6 +51,9 @@ class _FakeResult:
     def __init__(self, rows: list) -> None:
         self._rows = rows
 
+    def __iter__(self):
+        return iter(self._rows)
+
     def first(self):
         return self._rows[0] if self._rows else None
 
@@ -65,7 +68,11 @@ class _FakeResult:
 
 
 class _FakeSession:
-    """按序出栈的假 session：wiki.py 的每次 execute / get 按调用顺序消费结果。"""
+    """按序出栈的假 session：wiki.py 的每次 execute / get 按调用顺序消费结果。
+
+    results 的每个元素是「一次 execute 应返回的行列表」，统一包成 _FakeResult
+    （端点在 Result 语义上调 .first()/.all()/迭代 —— 不能把裸 list 交回去）。
+    """
 
     def __init__(self, results: list) -> None:
         self._results = list(results)
@@ -73,7 +80,7 @@ class _FakeSession:
 
     async def execute(self, stmt, params=None):
         self.sql.append(str(stmt))
-        return self._results.pop(0)
+        return _FakeResult(self._results.pop(0))
 
     async def get(self, model, pk):
         return self._results.pop(0)
@@ -107,6 +114,10 @@ class _Harness:
 
 
 def _client() -> TestClient:
+    # ★ 不用 `with TestClient(app)`（不触发 lifespan），与 tests/chat 同款纪律：
+    #   lifespan 会真连一次 DB，asyncpg 连接池绑定到第一个事件循环，
+    #   第二个 with 就会 Event loop is closed。本文件全部依赖已打桩，
+    #   lifespan 初始化的东西一样都不需要。
     return TestClient(app)
 
 
@@ -119,9 +130,9 @@ def test_disabled_wiki_returns_404_on_both_endpoints():
     app.dependency_overrides[get_current_user] = lambda: _user()
     app.dependency_overrides[get_db] = lambda: session
     try:
-        with _client() as client:
-            r1 = client.get(f"/api/kbs/{KB_ID}/wiki/pages")
-            r2 = client.get(f"/api/wiki/pages/{PAGE_ID}")
+        client = _client()
+        r1 = client.get(f"/api/kbs/{KB_ID}/wiki/pages")
+        r2 = client.get(f"/api/wiki/pages/{PAGE_ID}")
     finally:
         app.dependency_overrides.clear()
     assert r1.status_code == 404
@@ -137,8 +148,8 @@ def test_list_requires_kb_membership(monkeypatch):
     non_member = _user(clearance=10, kbs=[])  # authorized_kb_ids 不含 KB_ID
     h = _Harness(non_member, results=[], wiki_enabled=True)
     try:
-        with _client() as client:
-            resp = client.get(f"/api/kbs/{KB_ID}/wiki/pages")
+        client = _client()
+        resp = client.get(f"/api/kbs/{KB_ID}/wiki/pages")
     finally:
         h.close()
     assert resp.status_code == 403
@@ -147,8 +158,8 @@ def test_list_requires_kb_membership(monkeypatch):
 def test_list_unknown_kb_404(monkeypatch):
     h = _Harness(_user(), results=[None], wiki_enabled=True)  # kb get → None
     try:
-        with _client() as client:
-            resp = client.get(f"/api/kbs/{uuid.uuid4()}/wiki/pages")
+        client = _client()
+        resp = client.get(f"/api/kbs/{uuid.uuid4()}/wiki/pages")
     finally:
         h.close()
     assert resp.status_code == 404
@@ -162,8 +173,8 @@ def test_list_returns_only_visible_documents(monkeypatch):
     kb = SimpleNamespace(id=KB_ID, tenant_id=TENANT_ID)
     h = _Harness(_user(), results=[kb, [(uuid.UUID(int=1),)], [row]], wiki_enabled=True)
     try:
-        with _client() as client:
-            resp = client.get(f"/api/kbs/{KB_ID}/wiki/pages")
+        client = _client()
+        resp = client.get(f"/api/kbs/{KB_ID}/wiki/pages")
     finally:
         h.close()
     assert resp.status_code == 200
@@ -181,8 +192,8 @@ def test_list_empty_when_no_visible_pages(monkeypatch):
     kb = SimpleNamespace(id=KB_ID, tenant_id=TENANT_ID)
     h = _Harness(_user(), results=[kb, [(uuid.UUID(int=1),)], []], wiki_enabled=True)
     try:
-        with _client() as client:
-            resp = client.get(f"/api/kbs/{KB_ID}/wiki/pages")
+        client = _client()
+        resp = client.get(f"/api/kbs/{KB_ID}/wiki/pages")
     finally:
         h.close()
     assert resp.status_code == 200
@@ -196,8 +207,8 @@ def test_detail_404_when_row_missing():
     """页面不存在 → 404（三合一之一）。"""
     h = _Harness(_user(), results=[[(uuid.UUID(int=1),)], []], wiki_enabled=True)
     try:
-        with _client() as client:
-            resp = client.get(f"/api/wiki/pages/{PAGE_ID}")
+        client = _client()
+        resp = client.get(f"/api/wiki/pages/{PAGE_ID}")
     finally:
         h.close()
     assert resp.status_code == 404
@@ -206,11 +217,12 @@ def test_detail_404_when_row_missing():
 def test_detail_404_when_no_visible_chunk():
     """用户对该文档无可见 chunk（EXISTS 过滤掉）→ 404，**不是 403**
     —— 用 404/403 差异探测「某密级文档是否存在」会泄漏存在性（§9.6 ③）。"""
+    # 非 admin 分支不查租户 kb 集（直接用 authorized_kb_ids）→ 只有一次 execute
     low_user = _user(clearance=10, kbs=[KB_ID])
-    h = _Harness(low_user, results=[[(uuid.UUID(int=1),)], []], wiki_enabled=True)
+    h = _Harness(low_user, results=[[]], wiki_enabled=True)
     try:
-        with _client() as client:
-            resp = client.get(f"/api/wiki/pages/{PAGE_ID}")
+        client = _client()
+        resp = client.get(f"/api/wiki/pages/{PAGE_ID}")
     finally:
         h.close()
     assert resp.status_code == 404
@@ -226,8 +238,8 @@ def test_detail_returns_page_with_disclaimer_and_caliber():
     )
     h = _Harness(_user(), results=[[(uuid.UUID(int=1),)], [row]], wiki_enabled=True)
     try:
-        with _client() as client:
-            resp = client.get(f"/api/wiki/pages/{PAGE_ID}")
+        client = _client()
+        resp = client.get(f"/api/wiki/pages/{PAGE_ID}")
     finally:
         h.close()
     assert resp.status_code == 200
@@ -246,14 +258,14 @@ def test_detail_404_when_generation_failed_is_same_as_missing():
     # SQL 里 status='ready' 过滤 → row None；与「页不存在」走同一分支
     h = _Harness(_user(), results=[[(uuid.UUID(int=1),)], []], wiki_enabled=True)
     try:
-        with _client() as client:
-            resp1 = client.get(f"/api/wiki/pages/{PAGE_ID}")
+        client = _client()
+        resp1 = client.get(f"/api/wiki/pages/{PAGE_ID}")
     finally:
         h.close()
     h2 = _Harness(_user(), results=[[(uuid.UUID(int=1),)], []], wiki_enabled=True)
     try:
-        with _client() as client:
-            resp2 = client.get(f"/api/wiki/pages/{uuid.uuid4()}")
+        client = _client()
+        resp2 = client.get(f"/api/wiki/pages/{uuid.uuid4()}")
     finally:
         h2.close()
     assert resp1.status_code == resp2.status_code == 404
