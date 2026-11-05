@@ -881,6 +881,64 @@ def _chunk_before_insert(mapper, connection, target):
     _validate_and_normalize_acl_tags(target)
 
 
+class WikiPage(Base):
+    """LLM wiki 导航页（迁移 0026，第 3 步）—— 纯派生数据的读模型。
+
+    ★ 一文档一页（uq_wiki_pages_document）：重复生成的幂等语义是
+      「content_hash 相同跳过，不同 DELETE 旧页 + INSERT 新页」（§9.4）。
+    ★ 本表**不进检索**（术语扩展是第 4 步）：检索侧一行不读它，
+      WIKI_ENABLED=false 时整张表无人读写。
+    ★ 不冗余存 ACL 字段（§8.4）：页的可见性由读接口判定 —— 列表按 kb 成员，
+      详情按「该文档存在至少一条过四闸门的 chunk」（EXISTS 内联 _WHERE_BASE）。
+      冗余一份权限副本 = 文档改密级时副本不会跟着变，而漂移不报错。
+    ★ source_chunk_ids 是 UUID[]（数组不能建 FK）：重索引换 chunk 行后页会指向
+      死 id —— 对策是 purge_derived() 在重索引**同一事务**内 DELETE 页（§8.5），
+      不是外键。
+    """
+
+    __tablename__ = "wiki_pages"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False
+    )
+    scope: Mapped[str] = mapped_column(Text, nullable=False, server_default="doc")
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    # 200~400 字导航摘要（LLM 产物，**不可引用** —— 读接口带固定 disclaimer）
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    # sections = [{"heading_path": str, "summary": str, "key_terms": [str], "chunk_ids": [uuid]}]
+    sections: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    # 全页术语（已 sorted 去重），供第 4 步查询扩展
+    key_terms: Mapped[list[str]] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    # 生成依据（仅供审计；数组不能建 FK，靠 purge_derived 同事务删页）
+    source_chunk_ids: Mapped[list[uuid.UUID]] = mapped_column(
+        ARRAY(UUID(as_uuid=True)), nullable=False, server_default=text("'{}'")
+    )
+    generator_model: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_version: Mapped[str] = mapped_column(Text, nullable=False)
+    # sha1(输入文本 + 模型 + prompt 版本)[:12]（幂等键，§9.4）
+    content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="ready")
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("scope IN ('doc')", name="ck_wiki_pages_scope"),
+        CheckConstraint("status IN ('ready','stale','failed')", name="ck_wiki_pages_status"),
+        UniqueConstraint("document_id", name="uq_wiki_pages_document"),
+        Index("idx_wiki_pages_kb", "tenant_id", "kb_id", "status"),
+    )
+
+
+
 @event.listens_for(Chunk, "before_update")
 def _chunk_before_update(mapper, connection, target):
     _validate_and_normalize_acl_tags(target)

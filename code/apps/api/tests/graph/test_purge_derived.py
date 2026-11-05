@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import pathlib
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,12 +42,36 @@ class _FakeDocument:
 
 
 class _FakeSession:
-    def __init__(self, document: _FakeDocument | None) -> None:
+    """替身 AsyncSession：记录 execute 的 SQL，模拟 to_regclass 探测结果。
+
+    wiki_table_exists 模拟 `to_regclass('wiki_pages')` —— purge 第 3 步起
+    用它守卫 wiki 页删除（迁移 0026 可能未跑，缺表必须跳过而不是炸）。
+    """
+
+    def __init__(self, document: _FakeDocument | None = None,
+                 wiki_table_exists: bool = True) -> None:
         self._document = document
         self.commits = 0
+        self.wiki_table_exists = wiki_table_exists
+        self.executed: list[str] = []
+        self.params: list[dict] = []
+
+    async def scalar(self, _stmt):
+        return self.wiki_table_exists
 
     async def get(self, _model, _pk):
         return self._document
+
+    async def execute(self, stmt, _params=None):
+        self.executed.append(str(stmt))
+        self.params.append(dict(_params or {}))
+        return SimpleNamespace(rowcount=1)
+
+    def executed_sql(self) -> str:
+        return "\n".join(self.executed)
+
+    def deleted_wiki_pages(self) -> bool:
+        return "DELETE FROM wiki_pages" in self.executed_sql()
 
 
 class _FakeStore:
@@ -60,7 +85,11 @@ class _FakeStore:
 
 @pytest.mark.asyncio
 async def test_purge_is_noop_when_graph_disabled(env, monkeypatch):
-    """关闭能力时 MUST NOT 碰表：迁移可能没跑，碰了就是解析主路径炸掉。"""
+    """关闭图能力时 MUST NOT 碰图表：迁移可能没跑，碰了就是解析主路径炸掉。
+
+    ★ 注意 wiki 页清理**不受**图开关管辖（见 test_purge_deletes_wiki_pages_
+      even_when_graph_disabled）—— 本测试只断言图侧的 no-op。
+    """
     env.setenv("GRAPH_ENABLED", "false")
     get_settings.cache_clear()
 
@@ -74,6 +103,47 @@ async def test_purge_is_noop_when_graph_disabled(env, monkeypatch):
     assert deleted == 0
     assert store.calls == []          # 存储层一次都没被调用
     assert document.graph_status == "done"  # 状态未被改写
+
+
+@pytest.mark.asyncio
+async def test_purge_deletes_wiki_pages_even_when_graph_disabled(env, monkeypatch):
+    """§8.5：重索引同事务内 DELETE wiki 页 —— 守卫是**表存在**，不是 wiki_enabled。
+
+    ★ 「历史上开过 wiki、后来关掉」的部署页还在库里；关图（或关 wiki）期间
+      重解析若不删页，页的 source_chunk_ids 会指向死 chunk id —— 数组列没有
+      外键，数据库不会替我们清。
+    """
+    env.setenv("GRAPH_ENABLED", "false")
+    get_settings.cache_clear()
+
+    store = _FakeStore()
+    monkeypatch.setattr(purge_module, "get_graph_store", lambda: store)
+    session = _FakeSession(document=None, wiki_table_exists=True)
+    document_id = uuid.uuid4()
+
+    deleted = await purge_module.purge_derived(session, document_id=document_id)
+
+    assert deleted == 0                      # 图侧 no-op
+    assert store.calls == []
+    assert session.deleted_wiki_pages(), "wiki 页没有被同事务删除"
+    assert {"id": document_id} in session.params, "DELETE 没有按 document_id 收敛"
+
+
+@pytest.mark.asyncio
+async def test_purge_skips_wiki_pages_when_table_missing(env, monkeypatch):
+    """迁移 0026 未跑（缺表）时 MUST 跳过 wiki 清理 —— to_regclass 探测，
+    绝不能让 UndefinedTable 炸掉解析主路径。"""
+    env.setenv("GRAPH_ENABLED", "false")
+    get_settings.cache_clear()
+
+    store = _FakeStore()
+    monkeypatch.setattr(purge_module, "get_graph_store", lambda: store)
+    session = _FakeSession(document=None, wiki_table_exists=False)
+
+    deleted = await purge_module.purge_derived(session, document_id=uuid.uuid4())
+
+    assert deleted == 0
+    assert not session.deleted_wiki_pages(), "缺表时不应发出 wiki DELETE"
 
 
 @pytest.mark.asyncio

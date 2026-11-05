@@ -14,16 +14,20 @@
   关闭能力时 MUST 连表都不碰（迁移可能未跑，碰了就是 UndefinedTable 炸掉解析主路径）。
   把「什么时候该清」的判断收在一处，避免调用方各写一份 if。
 
-★ 本步（第 1 步）**不含** wiki 派生清理：`wiki_pages` 表属迁移 0026（第 3 步）。
-  第 3 步 MUST 在本函数的同一个事务内补一段 `DELETE FROM wiki_pages WHERE
-  document_id = :id`（页的 source_chunk_ids 是数组、无外键，不删就会指向死 id）。
-  这行不强加在本步，是因为在 0026 尚未存在的部署上执行它会让重解析整体失败。
+★ 第 3 步补记：wiki 页也在本事务内一并删除（§8.5 表格第一行）。
+  `wiki_pages.source_chunk_ids` 是 UUID[]（数组不能建外键），重索引换 chunk 行后
+  页会指向死 id —— 对策是同事务 DELETE，不是外键。与图的差别只在守卫方式：
+  用 `to_regclass` 探测表是否存在而不是看开关 —— 「历史上开过 wiki、后来关掉」
+  的部署页还在库里，按开关跳过会留下死页；而 to_regclass 只查 catalog，
+  表不存在时返回 NULL（不会 UndefinedTable 炸掉解析主路径），关闭态也不需要
+  「连表都不碰」的特殊豁免 —— 它根本没有数据访问。
 """
 from __future__ import annotations
 
 import logging
 import uuid
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import get_settings
@@ -55,6 +59,24 @@ async def purge_derived(
     reason 只用于日志：'reindex'（重解析）/ 运维手动触发。审计需要知道
     「是谁把状态打回 pending 的」，否则数据消失时无从追溯。
     """
+    # ── wiki 页（第 3 步，§8.5）：与 chunks 写入同事务。
+    #    ★ 守卫是「表是否存在」（to_regclass），**不是** wiki_enabled 开关：
+    #    「历史上开过 wiki、后来关掉」的部署页还在库里，按开关跳过会留下死页。
+    #    to_regclass 只查 catalog（缺表返回 NULL，不会 UndefinedTable），
+    #    关闭态也不违背「连表都不碰」的纪律 —— 它根本没有数据访问。
+    #    表可能尚未迁移到 0026：缺表即跳过（那上面本来就没有页），
+    #    绝不能让解析主路径失败。
+    has_wiki_table = await session.scalar(
+        text("SELECT to_regclass('wiki_pages') IS NOT NULL")
+    )
+    wiki_deleted = 0
+    if has_wiki_table:
+        result = await session.execute(
+            text("DELETE FROM wiki_pages WHERE document_id = :id"),
+            {"id": document_id},
+        )
+        wiki_deleted = int(result.rowcount or 0)
+
     if not graph_purge_needed():
         return 0
 
@@ -74,6 +96,7 @@ async def purge_derived(
             extra={
                 "document_id": str(document_id),
                 "deleted_relations": deleted,
+                "deleted_wiki_pages": wiki_deleted,
                 "reason": reason,
             },
         )
