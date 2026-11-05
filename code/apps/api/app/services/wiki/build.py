@@ -227,11 +227,15 @@ def _normalize_sections(
                 chunk_ids.append(chunk_id)
         if not chunk_ids:
             continue
+        # ★ sections 整体进 JSONB：chunk_ids 必须是 JSON 可序列化的字符串形式
+        #   （真库联调实证：UUID 对象直塞 JSONB → asyncpg
+        #   "Object of type UUID is not JSON serializable"，页生成成功却落不了库）。
+        #   used_chunk_ids 保持 UUID —— 那是给 source_chunk_ids（UUID[] 数组列）用的。
         sections.append({
             "heading_path": heading_path,
             "summary": summary,
             "key_terms": _clean_terms(item.get("key_terms")),
-            "chunk_ids": chunk_ids,
+            "chunk_ids": [str(c) for c in chunk_ids],
         })
         used_chunk_ids.extend(chunk_ids)
     return sections, used_chunk_ids

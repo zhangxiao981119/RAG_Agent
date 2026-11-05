@@ -167,7 +167,10 @@ def test_normalize_sections_drops_fabricated_chunk_ids():
     ]
     sections, used = _normalize_sections(raw, valid)
     assert len(sections) == 1
-    assert sections[0]["chunk_ids"] == [uuid.UUID(int=1)]
+    # sections 进 JSONB：chunk_ids 必须是 JSON 可序列化的字符串（真库实证：
+    # UUID 对象直塞 JSONB → asyncpg 序列化失败，页生成成功却落不了库）
+    assert sections[0]["chunk_ids"] == [str(uuid.UUID(int=1))]
+    # used 保持 UUID —— 给 source_chunk_ids（UUID[] 数组列）用
     assert used == [uuid.UUID(int=1)]
 
 
@@ -248,9 +251,9 @@ async def test_generate_page_content_normalizes(wiki_env, monkeypatch):
     assert fake.calls == 1
     assert page.title == "差旅报销制度"
     assert len(page.sections) == 2
-    # 编造的 id（int=999 不在输入里）被丢弃
-    assert all(cid in {uuid.UUID(int=1), uuid.UUID(int=2), uuid.UUID(int=3)}
-               for s in page.sections for cid in s["chunk_ids"])
+    # 编造的 id（int=999 不在输入里）被丢弃；sections 进 JSONB → chunk_ids 是字符串
+    valid_strs = {str(uuid.UUID(int=n)) for n in (1, 2, 3)}
+    assert all(cid in valid_strs for s in page.sections for cid in s["chunk_ids"])
     # 全页术语 sorted 去重
     assert page.key_terms == sorted(set(page.key_terms))
     assert "差旅报销" in page.key_terms
