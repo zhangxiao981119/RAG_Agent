@@ -170,7 +170,7 @@ code/
 │   │   │   └── infra/          metrics · trace · redis/arq 连接池
 │   │   ├── alembic/versions/   26 版迁移（0001~0026）
 │   │   ├── scripts/            eval 链 · calibrate · backfill_fts_text · build_kb_terms · loadtest
-│   │   └── tests/              pytest（45 文件 / 638 用例，行覆盖 65%）
+│   │   └── tests/              pytest（70 个 test_*.py 文件；行覆盖 65% 为早期快照）
 │   ├── ocr/                    GOT-OCR2.0（扫描件专用，单路串行）
 │   └── web/                    React 18 前端（5 业务页 + 12 管理面板）
 ├── docker-compose.yml          开发 10 服务
