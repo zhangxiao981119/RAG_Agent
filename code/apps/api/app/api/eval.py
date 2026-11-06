@@ -44,6 +44,11 @@ class EvalReportResponse(BaseModel):
     graph_covered: int = 0
     graph_unique: int = 0
     graph_degraded_reasons: dict[str, int] = {}
+    # 第 4 步 wiki 导航三数（只记录；admin 门禁是辅助链路，与 run_eval.py
+    # 生产链路的同名三数禁止横向比较，见 CROSS_PATH_NOTE）
+    wiki_nav_hit_cases: int = 0
+    wiki_nav_expanded_cases: int = 0
+    wiki_nav_expanded_terms: int = 0
     cases: list[EvalCaseResultItem]
 
 
@@ -81,6 +86,10 @@ async def eval_run(
             "context_caliber": report.context_caliber,
             "graph_covered": report.graph_covered,
             "graph_unique": report.graph_unique,
+            # 第 4 步三数进审计（只记录，不改变任何判定）
+            "wiki_nav_hit_cases": report.wiki_nav_hit_cases,
+            "wiki_nav_expanded_cases": report.wiki_nav_expanded_cases,
+            "wiki_nav_expanded_terms": report.wiki_nav_expanded_terms,
         },
     )
 
@@ -96,6 +105,9 @@ async def eval_run(
         graph_covered=report.graph_covered,
         graph_unique=report.graph_unique,
         graph_degraded_reasons=report.graph_degraded_reasons,
+        wiki_nav_hit_cases=report.wiki_nav_hit_cases,
+        wiki_nav_expanded_cases=report.wiki_nav_expanded_cases,
+        wiki_nav_expanded_terms=report.wiki_nav_expanded_terms,
         cases=[
             EvalCaseResultItem(
                 question=c.question,

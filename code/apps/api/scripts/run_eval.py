@@ -36,6 +36,17 @@
   v1.1 以三路候选池为分母的旧口径已被真库实测证伪 —— 候选池可达 150 个 id，
   远大于最终 top-K，会让 `graph_unique` 结构性恒 0。报告里 MUST NOT 再拿
   `graph_unique=0` 声称「图没用」。
+
+★ 第 4 步 · wiki 导航观测与**假绿防线**（设计 §2.6 ②-b，本步最高优先级）：
+  dev 真库只有 1 页 wiki（F15），「只在命中 wiki 页时扩词」+ 现有数据 ⇒ 217 条里
+  扩展几乎一次都不触发 ⇒ 「命中率不降」会以 100% 通过率通过，但测的是**关闭态**。
+  故本脚本按轮聚合 `path_stats.wiki_nav_hits / wiki_nav_terms`，报告 MUST 打印
+  `hit_cases / expanded_cases / expanded_terms` 三个数；前置门槛
+  `hit_cases >= 20 且 expanded_cases > 0` 不满足时**本轮评测结论无效**
+  （既不是通过也不是失败），禁止据此宣称「不劣化通过」。三个数只记录，
+  `_compare_baseline()` 仍只比三项既有指标，wiki_* 不进方向表。
+  ⚠ `retrieve_chain()` 多轮下两键是**按轮累加值**（§7-U-E），报告口径已注明；
+     逐请求精确值请看 `rag.wiki.nav.hit` / `rag.wiki.nav.terms_bucket` 聚合指标。
 """
 from __future__ import annotations
 
@@ -44,6 +55,7 @@ import asyncio
 import json
 import sys
 from collections import Counter
+from typing import Final
 
 import httpx
 from sqlalchemy import select
@@ -81,6 +93,97 @@ def _accumulate_graph_observation(acc: dict, ask_result: dict) -> None:
     if reason:
         acc["degraded"][reason] += 1
     acc["rounds"] += 1
+
+
+# 先验值（N3 / 设计 §2.6 ②-b）：首轮实测后重设，走代码评审 + 重跑 217 条。
+# ★ 禁止因某轮评测不达标而临时上调/下调 —— 改它 = 基线不可比（主文档 §20-U10）。
+WIKI_NAV_MIN_HIT_CASES: Final[int] = 20
+
+
+def _accumulate_wiki_nav_observation(
+    acc: dict, ask_result: dict, *, answerable: bool
+) -> None:
+    """把单轮的 wiki 导航观测累加进本次运行的聚合桶（§2.6 ②-b）。
+
+    acc 结构：`{"hit_cases": int, "expanded_cases": int, "expanded_terms": int,
+               "degraded_reasons": Counter[str], "rounds": int,
+               "answerable_rounds": int}`
+
+    ★ `hit_cases` / `expanded_cases` **只在可答类上统计**：§2.6 ②-b 的门槛
+      「≥ 20」是相对 111 条可答类设的，把不可答轮混进来会悄悄放宽假绿防线。
+      `expanded_terms` 则是全量轮的累计产出量（报告三数之一）。
+    ★ 按**轮**累加而不是只统计「有答案的轮」：导航是检索侧行为，与这轮最后
+      答不答得出来无关（与 `_accumulate_graph_observation` 同纪律）。
+    ★ 缺字段按 0 计、不抛：观测字段缺失（老版本服务端 / 检索前就拒答的轮）
+      不该让整轮评测失败 —— 它是量化数据，不是正确性数据。
+    ★ 多轮 `retrieve_chain()` 下 `wiki_nav_hits` / `wiki_nav_terms` 是**按轮求和**
+      （§7-U-E），故这里用 `> 0` 判「这一轮至少命中 / 至少扩出过词」，而不是 `== 1`。
+    """
+    stats = ask_result.get("path_stats") or {}
+    hits = int(stats.get("wiki_nav_hits", 0) or 0)
+    terms = int(stats.get("wiki_nav_terms", 0) or 0)
+    acc["rounds"] += 1
+    acc["expanded_terms"] += terms
+    acc["answerable_rounds"] += int(answerable)
+    if answerable:
+        acc["hit_cases"] += int(hits > 0)
+        acc["expanded_cases"] += int(terms > 0)
+
+
+def _wiki_nav_gate_ok(hit_cases: int, expanded_cases: int) -> bool:
+    """假绿前置门槛（§2.6 ②-b）：不满足 → 本轮评测**结论无效**。
+
+    纯函数（无 IO / 无配置），便于单测把「无效」和「通过 / 失败」三态钉住。
+    注意：本函数返回 False 不是「评测失败」，而是「这轮根本没测到东西」。
+    """
+    return hit_cases >= WIKI_NAV_MIN_HIT_CASES and expanded_cases > 0
+
+
+def _print_wiki_nav_observation(acc: dict, wiki_enabled: bool) -> None:
+    """报告 MUST 打印 `hit_cases / expanded_cases / expanded_terms` 三个数（§2.6 ②-b）。
+
+    抽成纯函数（只有 print）是为了让「报告是否真的打印了三个数」可被执行验证，
+    而不是靠人眼看日志 —— 这条是本步最容易被「217 条全绿」掩盖的防线。
+    """
+    print(f"wiki 能力: WIKI_ENABLED={wiki_enabled}")
+    print(
+        f"wiki 导航观测（{acc['rounds']} 轮累加，其中可答"
+        f" {acc['answerable_rounds']} 轮）: "
+        f"hit_cases={acc['hit_cases']} "
+        f"expanded_cases={acc['expanded_cases']} "
+        f"expanded_terms={acc['expanded_terms']}"
+    )
+    print(
+        "  口径: hit_cases / expanded_cases 只在可答类上统计（门槛 20 相对 111 条"
+        "可答类）；expanded_terms 是全量轮按轮求和值（§7-U-E），非逐请求值。"
+    )
+    print(
+        "  降级原因: 按设计 §2.4 只进 rag.wiki.nav.degraded{reason=...} 聚合指标，"
+        "不新增 RetrievalResult 顶层字段；caliber 里该键留空，不伪造。"
+    )
+    if not wiki_enabled:
+        print(
+            "声明: 本次 WIKI_ENABLED=false，wiki 导航未启用；本报告**不覆盖**"
+            "第 4 步效果，禁止用分数未变化宣称「wiki 导航无副作用」。"
+        )
+    elif not _wiki_nav_gate_ok(acc["hit_cases"], acc["expanded_cases"]):
+        print(
+            f"⚠ 假绿防线未过: hit_cases={acc['hit_cases']} "
+            f"(需 >= {WIKI_NAV_MIN_HIT_CASES}) 或 "
+            f"expanded_cases={acc['expanded_cases']} (需 > 0) "
+            "→ **本轮评测结论无效**，既不是通过也不是失败；"
+            "禁止宣称「不劣化通过」。"
+        )
+        print(
+            "  补页路径（N4）：优先 python -m scripts.rebuild_wiki --all 补真实页；"
+            "或构造合成 wiki 页 fixture（单独 kb / 事务内、跑完清理、"
+            "报告 MUST 标注「含合成页」）。"
+        )
+    else:
+        print(
+            "声明: 假绿前置门槛已满足（扩展确实发生过），本轮指标可用于判定；"
+            "仍需核对 rag.wiki.nav.terms_bucket{bucket=2} > 0 与 {bucket=3} = 0。"
+        )
 
 
 async def _ask_one(
@@ -189,9 +292,11 @@ def _compare_baseline(base: dict, now: dict, max_regression: float) -> int:
 def _warn_caliber_drift(base_caliber: dict, now_caliber: dict) -> None:
     """基线与本轮的口径不一致时**大声提示**（只提示，不改变 --baseline 的判定）。
 
-    比对的两个键：
+    比对的三个键：
       · `graph_enabled`   —— 开图 / 关图的两条基线本来就不该直接比
       · `context_caliber` —— 不同上下文口径（生产链路 vs 门禁路径）更不能比
+      · `wiki_enabled`    —— 第 4 步（§2.6 ② / F14）：开/关 wiki 的两条基线互比，
+        会把「导航根本没跑」当成「导航没副作用」，正是双口径禁令要防的
 
     ★ 为什么只提示不改判定：口径变了不代表代码退步，把口径变化算成回退会制造
       假红灯，运维很快学会把 --max-regression 调大 —— 那道门就白设了。
@@ -203,6 +308,7 @@ def _warn_caliber_drift(base_caliber: dict, now_caliber: dict) -> None:
     for key, label in (
         ("graph_enabled", "图能力开关"),
         ("context_caliber", "上下文口径"),
+        ("wiki_enabled", "wiki 能力开关"),
     ):
         old = base_caliber.get(key, "<未记录>")
         new = now_caliber.get(key, "<未记录>")
@@ -273,12 +379,23 @@ async def run_eval(
     # 图召回观测（§14.6 可测化）：按轮累加，与上面四个答案质量计数**分开**
     # —— 「答得对不对」和「图补了多少」是两个维度，混进同一个计数器就都解释不清
     graph_acc: dict = {"covered": 0, "unique": 0, "degraded": Counter(), "rounds": 0}
+    # 第 4 步 wiki 导航观测（§2.6 ②-b 假绿防线）：与答案质量计数分开聚合，
+    # 三个数只记录、不进 `_compare_baseline()` 的方向表。
+    wiki_acc: dict = {
+        "hit_cases": 0,
+        "expanded_cases": 0,
+        "expanded_terms": 0,
+        "degraded_reasons": Counter(),
+        "rounds": 0,
+        "answerable_rounds": 0,
+    }
 
     async with httpx.AsyncClient() as client:
         # 可答
         for case in answerable:
             result = await _ask_one(client, base_url, case.question, kb_ids, token)
             _accumulate_graph_observation(graph_acc, result)
+            _accumulate_wiki_nav_observation(wiki_acc, result, answerable=True)
             if result["refused"]:
                 wrong_refusal += 1
                 print(f"[漏答] {case.question} -> refused({result['refuse_reason']})")
@@ -299,6 +416,7 @@ async def run_eval(
         for case in unanswerable:
             result = await _ask_one(client, base_url, case.question, kb_ids, token)
             _accumulate_graph_observation(graph_acc, result)
+            _accumulate_wiki_nav_observation(wiki_acc, result, answerable=False)
             if result["refused"]:
                 correct_refusal += 1
                 print(f"[拒答] {case.question} -> {result['refuse_reason']}")
@@ -361,6 +479,9 @@ async def run_eval(
         )
     print(f"★ 口径禁令: {CROSS_PATH_NOTE}")
 
+    # ── 第 4 步 · wiki 导航观测：报告 MUST 打印三个数（§2.6 ②-b）──
+    _print_wiki_nav_observation(wiki_acc, bool(settings.wiki_enabled))
+
     metrics = {
         "refusal_rate": round(refusal_rate, 4),
         "miss_rate": round(miss_rate, 4),
@@ -375,6 +496,13 @@ async def run_eval(
         "graph_unique": graph_acc["unique"],
         "graph_degraded_reasons": degraded,
         "graph_rounds": graph_acc["rounds"],
+        # ── 第 4 步 wiki 导航三数（**只记录**）──
+        # ★ `_compare_baseline()` 仍只遍历 refusal_rate / hit_rate / miss_rate 三项，
+        #   这三个键不会进方向表；改了值也不会让 --baseline 误判回退。
+        # ★ 门槛判定在报告打印处，不在落库处：结论无效 ≠ 运行失败，不能写成 FAIL。
+        "wiki_nav_hit_cases": wiki_acc["hit_cases"],
+        "wiki_nav_expanded_cases": wiki_acc["expanded_cases"],
+        "wiki_nav_expanded_terms": wiki_acc["expanded_terms"],
     }
 
     failed = 0
@@ -399,6 +527,22 @@ async def run_eval(
         # 跨链路口径禁令随记录落库（与门禁报告共用同一份文本，见 CROSS_PATH_NOTE）：
         # 只看 eval_runs 的人也必须看到「本行分数不能和 admin 门禁的分数比」
         caliber["context_note"] = CROSS_PATH_NOTE
+        # 第 4 步 · wiki 能力开关（§2.6 ② / F14）：`config_fingerprint` 里虽有
+        # `wiki_enabled`，但指纹是哈希，回答不了「这条基线开没开 wiki」。这里补一个
+        # 顶层可读键，`_warn_caliber_drift` 才能真正在开/关两条基线互比时报警。
+        # 与 `context_caliber` 同属**本批次运行口径**，故在 run_eval 层留痕，
+        # 不改 `caliber.build_caliber_snapshot()`（消息级答案口径，另一个消费面）。
+        caliber["wiki_enabled"] = bool(settings.wiki_enabled)
+        # §2.6 ② 新增的 caliber["wiki_nav"]（只记录，不进方向表）。
+        # ★ `degraded_reasons` 刻意留空：设计 §2.4 明确**不新增** `RetrievalResult`
+        #   顶层降级字段，逐请求原因只走 `rag.wiki.nav.degraded` 聚合指标；
+        #   SSE 载荷里没有可读的逐轮原因，这里若填数字就是伪造证据。
+        caliber["wiki_nav"] = {
+            "hit_cases": wiki_acc["hit_cases"],
+            "expanded_cases": wiki_acc["expanded_cases"],
+            "expanded_terms": wiki_acc["expanded_terms"],
+            "degraded_reasons": {},
+        }
 
         if baseline:
             base_row = await latest_eval_run(session, tenant_id, fingerprint)

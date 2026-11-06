@@ -115,6 +115,13 @@ class EvalReport:
     graph_covered: int = 0
     graph_unique: int = 0
     graph_degraded_reasons: dict[str, int] = field(default_factory=dict)
+    # 第 4 步 wiki 导航三数（**只记录**，设计 §4 段 C / §2.6 ②-b）：
+    # 不进任何通过/失败判定、不进基线方向表；admin 门禁是辅助链路，三数与
+    # run_eval.py 生产链路的同名三数**禁止横向比较**（CROSS_PATH_NOTE 双口径禁令）。
+    # 三个字段与 run_eval 报告打印的 hit_cases / expanded_cases / expanded_terms 同义。
+    wiki_nav_hit_cases: int = 0
+    wiki_nav_expanded_cases: int = 0
+    wiki_nav_expanded_terms: int = 0
     # 逐条结果
     cases: list[EvalCaseResult] = field(default_factory=list)
 
@@ -127,6 +134,23 @@ def _accumulate_graph_stats(
     report.graph_unique += int(result.path_stats.get("graph_unique", 0))
     if result.graph_degraded_reason:
         reasons[result.graph_degraded_reason] += 1
+
+
+def _accumulate_wiki_nav_stats(report: EvalReport, result: RetrievalResult) -> None:
+    """把单条检索的 wiki 导航观测并进报告（**只记录**，第 4 步段 C）。
+
+    ★ 两个入口口径不同：`with_recall_chunks=False` 走单趟 `retrieve()`（逐请求值），
+      `True` 走 `retrieve_chain()`（多轮**按轮求和值**，§7-U-E）。这里统一用
+      `> 0` 判「这一条 case 至少命中 / 至少扩出过词」，词元数按原值累加。
+      与 run_eval.py 生产链路的三数**禁止横向比较**（CROSS_PATH_NOTE）。
+    ★ 缺字段按 0 计：关闭态 / 降级态 / 老版本服务端没有这两个键，不该让评估失败。
+    """
+    stats = result.path_stats or {}
+    hits = int(stats.get("wiki_nav_hits", 0) or 0)
+    terms = int(stats.get("wiki_nav_terms", 0) or 0)
+    report.wiki_nav_hit_cases += int(hits > 0)
+    report.wiki_nav_expanded_cases += int(terms > 0)
+    report.wiki_nav_expanded_terms += terms
 
 
 async def run_eval(
@@ -217,6 +241,8 @@ async def run_eval(
 
         # 图召回是召回侧观测，与"喂不喂给模型"无关 —— 无论开关都收
         _accumulate_graph_stats(report, result, graph_reasons)
+        # 第 4 步 wiki 导航三数同理：只记录、不进通过判定、不进方向表
+        _accumulate_wiki_nav_stats(report, result)
 
         # 如果检索阶段就拒答
         if result.refused:
@@ -303,6 +329,10 @@ async def run_eval(
             "graph_covered": report.graph_covered,
             "graph_unique": report.graph_unique,
             "graph_degraded_reasons": report.graph_degraded_reasons,
+            # 第 4 步三数（只记录；日志里留痕，不参与任何判定）
+            "wiki_nav_hit_cases": report.wiki_nav_hit_cases,
+            "wiki_nav_expanded_cases": report.wiki_nav_expanded_cases,
+            "wiki_nav_expanded_terms": report.wiki_nav_expanded_terms,
         },
     )
 
