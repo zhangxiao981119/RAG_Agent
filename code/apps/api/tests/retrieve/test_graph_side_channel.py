@@ -137,6 +137,7 @@ def svc(monkeypatch: pytest.MonkeyPatch):
                 rerank_enabled=False,
                 graph_enabled=graph_enabled,
                 graph_retrieve_timeout_ms=800,
+                wiki_enabled=False,
             ),
         )
         # FTS 路关掉：与本文件要验证的接线无关，少一个分支

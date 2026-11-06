@@ -14,14 +14,29 @@
   `summary` / `sections` 一个字都不进上下文（SQL 只 SELECT document_id, key_terms）。
   术语错的最坏后果是「多召回几片无关原文」，由既有 L1 阈值与 RRF 排序自然淘汰，
   不会变成「模型被告知了一个假事实」。
+
+★ 失败语义（设计 §2.4）：在线 **fail-open** —— 超时 / 异常 / 无页都返回「不扩展」
+  哨兵，绝不把异常抛回 `retrieve()`。`set_config(..., is_local=true)` 的作用域是
+  **整个事务**，成功路径 MUST 还原到调用前值；失败路径 `rollback()` 后事务级设置
+  随之消失，**不再发还原 SQL**（与 `services/graph/recall.py` 同款，F16）。
 """
 from __future__ import annotations
 
+import logging
+import time
 import uuid
 from dataclasses import dataclass
 
+from asyncpg.exceptions import QueryCanceledError
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import decisions
+from app.config.wiki_profile import WikiProfile
+from app.infra import metrics
 from app.services import keyword_text
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -105,3 +120,192 @@ def select_nav_terms(
         if len(out) >= decisions.WIKI_NAV_MAX_TERMS:
             break
     return out, list(dict.fromkeys(fts))
+
+
+# ── 段 B：导航 SQL（设计 §2.1.3，可直接编码）──────────────────────────
+# {where_base} 由 app.services.retrieve._WHERE_BASE **延迟 import 逐字内联**：
+# 取的是同一个字符串对象，不是副本；复制一份到本文件必然漂移，而漂移的表现是
+# 越权或漏召回，都不报错（与 graph/recall.py:_CHUNK_SQL_TEMPLATE 同款纪律）。
+# 别名 `c` 不变、四闸门不增不减不重排；`**pushdown` 4 个绑定值原样展开。
+_WIKI_NAV_SQL = """
+WITH hit AS (
+    SELECT p.document_id,
+           p.key_terms,
+           max(length(n.term))     AS best_len,
+           count(DISTINCT n.term)  AS hit_terms
+    FROM wiki_pages p
+    CROSS JOIN LATERAL unnest(CAST(:needles AS text[])) AS n(term)
+    JOIN LATERAL jsonb_array_elements_text(p.key_terms) AS kt(term) ON TRUE
+    WHERE p.tenant_id = :tenant_id
+      AND p.kb_id = ANY(:authorized_kb_ids)
+      AND p.scope = 'doc'
+      AND p.status = 'ready'
+      AND p.generator_model = :gm
+      AND p.prompt_version  = :pv
+      AND EXISTS (
+            SELECT 1 FROM chunks c
+            {where_base}
+              AND c.document_id = p.document_id
+      )
+      AND strpos(lower(kt.term), n.term) > 0
+    GROUP BY p.document_id, p.key_terms
+)
+SELECT document_id, key_terms
+FROM hit
+ORDER BY best_len DESC, hit_terms DESC, document_id ASC
+LIMIT :max_pages
+"""
+# 逐条说明（都是可写错的地方，见设计 §2.1.3）：
+# · `p.tenant_id = :tenant_id` 与 `_WHERE_BASE` 的 `c.tenant_id = :tenant_id`
+#   **并存不冲突**：前者让 idx_wiki_pages_kb 立刻收敛，后者保证 EXISTS 内的 chunk
+#   属于本租户；`c.document_id = p.document_id` 把两者绑定。第 3 步详情 SQL 靠
+#   page_id 定位所以没写，本步按 kb 集合扫描**必须**显式加。
+# · **不重算 `authorized_kb_ids`**：`pushdown` 已是 chat.py 算好的 effective_kb_ids
+#   （含 admin 豁免 + 前端选库交集）。再查一次库 / 再合并一次会重蹈「admin 豁免
+#   失效 / 检索范围被扩大」的既有坑。
+# · 口径双过滤（gm / pv 来自 `current_wiki_profile()`）：旧口径页在重建窗口期被
+#   **排除**而非混算，与图召回 fail-closed 同纪律。
+# · 排序全序：`best_len DESC`（命中最长查询词元 = 最具体）→ `hit_terms DESC` →
+#   `document_id ASC`。**不用 `p.id`**：页重建 = DELETE+INSERT 换 id（P2-2）。
+# · `LIMIT :max_pages = 1`：只取一页，避免不同主题术语拼进同一个查询。
+# · **红线 A**：SQL 只 SELECT `document_id, key_terms`；`summary` / `sections`
+#   连读都没被读，wiki 文本一个字都不进上下文。
+# · `:needles` 传 Python `list[str]`，显式 `CAST(:needles AS text[])` 给 asyncpg
+#   类型推断兜底；不拼字符串再 `string_to_array`（词元可能含逗号 / 空格）。
+
+
+def _classify(exc: BaseException) -> str:
+    """把在线失败归到 ``timeout`` / ``error`` 两档（只用于 metrics 的 reason 标签）。
+
+    ★ **不新造异常分类体系**，照抄项目既有异常面（`services/graph/recall.py`）：
+      · Python 侧墙钟取消 = ``TimeoutError``（``asyncio.timeout``，py3.11+ 即内建，
+        ``asyncio.TimeoutError is TimeoutError`` 已实证）；
+      · DB 侧 ``statement_timeout`` 取消 = ``asyncpg.exceptions.QueryCanceledError``，
+        SQLAlchemy 可能包一层，原始异常挂在 ``.orig`` / ``__cause__`` / ``__context__``。
+      其余一律 ``error``。沿链展开而不是只判顶层：包一层的驱动异常若被判成 error，
+      超时就会静默混进「代码 bug」桶，运维据此查错方向全错。
+    """
+    chain: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while chain:
+        cur = chain.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if isinstance(cur, (TimeoutError, QueryCanceledError)):
+            return "timeout"
+        orig = getattr(cur, "orig", None)
+        if isinstance(orig, BaseException):
+            chain.append(orig)
+        for nxt in (cur.__cause__, cur.__context__):
+            if isinstance(nxt, BaseException):
+                chain.append(nxt)
+    return "error"
+
+
+async def _rollback_quietly(session: AsyncSession) -> None:
+    """吞掉 rollback 自身的异常：连接可能已断，它的失败不该盖住原始错因。"""
+    try:
+        await session.rollback()
+    except Exception:  # noqa: BLE001 - 见 docstring
+        logger.debug("wiki 导航失败后的 rollback 也失败了（忽略）", exc_info=True)
+
+
+async def _read_statement_timeout(session: AsyncSession) -> str:
+    """读当前事务生效的 statement_timeout，作为稍后还原的目标值。
+
+    读失败退回 ``"0"``（PG 默认值 = 不限）：还原目标拿不到不该让导航整体失败，
+    也不该抛到 `retrieve()` 破坏 fail-open（设计 §2.4 ①「读原值，不硬编码 0」
+    指的是**不假设**原值为 0，读失败时的兜底与它不矛盾；与 graph/recall.py 同款）。
+    """
+    try:
+        value = await session.scalar(text("SELECT current_setting('statement_timeout')"))
+    except Exception:  # noqa: BLE001 - 见 docstring
+        logger.debug("读取 statement_timeout 失败，还原目标退回 0", exc_info=True)
+        return "0"
+    return "0" if value is None else str(value)
+
+
+async def load_wiki_nav_page(
+    session: AsyncSession,
+    *,
+    needles: list[str],                        # = build_ilike_terms(query)，未扩展
+    pushdown: dict[str, object],               # 直接 ** 展开，不重算、不改名
+    profile: WikiProfile,                      # gm / pv 的唯一来源
+    timeout_ms: int,
+) -> WikiNavPage:
+    """发 1 条 SELECT 找命中页；任何失败都返回「不扩展」，**绝不抛给主链路**。
+
+    ★ 三段式（设计 §2.4，照抄第 2 步踩过的 F16 坑）：
+      ① 读原值 → ② `set_config('statement_timeout', :ms, true)` → ③ 导航 SELECT，
+      成功路径最后一条 SQL MUST 是 ④ 还原到**调用前值**；失败路径 `rollback()` 后
+      事务级设置随事务消失，**不还原**、也不再发任何 SQL。
+    ★ 位置特殊性：导航查询在三路关键词召回**之前**，比图召回更靠前。溢出会套到
+      紧接着的 ILIKE（顺序扫描，最易超时）/ FTS 上，所以还原点唯一且不可漏。
+    ★ 还原失败也 fail-open：单独 try 包住，失败就 `rollback()` 并返回「不扩展」，
+      绝不把异常抛回 `retrieve()`。
+    ★ ``no_match`` 是正常态：只打 ``rag.wiki.nav.no_match``，**不计 degraded**；
+      保留在 `degraded_reason` 仅供单测与本地排障区分「空 needles / 无页 / 空选词」。
+    """
+    started = time.perf_counter()
+
+    def _ms() -> float:
+        return (time.perf_counter() - started) * 1000
+
+    if not needles:
+        return WikiNavPage(degraded_reason="no_match")
+
+    # 延迟 import：retrieve 包正向 import 了 wiki 包（在 if wiki_on 内），模块级
+    # 反向 import `_WHERE_BASE` 会成环；取同一个字符串对象，逐字内联，别名 c 不变。
+    from app.services.retrieve import _WHERE_BASE
+
+    sql = _WIKI_NAV_SQL.format(where_base=_WHERE_BASE)
+    params = {
+        **pushdown,
+        "needles": needles,
+        "gm": profile.generator_model,
+        "pv": profile.prompt_version,
+        "max_pages": decisions.WIKI_NAV_MAX_PAGES,
+    }
+
+    previous = await _read_statement_timeout(session)
+    try:
+        # ★ MUST 用 set_config() 而不是 `SET LOCAL statement_timeout = :ms`：
+        #   SET 是工具语句，不接受绑定参数（asyncpg 扩展协议发 $1 → syntax error）。
+        await session.execute(
+            text("SELECT set_config('statement_timeout', :ms, true)"),
+            {"ms": str(int(timeout_ms))},
+        )
+        row = (await session.execute(text(sql), params)).first()
+    except Exception as exc:  # noqa: BLE001 - 契约：本函数永不抛（见模块 docstring）
+        # QueryCanceled 会让事务进入 aborted 状态 → MUST rollback，否则紧接着的
+        # ILIKE / FTS 两条 SQL 全部报 "current transaction is aborted"。
+        await _rollback_quietly(session)
+        reason = _classify(exc)
+        logger.info("wiki 导航查询失败，本次不扩展词元: %s", reason, exc_info=exc)
+        metrics.incr("rag.wiki.nav.degraded", reason=reason)
+        return WikiNavPage(degraded_reason=reason, elapsed_ms=_ms())
+
+    # 成功路径（含 no_match）：最后一条 SQL 是还原，且只此一处 —— 失败路径已
+    # rollback，事务级设置随之消失，不需要也不应该再发 SQL。
+    try:
+        await session.execute(
+            text("SELECT set_config('statement_timeout', :v, true)"),
+            {"v": previous},
+        )
+    except Exception:  # noqa: BLE001 - 见 §2.4 ④
+        await _rollback_quietly(session)
+        logger.warning("wiki 导航还原 statement_timeout 失败", exc_info=True)
+        metrics.incr("rag.wiki.nav.degraded", reason="error")
+        return WikiNavPage(degraded_reason="error", elapsed_ms=_ms())
+
+    elapsed = _ms()
+    if row is None:
+        metrics.incr("rag.wiki.nav.no_match")
+        return WikiNavPage(degraded_reason="no_match", elapsed_ms=elapsed)
+    metrics.incr("rag.wiki.nav.hit")
+    return WikiNavPage(
+        document_id=row.document_id,
+        key_terms=tuple(row.key_terms or ()),
+        elapsed_ms=elapsed,
+    )

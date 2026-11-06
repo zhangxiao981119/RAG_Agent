@@ -131,7 +131,9 @@ def svc(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(
             retrieve_mod,
             "get_settings",
-            lambda: SimpleNamespace(rerank_enabled=True, graph_enabled=False),
+            lambda: SimpleNamespace(
+                rerank_enabled=True, graph_enabled=False, wiki_enabled=False
+            ),
         )
         monkeypatch.setattr(decisions, "KEYWORD_TSQUERY_ENABLED", False)
         return RetrievalService(), lambda: FakeSession(h)

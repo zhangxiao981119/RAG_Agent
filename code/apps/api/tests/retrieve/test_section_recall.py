@@ -134,7 +134,9 @@ def svc(monkeypatch: pytest.MonkeyPatch):
             retrieve_mod,
             "get_settings",
             # graph_enabled=False：本文件测章节补全时序，开图会多一条图 SQL
-            lambda: SimpleNamespace(rerank_enabled=True, graph_enabled=False),
+            lambda: SimpleNamespace(
+                rerank_enabled=True, graph_enabled=False, wiki_enabled=False
+            ),
         )
         monkeypatch.setattr(decisions, "KEYWORD_TSQUERY_ENABLED", False)
         return RetrievalService(), lambda: FakeSession(h)

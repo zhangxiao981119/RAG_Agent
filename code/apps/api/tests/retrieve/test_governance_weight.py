@@ -115,7 +115,9 @@ def svc(monkeypatch: pytest.MonkeyPatch):
             retrieve_mod,
             "get_settings",
             # graph_enabled=False：本文件测治理加权的阈值口径，图召回与此无关
-            lambda: SimpleNamespace(rerank_enabled=True, graph_enabled=False),
+            lambda: SimpleNamespace(
+                rerank_enabled=True, graph_enabled=False, wiki_enabled=False
+            ),
         )
         # 关掉 FTS 路径：审查加权行为与关键词路无关，减少分支
         monkeypatch.setattr(decisions, "KEYWORD_TSQUERY_ENABLED", False)

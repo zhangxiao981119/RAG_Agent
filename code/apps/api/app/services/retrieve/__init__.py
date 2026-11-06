@@ -28,6 +28,7 @@ from app.services.keyword_text import (
     build_fts_query,
     build_ilike_pattern,
     build_ilike_terms,
+    normalize_query_text,
 )
 from app.services.lexicon import alias_index_tokens, load_alias_map
 from app.services.retrieve.base import RetrievalResult, RetrievedChunk
@@ -245,8 +246,41 @@ class RetrievalService:
         #    tsquery 走 GIN 索引，混在一起会把两路的成本差异互相掩盖。
         t0 = time.perf_counter()
         ilike_terms = build_ilike_terms(query)
+
+        # ① wiki 导航查页（第 4 步，设计 §2.3.2）：判定用**未扩展**的 ilike_terms，
+        #   让「命中页 → 扩词」严格单向，避免一次请求内自我放大（§2.1.1）。
+        #   ★ 关闭态不能出现任何 wiki 模块符号（连 dataclass 都不实例化）——否则
+        #     「零加载」会退化成「零 SQL 但已 import」。故全部用原生哨兵 + 函数句柄，
+        #     wiki 模块的 import 一律放在 if 内。
+        nav_key_terms: tuple[str, ...] = ()
+        nav_hit = False
+        nav_select = None                                  # type: Callable | None
+        nav_stats: dict[str, int] = {}                     # 见 ⑥：path_stats 到 698 行才存在
+        wiki_terms: list[str] = []
+        wiki_fts_tokens: list[str] = []
+        wiki_on = get_settings().wiki_enabled
+
+        if wiki_on and ilike_terms:
+            from app.config.wiki_profile import current_wiki_profile
+            from app.services.wiki.navigate import load_wiki_nav_page, select_nav_terms
+
+            nav_select = select_nav_terms
+            page = await load_wiki_nav_page(
+                session,
+                needles=ilike_terms,
+                pushdown=pushdown,
+                profile=current_wiki_profile(),
+                timeout_ms=get_settings().wiki_nav_timeout_ms,
+            )
+            nav_key_terms = page.key_terms
+            nav_hit = page.document_id is not None
+            stages["wiki_nav"] = int(page.elapsed_ms)
+            metrics.observe_ms("rag.retrieve.wiki_nav", page.elapsed_ms)
+            nav_stats["wiki_nav_hits"] = int(nav_hit)
+
         # 领域词表扩展（kb_terms）：命中词元补另一侧写法，ILIKE 正则与 tsquery 共用。
         # 一次精确键查询（jsonb ?|），词表再大也只回命中行。
+        # ② 位置不变；nav 查询在前，只是因为 ③ 选词要等 alias_map 就绪。
         alias_map: dict[str, list[str]] = {}
         if ilike_terms and decisions.ALIAS_EXPANSION_ENABLED:
             t_lex = time.perf_counter()
@@ -256,6 +290,31 @@ class RetrievalService:
             metrics.observe_ms("rag.retrieve.lexicon", lexicon_ms)
             if alias_map:
                 metrics.incr("rag.lexicon.expand", len(alias_map))
+
+        # ③ 选词（纯函数，零 SQL）：仅在开关开启且查页成功时才可能产出非空。
+        #    wiki_terms / wiki_fts_tokens 是**同一次** select_nav_terms 的两个返回值，
+        #    ILIKE 与 FTS 共用，不存在「两路各自查一次库」或「两路扩了不同的词」。
+        if nav_select is not None and nav_key_terms:
+            alias_forms = {f for forms in alias_map.values() for f in forms}
+            wiki_terms, wiki_fts_tokens = nav_select(
+                list(nav_key_terms),
+                ilike_terms,
+                normalize_query_text(query[:400]),
+                alias_forms,
+            )
+            nav_stats["wiki_nav_terms"] = len(wiki_terms)
+
+        # ③-b 观测：★ 每个开启态请求都打桶（含 0 词元），否则分布缺 0 桶、
+        #    分位数失真。bucket=min(n,3) 把 {0,1,2,3+} 映射成 4 个低基数枚举值，
+        #    报告侧把 "3" 显示为 gt2；WIKI_NAV_MAX_TERMS=2 是硬上限，
+        #    故 bucket="3" 恒为 0 正是「上限没被绕过」的可证事实。
+        if wiki_on:
+            metrics.incr(
+                "rag.wiki.nav.terms_bucket", bucket=str(min(len(wiki_terms), 3))
+            )
+            if wiki_terms:
+                metrics.incr("rag.wiki.nav.expand", len(wiki_terms))
+
         # 词表查询单独计时，ILIKE 段只算自身 SQL —— 否则词表往返会被算进子串扫
         t0 = time.perf_counter()
         keyword_rows: list = []
@@ -267,8 +326,15 @@ class RetrievalService:
                     **pushdown,
                     # 型号词元由 build_ilike_pattern 展开可选分隔符
                     # （`xyz[-_ ]?1000`），其余词元只做 re.escape；
-                    # 词表别名作为同一逻辑词元的分支并列 OR
-                    "pattern": build_ilike_pattern(ilike_terms, alias_map),
+                    # 词表别名作为同一逻辑词元的分支并列 OR；
+                    # ④ wiki 扩展词走**独立预算**的附加 OR 分支，不占 ILIKE_MAX_TERMS
+                    #   名额、不重排截断原词元（§2.2.1 / §6-C7）。降级时 wiki_terms=[]
+                    #   → 与不传 extra_terms 逐字节相同（Golden Test 钉住）。
+                    "pattern": build_ilike_pattern(
+                        ilike_terms, alias_map, extra_terms=wiki_terms
+                    ),
+                    # ★ :needle 不变：仍是最长的**原 query 词元**。换成 wiki 词元会
+                    #   改变 ORDER BY 的 strpos 定序 → RRF 顺序漂移 → 217 条基线风险。
                     "needle": ilike_terms[0].lower(),
                     "limit": decisions.TOP_K_RECALL,
                 },
@@ -281,8 +347,14 @@ class RetrievalService:
         # ★ tsquery 路径：走 idx_chunk_fts_vec，中文按 3 字窗口、ASCII 按整词
         fts_rows = []
         fts_ms = 0.0
+        # ⑤ wiki 索引词元走独立 FTS 预算（WIKI_NAV_MAX_FTS_TOKENS=6），
+        #   不重截原 24 词元窗口；降级时 extra_index_tokens=[] → 原分支逐字节相同。
         tsquery = (
-            build_fts_query(query, alias_index_tokens(alias_map))
+            build_fts_query(
+                query,
+                alias_index_tokens(alias_map),
+                extra_index_tokens=wiki_fts_tokens,
+            )
             if decisions.KEYWORD_TSQUERY_ENABLED
             else None
         )
@@ -721,6 +793,13 @@ class RetrievalService:
             neighbor_ids = {n.chunk_id for n in graph_outcome.neighbors}
             path_stats["graph_covered"] = len(neighbor_ids & retrieved_ids)
             path_stats["graph_unique"] = len(graph_chunks)
+
+        # ⑥ wiki 导航两键：只能在 `path_stats` 初始化（原第 698 行）**之后**写，
+        #    在第 247 行直接写会是 NameError。关闭态 nav_stats 为空 → 不写任何
+        #    wiki_* 键，path_stats 与未实现本步时逐键相同（本步最高优先级的回滚保证）。
+        #    两个值都是 int，chat.py 的 **result.path_stats 自动带进 SSE / 审计，
+        #    merge_rounds 按轮求和；原因字符串只进 metrics.incr，不进这里。
+        path_stats.update(nav_stats)
 
         return RetrievalResult(
             chunks=retrieved,
