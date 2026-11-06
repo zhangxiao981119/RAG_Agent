@@ -1,13 +1,13 @@
 # 测试报告 · 第 4 步「wiki 导航参与检索」P3 独立验证
 
 > **验证者**：agent-harness-tester-3（P3 独立验证者）
-> **日期**：2026-11-06（含「真库前提更新」补充轮）
+> **日期**：2026-11-06（含「真库前提更新」补充轮、增量复验轮、**最终形态复核轮 / P1-1 修复后独立复验**）
 > **项目根**：`C:\Users\86186\Desktop\AI Agent学习\file_rag_agent`
 > **工作模式**：**只读实现代码**。全程未修改任何实现文件 / `docker-compose.yml` / `Dockerfile`（变异自检在临时副本上、真库诊断补丁在临时脚本上，原文件 SHA256 前后一致）；未 `git commit`、未 `git push`。补充轮按 N4 向**真库**写入过合成页（独立租户，跑完由交付文件自带的 `_cleanup` 清理、并经独立只读 SQL 复核 count=0）。
 > **独立性声明**：不采信实现者「已完成」声明，**也不采信下发前提**。补充轮亲自复核了 Docker / PG 环境与真库元数据；以下每条结论均来自本轮实际执行的命令与原始输出；无「已核对」「存在」一类空话。
 > **补充轮说明**：首轮下发「Docker daemon 未启动、无 PostgreSQL 实例」在本轮开始前已过时。本轮按实测重写 §0.2 环境、§0.3、§0.4、H6、H8、H10、I 全节、问题清单与放行建议，并**真的把真库探针跑起来**；A~G 七项的结论与证据不变。
 > **增量复验轮**：coder-3 提交 `3c5d209` 声称修复 P1-1 / P2-7 后，本轮再次独立复核提交范围、重建镜像、注入真库 URL 复跑探针（**10 passed / 0 failed / 0 skipped**）、跑全量回归、做提交态钉子变异自检，并如实记录**工作区存在未提交改动、与提交态不一致**的版本漂移（P2-8）。完整证据见 §0.5、H6 / H10、I4 与问题清单。
-> **中间形态复核轮（§0.6，已被撤销，历史记录）**：§0.5 落盘后 HEAD 一度被 amend 为 `cbd7b0d`（303 行 / 10 用例 / **删除回归钉子**）。本轮独立核对该形态三方 hash 一致（`8299e309…`）、真库 `10/10` 复跑通过，并做对抗性实证（删 3 列复现 P1-1 → 宿主 `sssssssss.` 全绿 exit=0 / 容器真库 `FFFFFFFFF.` 9 FAILED exit=1），据此登记 P2-8「回归护栏缺失」。**随后 reflog 显示 `reset: moving to 3c5d209`，该形态已被撤销**；§0.6 保留为过程审计，不再是最终结论。
+> **中间形态复核轮（§0.6，已被撤销，历史记录）**：§0.5 落盘后 HEAD 一度因误做 `git commit --amend` 变为游离对象 `cbd7b0d`（303 行 / 10 用例 / **删除回归钉子**），后按交付裁决 `reset` 恢复。本轮独立核对该形态三方 hash 一致（`8299e309…`）、真库 `10/10` 复跑通过，并做对抗性实证（删 3 列复现 P1-1 → 宿主 `sssssssss.` 全绿 exit=0 / 容器真库 `FFFFFFFFF.` 9 FAILED exit=1），据此登记 P2-8「回归护栏缺失」。**随后 reflog 显示 `reset: moving to 3c5d209`，该形态已被撤销**；§0.6 保留为过程审计，不再是最终结论。
 > **最终形态复核轮（§0.7，当前口径）**：HEAD 已 reset 回 `3c5d209`（363 行 / **11 用例 / 含回归钉子**）；工作区为 CRLF、HEAD blob 为 LF，`core.autocrlf=true` 归一化后逐字节一致。本轮再重建镜像（`BUILD_EXIT=0`，镜像内 363 行 / `e9e0c01a…` / 含钉子）、重跑宿主探针（`sssssssss..` = 9 skip + **2** pass，钉子在宿主可跑）、真库探针（junit `tests=11 failures=0 errors=0 skipped=0`、exit=0）、容器内全量（`942 / 930 passed / 1 failed / 0 errors / 11 skipped`，唯一失败仍是 redis DNS 环境问题）、钉子变异自检（删列名 → `AssertionError: 列清单漏了必填列 embedding_model` → 还原转绿）。**P2-8 随钉子回归而消解**；新增 P2-9 登记 HEAD 三次改写与行尾差异。**本报告的最终放行口径以 §0.7 与文末「放行建议」为准。**
 
 ---
@@ -108,11 +108,13 @@ $ python <字节比对>  → 工作区 17057 bytes / CRLF 363 行；HEAD blob 16
                        core.autocrlf=true；归一化后逐字节一致 = True；git diff HEAD -- 该文件 = 空
 ```
 
-→ **当前最终交付形态 = `3c5d209`（363 行 / 11 用例 / 含回归钉子 / 补 3 列 / P2-7 文案已改）**。验证期间 HEAD 共被改写 3 次（`3c5d209` → `cbd7b0d` → reset 回 `3c5d209`），登记 **P2-9**（流程与行尾一致性建议）。本轮所有**最终**结论以 `3c5d209` 为对象，见 §0.7；§0.6 降级为中间形态审计记录。
+→ **当前最终交付形态 = `3c5d209`（363 行 / 11 用例 / 含回归钉子 / 补 3 列 / P2-7 文案已改）**。HEAD 共出现 **三次视图变化**：`3c5d209`（定稿形态）→ 实现者**误做** `git commit --amend`，生成游离对象 `cbd7b0d`（删钉子、11→10 用例）→ 按 team-lead「保留 4 commit、不 amend」裁决执行 `git reset --mixed 3c5d209` **恢复分支指针**。属**一次误操作 + 一次恢复动作，非主动反复改形态**；过程事实如实保留，登记 **P2-9**（流程与行尾一致性建议）。本轮所有**最终**结论以 `3c5d209` 为对象，见 §0.7；§0.6 降级为中间形态审计记录。
+
+**HEAD 后续前进（交付批次，本轮亲自复核）**：team-lead 统一提交文档批次与本报告后，HEAD 已前进为 `392ddbb`（`test(report): 纳入第 4 步 wiki 导航 P3 独立验证报告`），其 parent 链含 `367d2fb`（`docs(step4): 刷新第 4 步交付状态`）→ `3c5d209`。`$ git merge-base --is-ancestor 3c5d209 HEAD` = **YES**；`$ git diff --name-only 3c5d209 HEAD` 仅含文档 / 报告文件，**`code/apps/api/tests/wiki/test_nav_acl.py` 零变化**（工作区仍 `e9e0c01a…` / 363 行）。→ **验证对象未变**，本报告所有 `3c5d209` 证据继续有效；`86f5fc7` 仍是 I1.2 镜像 hash 锚点。
 
 **⚠ 验证对象漂移（登记 P2-8）**：提交态 `3c5d209` 的文件是 **363 行 / 11 用例**（含新钉子 `test_seed_insert_includes_chunks_not_null_columns`、模块级常量 `_SEED_*`）；磁盘当前工作区文件（**未提交 ` M`**）是 **303 行 / sha256 `8299e309…` / 10 用例**，钉子与模块常量被删、绑定值改为内联字面量、skip reason 又改一版。两版**都含** 3 列修复与 P2-7 整改。本轮真库证据一律以**磁盘当前内容**为准（镜像内 hash 已核对一致，见 §0.5.2），**不把「11 passed」写成当前版本结果**。
 
-> **★ 状态更新（§0.7，最终口径）**：上述漂移经历 3 次 HEAD 改写后**已彻底消除**：当前 HEAD = `3c5d209`，工作区（CRLF）与 HEAD blob（LF）归一化后逐字节一致、镜像内文件与工作区逐字节一致（§0.7.1）；**回归钉子已回到最终交付中**，宿主无 DB 时钉子 + 纯函数共 2 例可跑（`sssssssss..`）→ **P2-8「回归护栏缺失」已消解并关闭**。§0.6.3 的对抗性实测仍保留，作为「为什么必须有这条钉子」的实证（无钉子形态下宿主全绿会掩盖 P1-1 回归）。历史漂移记录在此供追溯；新增 **P2-9** 登记 HEAD 并发改写与行尾差异。
+> **★ 状态更新（§0.7，最终口径）**：上述三次 HEAD 视图变化（一次误做 amend + 一次按裁决 reset 恢复）后，交付形态**已锁定**：验证对象 = `3c5d209`（现为 HEAD 的 ancestor，见上文），工作区（CRLF）与 HEAD blob（LF）归一化后逐字节一致、镜像内文件与工作区逐字节一致（§0.7.1）；**回归钉子已回到最终交付中**，宿主无 DB 时钉子 + 纯函数共 2 例可跑（`sssssssss..`）→ **P2-8「回归护栏缺失」已消解并关闭**。§0.6.3 的对抗性实测仍保留，作为「为什么必须有这条钉子」的实证（无钉子形态下宿主全绿会掩盖 P1-1 回归）。历史漂移记录在此供追溯；新增 **P2-9** 登记 HEAD 并发改写与行尾差异。
 
 ### 0.2 环境
 
@@ -155,6 +157,10 @@ $ python <字节比对>  → 工作区 17057 bytes / CRLF 363 行；HEAD blob 16
 | I 真库边界 | **分层**：已实测 0026 在库 / 真库探针实跑**并转绿** / DDL 相容性 / 合成页入库清理 / 真库 `statement_timeout` 还原 / C4 217 条精确占比；仍未跑 26 迁移全链 / 217 A/B / EXPLAIN / P95 → **「不劣化」结论仍未验证** | 容器内真库 + psql 只读 | P1-1 已修复并经**最终形态**真库复跑确认；P2-8 已消解关闭（钉子回归）；新增 P2-9（HEAD 三次改写 + 行尾差异） |
 
 **计数：P0 = 0，P1 = 0（P1-1 已修复并经最终形态复跑确认），P2 = 7 未结**（P2-7 / P2-8 已关闭、P2-9 本轮新增；详见「问题清单」）。
+
+> **P2 计数口径变化（如实登记，不悄悄删行）**：首轮 `P2 = 7`（P2-1 ~ P2-7）→ 增量复验轮登记 P2-8（`cbd7b0d` 中间形态「回归护栏缺失」）后为 `8` → 最终形态 `3c5d209` 恢复钉子后 **P2-8 消解关闭**、**P2-7 整改关闭**、新增 **P2-9**（HEAD 视图变化 + 行尾差异）→ 回到 **`P2 = 7` 未结**（P2-1 ~ P2-6 + P2-9）。**P2-8 条目保留在问题清单中并标注消解，未删行。**
+>
+> **交付台账状态（team-lead 文档批次已落盘）**：**P2-1、P2-7 已由文档批次同步**（P2-7 同时经 `3c5d209` 代码整改）；**P2-2 / P2-6 已登记进 `项目待优化清单.md`**，作为后续待办跟踪，不计入本步放行前置条件。
 
 ### 0.5 增量复验：`3c5d209` 修复 P1-1 / P2-7（本轮追加）
 
@@ -266,7 +272,7 @@ wiki_pages status → ready|1
 
 ### 0.6 中间形态复核：`cbd7b0d`（已被撤销，历史记录，非最终结论）
 
-> **状态说明（务必先读）**：本章写于 HEAD = `cbd7b0d` 期间；其后 reflog 出现 `reset: moving to 3c5d209`，该提交已被撤销、不再是 HEAD。**本章结论（尤其「P2-8 成立且已固化」）已失效**，最终口径见 §0.7。本章保留的理由：① 记录验证对象被并发改写的审计轨迹；② §0.6.3 的对抗性实测是「无钉子形态下宿主全绿掩盖 P1-1 回归」的唯一实证，恰好反证最终形态补回钉子的必要性。
+> **状态说明（务必先读）**：本章写于 HEAD = `cbd7b0d` 期间；其后 reflog 出现 `reset: moving to 3c5d209`，该提交已被撤销、不再是 HEAD。**本章结论（尤其「P2-8 成立且已固化」）已失效**，最终口径见 §0.7。本章保留的理由：① 记录验证对象视图变化（误做 amend + 按裁决 reset 恢复）的审计轨迹；② §0.6.3 的对抗性实测是「无钉子形态下宿主全绿掩盖 P1-1 回归」的唯一实证，恰好反证最终形态补回钉子的必要性。
 >
 > 触发原因：§0.5 落盘后复查 `git log` 发现 HEAD 不再是 `3c5d209`。按独立性红线，**验证对象变了就必须重验**，不能把上一轮证据直接套用到新提交上。
 
@@ -355,9 +361,14 @@ $ sha256sum code/apps/api/tests/wiki/test_nav_acl.py
 | **P2-8** | **当时成立、现已消解**：`cbd7b0d` 删除回归钉子，实测「删 3 列后宿主全绿 / 真库 9 FAILED」；`reset` 回 `3c5d209` 后钉子回归，宿主可跑且变异自检有牙（§0.7.2 / §0.7.5）→ **关闭** |
 | 效果层 | **仍未验证**：I2 六项（26 迁移全链 / 217 A/B / EXPLAIN / P95 / 假绿门槛真实触发 / 多页库）全未跑；真实 wiki 页仍仅 1 页 `ready`（此条跨形态不变） |
 
-### 0.7 最终交付形态复核：`3c5d209`（当前口径，最终结论）
+### 0.7 P1-1 修复后独立复验 / 最终交付形态复核：`3c5d209`（当前口径，最终结论）
 
-> 触发：reflog 出现 `reset: moving to 3c5d209`，HEAD 又变了。按独立性红线**再次重验**，不复用 §0.6 的任何结论。
+> **日期**：2026-11-06（最终形态复核轮）。**验证对象**：commit `3c5d209`（链 `ea552c0 → 6717a85 → 86f5fc7 → 3c5d209`），工作区 `test_nav_acl.py` = 363 行 / 11 用例 / sha256 `e9e0c01a…`；已锁定，team-lead 裁决不再 amend / reset / squash。
+> **修复 commit `3c5d209`（段 C 返工）**：`_seed` 的 chunks INSERT 补 `embedding_model` / `embedding_text_version` / `chunker_version`（值 `bge-m3` / `etext-v1` / `c400-800-60`）；新增一条**不依赖真库**的「列清单钉子」`test_seed_insert_includes_chunks_not_null_columns`（捕获型假 engine 检查 INSERT 列清单段）；同文件两处过时环境文案（P2-7）改为与具体机器无关的表述。该文件现共 **11 用例**（原 9 真库探针 + 1 statement_timeout + 1 新钉子）。
+> **复跑命令与结果（P3 本人实跑，非引用实现者）**：`docker compose -f code/docker-compose.yml build api` → `BUILD_EXIT=0`；`docker compose -f … run --rm --no-deps -T -e WIKI_NAV_ACL_DB_URL=postgresql+asyncpg://user:pass@postgres:5432/kagent api sh -c "pip install -q -i https://mirrors.aliyun.com/pypi/simple/ '.[dev]' && pytest tests/wiki/test_nav_acl.py -q -ra"` → `...........` / `DEV_MIRROR_EXIT=0`；另一路 `--junitxml` 复跑 `tests=11 failures=0 errors=0 skipped=0` / `REALDB_EXIT=0`。**验收线 `11 passed / 0 failed / exit=0` 达标**，原 9 条由 FAILED 转 PASS。详见 §0.7.3。
+> **清理复核输出（I1.5 同一套只读 SQL）**：`navacl-%` = `0`；四表合成前缀 `0|0|0|0`；真实总量 `wiki_pages=1 / chunks=580 / documents=26 / eval_cases=217 / tenants=1`；`alembic_version=0026`；`PSQL_EXIT=0`。详见 §0.7.6。
+> **边界**：**本次复验只关闭真库单请求级探针，不覆盖 217 条 A/B / EXPLAIN / P95 / 26 迁移全链**；I2 六项未跑清单与「不劣化结论未验证」一字未改（见 I2 加注）。
+> **触发**：reflog 出现 `reset: moving to 3c5d209`（按交付裁决恢复分支指针），HEAD 视图变化。按独立性红线**再次重验**，不复用 §0.6 的任何结论。
 
 #### 0.7.1 交付形态与三方一致性（含行尾差异的如实登记）
 
@@ -379,6 +390,8 @@ e9e0c01a19553f794c84a23a38add47ecdf867ddd19f24133a3f154426b02861  /workspace/app
 ```
 
 → **镜像内文件与工作区逐字节一致**（`e9e0c01a…`，363 行，含钉子）；工作区与 HEAD blob 仅行尾差异（CRLF / LF，`core.autocrlf=true` 归一化后逐字节一致），**逻辑内容完全一致**，不影响测试结论。如实登记为 P2-9。
+
+> **加注**：上述 `$ git rev-parse HEAD` 是**复核当时**的输出。此后 team-lead 统一提交文档批次与本报告，HEAD 前进至 `392ddbb`（`367d2fb` 文档刷新 → `392ddbb` 纳入本报告）；`$ git merge-base --is-ancestor 3c5d209 HEAD` = YES，`$ git diff --name-only 3c5d209 HEAD` 不含 `test_nav_acl.py`。**验证对象文件零变化**，本节证据继续有效（详见 §0.1）。
 
 #### 0.7.2 宿主探针：钉子在无 DB 环境确实可跑（P2-8 消解）
 
@@ -402,6 +415,19 @@ $ python <junit XML 解析>
 ```
 
 11 个用例逐条为 8 个 ACL 参数化 + `test_success_path_restores_statement_timeout` + **`test_seed_insert_includes_chunks_not_null_columns`** + `test_hit_page_whose_terms_are_all_in_query_expands_nothing`。**P1-1 在最终交付形态上确认解除：9 FAILED → 9 PASS，整文件 `11 passed / 0 failed / 0 skipped / exit=0`。**
+
+**另按 team-lead 指定的原命令复跑（如实登记两种结果，均为 P3 本人实跑）**：
+
+```
+$ docker compose -f … run --rm --no-deps -T -e WIKI_NAV_ACL_DB_URL=… api sh -c "pip install -q '.[dev]' && pytest tests/wiki/test_nav_acl.py -q"
+→ 依赖源拉取超时，命令被 SIGTERM 终止；输出仅容器创建两行（`p3f_original_cmd.txt`），
+  **pytest 未运行、真库未被写** → 不构成一次测试结论，不得计为通过或失败
+$ docker compose -f … run --rm --no-deps -T -e WIKI_NAV_ACL_DB_URL=… api sh -c "pip install -q -i https://mirrors.aliyun.com/pypi/simple/ '.[dev]' && pytest tests/wiki/test_nav_acl.py -q -ra"
+...........                                                              [100%]
+DEV_MIRROR_EXIT=0
+```
+
+即：仅把依赖源换为可达镜像、装的**仍是同一份 `.[dev]`**，测试用例与上面 junit 复跑同源；`11 passed / exit=0` 由两条独立命令互证。**实现者自报的同款结果不采信为 P3 证据**（QA 分层见 I2 加注）。
 
 #### 0.7.4 全量回归（容器内，精确计数）
 
@@ -443,6 +469,20 @@ $ docker exec code-postgres-1 psql -U user -d kagent -t -A -c "<5 表合成前�
 0|0|0|0|0
 wiki_pages|1 / chunks|580 / documents|26 / tenants|1 / eval_cases|217
 $ sha256sum code/apps/api/tests/wiki/test_nav_acl.py   → e9e0c01a…（未变）
+
+**另按 I1.5 同一套只读 SQL 复核（team-lead 指定口径，本轮实跑）**：
+
+```
+$ docker exec code-postgres-1 psql -U user -d kagent -t -A -c "SELECT count(*) FROM tenants WHERE code LIKE 'navacl-%';"
+0
+$ docker exec code-postgres-1 psql -U user -d kagent -t -A -c "<四表按本次合成前缀 count 联合查询>"
+0|0|0|0
+$ docker exec code-postgres-1 psql -U user -d kagent -t -A -c "<真实总量 + alembic_version 联合查询>"
+1|580|26|217|1|0026
+PSQL_EXIT=0
+```
+
+即：`navacl-%` 合成租户 = 0、四表合成数据 `0|0|0|0`、真实总量 `wiki_pages=1 / chunks=580 / documents=26 / eval_cases=217 / tenants=1` 与 `alembic_version=0026` 均未变，与复跑前基线一致。
 ```
 
 合成数据零残留、真实数据总量与基线一致；工作区实现文件 hash 未变；临时副本已删除。**本轮未改任何实现文件、未 commit、未 push。**
@@ -455,7 +495,7 @@ $ sha256sum code/apps/api/tests/wiki/test_nav_acl.py   → e9e0c01a…（未变�
 | P2-7 | **已整改关闭**：两处过时文案清除，skip 判据与 N4 纪律未动 |
 | P2-8 | **已消解关闭**：回归钉子回到最终交付；宿主可跑（`sssssssss..`），变异自检证明有牙（§0.7.2 / §0.7.5） |
 | 版本漂移 | **逻辑上已消除**：工作区 CRLF / HEAD blob LF 归一化后一致、镜像与工作区逐字节一致；行尾差异与 HEAD 三次改写登记为 P2-9 |
-| **P2-9（新）** | HEAD 在验证期间被并发改写 3 次（`3c5d209 → cbd7b0d → reset 回 3c5d209`），验证对象漂移；建议锁定交付形态、统一行尾 |
+| **P2-9（新）** | HEAD 三次视图变化（`3c5d209` → 误做 amend 生成游离 `cbd7b0d` → 按裁决 `reset --mixed 3c5d209` 恢复），**非主动反复改形态**；过程事实保留。建议锁定交付形态、统一行尾 |
 | 效果层 | **仍未验证**：I2 六项（26 迁移全链 / 217 A/B / EXPLAIN / P95 / 假绿门槛真实触发 / 多页库）全未跑；真实 wiki 页仍仅 1 页 `ready` |
 
 ---
@@ -1037,7 +1077,9 @@ a7695b1d1c6415ed70c02ed7d33770af2f0313d5c40ac7dca1db8bd2fb7f29aa  tests/wiki/tes
 
 四个 hash 与主机工作区 `Get-FileHash` 逐字节一致。重建前旧镜像中 `test_nav_acl.py` / `test_eval_wiki_nav_observation.py` / `navigate.py` 均为 `MISSING`、`keyword_text.py` = `1f6ebac7…` → 证明 rebuild 必要且生效，下面跑的确是段 C 交付代码。
 
-#### I1.3 交付探针原样实跑 → P1-1 真库复现（9 failed / 1 passed）〔修复前，历史证据〕
+#### I1.3 交付探针原样实跑 → P1-1 真库复现（9 failed / 1 passed）
+
+> **加注（上文原文逐字未改）**：本节与 H6 / I1.4 的 `9 FAILED / 1 PASSED` 是 **`86f5fc7` 修复前的历史快照，按交付裁决逐字保留**。P1-1 修复（`3c5d209`）与 P3 独立复验见 §0.7；修复后同一探针为 `11 passed / 0 failed / exit=0`。
 
 见 H6 完整命令与堆栈。摘录：
 
@@ -1149,6 +1191,14 @@ tenants|status|NO|'active'::text
 
 与 E 节打桩（FakeSession 记录 4 条 SQL 顺序、`previous='1234ms'`）互为交叉证据：真库 `set_config(..., true)` 事务级语义成立、导航查询返回基线命中页、超时预算未泄漏到后续 SQL。
 
+#### I1.8 P1-1 修复后独立复验（索引；完整证据见 §0.7）
+
+> **日期**：2026-11-06。**修复 commit**：`3c5d209`（chunks INSERT 补 3 列 + 不依赖真库的「列清单钉子」 + P2-7 文案整改；`test_nav_acl.py` 共 11 用例）。
+> **P3 独立复跑（本人实跑）**：`docker compose -f code/docker-compose.yml build api` → `BUILD_EXIT=0`；容器内注入 `WIKI_NAV_ACL_DB_URL=postgresql+asyncpg://user:pass@postgres:5432/kagent` 跑 `pytest tests/wiki/test_nav_acl.py -q` → **`11 passed / 0 failed / 0 skipped / exit=0`**，原 9 条由 FAILED 转 PASS（junit `tests=11 failures=0 errors=0 skipped=0`）。按指定原命令 `pip install -q '.[dev]'` 因依赖源超时被 SIGTERM、pytest 未运行；换可达镜像装**同一份 `.[dev]`** 后 `...........` / `DEV_MIRROR_EXIT=0`。
+> **清理复核（I1.5 同一套只读 SQL）**：`navacl-%` = `0`；四表合成前缀 `0|0|0|0`；真实总量 `wiki_pages=1 / chunks=580 / documents=26 / eval_cases=217 / tenants=1`；`alembic_version=0026`；`PSQL_EXIT=0`。
+> **完整证据**（hash 链、宿主探针 `9 skip + 2 pass`、容器全量 `942/930/1/0/11`、钉子变异自检、无钉子形态对抗性反证、§0.7.7 结论表）见 **§0.7.1 ~ §0.7.7**；命令清单见附录 A「最终形态复核轮」。
+> **边界**：**本次复验只关闭真库单请求级探针，不覆盖 217 条 A/B / EXPLAIN / P95 / 26 迁移全链**；I2 六项仍未跑，「不劣化」结论未验证。
+
 ### I2 仍未跑（如实列出；「不劣化」结论未验证）
 
 | # | 未跑项 | 状态 / 原因 |
@@ -1160,9 +1210,13 @@ tenants|status|NO|'active'::text
 | 5 | 假绿门槛 `hit_cases ≥ 20 且 expanded_cases > 0` 的**真实触发** | **未跑**。依赖 #2；本轮合成页只用于诊断，不计入业务结论 |
 | 6 | 全服务 `docker compose up` 启动验证 | **未跑**。api / web / redis / minio / embedding / reranker 仍 Exited(255)；本轮只起了 PG 单容器 + `run --no-deps` 临时容器 |
 
-> **「不劣化」结论仍未验证。** 本轮通过项覆盖「代码路径 / 纯函数 / 打桩 SQL 顺序 / 静态契约 / **真库单请求级 ACL 与超时语义**」五层；但行为层的 217 条四项指标、性能预算、全链迁移可重放性一律没有证据，**不得推断成通过**。
+> **「不劣化」结论仍未验证。** 本轮通过项覆盖「代码路径 / 纯函数 / 打桩 SQL 顺序 / 静态契约 / **真库单请求级 ACL 与超时语义**」五层；但行为层的 217 条四项指标、性能预算、全链迁移可重放性一律没有证据，**不得推断成通过**。真库探针虽已实跑，交付文件仍是 **9 FAILED**（P1-1），不能当作「真库回归全绿」。
 >
-> **状态更新（§0.7，最终口径）**：上文「交付文件仍是 9 FAILED」是**补充轮（修复前）**口径，现已作废 —— P1-1 已修复，交付文件在最终形态 `3c5d209` 上真库 `11 passed / 0 failed / 0 skipped / exit=0`（§0.7.3）。但**「真库探针转绿」不等于「不劣化通过」**：效果层六项仍未跑，本节结论（不劣化未验证）不变。9 条真库探针须在注入 `WIKI_NAV_ACL_DB_URL` 的容器内跑；宿主现在另有钉子 + 纯函数 2 例可跑（§0.7.2），但 skip 的 9 例仍不能由宿主「全绿」代替。
+> **加注（I2 六项清单与「不劣化结论未验证」原文逐字未改，一字不动）**：
+> 1. 上文「交付文件仍是 9 FAILED」是 **补充轮（修复前）历史快照**，按 team-lead 裁决逐字保留、只在旁边加注。P1-1 已修复（`3c5d209`），P3 独立复验为 `11 passed / 0 failed / 0 skipped / exit=0`（§0.7.3），该句描述的对象已不存在。
+> 2. **本次复验只关闭真库单请求级探针，不覆盖 217 条 A/B / EXPLAIN / P95 / 26 迁移全链**；I2 六项仍未跑，**「不劣化」结论仍未验证**。
+> 3. **QA 分层（如实登记）**：实现者自验（容器内 `11 passed / exit=0`）与 P3 独立复验（§0.7 本节）**两层均已覆盖**；宿主侧 `10 skipped` 属预期，不构成覆盖（该 10 为两套件合计口径；本文件单独跑为 `9 skipped + 2 passed`）。实现者自验数据由其自报，P3 **未采信为独立证据**，本报告全部结论以本人实跑输出为准。
+> 4. 9 条真库探针须在注入 `WIKI_NAV_ACL_DB_URL` 的容器内跑；宿主另有钉子 + 纯函数 2 例可跑（§0.7.2），但 skip 的 9 例仍不能由宿主「全绿」代替。
 
 ### I3 PGlite 口径隔离（不得写成真库全链通过）
 
@@ -1210,7 +1264,9 @@ INSERT INTO wiki_pages (id, tenant_id, kb_id, document_id, title, summary, key_t
 
 **补充轮新增的「唯一阻塞」证明**（I1.4）：把 `_seed` 的 chunks INSERT 补上这 3 列后，交付文件自带的 8 个 ACL/状态/口径用例 + statement_timeout 用例 + 纯函数用例 **10/10 PASS**，且 `_cleanup` / `_verify_cleanup` 在有真实合成数据时逐表 count=0。说明 P1-1 是**唯一**阻塞项，其余 DDL / CHECK / 唯一约束 / 校准口径均无隐藏问题；修这 3 列即可让 9 个真库探针由 FAILED 转 PASS。
 
-**影响（按实测修正）**：交付文件在真库执行时 `_seed` 第一条 chunks INSERT 即抛 `NotNullViolationError`，`_real_db` 在 `try` 之前就失败 → 9 个真库探针全部无法执行。首轮「本机无 DB 显式 skip 全绿」掩盖了它；补充轮在容器内注入 `WIKI_NAV_ACL_DB_URL` 后**真实复现为 9 FAILED / 1 PASSED / exit=1**。**以上均为修复前（86f5fc7）的实测记录**；整改后交付文件已在真库转绿（§0.5.3 / §0.6.2 / §0.7.3 最终形态 11 passed），此处保留仅作根因与掩盖机制的审计证据。
+**影响（按实测修正）**：交付文件在真库执行时 `_seed` 第一条 chunks INSERT 即抛 `NotNullViolationError`，`_real_db` 在 `try` 之前就失败 → 9 个真库探针全部无法执行。首轮「本机无 DB 显式 skip 全绿」掩盖了它；补充轮在容器内注入 `WIKI_NAV_ACL_DB_URL` 后**真实复现为 9 FAILED / 1 PASSED / exit=1**。
+
+> **加注（上文原文逐字未改）**：本节为 **修复前（`86f5fc7`）实测记录**，按交付裁决保留，仅作根因与「宿主全 skip 假绿」掩盖机制的审计证据。整改后交付文件已在真库转绿（§0.5.3 / §0.6.2 / §0.7.3 最终形态 `11 passed`）；修复 commit `3c5d209` 与独立复验见 §0.7。
 
 ### I5 C4「217 条精确占比」—— 由「推断」升级为「实测」（单列一节）
 
@@ -1285,7 +1341,7 @@ cases_all.json answerable 原值分布 = {'True': 110, 'False': 96}
 | **P2-6** | `02-design/C4-别名静默截断影响面量化.md` §5 第 8 行 / `.workbuddy/cases_all.json` | 文档把「11 条 = +1 可答 / +10 不可答」标为算术推断，隐含假设离线 206 样本与真库标签一致。**真库实测**：二者有 **9 条 `answerable` 标签不一致**，11 条新增题面真实分布为 **8 可答 / 3 不可答**（I5）。这会影响后续任何基于离线样本与真库 `eval_cases` 的口径对齐，是 217 条 A/B 基线可比性的潜在偏差源 | 以真库 `eval_cases.expected_answerable` 为唯一口径；若要用 `cases_all.json` 复算基线，先对齐这 9 条标签。§5 第 14 行「217 条精确占比 = 0」则已由本轮升级为**实测 0/217**，可关闭（U1 解除，U2 仍未知） |
 | **P2-7**（★ 已整改关闭） | `tests/wiki/test_nav_acl.py` L20 docstring / L66 skip reason | 原写「本机无 Docker daemon / 无 PostgreSQL 实例」「本机…**未跑**」，与补充轮实测环境（Docker 29.4.0 / PG healthy、探针已真跑）冲突。**仅文案，不影响行为**（skip 判据仍是 `if not _DB_URL`） | **已闭环**：§0.5.5 / §0.7.2 复核三种形态，两处均不再出现「本机无 Docker daemon / 无 PostgreSQL 实例」，改为「未显式提供 `WIKI_NAV_ACL_DB_URL` 或不在 compose 网络内时跳过」「PG 无宿主机端口映射，须在 compose 网络 `code_default` 内的容器里跑」（当前 HEAD `3c5d209` 措辞略异但语义相同）；「含合成页 / 逐表清理 + SQL 复核」纪律文字保留未动 |
 | **P2-8**（★ 已消解关闭） | 中间形态 `cbd7b0d`（303 行 / 10 用例 / 无钉子），**已被 `reset` 撤销** | 曾实测：无钉子形态下把 3 列删回、复现 P1-1，宿主 / CI 无 DB 仍是 `sssssssss.`（9 skip + 1 pass）**全绿 exit=0**，只有真库容器才 `FFFFFFFFF.` 9 FAILED（§0.6.3）→ 宿主侧无护栏。**当前最终形态 `3c5d209` 已把钉子补回**：宿主 `sssssssss..`（9 skip + **2** pass，§0.7.2）、钉子变异自检「删列名留占位符 → `AssertionError: 列清单漏了必填列 embedding_model` → 还原转绿」（§0.7.5）→ 风险已消除 | **关闭，无需裁决**。保留 §0.6.3 对抗性证据作为「为什么必须有这条钉子」的实证；后续若再删钉子，须重跑该对照 |
-| **P2-9**（本轮新增） | Git 提交链 / 行尾一致性 | **HEAD 在验证期间被并发改写 3 次**：`3c5d209`（含钉子）→ `cbd7b0d`（amend，删钉子）→ `reset: moving to 3c5d209`（含钉子）。验证对象反复漂移，任一中间态的测试结论都不能直接套用到下一形态，本轮为此按三种形态分别重验。另：当前工作区文件为 CRLF（17057 bytes / sha256 `e9e0c01a…`），HEAD blob 为 LF（16694 bytes / `fd741fe2…`）；`core.autocrlf=true` 使 `git diff` 为空、逻辑内容归一化后一致，**但「逐字节 hash 三方一致」不成立**（镜像与工作区一致，HEAD blob 不同） | 建议 team-lead **锁定最终交付形态**（明确 commit hash，验证 / 交付期间不再 amend / reset）；如需字节级 hash 证据，统一行尾（LF→LF 或关闭 autocrlf 后重提交）。此条为流程建议，不影响测试结论 |
+| **P2-9**（本轮新增） | Git 提交链 / 行尾一致性 | **HEAD 共三次视图变化（一次误操作 + 一次恢复）**：`3c5d209`（含钉子）→ 实现者**误做** `git commit --amend`，生成游离对象 `cbd7b0d`（删钉子、11→10 用例）→ 按 team-lead「保留 4 commit、不 amend」裁决执行 `git reset --mixed 3c5d209` **恢复分支指针**（含钉子）。属**一次误操作 + 一次恢复动作**，过程事实如实保留。任一中间态的测试结论都不能直接套用到下一形态，本轮为此按三种形态分别重验。另：当前工作区文件为 CRLF（17057 bytes / sha256 `e9e0c01a…`），HEAD blob 为 LF（16694 bytes / `fd741fe2…`）；`core.autocrlf=true` 使 `git diff` 为空、逻辑内容归一化后一致，**但「逐字节 hash 三方一致」不成立**（镜像与工作区一致，HEAD blob 不同） | 建议 team-lead **锁定最终交付形态**（明确 commit hash，验证 / 交付期间不再 amend / reset）；如需字节级 hash 证据，统一行尾（LF→LF 或关闭 autocrlf 后重提交）。此条为流程建议，不影响测试结论 |
 
 ---
 
@@ -1294,12 +1350,14 @@ cases_all.json answerable 原值分布 = {'True': 110, 'False': 96}
 > **结论：P0 = 0，P1 = 0（P1-1 已修复并经最终形态真库复跑确认），P2 = 7 未结（P2-7 / P2-8 已关闭、P2-9 本轮新增）。建议「不以『第 4 步验收通过』放行」，改为「代码层有条件放行（保持 `WIKI_ENABLED=false` 默认关闭态）+ 效果层验收挂起」。** P1-1 硬阻塞**已解除**、回归护栏已补回，但 **「不劣化」仍完全未验证** → 结论不放宽。
 >
 > 注意：本节曾写作「P1 = 1 / 交付文件在真库上是 9 FAILED」（补充轮、修复前），后按 `cbd7b0d` 写过一版，又因 HEAD `reset` 改写为当前 `3c5d209` 口径。历史证据保留在 H6 / I1.3 / §0.6 供追溯。
+>
+> **计数台账（与 §0.4 一致）**：P0 = 0 / P1 = 0（P1-1 修复后关闭）/ **P2 = 7**（P2-7、P2-8 已关闭、P2-9 本轮新增，8→7 口径变化见 §0.4）；其中 **P2-1、P2-7 已由文档批次同步**，**P2-2 / P2-6 已登记进 `项目待优化清单.md`**，作为后续待办跟踪，不计入本步放行前置条件。
 
 **理由**：
 
 1. **代码层证据充分，且已延伸到最终交付形态的真库单请求级**：A~G 七项全部通过——关闭态零 import/零 SQL 有 AST + 运行时双证；Golden 与 C4/F6 各经一次变异自检击杀并还原复跑、原文件 hash 与 `git diff` 零改动；导航 SQL 与设计 §2.1.3 **零差异**、12 条契约全 PASS、`_WHERE_BASE` 取同一对象有哨兵实证；三段式含 `previous='1234ms'`、失败/还原失败路径符合设计；段 C「只记录」纪律与 N5 成立。补充轮 + 增量复验轮 + 最终形态复核轮新增：镜像内文件与工作区逐字节一致（`e9e0c01a…`，§0.7.1），工作区（CRLF）与 HEAD blob（LF）归一化后一致；真库 `0026` 在库；交付探针**实跑并转绿**（§0.5.3 `10 passed in 1.59s`、§0.6.2 中间形态 `10/0/0/0`、**§0.7.3 最终形态 `3c5d209` junit `tests=11 failures=0 errors=0 skipped=0 / REALDB_EXIT=0`**）；四类越权 / 状态 / 口径语义、真库 `statement_timeout` 非零前值还原、合成页清理逐表 0；容器内全量 **930 passed**（942 / 1 failed / 0 errors / 11 skipped，唯一失败 `test_health.py` redis DNS 属环境、非本批次）；宿主探针 `9 skip + 2 pass`（钉子可跑）；钉子变异自检击杀并还原复跑（§0.7.5）。`ruff check .` / `compileall` exit=0。
 2. **但效果层仍完全没有证据**：26 迁移从零全链、217 条 A/B、EXPLAIN、P95 对照、假绿门槛真实触发 **全部未跑**（I2）；「不劣化」结论 **未验证**。真库真实 wiki 页只有 **1 页 ready**，远不足以让 `hit_cases >= 20` 自然成立。
-3. **P1-1 已解除、回归护栏已补回（P2-8 关闭），但存在流程风险（P2-9）**：当前最终形态 `3c5d209` 含不依赖真库的钉子，宿主 `sssssssss..` 有 2 例真实执行，变异自检证明删列名即 FAILED（§0.7.2 / §0.7.5）；§0.6.3 的无钉子对照恰好反证其必要性。但 HEAD 在验证期间被并发改写 3 次（`3c5d209 → cbd7b0d → reset 回 3c5d209`），任一中间态结论都不能套用到下一形态，本轮为此按三种形态分别重验。**仍需强调**：9 条真库探针必须在注入 `WIKI_NAV_ACL_DB_URL` 的容器内跑，宿主 skip 不等于真库通过。请 team-lead 锁定交付形态（P2-9）。
+3. **P1-1 已解除、回归护栏已补回（P2-8 关闭），但存在流程风险（P2-9）**：当前最终形态 `3c5d209` 含不依赖真库的钉子，宿主 `sssssssss..` 有 2 例真实执行，变异自检证明删列名即 FAILED（§0.7.2 / §0.7.5）；§0.6.3 的无钉子对照恰好反证其必要性。但 HEAD 出现三次视图变化（`3c5d209` → 误做 amend 生成游离 `cbd7b0d` → 按裁决 `reset` 恢复），属**一次误操作 + 一次恢复、非主动反复改形态**；任一中间态结论都不能套用到下一形态，本轮为此按三种形态分别重验。**仍需强调**：9 条真库探针必须在注入 `WIKI_NAV_ACL_DB_URL` 的容器内跑，宿主 skip 不等于真库通过。请 team-lead 锁定交付形态（P2-9）。
 
 **放行前置条件（按优先级；第 1 条已完成）**：
 1. **已完成**：修 P1-1（补 3 列）→ 容器内重跑 `pytest tests/wiki/test_nav_acl.py -q`，9 例由 FAILED 转 PASS、`exit=0`（§0.5.3 / §0.6.2 / **§0.7.3 最终 HEAD `3c5d209` 复跑 `11 passed`**）；P2-7 过时文案整改完成（§0.5.5）；P2-8 回归钉子已补回且变异自检有牙（§0.7.5）。
@@ -1437,6 +1495,22 @@ docker compose -f … run --rm --no-deps -T -v <temp>/p3e_junit:/tmp/p3ejunit \
   api sh -c "… python -m pytest -q -rs --tb=line --junitxml=/tmp/p3ejunit/full.xml"   # 942 / 930 / 1 / 0 / 11
 python <temp>/p3e_mutate.py                     # 钉子基线 PASS → 删列名 FAILED(AssertionError 点名 embedding_model) → 还原转绿
 docker exec code-postgres-1 psql -U user -d kagent -t -A -c "<5 表合成前缀 count + 总量>"   # 0|0|0|0|0
+
+# ---- 交付批次后复核（§0.1 / §0.7.1：HEAD 前进，验证对象零变化）----
+git -C <root> rev-parse HEAD ; git -C <root> log --oneline -5    # 392ddbb / 367d2fb / 3c5d209 / …
+git -C <root> merge-base --is-ancestor 3c5d209 HEAD              # YES
+git -C <root> diff --name-only 3c5d209 HEAD                      # 仅文档 / 报告文件
+git -C <root> diff --stat 3c5d209 HEAD -- code/apps/api/tests/wiki/test_nav_acl.py   # 空
+sha256sum code/apps/api/tests/wiki/test_nav_acl.py               # e9e0c01a…（未变）
+
+# ---- 按 team-lead 指定原命令独立复跑（§0.7.3 / I1.8）----
+docker compose -f … run --rm --no-deps -T -e WIKI_NAV_ACL_DB_URL=… api sh -c "pip install -q '.[dev]' && pytest tests/wiki/test_nav_acl.py -q"          # 依赖源超时 → SIGTERM，pytest 未运行
+docker compose -f … run --rm --no-deps -T -e WIKI_NAV_ACL_DB_URL=… api sh -c "pip install -q -i https://mirrors.aliyun.com/pypi/simple/ '.[dev]' && pytest tests/wiki/test_nav_acl.py -q -ra"   # ........... / DEV_MIRROR_EXIT=0
+
+# ---- I1.5 同一套只读 SQL 复核（§0.7.6）----
+docker exec code-postgres-1 psql -U user -d kagent -t -A -c "SELECT count(*) FROM tenants WHERE code LIKE 'navacl-%';"   # 0
+docker exec code-postgres-1 psql -U user -d kagent -t -A -c "<四表按本次合成前缀 count 联合查询>"                          # 0|0|0|0
+docker exec code-postgres-1 psql -U user -d kagent -t -A -c "<真实总量 + alembic_version 联合查询>"                      # 1|580|26|217|1|0026 / PSQL_EXIT=0
 ```
 
 ## 附录 B：数字与证据的复算方式
@@ -1463,6 +1537,9 @@ docker exec code-postgres-1 psql -U user -d kagent -t -A -c "<5 表合成前缀 
 | `e9e0c01a…` / 363 行 / 含钉子；CRLF vs LF 归一化一致 | §0.7.1 | `sha256sum` 工作区 / `git show HEAD:… \| sha256sum` / 镜像 `sha256sum`；`python` 归一化比对；`core.autocrlf=true` |
 | 宿主 `sssssssss..`（9 skip + 2 pass） | §0.7.2 `p3e_host.txt` | 宿主无 `WIKI_NAV_ACL_DB_URL` 跑 `pytest -q -rs tests/wiki/test_nav_acl.py` |
 | 钉子删列名 → FAILED 且点名 `embedding_model` → 还原转绿 | §0.7.5 `p3e_mutate_out.txt` | 重跑 `p3e_mutate.py`（输出保留 4000 字符）；副本已删、原文件 hash 未变 |
+| `11 passed / exit=0`（指定 `.[dev]` 命令、换可达镜像） | §0.7.3 / I1.8 | 重跑附录 A 两条命令；原 `pip install -q '.[dev]'` 因依赖源超时被 SIGTERM、pytest 未运行，**不计测试结论** |
+| `0` / `0\|0\|0\|0` / `1\|580\|26\|217\|1\|0026` | §0.7.6 I1.5 口径 SQL | 重跑附录 A 三条 `docker exec psql` 只读命令 |
+| HEAD `392ddbb`；`3c5d209` 仍为 ancestor；验证对象文件零变化 | §0.1 / §0.7.1 加注 | `git merge-base --is-ancestor 3c5d209 HEAD`、`git diff --name-only 3c5d209 HEAD`、`git diff --stat 3c5d209 HEAD -- <file>` |
 | 941 / 929 / 1 / 0 / 11 | H10 的容器内 `full.xml` | 解析 `--junitxml`：`tests/failures/errors/skipped`，`passed = tests−failures−errors−skipped` |
 | 0 / 217 = 0.00% | I5 `p3b_c4_out.txt` | `docker cp` 导出 217 条 → 附录 A 的 `stats()/verify()`；`sum(w>=24)`、`max(w)`、`verify(all)` |
 | 9 条标签不一致 / 11 条新增 = 8 可答 + 3 不可答 | I5 `p3b_labels_out.txt` | 按 `question` 连接 `eval_cases.expected_answerable` 与 `cases_all.json.answerable`，`norm()` 归一后计数 |
@@ -1470,4 +1547,6 @@ docker exec code-postgres-1 psql -U user -d kagent -t -A -c "<5 表合成前缀 
 | 清理后 0 / 0 / 0 / 0 与总量 1/580/26/1 | I1.5 独立只读 SQL | 重跑附录 A 的两组只读 SQL；`navacl-%` 与合成前缀计数全 0 |
 | tree `f3c9b0c3…` | §0.1 message-only amend | `git show -s --format=%T ea1fe09` / `86f5fc7` / `git diff --stat` |
 
-> **临时产物如实登记（不声称「全部删除」）**：项目仓库内无任何临时脚本 / 副本；本验证轮在宿主临时目录 `%TEMP%` 下保留了可复算证据 `p3c_*.txt` / `p3c_mutate2.py` / `p3c_junit/*.xml` / `p3d_adversarial.py` / `p3d_adversarial_out.txt` / `p3d_final.txt` / `p3d_mutant_container.txt` / `p3d_junit/nav_final.xml` / `p3e_*.txt` / `p3e_mutate.py` / `p3e_junit/*.xml`（均在仓库之外、不进 git，**未删除，供 team-lead 复算**）；临时变异副本 `p3d_mutant/` 与 `p3e_mutant/` 已删除；容器内 `/tmp/p3_eval217.csv` 已 `rm -f`；`docker compose run --rm` 的临时容器自动回收。**仓库内唯一未跟踪文件即本报告**；`git status` 中另有若干 ` M` 文档文件，属文档刷新 worker 的未提交改动，**非本验证者所为**。原实现文件 SHA256 前后一致（当前形态 `e9e0c01a…`；中间形态 `8299e309…`），本轮未 `git commit` / `git push`，未改 `docker-compose.yml` / `Dockerfile` / 实现代码；真库真实数据零改动（§0.6.4 / §0.7.6 复核：合成前缀 5 表全 0，总量 `wiki_pages=1 / chunks=580 / documents=26 / tenants=1 / eval_cases=217` 与基线一致）。
+> **临时产物处置（如实登记）**：项目仓库内无任何临时脚本 / 副本；宿主临时目录 `%TEMP%` 下的本轮脚本与输出已**按具体文件名逐一删除**（`p3c_*.txt` / `p3c_mutate*.py` / `p3c_junit/nav.xml` / `p3c_junit/full.xml` / `p3d_adversarial.py` / `p3d_adversarial_out.txt` / `p3d_final.txt` / `p3d_mutant_container.txt` / `p3d_junit/nav_final.xml` / `p3e_*.txt` / `p3e_mutate.py` / `p3e_junit/nav.xml` / `p3e_junit/full.xml` / `p3f_original_cmd.txt` / `p3f_dev_mirror.txt`；三个空目录 `p3c_junit` / `p3d_junit` / `p3e_junit` 用 `rmdir` 移除）。**未做目录级递归删除、未触碰 `.workbuddy/`**。临时变异副本 `p3d_mutant/` / `p3e_mutant/` 已删除；容器内 `/tmp/p3_eval217.csv` 已 `rm -f`；`docker compose run --rm` 临时容器自动回收。
+> **附录 B「来源」列中的临时输出文件名现为历史索引**：文件已删除，但**所有引用型数字均可由附录 A 的命令重跑复算**（不依赖留存文件），报告正文已贴出命令与原始输出。
+> **仓库状态**：本轮修订使本报告相对 `392ddbb` 产生 ` M`（由 team-lead 统一提交）；本验证者**未 `git commit` / `add` / `push`**，未改实现代码 / `docker-compose.yml` / `Dockerfile` / README / 设计文档 / C4 报告 / `项目待优化清单.md`。原实现文件 SHA256 前后一致（`e9e0c01a…`）；真库真实数据零改动（§0.6.4 / §0.7.6：合成前缀 5 表全 0，总量 `wiki_pages=1 / chunks=580 / documents=26 / tenants=1 / eval_cases=217` 与基线一致）。
