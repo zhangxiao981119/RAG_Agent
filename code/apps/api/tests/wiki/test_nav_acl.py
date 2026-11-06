@@ -17,9 +17,15 @@
 ★ 环境纪律：缺 `WIKI_NAV_ACL_DB_URL` / 连不上 / 未跑到 0026 → **显式 skip**。
   容器内用法：
   WIKI_NAV_ACL_DB_URL=postgresql+asyncpg://user:pass@postgres:5432/kagent pytest ...
-  本机（无 Docker daemon / 无 PostgreSQL 实例）**未跑**，见交付回报的未跑项清单。
-  纯函数用例（`test_hit_page_whose_terms_are_all_in_query_expands_nothing`）
-  不依赖真库，任何环境都跑；它证明的是选词规则，不替代 ACL 真库探针。
+  未显式提供该变量或不在 compose 网络内时跳过（skip 判据与具体本机环境无关）。
+  真库复跑由 P3 独立验证者在容器内执行，命令与原始输出见
+  `04-test/测试报告-第4步wiki导航.md` I1 / I5。
+  不依赖真库、任何环境都跑的两条钉子：
+    · `test_hit_page_whose_terms_are_all_in_query_expands_nothing`（选词规则）
+    · `test_seed_insert_includes_chunks_not_null_columns`（P1-1 回归钉子：捕获
+      `_seed` 的 INSERT 列形状，防止宿主侧 9 条探针全 skip 时再次掩盖
+      0011 三列 NOT NULL 的遗漏）
+  这两条**不替代** ACL 真库探针 —— 它们证明不了四闸门在 PG 里的语义。
 """
 from __future__ import annotations
 
@@ -44,6 +50,15 @@ KB_B = uuid.uuid4()       # 越权库
 PROFILE = WikiProfile(generator_model="acl-probe-model", prompt_version="wprompt-v1")
 OK_SUBJECT = "dept:it"
 
+# 0011 迁移的回填常量（见 alembic/versions/0011_*.py::_BACKFILL_*）：
+# chunks 的这三列被 `alter_column(nullable=False)` 置为 NOT NULL 却**没有**
+# server_default，真库 information_schema 实测为 NO | <NO_DEFAULT>。合成 chunk
+# 必须显式给值，否则 _seed 抛 NotNullViolationError（P1-1 真库实测）。取值与
+# 库内既有行同口径；导航 SQL 的 EXISTS 四闸门不检查这三列，它们只负责满足约束。
+_SEED_EMBEDDING_MODEL = "bge-m3"
+_SEED_EMBEDDING_TEXT_VERSION = "etext-v1"
+_SEED_CHUNKER_VERSION = "c400-800-60"
+
 # (用例名, needle, kb, level_rank, acl_tags, deny_subjects, status, gm)
 CASES = (
     ("ok", "访问", KB_A, 10, [OK_SUBJECT], [], "ready", PROFILE.generator_model),
@@ -63,7 +78,7 @@ def db_url() -> str:
     if not _DB_URL:
         pytest.skip(
             "需显式提供 WIKI_NAV_ACL_DB_URL（容器内真库，已 alembic upgrade head）；"
-            "宿主机默认跳过（本机无 Docker daemon / 无 PostgreSQL 实例）"
+            "未显式提供该变量或不在 compose 网络内时跳过"
         )
     return _DB_URL
 
@@ -132,13 +147,18 @@ async def _seed(engine) -> None:
                 text(
                     "INSERT INTO chunks"
                     " (id, tenant_id, kb_id, document_id, chunk_index, content,"
-                    "  token_count, level_rank, acl_tags, deny_subjects, is_latest)"
+                    "  token_count, level_rank, acl_tags, deny_subjects, is_latest,"
+                    "  embedding_model, embedding_text_version, chunker_version)"
                     " VALUES (:cid, :tid, :kb, :doc, 0, 'nav-acl-probe-chunk', 1,"
-                    "  :level, CAST(:acl AS text[]), CAST(:deny AS text[]), true)"
+                    "  :level, CAST(:acl AS text[]), CAST(:deny AS text[]), true,"
+                    "  :embedding_model, :embedding_text_version, :chunker_version)"
                 ),
                 {
                     "cid": uuid.uuid4(), "tid": TENANT, "kb": kb, "doc": doc_id,
                     "level": level, "acl": acl_tags, "deny": deny,
+                    "embedding_model": _SEED_EMBEDDING_MODEL,
+                    "embedding_text_version": _SEED_EMBEDDING_TEXT_VERSION,
+                    "chunker_version": _SEED_CHUNKER_VERSION,
                 },
             )
             await conn.execute(
@@ -276,6 +296,56 @@ async def test_success_path_restores_statement_timeout(db_url):
             ).scalar_one()
         assert out.document_id is not None
         assert after == before, "事务级超时预算泄漏到了后续 SQL"
+
+
+class _CapturingConn:
+    """只记录 SQL / 绑定值，不连库；用于本机验证 `_seed` 的 INSERT 列形状。"""
+
+    def __init__(self) -> None:
+        self.sql: list[str] = []
+        self.params: list[dict] = []
+
+    async def execute(self, stmt, params=None):  # noqa: ANN001, ANN201
+        self.sql.append(stmt.text if hasattr(stmt, "text") else str(stmt))
+        self.params.append(dict(params or {}))
+
+
+class _CapturingEngine:
+    def __init__(self) -> None:
+        self.conn = _CapturingConn()
+
+    @asynccontextmanager
+    async def begin(self):  # noqa: ANN201
+        yield self.conn
+
+
+@pytest.mark.asyncio
+async def test_seed_insert_includes_chunks_not_null_columns():
+    """P1-1 回归钉子：**本机可跑，不依赖真库**。
+
+    P1-1 的成因是 0011 把 chunks 三列置 NOT NULL 却没给 server_default，而
+    `_seed` 的 INSERT 漏了它们 —— 真库 9 条探针全 FAILED，但**宿主缺 DB 时
+    9 条全 skip、全绿**，问题被完全掩盖（04-test 报告 I1.3）。故必须有一条
+    不需要真库就能检查 INSERT 列形状的用例：删掉任一列，本用例立刻变红。
+    """
+    engine = _CapturingEngine()
+    await _seed(engine)
+
+    idx = next(i for i, s in enumerate(engine.conn.sql) if "INSERT INTO chunks" in s)
+    chunk_sql, chunk_params = engine.conn.sql[idx], engine.conn.params[idx]
+    # ★ 只检查 INSERT 的**列清单**段：占位符 `:embedding_model` 在 VALUES 段，
+    #   拿整条 SQL 做 `in` 判断会被「删了列名但残留占位符」骗过（弱断言）。
+    columns_part = chunk_sql.split("INSERT INTO chunks", 1)[1].split(") VALUES", 1)[0]
+    for column in (
+        "embedding_model",
+        "embedding_text_version",
+        "chunker_version",
+    ):
+        assert column in columns_part, f"chunks INSERT 列清单漏了必填列 {column}"
+        assert f":{column}" in chunk_sql, f"{column} 没有对应绑定占位符"
+    assert chunk_params["embedding_model"] == _SEED_EMBEDDING_MODEL
+    assert chunk_params["embedding_text_version"] == _SEED_EMBEDDING_TEXT_VERSION
+    assert chunk_params["chunker_version"] == _SEED_CHUNKER_VERSION
 
 
 def test_hit_page_whose_terms_are_all_in_query_expands_nothing():
