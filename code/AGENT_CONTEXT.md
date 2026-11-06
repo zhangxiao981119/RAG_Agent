@@ -1,7 +1,8 @@
 # AGENT_CONTEXT - 给 Agent 的上下文恢复文件
 
 > 这不是给人看的 README，是**上下文恢复文件**。新接手的 Agent 读完应当立刻知道：这是什么项目、哪些口径不能动、当前链路是怎么走的、接下来该做什么。
-> 生成：2026-09-22 ｜ 最近更新：2026-10-26（对齐检索词元化 + 章节补全 + 查询扩展 + 误拒重试；迁移 0023，测试 638）
+> 生成：2026-09-22 ｜ 最近更新：2026-11-06（对齐检索词元化 + 章节补全 + 查询扩展 + 误拒重试；迁移 0026，测试 70 个 test_*.py 文件）
+> 交付状态：GraphRAG 第 1/2 步（图数据地基 + 在线图召回 side channel（旁路通道））、LLM Wiki 第 3 步（生成 + 读接口）已交付；第 4 步仅完成增量设计、未实现。
 
 ---
 
@@ -167,7 +168,7 @@ code/
 │   │   │   ├── schemas/        Pydantic
 │   │   │   ├── config/         settings.py · decisions.py（口径单一真源）· prompts.py
 │   │   │   └── infra/          metrics · trace · redis/arq 连接池
-│   │   ├── alembic/versions/   23 版迁移（0001~0023）
+│   │   ├── alembic/versions/   26 版迁移（0001~0026）
 │   │   ├── scripts/            eval 链 · calibrate · backfill_fts_text · build_kb_terms · loadtest
 │   │   └── tests/              pytest（45 文件 / 638 用例，行覆盖 65%）
 │   ├── ocr/                    GOT-OCR2.0（扫描件专用，单路串行）

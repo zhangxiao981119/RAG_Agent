@@ -30,8 +30,12 @@
   `path_stats.graph_covered / graph_unique` 与 `graph_degraded_reason`
   （这两个字段由 chat.py 追加到 `done` / 检索后的 `refused` 事件载荷里），
   既写进当次运行的 metrics 与 eval_runs 记录，也打印在「上下文口径」块里。
-  ⚠ `graph_unique` 的分母口径仍在裁决中（当前取三路候选池），报告里 MUST NOT
-  用 `graph_unique=0` 声称「图没用」。
+  ⚠ 图路两键的口径已按 v1.2 契约（`d6ff0f4`）定稿，参照系是**交付上下文**：
+  `graph_unique` = 最终进入上下文的图召回片数（不是候选池分母）；
+  `graph_covered` = 图邻居中已在最终命中片的条数（预算裁剪前统计）。
+  v1.1 以三路候选池为分母的旧口径已被真库实测证伪 —— 候选池可达 150 个 id，
+  远大于最终 top-K，会让 `graph_unique` 结构性恒 0。报告里 MUST NOT 再拿
+  `graph_unique=0` 声称「图没用」。
 """
 from __future__ import annotations
 
