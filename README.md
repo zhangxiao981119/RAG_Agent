@@ -153,7 +153,7 @@
 | 前端 | React 18 + TypeScript，**5 个业务页面 + 12 个管理面板** |
 | 后端 | FastAPI，**23 个 REST 路由模块 / 83 个接口 / 26 版 Alembic 迁移（0001~0026）** |
 | 解析 | **8 类格式 / 13 个扩展名**，四类文档支持内嵌图转录 |
-| 测试 | **70 个测试文件**（`tests/` 下 `test_*.py`）；第 3 步独立验证 **520 用例全过**（P0=0 / P1=0 / P2=3），见 [04-test/测试报告-第3步-wiki.md](04-test/测试报告-第3步-wiki.md) |
+| 测试 | **71 个测试文件**（`tests/` 下 `test_*.py`）；第 3 步独立验证 **520 用例全过**（P0=0 / P1=0 / P2=3），见 [04-test/测试报告-第3步-wiki.md](04-test/测试报告-第3步-wiki.md) |
 | 评测 | **217 条** eval 用例（111 可答 + 106 不可答） |
 | 图与 Wiki | 迁移 0024 / 0025（实体图） + 0026（`wiki_pages`）；在线图召回旁路、文档级 LLM Wiki 生成与读接口已交付；第 4 步导航检索未实现 |
 | 容器 | 开发 10 服务、生产 12 服务（含迁移 / 网关 / 监控）一键启动 |
@@ -781,7 +781,7 @@ code/
 │   │   │   └── config/          # 配置 + 全局口径（decisions.py / index_profile.py / 启动自检）
 │   │   ├── alembic/versions/    # 26 版数据库迁移（0001~0026）
 │   │   ├── scripts/             # 评测 / 标定 / 压测 / 重算 / 图数据补建 / wiki 重建脚本
-│   │   └── tests/               # pytest（70 个测试文件）
+│   │   └── tests/               # pytest（71 个测试文件）
 │   ├── ocr/                     # 扫描件 OCR 服务（GOT-OCR2.0）
 │   └── web/                     # 前端
 │       ├── src/pages/           # 5 个业务页面
@@ -826,7 +826,7 @@ code/
 - **可复现构建**：`requirements.lock` + `package-lock.json` 锁定全部传递依赖，基础镜像按 `sha256` digest 固定
 - **CI 门禁**：push master 与所有 PR 触发，后端 `ruff + pytest`（带 Redis 服务容器）、前端 `tsc + vite build` 两个独立 job
 - **资源复用**：Redis 与 arq 连接池**进程级共享**（请求级调用点拿到的 `aclose()` 是 no-op）
-- **测试现状**：**70 个测试文件**（`tests/` 下 `test_*.py`）；第 3 步独立验证 **520 用例全过**（P0=0 / P1=0 / P2=3，见 [04-test/测试报告-第3步-wiki.md](04-test/测试报告-第3步-wiki.md)）。行覆盖 **65%**（9212 行语句）是早期快照，未随本轮增量重算。新模块覆盖（`keyword_text` 100% / `lexicon` 96% / `retrieve` 91% / `ocr` 98%），最大缺口仍在 `workers/parse_job.py`（14%）
+- **测试现状**：**71 个测试文件**（`tests/` 下 `test_*.py`）；第 3 步独立验证 **520 用例全过**（P0=0 / P1=0 / P2=3，见 [04-test/测试报告-第3步-wiki.md](04-test/测试报告-第3步-wiki.md)）。行覆盖 **65%**（9212 行语句）是早期快照，未随本轮增量重算。新模块覆盖（`keyword_text` 100% / `lexicon` 96% / `retrieve` 91% / `ocr` 98%），最大缺口仍在 `workers/parse_job.py`（14%）
 - **连接池参数**：`db_pool_size` / `db_max_overflow` / `db_pool_timeout_s` 全部可环境覆盖，默认 20+20、超时 5s；单测锁死"参数必须来自 settings、timeout ≤10s、容量 ≤45"，防止有人把池调成 200 再去扩副本
 - **关键词切分单一真源**：入库与查询共用 `services/keyword_text.py`。两侧各写一份 bigram 逻辑必然漂移 —— 全角/半角、断点位置差一个字符，索引里的 token 与查询生成的 token 就对不上，表现为**静默 0 召回**（不报错、不告警）
 - **双镜像同步**：`api` 与 `worker` 是两个镜像，只 `build api` 会让 worker 静默跑旧代码 —— 任务照常返回 `indexed`，新解析逻辑不生效且日志无异常。部署脚本按同一 tag 同时重建两侧
