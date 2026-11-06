@@ -144,7 +144,7 @@ curl -fsSk https://<站点地址>/api/health
 | `GRAPH_RETRIEVE_TIMEOUT_MS` | `800` | 在线图召回硬超时（毫秒） | 取值须在 `[50, 5000]`，否则拒绝启动；已生效（第 2 步已交付） |
 | `GRAPH_EXTRACT_TIMEOUT_SECONDS` | `120` | 单次抽取 LLM 调用超时（秒） | 必须 `> 0` |
 | `GRAPH_EXTRACT_MAX_OUTPUT_TOKENS` | `8000` | 单次抽取调用的**输出**上限（token） | 必须 `>= 1`。**不要**和全局 `LLM_MAX_OUTPUT_TOKENS=4000` 混：后者受 `CONTEXT_OUTPUT_RESERVE_TOKENS` 约束不能改大，图抽取只能按调用覆盖。配 `0` 会被静默回落成 4K，抽取随即在实体列表中途被截断（症状是「LLM 输出非法 JSON」），所以启动自检直接拒绝 |
-| `WIKI_ENABLED` | `false` | LLM wiki 导航（页生成 + 导航读接口） | **已实现**（迁移 0026，分步路线第 3 步已交付）：置 `true` 前先 `alembic upgrade head`，开启后 MUST `rebuild_wiki --all` 建页；wiki 不进检索（术语扩展属第 4 步，未实现） |
+| `WIKI_ENABLED` | `false` | LLM wiki 导航（页生成 + 导航读接口） | **已实现**（迁移 0026，分步路线第 3 步已交付）：置 `true` 前先 `alembic upgrade head`，开启后 MUST `rebuild_wiki --all` 建页；检索侧术语扩展（第 4 步）已实现；`WIKI_ENABLED=false` 即关闭态零 SQL |
 | `WIKI_GENERATOR_MODEL` | 空（跟随 `LLM_MODEL`） | 页生成模型 | 留空回落 `LLM_MODEL` —— **若那是推理模型（如 deepseek-v4-flash，只吐 reasoning_content、content 为空）wiki 生成必然失败**。生产启用 wiki MUST 显式配非推理模型；换模型 = 口径变更，旧口径页会被判为待重建（`rebuild_wiki --recaliber`） |
 
 ★ 上表 7 个 + wiki 的 4 个（`WIKI_SCOPE` / `WIKI_GENERATOR_MODEL` / `WIKI_GENERATE_TIMEOUT_SECONDS` /

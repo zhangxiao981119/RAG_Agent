@@ -1,8 +1,8 @@
 # AGENT_CONTEXT - 给 Agent 的上下文恢复文件
 
 > 这不是给人看的 README，是**上下文恢复文件**。新接手的 Agent 读完应当立刻知道：这是什么项目、哪些口径不能动、当前链路是怎么走的、接下来该做什么。
-> 生成：2026-09-22 ｜ 最近更新：2026-11-06（对齐检索词元化 + 章节补全 + 查询扩展 + 误拒重试；迁移 0026，测试 71 个 test_*.py 文件）
-> 交付状态：GraphRAG 第 1/2 步（图数据地基 + 在线图召回 side channel（旁路通道））、LLM Wiki 第 3 步（生成 + 读接口）已交付；第 4 步仅完成增量设计、未实现。
+> 生成：2026-09-22 ｜ 最近更新：2026-11-06（对齐检索词元化 + 章节补全 + 查询扩展 + 误拒重试 + 第 4 步 wiki 导航；迁移 0026，测试 80 个 test_*.py 文件）
+> 交付状态：GraphRAG 第 1/2 步（图数据地基 + 在线图召回 side channel（旁路通道））、LLM Wiki 第 3 步（生成 + 读接口）、第 4 步 wiki 导航参与检索（三段 commit `ea552c0` / `6717a85` / `86f5fc7`）代码均已交付，N1~N6 已裁决；默认 `WIKI_ENABLED=false` 为关闭态，与未实现第 4 步时逐字节等价。**真库效果层未验证**：217 条 A/B、EXPLAIN、P95、26 迁移从零全链均未跑，dev 库仅 1 页 wiki ready，`hit_cases >= 20` 不满足时评测结论判「无效」，「不劣化」未验证，唯一安全交付形态是关闭态。
 
 ---
 
@@ -170,7 +170,7 @@ code/
 │   │   │   └── infra/          metrics · trace · redis/arq 连接池
 │   │   ├── alembic/versions/   26 版迁移（0001~0026）
 │   │   ├── scripts/            eval 链 · calibrate · backfill_fts_text · build_kb_terms · loadtest
-│   │   └── tests/              pytest（71 个 test_*.py 文件；行覆盖 65% 为早期快照）
+│   │   └── tests/              pytest（80 个 test_*.py 文件；行覆盖 65% 为早期快照）
 │   ├── ocr/                    GOT-OCR2.0（扫描件专用，单路串行）
 │   └── web/                    React 18 前端（5 业务页 + 12 管理面板）
 ├── docker-compose.yml          开发 10 服务

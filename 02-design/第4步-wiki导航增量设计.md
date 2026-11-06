@@ -689,6 +689,22 @@ if not (WIKI_NAV_MIN_CJK_CHARS <= WIKI_NAV_MAX_TERM_CHARS
 
 ---
 
+### 5.1 裁决结果（2026-11-06，已落地）
+
+> 本小节只记录**后续裁决结果**；上表的「待裁决」标记是设计定稿时的状态快照，逐字保留不改。
+> 第 4 步代码分三段交付：`ea552c0` / `6717a85` / `86f5fc7`（`ea1fe09` 是 message-only amend 前的旧 hash，树内容逐字节相同）。用户已裁决 N1~N6：
+
+- **N1**：读侧 `strpos(lower(kt.term), n.term) > 0` 字面子串，零迁移零重建；否决 `jsonb ?|` + 迁移 0027 方案。落地 `services/wiki/navigate.py::_WIKI_NAV_SQL`。
+- **N2**：`settings.wiki_nav_timeout_ms: int = 50`，范围 `[10,200]`；同步 `settings.py` / `config_profile` 白名单 / `self_check_ext.py` / DEPLOY §3.5 / 能力页文案。
+- **N3**：先验常量按设计默认值落地，禁止因评测不达标临时调参；`WIKI_NAV_MIN_HIT_CASES=20` 属**单模块评测门槛**（设计 §3 的 8 个 `Final` 不含它），保留在 `scripts/run_eval.py` 模块级 `Final[int]`，不进 `decisions.py` / `self_check`。
+- **N4**：允许合成 wiki fixture，限单独 kb 或事务内、跑完清理 + SQL 复核、报告标注「含合成页」；优先 `python -m scripts.rebuild_wiki --all` 补真实页。**本步只把它实现为真库 ACL 探针数据，不给 217 条评测补页**（探针跑完即清理，结构上不可能补页），故真库 `hit_cases < 20` 是预期现状、`run_eval.py` 会打印「本轮评测结论无效」。
+- **N5**：不新增 `WIKI_NAV_ENABLED`，与 `WIKI_ENABLED` 共用；全仓零标识符。
+- **N6**：C4/F6 别名静默截断随第 4 步一起修，采用与 wiki 扩词相同的独立预算范式；§6-C4 / §7-U-C / §2.2.4 三处措辞已同步，两条「达上限 × 传别名」红断言已同批转绿。
+
+> 边界：关闭态零 import / 零 SQL 有 AST + 运行时双证，导航 SQL 与 §2.1.3 零差异；但**真库效果层未验证**（217 条 A/B、EXPLAIN、P95、26 迁移从零全链未跑），「不劣化」结论不得写成已验证，唯一安全交付形态是 `WIKI_ENABLED=false`。
+
+---
+
 ## 6. 与主文档 v1.2 / 第 3 步已实现代码的冲突与待同步项（单列）
 
 | # | 冲突 / 缺口 | 性质 | 处置 |

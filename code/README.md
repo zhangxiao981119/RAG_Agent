@@ -88,7 +88,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 两个开关打开时**启动自检是 fail-closed（失败即拒绝启动）**：缺表、缺 LLM Key、抽取 / 生成模型解析为空都会直接拦下，不会带病运行。
 `WIKI_GENERATOR_MODEL` 留空会回落 `LLM_MODEL` —— 若主模型是只吐 `reasoning_content` 的推理模型，wiki 生成会必然失败，必须显式指定普通对话模型。
 
-> 当前 wiki 页**只生成与阅读，不参与检索**（分步路线第 4 步尚未实现）。完整配置说明见 [docs/DEPLOY.md](docs/DEPLOY.md)。
+> `WIKI_ENABLED=false` 默认关闭时 wiki 页不参与检索（零 SQL）；置 true 后第 4 步导航生效（真库效果层未验证，生产启用前须跑 217 条 A/B）。完整配置说明见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 
 ---
 
