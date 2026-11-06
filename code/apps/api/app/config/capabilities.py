@@ -245,7 +245,12 @@ def capability_snapshot(
                     "generator_model": wiki_profile.generator_model,
                     "prompt_version": wiki_profile.prompt_version,
                 },
-                "runtime": {"input_max_chars": settings.wiki_input_max_chars},
+                "runtime": {
+                    "input_max_chars": settings.wiki_input_max_chars,
+                    # 第 4 步：在线导航 SQL 的硬超时（毫秒），与图召回 timeout_ms 同款展示 ——
+                    # 管理端要能看出「这条找页 SQL 被限到多少毫秒」，而不是只藏在指纹里。
+                    "nav_timeout_ms": settings.wiki_nav_timeout_ms,
+                },
                 # 页面统计（§9.6 ①）：None = 未启用 / 未统计（MUST NOT 用 0 冒充）
                 "data": {
                     "pages_total": None if wiki_stats is None else wiki_stats.get("pages_total"),
@@ -259,6 +264,12 @@ def capability_snapshot(
                 "rebuild": {
                     "on_toggle": "重建 wiki 页：python -m scripts.rebuild_wiki --all",
                     "not_needed": "无需重跑解析、分块、嵌入、图抽取",
+                    # 第 4 步 / N2：新配置项的「改了要重做什么」。超时是部署期配置，
+                    # 改它只影响在线找页 SQL 的墙钟上限，不触碰任何已生成数据。
+                    "on_nav_timeout_change": (
+                        "改 WIKI_NAV_TIMEOUT_MS → 重启 api 与 worker 两个容器；"
+                        "仅在线超时值变化，不用重建 wiki 页（零迁移、零重跑）"
+                    ),
                 },
             },
         ],
@@ -355,6 +366,8 @@ def _render_text(
                 "                          不用重跑：解析、分块、嵌入",
                 "   · 开/关 wiki        → 重建 wiki 页（scripts/rebuild_wiki.py）",
                 "                          不用重跑：解析、分块、嵌入、图抽取",
+                "   · 改 WIKI_NAV_TIMEOUT_MS → 重启 api 与 worker 两个容器",
+                "                          （仅在线超时值，不用重建 wiki 页）",
                 "   · 换分块器          → 全链重跑：解析 → 分块 → 嵌入 → 抽取 → wiki",
                 "   · 换嵌入口径        → 只需重算向量（chunk 行不变，不用重抽图与 wiki）",
                 " [改之前请先读] code/docs/DEPLOY.md §3.5「能力开关与重跑口径」",

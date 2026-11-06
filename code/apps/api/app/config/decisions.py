@@ -89,6 +89,53 @@ LEXICON_MAX_ALIASES_PER_KEY: Final[int] = 2
 限定 2 是为了压住扩词噪声：词表若把同一概念连出很长的同义链，扩出来的分支
 里必然混入只在个别文档出现的写法，命中行数上去、精度下来。"""
 
+# ── 第 4 步 · wiki 导航查询扩展 + 词表别名独立预算（检索侧口径常量）────
+# ★ 全部为**先验值，首轮实测后重设**：dev 真库仅 1 页 wiki（第 4 步设计 §1 F15），
+#   没有历史分布可依。N3 裁决：MUST NOT 因某轮评测不达标临时上调 / 下调 ——
+#   改它们 = 217 条评测基线不可比，必须走代码评审 + 全量重跑。
+# ★ 判定语义 / 口径类常量放本文件（而不是 settings）的判据见主文档 §9.5：
+#   随部署环境取不同值是正常预期的「超时 / 开关」才进 settings。
+WIKI_NAV_MAX_TERMS: Final[int] = 2
+"""一次导航最多扩几个**顶层词元**。
+
+与 LEXICON_MAX_ALIASES_PER_KEY=2 同量级：扩词从宽会精度崩（项目既有教训）。
+改它 = 217 条基线不可比。"""
+
+WIKI_NAV_MAX_FTS_TOKENS: Final[int] = 6
+"""wiki 词元在 FTS 侧的**二级独立预算**（索引词元数，非顶层词元数）。
+
+中文顶层词元经 to_fts_text 会 1→N 展开成 2-gram；按「2 个词元 × 典型 3 gram」
+取 6。MUST >= WIKI_NAV_MAX_TERMS，否则每个中文词元都装不下。"""
+
+WIKI_NAV_MAX_PAGES: Final[int] = 1
+"""一次导航只取一页。多页混合不同主题术语 = 噪声叠加，且需先标定跨页相关性口径。"""
+
+WIKI_NAV_MIN_CJK_CHARS: Final[int] = 2
+"""纯中文词元最短长度，与 build_ilike_terms 的 `len(segment) >= 2` 同源。"""
+
+WIKI_NAV_MIN_ASCII_CHARS: Final[int] = 4
+"""ASCII 主导词元最短长度，与 _ASCII_RE 路同源（挡 `vs` / `js`）；含 `_` 的标识符例外。"""
+
+WIKI_NAV_MAX_TERM_CHARS: Final[int] = 12
+"""词元最长长度。超过后 FTS 展开必撞 6 token 预算，且长短语在原文里几乎不可能原样命中。
+
+MUST <= 第 3 步 services/wiki/prompts.py::WIKI_TERM_MAX_CHARS(=40)；跨模块一致性
+由 tests/wiki/test_nav_constants.py 单测钉住，不进 self_check（配置层不反向依赖服务层）。"""
+
+WIKI_NAV_CANDIDATE_PAGE_GUARD: Final[int] = 5_000
+"""**观测触发阈值**，不是 SQL 里的 LIMIT（LIMIT 放在 ACL 之前会系统性漏掉命中的页）。
+
+pages_ready 超它、或 rag.retrieve.wiki_nav p95 > 10ms 连续两个观测窗 →
+启动第 4 步设计 §2.1.5 的写侧归一列 + GIN 升级评估（本步不实现）。"""
+
+LEXICON_FTS_ALIAS_MAX_TERMS: Final[int] = 6
+"""词表别名在 tsquery 上的**独立预算**（N6 / C4-F6 修复）。
+
+与 WIKI_NAV_MAX_FTS_TOKENS 同量级、同范式：ILIKE_MAX_TERMS(3) ×
+LEXICON_MAX_ALIASES_PER_KEY(2) = 6 个顶层写法。别名不再被
+`_dedupe(windows + aliases)[:FTS_QUERY_MAX_TERMS]` 重截吞掉；
+独立预算 ≠ 无预算，6 个中文别名各展开 ≤11 个 2-gram 会把 tsquery 撑爆，故仍需限流。"""
+
 GENERATION_TEMPERATURE: Final[float] = 0.0      # L2
 # 生成温度固定 0：RAG 问答要的是"同一份上下文给出同一个答案"，评测门禁与线上
 # 回答必须可复现。0.1 下实测同一问题两次跑会一次拒答、一次自编 Python 实现，
@@ -1211,6 +1258,20 @@ def self_check() -> None:
         or GRAPH_LINK_SUBSTR_MAX_ENTITIES < 1
     ):
         raise RuntimeError("GRAPH_* 抽取/链接护栏 MUST 为正 —— 0 值会让抽取与链接整体失效")
+
+    # ── 第 4 步 · wiki 导航检索口径（设计 §3）──
+    # ★ 这四条是**纯常量**断言：self_check MUST NOT import `app.services.*`。
+    #   配置层反向依赖服务层会在启动期拉出检索模块，破坏「关闭态零加载」；
+    #   跨模块上限一致性（WIKI_TERM_MAX_CHARS）改由单测钉，不在这里查。
+    if not (1 <= WIKI_NAV_MAX_TERMS <= 2):
+        raise RuntimeError("WIKI_NAV_MAX_TERMS MUST ∈ [1,2]：放开会让扩词精度崩（项目既有教训）")
+    if WIKI_NAV_MAX_FTS_TOKENS < WIKI_NAV_MAX_TERMS:
+        raise RuntimeError("FTS token 预算 MUST >= 顶层词元上限，否则每个中文词元都装不下")
+    if WIKI_NAV_MAX_PAGES != 1:
+        raise RuntimeError("本步只支持单页扩展；多页需先标定跨页相关性口径")
+    if not (WIKI_NAV_MIN_CJK_CHARS <= WIKI_NAV_MAX_TERM_CHARS
+            and WIKI_NAV_MIN_ASCII_CHARS <= WIKI_NAV_MAX_TERM_CHARS):
+        raise RuntimeError("词元长度下限 MUST <= 上限，否则恒选不出词")
     # prompt 版本与正文同源（正文在 services/graph/prompts.py）：空版本 = 口径过滤失效
     # —— 检索侧 `prompt_version = :pv` 会匹配到所有历史的空串行。
     from app.config.graph_profile import GRAPH_PROMPT_VERSION

@@ -109,6 +109,19 @@ def _check_scalar_ranges() -> None:
             "  （与 GOVERNANCE_PROMPT_MAX_CHARS 同口径）。\n"
             "  ★ 拒绝启动。"
         )
+    # 第 4 步 wiki 导航在线超时（N2）：50ms 是先验值，范围 [10, 200]。
+    # ★ 与开关无关地检查（见模块 docstring）：配错的值不会因为 WIKI_ENABLED=false
+    #   变成对的；等真开启时才发现，错误就发生在「只改了个环境变量」的部署窗口里。
+    #   下限 10ms 防「必然超时、导航恒走 0 路」的假配置；上限 200ms 防把
+    #   一条找页 SQL 的墙钟预算拖到与图召回（800ms）同量级。
+    if not (10 <= settings.wiki_nav_timeout_ms <= 200):
+        _fail(
+            f"[WIKI_NAV_TIMEOUT] WIKI_NAV_TIMEOUT_MS={settings.wiki_nav_timeout_ms} "
+            "超出允许区间 [10, 200]（毫秒）。\n"
+            "  10ms 以下在真实库上必然超时（导航恒降级、扩展恒 0）；"
+            "200ms 以上会让一次问答的首字节被这条找页 SQL 拖住。\n"
+            "  ★ 拒绝启动 —— 关闭是合法终态：置 WIKI_ENABLED=false，或改成合理值。"
+        )
 
     # 解析后的口径不能为空：空模型名会让写入盖章落空串，检索侧过滤随即失效。
     if settings.graph_enabled and not current_graph_profile().extractor_model.strip():

@@ -201,6 +201,7 @@ docker compose -p kagent exec -T worker python -c "from app.config.settings impo
 | 调 `GRAPH_EXTRACT_MAX_OUTPUT_TOKENS` | **不用重跑数据**；但之前因截断记为 `failed` 的文档要用 `--all` 重新补（`--pending` 不会选中 failed） | 解析、分块、嵌入 |
 | 换分块器（`CHUNK_*` 变动） | **全链重跑**：解析 → 分块 → 嵌入 → 抽取 | —— |
 | 换嵌入口径（模型 / 向量文本公式） | 只重算向量：`python -m scripts.reindex_embeddings` | 图抽取、解析 |
+| 调 `WIKI_NAV_TIMEOUT_MS`（wiki 导航在线超时，默认 `50`ms，取值 `[10, 200]` 由启动自检卡住） | **不用重跑数据**；但改了 MUST 重启 api 与 worker 两个容器（部署期配置，运行期不重读） | 解析、分块、嵌入、图抽取、wiki 页重建 |
 
 **为什么「换分块器」必须全链重跑**：重解析会 `DELETE chunks` 再 INSERT（分片是新 uuid）。图数据的证据都挂在 `chunk_id` 上 —— 分片一换，旧证据全部失效。系统在重解析的**同一事务**里主动清理派生数据（`purge_derived`），但**清理不等于重建**：抽取仍需重跑。
 

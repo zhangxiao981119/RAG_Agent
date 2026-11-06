@@ -183,6 +183,16 @@ class Settings(BaseSettings):
     # 送生成器的拼接文本上限（字符）。与 GOVERNANCE_PROMPT_MAX_CHARS 同口径：
     # 不截断则超长文档会打出 LLM 超时风暴。
     wiki_input_max_chars: int = 12_000
+    # 第 4 步：wiki 导航 SQL 的在线硬超时（毫秒）。N2 裁决放 settings ——
+    # 超时是「随部署环境取不同值是正常预期」的项（主文档 §9.5 判据），
+    # 不是影响判定语义 / 口径、会让评测基线失去可比性的冻结常量。
+    # ★ 取值范围 [10, 200] 由 config/self_check_ext.py::_check_scalar_ranges
+    #   在启动时卡住（与开关无关，关着也要查）；50ms 是**先验值，首轮实测后重设**。
+    # ★ 改它 = 跨角色配置变化：MUST 同步 config_profile 的 CROSS_ROLE_FIELDS
+    #   （config_fingerprint）、DEPLOY.md §3.5 变更后果矩阵、启动横幅与管理端
+    #   能力页的「改了要重做什么」，并重启 api 与 worker 两个容器；
+    #   **不需要重建 wiki 页**（本步零迁移、零索引、零新列）。
+    wiki_nav_timeout_ms: int = 50
     # ── M6 安全加固 ──────────────────────────────────────────
     chat_rate_limit_per_minute: int = 20  # 单用户每分钟最多提问次数，超过返回 429
     # ── M6 续篇：配额管理（手册第 14 步 — 双层速率+总量）─────

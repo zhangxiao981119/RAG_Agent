@@ -72,6 +72,9 @@ CROSS_ROLE_FIELDS: Final[tuple[str, ...]] = (
     "wiki_generator_model",
     "wiki_generate_timeout_seconds",
     "wiki_input_max_chars",
+    # 第 4 步 wiki 导航在线超时：api 侧消费（worker 不跑检索，但两侧取不同值
+    # 会让「同一套配置」的指纹比对失真 —— 与 graph_retrieve_timeout_ms 同款判据）。
+    "wiki_nav_timeout_ms",
 )
 """跨角色必须一致的字段白名单 —— `config_fingerprint` **只**对这份子集求指纹。
 
@@ -137,6 +140,7 @@ def runtime_config_snapshot() -> dict:
         "wiki_generator_model": s.wiki_generator_model,
         "wiki_generate_timeout_seconds": s.wiki_generate_timeout_seconds,
         "wiki_input_max_chars": s.wiki_input_max_chars,
+        "wiki_nav_timeout_ms": s.wiki_nav_timeout_ms,
     }
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Sequence
 
 from app.config import decisions
 
@@ -46,10 +47,37 @@ _ILIKE_SPLIT_WORDS = (
 )
 _ILIKE_SPLIT_RE = re.compile("|".join(_ILIKE_SPLIT_WORDS))
 
+# 两个既有私有常量提升为**公开别名**（只改名字，不改值、不改正则）：
+# 供 wiki 导航选词的 _acceptable 复用同一份中文判定与停用词表，避免新造第二套
+# 规则 —— 两侧不同步的表现是「静默挑错词元」，不报错、只是扩展失效。
+CJK_RE = _CJK_RE
+ILIKE_STOPWORDS = _ILIKE_SPLIT_WORDS
+
 
 def _normalize(text: str) -> str:
     """NFKC 归一化 + 小写：统一全角字母数字与大小写，保证两侧切分结果一致。"""
     return unicodedata.normalize("NFKC", text).lower()
+
+
+def normalize_query_text(text: str) -> str:
+    """查询侧归一（与 `_normalize` **同源**，禁止复制第二份归一逻辑）。
+
+    ★ 截到 400 字符与 `build_fts_query` / `build_ilike_terms` 的 `query[:400]` 对齐：
+      wiki 选词用本函数的结果判断「这个词元原问句里是否已有」，若与召回侧用的
+      不是同一段文本，判定会和实际检索输入分叉。
+    """
+    return _normalize(text[:400])
+
+
+def normalize_key_term(term: str) -> str:
+    """页级 `key_terms` 的归一：NFKC + 小写 + 去首尾空白 + 折叠内部空白。
+
+    与 `_normalize` 同源（不另写一份 unicodedata 调用）；额外折叠空白是因为
+    第 3 步落库的是 LLM 原文术语，可能带换行 / 多空格，而查询词元不含这些。
+    ★ 不做 NFKC 之外的语义改写：归一只是让「大小写 / 全角」差消失，
+      术语本身仍是短语（`"App Router"`），与查询词元（`router`）靠子串匹配衔接。
+    """
+    return " ".join(_normalize(term).split())
 
 
 def _bigrams(run: str) -> list[str]:
@@ -93,8 +121,22 @@ def _model_codes(text: str) -> list[tuple[str, str]]:
     return list(seen)
 
 
-def build_fts_query(query: str, alias_tokens: list[str] | None = None) -> str | None:
+def build_fts_query(
+    query: str,
+    alias_tokens: list[str] | None = None,
+    *,
+    extra_index_tokens: Sequence[str] = (),
+    alias_max_terms: int = decisions.LEXICON_FTS_ALIAS_MAX_TERMS,
+) -> str | None:
     """把查询构造成 tsquery 文本；无可索引词元时返回 None（调用方跳过 FTS 路径）。
+
+    ★ 两个扩展来源都走**独立预算**，原 query 窗口（`FTS_QUERY_MAX_TERMS`）冻结：
+      · `alias_tokens`（词表别名，lexicon）：按 `alias_max_terms` 限流后追加，
+        不再把合并结果重截回 24（F6 / C4 的静默吞别名缺陷，N6 随本步修）；
+      · `extra_index_tokens`（wiki 导航）：已由 `select_nav_terms` 按
+        `WIKI_NAV_MAX_FTS_TOKENS` 整词限流，按总 cap 追加。
+      两个参数都是 keyword-only 且带默认值 → **所有既有调用点一个实参都不改**；
+      两者为空时返回值与改动前**逐字节相同**（Golden Test 钉住，回滚等价第 2 层证据）。
 
     连接口径：**3 字窗口 OR**
       中文连续段先切成重叠 2-gram，再把相邻两个 bigram 用 `&` 拼成一个「3 字窗口」，
@@ -137,13 +179,33 @@ def build_fts_query(query: str, alias_tokens: list[str] | None = None) -> str | 
         + [f"({letters} & {digits})" for letters, digits in _model_codes(text) if len(letters) >= 2]
     )[: decisions.FTS_QUERY_MAX_TERMS]
 
-    # 词表扩展的别名（已由 lexicon 转成索引词元）：并入对应组做 OR，
-    # 不新增 AND 组 —— 扩的是「同一语义的另一种写法」，不是额外的必要条件。
+    # 词表扩词（lexicon 别名）：并入对应组做 OR，不新增 AND 组 —— 扩的是
+    # 「同一语义的另一种写法」，不是额外的必要条件。
+    # ★ 独立预算（N6 / C4-F6 修复）：此前把 `windows + 别名` 重截回 24，而
+    #   `_dedupe` 保序让原窗口恒在前，被砍掉的**恒是别名** —— 达上限 / 剩余容量
+    #   不足的 query 会静默丢掉全部或部分别名，既不报错也不打点（C4 报告 §1.5
+    #   合成反例确凿）。现在别名侧按 `alias_max_terms` 单独限流后追加，
+    #   `:128` 已截到 24 的原 query 窗口一个不少，也不再重截。
     if alias_tokens:
-        cjk_aliases = [tok for tok in alias_tokens if _CJK_RE.fullmatch(tok)]
-        ascii_aliases = [tok for tok in alias_tokens if not _CJK_RE.fullmatch(tok)]
-        windows = _dedupe(windows + cjk_aliases)[: decisions.FTS_QUERY_MAX_TERMS]
-        ascii_items = _dedupe(ascii_items + ascii_aliases)[: decisions.FTS_QUERY_MAX_TERMS]
+        extra = list(dict.fromkeys(alias_tokens))[:alias_max_terms]
+        cjk_aliases = [tok for tok in extra if _CJK_RE.fullmatch(tok)]
+        ascii_aliases = [tok for tok in extra if not _CJK_RE.fullmatch(tok)]
+        windows = _dedupe(windows + cjk_aliases)
+        ascii_items = _dedupe(ascii_items + ascii_aliases)
+
+    # wiki 导航扩词：第二个独立扩展来源，同样不占原 query 窗口名额。
+    # ★ 不得复用上面别名的追加行 —— 那是另一个来源、另一份预算，混用会让
+    #   「wiki 扩词」与「词表扩词」互相挤占，评测时无法归因。
+    # ★ cap 是 tsquery 总词元硬上限（原窗口 24 + wiki 二级预算 6）；
+    #   `extra_index_tokens` 已在 select_nav_terms 里按整词限流，常规情形下
+    #   这里的裁剪碰不到原窗口。两个扩展来源同时满额时 wiki 让位给先到的别名，
+    #   是 cap 的正常行为（原窗口与别名都保留），不是「原 query 窗口被挤掉」。
+    if extra_index_tokens:
+        cap = decisions.FTS_QUERY_MAX_TERMS + decisions.WIKI_NAV_MAX_FTS_TOKENS
+        cjk_extra = [t for t in extra_index_tokens if _CJK_RE.fullmatch(t)]
+        ascii_extra = [t for t in extra_index_tokens if not _CJK_RE.fullmatch(t)]
+        windows = _dedupe(windows + cjk_extra)[:cap]
+        ascii_items = _dedupe(ascii_items + ascii_extra)[:cap]
 
     groups: list[str] = []
     if windows:
@@ -212,6 +274,8 @@ def extract_model_terms(text: str) -> list[tuple[str, list[str]]]:
 def build_ilike_pattern(
     terms: list[str],
     aliases: dict[str, list[str]] | None = None,
+    *,
+    extra_terms: Sequence[str] = (),
 ) -> str:
     """把词元拼成正则分支；型号词元展开为「可选分隔符」以容忍三种写法。
 
@@ -221,10 +285,17 @@ def build_ilike_pattern(
     aliases 是词表扩展结果（键为词元、值为其它写法）：同义词作为**同一逻辑词元**
     的分支并列 OR，不占用 ILIKE_MAX_TERMS 的名额 —— 否则「访问令牌」与
     「accesstoken」会互相挤掉本该保留的中文语义单元。
+
+    ★ `extra_terms`（wiki 导航扩词）是 keyword-only 且默认空：作为**附加 OR 分支**
+      追加在既有词元之后，不占 `ILIKE_MAX_TERMS` 名额，也**不修改 `terms` 本身**
+      （原词元集合冻结 = 关闭态逐字节等价的前提，设计 §2.2.1 / §6-C7 的致命方案）。
+      为空时返回值与改动前**逐字节相同**（Golden Test 钉住），所有既有调用点零改动。
     """
     aliases = aliases or {}
     parts: list[str] = []
-    for term in terms:
+    # 把 extra_terms 接进同一循环：型号展开 / re.escape 只保留一份逻辑，
+    # 且 extra_terms=() 时 `(*terms, *())` 的遍历顺序与改动前完全一致。
+    for term in (*terms, *extra_terms):
         for alt in (term, *aliases.get(term, [])):
             match = _MODEL_TERM_RE.match(alt)
             if match:
