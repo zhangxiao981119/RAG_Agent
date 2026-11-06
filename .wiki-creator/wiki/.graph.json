@@ -50,6 +50,28 @@
       ],
       "page": "pages/engineering-lessons/cross-role-config-fingerprint.md"
     },
+    "realdb-probe-vs-skip-green": {
+      "title": "真库探针与宿主 skip 假绿",
+      "topic": "engineering-lessons",
+      "aliases": [
+        "skip 假绿",
+        "PGlite 最小投影",
+        "真库探针",
+        "对抗性实测"
+      ],
+      "page": "pages/engineering-lessons/realdb-probe-vs-skip-green.md"
+    },
+    "statement-timeout-three-phase": {
+      "title": "statement_timeout 事务级三段式还原",
+      "topic": "engineering-lessons",
+      "aliases": [
+        "statement_timeout",
+        "三段式还原",
+        "事务级超时",
+        "set_config"
+      ],
+      "page": "pages/engineering-lessons/statement-timeout-three-phase.md"
+    },
     "closed-state-equivalence": {
       "title": "关闭态等价验证",
       "topic": "evaluation-gate",
@@ -89,6 +111,28 @@
       ],
       "page": "pages/graphrag-integration/graph-acl-pushdown.md"
     },
+    "graph-recall-v12-contract": {
+      "title": "图召回 v1.2 契约口径",
+      "topic": "graphrag-integration",
+      "aliases": [
+        "v1.2 契约",
+        "graph_unique",
+        "graph_covered",
+        "候选池分母"
+      ],
+      "page": "pages/graphrag-integration/graph-recall-v12-contract.md"
+    },
+    "dedup-before-trim": {
+      "title": "先排重后裁剪",
+      "topic": "retrieval-architecture",
+      "aliases": [
+        "dedup before trim",
+        "排重后裁剪",
+        "先排重",
+        "exclude_chunk_ids"
+      ],
+      "page": "pages/retrieval-architecture/dedup-before-trim.md"
+    },
     "hybrid-recall": {
       "title": "三路混合召回",
       "topic": "retrieval-architecture",
@@ -98,6 +142,18 @@
         "三路召回"
       ],
       "page": "pages/retrieval-architecture/hybrid-recall.md"
+    },
+    "independent-budget-expansion": {
+      "title": "独立预算扩展",
+      "topic": "retrieval-architecture",
+      "aliases": [
+        "独立预算",
+        "extra_terms",
+        "extra_index_tokens",
+        "不截断主词元",
+        "别名预算"
+      ],
+      "page": "pages/retrieval-architecture/independent-budget-expansion.md"
     },
     "rrf-fusion": {
       "title": "RRF 倒数排名融合",
@@ -121,53 +177,79 @@
     }
   },
   "alias_redirects": {
+    "能力失败三档语义": "capability-failure-semantics",
     "fail-closed": "capability-failure-semantics",
     "fail-open": "capability-failure-semantics",
     "fail-visible": "capability-failure-semantics",
     "失败语义": "capability-failure-semantics",
+    "配置变更与重跑口径矩阵": "config-change-reprocess-matrix",
     "重跑口径": "config-change-reprocess-matrix",
     "变更后果矩阵": "config-change-reprocess-matrix",
+    "部署期能力开关": "deployment-capability-switch",
     "能力开关": "deployment-capability-switch",
     "capability switch": "deployment-capability-switch",
     "部署期开关": "deployment-capability-switch",
+    "并发容量双校验": "concurrency-capacity-check",
     "连接池账": "concurrency-capacity-check",
     "容量校验": "concurrency-capacity-check",
-    "asyncsession 并发": "concurrency-capacity-check",
+    "AsyncSession 并发": "concurrency-capacity-check",
+    "跨角色配置指纹": "cross-role-config-fingerprint",
     "config fingerprint": "cross-role-config-fingerprint",
     "配置指纹": "cross-role-config-fingerprint",
     "一致性比对": "cross-role-config-fingerprint",
+    "真库探针与宿主 skip 假绿": "realdb-probe-vs-skip-green",
+    "skip 假绿": "realdb-probe-vs-skip-green",
+    "PGlite 最小投影": "realdb-probe-vs-skip-green",
+    "真库探针": "realdb-probe-vs-skip-green",
+    "对抗性实测": "realdb-probe-vs-skip-green",
+    "statement_timeout 事务级三段式还原": "statement-timeout-three-phase",
+    "statement_timeout": "statement-timeout-three-phase",
+    "三段式还原": "statement-timeout-three-phase",
+    "事务级超时": "statement-timeout-three-phase",
+    "set_config": "statement-timeout-three-phase",
+    "关闭态等价验证": "closed-state-equivalence",
     "关闭态等价": "closed-state-equivalence",
     "逐字节等价": "closed-state-equivalence",
+    "评测门禁": "eval-gate",
     "评估门禁": "eval-gate",
     "eval gate": "eval-gate",
     "217 条": "eval-gate",
+    "实体图存储": "entity-graph-store",
     "实体图": "entity-graph-store",
     "knowledge graph": "entity-graph-store",
     "图三表": "entity-graph-store",
+    "图扩展的权限下推": "graph-acl-pushdown",
     "图权限": "graph-acl-pushdown",
-    "acl 下推": "graph-acl-pushdown",
+    "ACL 下推": "graph-acl-pushdown",
     "四闸门": "graph-acl-pushdown",
+    "图召回 v1.2 契约口径": "graph-recall-v12-contract",
+    "v1.2 契约": "graph-recall-v12-contract",
+    "graph_unique": "graph-recall-v12-contract",
+    "graph_covered": "graph-recall-v12-contract",
+    "候选池分母": "graph-recall-v12-contract",
+    "先排重后裁剪": "dedup-before-trim",
+    "dedup before trim": "dedup-before-trim",
+    "排重后裁剪": "dedup-before-trim",
+    "先排重": "dedup-before-trim",
+    "exclude_chunk_ids": "dedup-before-trim",
+    "三路混合召回": "hybrid-recall",
     "混合召回": "hybrid-recall",
     "hybrid recall": "hybrid-recall",
     "三路召回": "hybrid-recall",
-    "rrf": "rrf-fusion",
-    "reciprocal rank fusion": "rrf-fusion",
+    "独立预算扩展": "independent-budget-expansion",
+    "独立预算": "independent-budget-expansion",
+    "extra_terms": "independent-budget-expansion",
+    "extra_index_tokens": "independent-budget-expansion",
+    "不截断主词元": "independent-budget-expansion",
+    "别名预算": "independent-budget-expansion",
+    "RRF 倒数排名融合": "rrf-fusion",
+    "RRF": "rrf-fusion",
+    "Reciprocal Rank Fusion": "rrf-fusion",
     "倒数排名融合": "rrf-fusion",
+    "旁路召回": "side-channel-recall",
     "side channel": "side-channel-recall",
     "上下文补充片": "side-channel-recall",
-    "旁路模式": "side-channel-recall",
-    "能力失败三档语义": "capability-failure-semantics",
-    "配置变更与重跑口径矩阵": "config-change-reprocess-matrix",
-    "部署期能力开关": "deployment-capability-switch",
-    "并发容量双校验": "concurrency-capacity-check",
-    "跨角色配置指纹": "cross-role-config-fingerprint",
-    "关闭态等价验证": "closed-state-equivalence",
-    "评测门禁": "eval-gate",
-    "实体图存储": "entity-graph-store",
-    "图扩展的权限下推": "graph-acl-pushdown",
-    "三路混合召回": "hybrid-recall",
-    "rrf 倒数排名融合": "rrf-fusion",
-    "旁路召回": "side-channel-recall"
+    "旁路模式": "side-channel-recall"
   },
   "page_to_sources": {
     "pages/deployment-capability/capability-failure-semantics.md": [
@@ -190,6 +272,12 @@
       "raw/2026-11-04-架构知识条目.md",
       "raw/2026-11-03-测试报告.md"
     ],
+    "pages/engineering-lessons/realdb-probe-vs-skip-green.md": [
+      "raw/2026-11-06-增量知识条目.md"
+    ],
+    "pages/engineering-lessons/statement-timeout-three-phase.md": [
+      "raw/2026-11-06-增量知识条目.md"
+    ],
     "pages/evaluation-gate/closed-state-equivalence.md": [
       "raw/2026-11-04-架构知识条目.md",
       "raw/2026-11-03-测试报告.md"
@@ -205,8 +293,17 @@
       "raw/2026-11-03-架构设计文档.md",
       "raw/2026-11-03-测试报告.md"
     ],
+    "pages/graphrag-integration/graph-recall-v12-contract.md": [
+      "raw/2026-11-06-增量知识条目.md"
+    ],
+    "pages/retrieval-architecture/dedup-before-trim.md": [
+      "raw/2026-11-06-增量知识条目.md"
+    ],
     "pages/retrieval-architecture/hybrid-recall.md": [
       "raw/2026-11-03-架构设计文档.md"
+    ],
+    "pages/retrieval-architecture/independent-budget-expansion.md": [
+      "raw/2026-11-06-增量知识条目.md"
     ],
     "pages/retrieval-architecture/rrf-fusion.md": [
       "raw/2026-11-03-架构设计文档.md"
@@ -243,6 +340,13 @@
       "pages/evaluation-gate/closed-state-equivalence.md",
       "pages/evaluation-gate/eval-gate.md",
       "pages/graphrag-integration/graph-acl-pushdown.md"
+    ],
+    "raw/2026-11-06-增量知识条目.md": [
+      "pages/engineering-lessons/realdb-probe-vs-skip-green.md",
+      "pages/engineering-lessons/statement-timeout-three-phase.md",
+      "pages/graphrag-integration/graph-recall-v12-contract.md",
+      "pages/retrieval-architecture/dedup-before-trim.md",
+      "pages/retrieval-architecture/independent-budget-expansion.md"
     ]
   },
   "duplicate_slugs": {}

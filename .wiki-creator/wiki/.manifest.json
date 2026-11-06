@@ -16,7 +16,12 @@
       "sha256": "71347e4be6271fb49db6e62c295c20b02be4232ce6832f7c5fc896ba11a43eff",
       "compiled_at": null,
       "compiled": true
+    },
+    "raw/2026-11-06-增量知识条目.md": {
+      "sha256": "abf5ce2a51569cead72694d09144fe9e5c83e2fc6240967d968dc7a9f4171819",
+      "compiled_at": null,
+      "compiled": true
     }
   },
-  "page_count": 12
+  "page_count": 17
 }

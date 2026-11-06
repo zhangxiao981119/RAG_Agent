@@ -1,14 +1,37 @@
 {
+  "capability-failure-semantics": [
+    "closed-state-equivalence",
+    "cross-role-config-fingerprint",
+    "deployment-capability-switch"
+  ],
+  "config-change-reprocess-matrix": [
+    "deployment-capability-switch"
+  ],
   "deployment-capability-switch": [
     "capability-failure-semantics",
     "config-change-reprocess-matrix",
     "cross-role-config-fingerprint"
   ],
+  "concurrency-capacity-check": [
+    "dedup-before-trim",
+    "realdb-probe-vs-skip-green",
+    "side-channel-recall"
+  ],
+  "cross-role-config-fingerprint": [
+    "deployment-capability-switch"
+  ],
+  "realdb-probe-vs-skip-green": [],
+  "statement-timeout-three-phase": [],
   "closed-state-equivalence": [
     "capability-failure-semantics",
     "deployment-capability-switch",
     "eval-gate",
+    "independent-budget-expansion",
+    "realdb-probe-vs-skip-green",
     "rrf-fusion"
+  ],
+  "eval-gate": [
+    "closed-state-equivalence"
   ],
   "entity-graph-store": [
     "capability-failure-semantics",
@@ -16,42 +39,39 @@
     "graph-acl-pushdown",
     "side-channel-recall"
   ],
-  "config-change-reprocess-matrix": [
-    "deployment-capability-switch"
-  ],
-  "capability-failure-semantics": [
-    "closed-state-equivalence",
-    "cross-role-config-fingerprint",
-    "deployment-capability-switch"
-  ],
-  "cross-role-config-fingerprint": [
-    "deployment-capability-switch"
-  ],
-  "side-channel-recall": [
-    "concurrency-capacity-check",
-    "entity-graph-store",
-    "eval-gate",
-    "hybrid-recall",
-    "rrf-fusion"
-  ],
   "graph-acl-pushdown": [
     "concurrency-capacity-check",
     "entity-graph-store",
-    "hybrid-recall"
+    "graph-recall-v12-contract",
+    "hybrid-recall",
+    "statement-timeout-three-phase"
   ],
-  "eval-gate": [
-    "closed-state-equivalence"
+  "graph-recall-v12-contract": [
+    "dedup-before-trim",
+    "independent-budget-expansion"
+  ],
+  "dedup-before-trim": [
+    "graph-recall-v12-contract"
   ],
   "hybrid-recall": [
     "graph-acl-pushdown",
+    "independent-budget-expansion",
     "rrf-fusion",
     "side-channel-recall"
   ],
+  "independent-budget-expansion": [],
   "rrf-fusion": [
     "hybrid-recall",
     "side-channel-recall"
   ],
-  "concurrency-capacity-check": [
-    "side-channel-recall"
+  "side-channel-recall": [
+    "concurrency-capacity-check",
+    "dedup-before-trim",
+    "entity-graph-store",
+    "eval-gate",
+    "graph-recall-v12-contract",
+    "hybrid-recall",
+    "rrf-fusion",
+    "statement-timeout-three-phase"
   ]
 }

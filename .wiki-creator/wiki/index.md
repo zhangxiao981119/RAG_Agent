@@ -8,7 +8,7 @@
 → 详见 topics/deployment-capability.md
 
 ### [[engineering-lessons]] 工程教训
-跨角色配置指纹、并发容量校验等可复用判断。共 2 页。
+跨角色配置指纹、并发容量校验、真库探针与宿主 skip 假绿、statement_timeout 事务级三段式还原等可复用判断。共 4 页。
 → 详见 topics/engineering-lessons.md
 
 ### [[evaluation-gate]] 评测门禁
@@ -16,9 +16,9 @@
 → 详见 topics/evaluation-gate.md
 
 ### [[graphrag-integration]] 图召回接入
-实体图存储、离线抽取管线、图扩展的权限下推。共 2 页。
+实体图存储、离线抽取管线、图扩展的权限下推、图召回 v1.2 契约口径。共 3 页。
 → 详见 topics/graphrag-integration.md
 
 ### [[retrieval-architecture]] 检索架构
-三路混合召回、RRF 融合、阈值与拒答、旁路上下文补充。共 3 页。
+三路混合召回、RRF 融合、阈值与拒答、旁路上下文补充、先排重后裁剪、独立预算扩展。共 5 页。
 → 详见 topics/retrieval-architecture.md
