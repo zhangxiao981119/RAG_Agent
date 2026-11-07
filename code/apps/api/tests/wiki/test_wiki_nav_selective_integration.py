@@ -55,8 +55,24 @@ _SEED_EMBEDDING_MODEL = "bge-m3"
 _SEED_EMBEDDING_TEXT_VERSION = "etext-v1"
 _SEED_CHUNKER_VERSION = "c400-800-60"
 
-# 1024 维 pgvector 字符串（'[...]' 形态，配合 `:embedding::vector` 内联转型）。
+# 1024 维 pgvector 字符串（'[...]' 形态，配合 `CAST(:embedding AS vector)` 转型）。
 _EMBEDDING_1024 = "[" + ",".join("0.01" for _ in range(1024)) + "]"
+
+# ★ 单一真源：这段 SQL 既给 _seed 用、也给下面的纯单测解析用。
+#   `:embedding::vector` 写法会被 SQLAlchemy 的参数正则（带 `(?!:)`）漏掉，
+#   `::` 原样发给 asyncpg → "syntax error at or near ':'"（README §踩坑 P1）。
+#   必须用 `CAST(... AS vector)`；纯单测钉住参数真的进了 _bindparams，
+#   这样即便真库用例因缺 WIKI_NAV_ACL_DB_URL 被 skip，回归也拦得住。
+_SEED_CHUNK_SQL = (
+    "INSERT INTO chunks"
+    " (id, tenant_id, kb_id, document_id, chunk_index, content, token_count,"
+    "  level_rank, acl_tags, deny_subjects, is_latest,"
+    "  embedding, embedding_model, embedding_text_version, chunker_version)"
+    " VALUES (:cid, :tid, :kb, :doc, 0, 'nav-sel-probe-chunk', 1,"
+    "  :level, CAST(:acl AS text[]), CAST(:deny AS text[]), true,"
+    "  CAST(:embedding AS vector), :embedding_model, :embedding_text_version,"
+    "  :chunker_version)"
+)
 
 # (用例名, key_terms, chunk_kb, level_rank, acl_tags, deny_subjects, status)
 # ★ 三页的 **wiki_pages.kb 都是 KB（授权库）**，所以页级过滤器（tenant/kb/scope/
@@ -99,7 +115,7 @@ async def _seed(engine, tenant_id: uuid.UUID = TENANT, kb_id: uuid.UUID = KB) ->
     """合成数据：独立租户 + 两个 kb + 三个文档/页（**含合成页**）。
 
     每页 dict 对应 `wiki_pages` 的必填列 + 一条匹配 `chunks` 行：
-      · 1024 维合法 embedding（`:embedding::vector`）；
+      · 1024 维合法 embedding（`CAST(:embedding AS vector)`）；
       · 0011 NOT-NULL 三列（embedding_model / embedding_text_version / chunker_version）；
       · 合法 ACL 值（level_rank / acl_tags / deny_subjects / is_latest）。
     """
@@ -133,16 +149,7 @@ async def _seed(engine, tenant_id: uuid.UUID = TENANT, kb_id: uuid.UUID = KB) ->
                 },
             )
             await conn.execute(
-                text(
-                    "INSERT INTO chunks"
-                    " (id, tenant_id, kb_id, document_id, chunk_index, content, token_count,"
-                    "  level_rank, acl_tags, deny_subjects, is_latest,"
-                    "  embedding, embedding_model, embedding_text_version, chunker_version)"
-                    " VALUES (:cid, :tid, :kb, :doc, 0, 'nav-sel-probe-chunk', 1,"
-                    "  :level, CAST(:acl AS text[]), CAST(:deny AS text[]), true,"
-                    "  :embedding::vector, :embedding_model, :embedding_text_version,"
-                    "  :chunker_version)"
-                ),
+                text(_SEED_CHUNK_SQL),
                 {
                     "cid": uuid.uuid4(), "tid": tenant_id, "kb": chunk_kb, "doc": doc_id,
                     "level": level, "acl": acl_tags, "deny": deny,
@@ -287,6 +294,20 @@ async def test_acl_four_gate_excludes_unauthorized_pages(db_url):
 # ════════════════════════════════════════════════════════════════════════
 # 无需 DB 的用例（任何环境都跑，不依赖 WIKI_NAV_ACL_DB_URL）
 # ════════════════════════════════════════════════════════════════════════
+def test_seed_chunk_sql_really_binds_embedding_param():
+    """钉住 `:embedding::vector` 回归：SQLAlchemy 必须把 embedding 解析成绑定参数。
+
+    无 DB 也跑 —— 真库用例缺 URL 会 skip，若只有它守着，这个坑在无库环境会静默
+    漏过去。`text()` 真实解析一次并断言参数名，且不残留 `::vector` 内联写法。
+    """
+    stmt = text(_SEED_CHUNK_SQL)
+    assert "embedding" in stmt._bindparams, (  # noqa: SLF001 - 断言的就是解析结果
+        "embedding 未被解析成绑定参数；检查是否又写回了 `:embedding::vector`"
+    )
+    assert ":embedding::" not in _SEED_CHUNK_SQL
+    assert "CAST(:embedding AS vector)" in _SEED_CHUNK_SQL
+
+
 def test_select_nav_terms_for_seeded_page_and_query():
     """纯函数层：用合成页同款 key_terms（access 页）+ 构造 query 选词。
 

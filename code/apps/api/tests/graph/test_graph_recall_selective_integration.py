@@ -415,13 +415,52 @@ async def test_selective_off_always_recalls(monkeypatch):
 #      两个测试函数定义在模块级、用 @requires_db 装饰，缺失 URL 时整体 skip。
 # ════════════════════════════════════════════════════════════════════════
 if GRAPH_TEST_DB_URL:
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy import text
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
 
     from app.config.graph_profile import current_graph_profile
-    from app.models import Chunk, Document, GraphEntityMention, GraphRelation, KnowledgeBase, Tenant
+    from app.models import Chunk, Document, KnowledgeBase, Tenant
 
-    _engine = create_async_engine(GRAPH_TEST_DB_URL, pool_pre_ping=True)
-    _Session = async_sessionmaker(_engine, expire_on_commit=False)
+    # ★ 每个用例独占 engine：pytest-asyncio 给每个 async 用例换一个 event loop，
+    #   模块级 engine 的连接池会跨 loop 复用 asyncpg 连接 —— 第二次 checkout 时
+    #   pool_pre_ping 在已关闭的 loop 上 ping，实测报
+    #   "'NoneType' object has no attribute 'send'" / "Event loop is closed"。
+    #   NullPool（不池化）+ statement_cache_size=0 与 wiki 真库夹具同口径。
+    @asynccontextmanager
+    async def _real_db():
+        """yield 一个 session；用前 / 用后各清一次 TENANT 合成行，保证零残留。"""
+        eng = create_async_engine(
+            GRAPH_TEST_DB_URL, poolclass=NullPool,
+            connect_args={"statement_cache_size": 0},
+        )
+        try:
+            await _purge(eng)
+            async with async_sessionmaker(eng, expire_on_commit=False)() as session:
+                try:
+                    yield session
+                finally:
+                    # 丢弃未提交事务 / failed 状态，避免与收尾 _purge 抢锁
+                    await session.rollback()
+            await _purge(eng)
+        finally:
+            await eng.dispose()
+
+    async def _purge(engine) -> None:
+        """按 FK 依赖顺序删净 TENANT 下所有合成行（幂等，N4 fixture 纪律）。"""
+        async with engine.begin() as conn:
+            for tbl in (
+                "graph_relations", "graph_entity_mentions", "graph_entities",
+                "chunks", "documents", "knowledge_bases",
+            ):
+                await conn.execute(
+                    text(f"DELETE FROM {tbl} WHERE tenant_id = :t"), {"t": TENANT}
+                )
+            await conn.execute(
+                text("DELETE FROM tenants WHERE id = :t"), {"t": TENANT}
+            )
 
     async def _seed_base(session) -> tuple[uuid.UUID, uuid.UUID]:
         """插入 tenant / kb / document / 两片 chunk（满足四闸门）。返回 (c1, c2)。"""
@@ -444,7 +483,7 @@ if GRAPH_TEST_DB_URL:
             id=c1, tenant_id=TENANT, kb_id=KB, document_id=DOC, chunk_index=0,
             content="差旅费报销标准由财务部制定。", fts_text="差旅费 报销 标准 财务部 制定",
             token_count=20, heading_path="第一章", page_no=1, level_rank=20,
-            acl_tags=["public"], deny_subjects=[], is_latest=True, embedding=None,
+            acl_tags=["dept:it"], deny_subjects=[], is_latest=True, embedding=None,
             embedding_model="test", embedding_text_version="v1", chunker_version="v1",
             governance_weight=0,
         )
@@ -452,11 +491,20 @@ if GRAPH_TEST_DB_URL:
             id=c2, tenant_id=TENANT, kb_id=KB, document_id=DOC, chunk_index=1,
             content="财务制度规定了预算审批流程。", fts_text="财务 制度 规定 预算 审批 流程",
             token_count=20, heading_path="第一章", page_no=1, level_rank=20,
-            acl_tags=["public"], deny_subjects=[], is_latest=True, embedding=None,
+            acl_tags=["dept:it"], deny_subjects=[], is_latest=True, embedding=None,
             embedding_model="test", embedding_text_version="v1", chunker_version="v1",
             governance_weight=0,
         )
-        session.add_all([tenant, kb, doc, chunk1, chunk2])
+        # ★ 逐层 flush：tenant → kb → doc → chunks。一次性 add_all + flush 会把
+        #   两片 chunk 合并成 insertmanyvalues 批量 INSERT，实测在真库上先于
+        #   tenant 落库 → chunks_tenant_id_fkey 违例。分层 flush 把 FK 顺序钉死。
+        session.add(tenant)
+        await session.flush()
+        session.add(kb)
+        await session.flush()
+        session.add(doc)
+        await session.flush()
+        session.add_all([chunk1, chunk2])
         await session.flush()
         return c1, c2
 
@@ -487,7 +535,7 @@ if GRAPH_TEST_DB_URL:
 async def test_real_db_seed_and_recall():
     """真实 PG：upsert_subgraph 落子图 → 真实 recall_by_graph 返回邻居片。"""
     store = get_graph_store()
-    async with _Session() as session:
+    async with _real_db() as session:
         c1, c2 = await _seed_base(session)
         result = _build_extraction_result(current_graph_profile(), c1, c2)
         written = await store.upsert_subgraph(
@@ -501,11 +549,14 @@ async def test_real_db_seed_and_recall():
             session, query="差旅费报销标准", pushdown=PUSHDOWN,
             timeout_ms=800, profile=current_graph_profile(),
         )
-        assert out.degraded_reason in ("", "no_entities", "no_neighbors")
+        # ★ 收紧到 ""：数据已正确 seed，静默降级成 no_entities / no_neighbors
+        #   也必须判失败 —— 否则「图路整条失效」会被当成通过（空集假阳性）。
+        assert out.degraded_reason == "", (
+            f"seed 完备时不应降级，实际 degraded_reason={out.degraded_reason!r}"
+        )
         chunk_ids = {c.chunk_id for c in out.chunks}
         assert c1 in chunk_ids, "种子实体自身提及片应被召回"
         assert out.graph_covered == 0
-        await session.rollback()
 
 
 @pytest.mark.asyncio
@@ -513,7 +564,7 @@ async def test_real_db_seed_and_recall():
 async def test_real_db_exclude_respected_and_timeout_safe():
     """真实 PG：exclude_chunk_ids 被尊重；快查询上 statement_timeout 路径不报错。"""
     store = get_graph_store()
-    async with _Session() as session:
+    async with _real_db() as session:
         c1, c2 = await _seed_base(session)
         result = _build_extraction_result(current_graph_profile(), c1, c2)
         await store.upsert_subgraph(
@@ -527,25 +578,21 @@ async def test_real_db_exclude_respected_and_timeout_safe():
             timeout_ms=800, profile=current_graph_profile(),
             exclude_chunk_ids=frozenset({c1}),
         )
+        # ★ 先钉住「基线确实召回过片」：若整条图路静默返回空集，
+        #   单有 `c1 not in {}` 会恒真通过 —— 这是空集假阳性，必须堵死。
+        assert out.degraded_reason == "", (
+            f"seed 完备时不应降级，实际 degraded_reason={out.degraded_reason!r}"
+        )
+        assert out.chunks, "基线必须召回到片，否则下面的 exclude 断言没有意义"
         assert c1 not in {c.chunk_id for c in out.chunks}
+        assert out.graph_covered >= 1, "被排除的 c1 应计入 graph_covered"
 
         # 快查询 + 大超时：statement_timeout 设置/还原路径不得抛错
         out2 = await recall_by_graph(
             session, query="差旅费报销标准", pushdown=PUSHDOWN,
             timeout_ms=800, profile=current_graph_profile(),
         )
-        assert out2.degraded_reason in ("", "no_entities", "no_neighbors")
-
-        # 清理：删除本档图数据 + 基础行
-        await store.delete_by_document(session, document_id=DOC)
-        await session.execute(
-            GraphRelation.__table__.delete().where(GraphRelation.document_id == DOC)
+        assert out2.degraded_reason == ""
+        assert c1 in {c.chunk_id for c in out2.chunks}, (
+            "不带 exclude 时应能召回 c1（与上面的排除结果构成对照）"
         )
-        await session.execute(
-            GraphEntityMention.__table__.delete().where(GraphEntityMention.document_id == DOC)
-        )
-        await session.execute(Chunk.__table__.delete().where(Chunk.document_id == DOC))
-        await session.execute(Document.__table__.delete().where(Document.id == DOC))
-        await session.execute(KnowledgeBase.__table__.delete().where(KnowledgeBase.id == KB))
-        await session.execute(Tenant.__table__.delete().where(Tenant.id == TENANT))
-        await session.commit()

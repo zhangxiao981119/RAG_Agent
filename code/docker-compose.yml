@@ -162,6 +162,12 @@ services:
       # ★ dev 编排同样要注入：只写在 prod 里的话，开发栈里设了 GRAPH_ENABLED=true 也不会
       #   生效 —— 「配了却不生效」正是本方案要堵的坑（见设计文档 §11.2）。
       GRAPH_ENABLED: ${GRAPH_ENABLED:-false}
+      # ── 按需路由开关（只注入 api：worker 不跑检索、不消费这两个开关，
+      #    故不注入 worker 段、也不进 config_fingerprint 白名单 ——
+      #    见 config_profile.py:79 的判定标准）。默认关 = 与未引入路由逐字节等价；
+      #    217 条 A/B 标定通过前 MUST 保持 false。
+      GRAPH_RECALL_SELECTIVE: ${GRAPH_RECALL_SELECTIVE:-false}
+      WIKI_NAV_SELECTIVE: ${WIKI_NAV_SELECTIVE:-false}
       GRAPH_STORE_BACKEND: ${GRAPH_STORE_BACKEND:-postgres}
       GRAPH_EXTRACTOR_MODEL: ${GRAPH_EXTRACTOR_MODEL:-}
       GRAPH_RETRIEVE_TIMEOUT_MS: ${GRAPH_RETRIEVE_TIMEOUT_MS:-800}
