@@ -1046,6 +1046,7 @@ M6 安全加固功能默认关闭，到「灰度开关」面板手动创建规�
 
 **Q: 图召回 / wiki 导航有「按需路由」（判别该不该走）吗？**
 有，但**默认关**（`GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE`，均在 `code/apps/api/app/config/settings.py`）。开启后：图召回仅当 top1 高置信（≥ `GRAPH_SKIP_SCORE=0.85`）且召回充足（≥ `GRAPH_SKIP_MIN_CHUNKS=8`）才跳过；wiki 导航仅当查询词元已很丰富（≥ `WIKI_NAV_SELECTIVE_MIN_TERMS=3`）才跳过（wiki 在第 4 步、主召回之前执行，retrieved 尚不存在，故用前置词元数信号）。两个阈值均为**站位值，待 217 条 A/B 标定**；默认关时行为与未引入路由逐字节相同，基线零影响。
+机制与常量详见 [`code/docs/按需路由设计.md`](code/docs/按需路由设计.md)（决策契约 / 真值表 / 不变量 / 标定计划）；图召回 / wiki 的三表 Schema、抽取写入、在线召回 8 步流程见 [`code/docs/GraphRAG检索召回.md`](code/docs/GraphRAG检索召回.md)。
 
 </details>
 

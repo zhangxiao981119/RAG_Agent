@@ -74,6 +74,39 @@ def test_self_check_rejects_invalid_wiki_nav_constants(monkeypatch, name, bad_va
         decisions.self_check()
 
 
+def test_wiki_nav_selective_min_terms_is_landed():
+    """WIKI_NAV_SELECTIVE 路由阈值（站位值，待 217 条 A/B 标定）原样落地为 3。"""
+    assert decisions.WIKI_NAV_SELECTIVE_MIN_TERMS == 3
+    # 与 ILIKE_MAX_TERMS 同源上界：len(ilike_terms) 上限即 3，故 3 = 最保守活跃值
+    assert decisions.WIKI_NAV_SELECTIVE_MIN_TERMS <= decisions.ILIKE_MAX_TERMS
+
+
+@pytest.mark.parametrize(
+    ("bad_value", "message"),
+    [
+        (0, "WIKI_NAV_SELECTIVE_MIN_TERMS MUST"),  # 低于下界 1
+        (decisions.ILIKE_MAX_TERMS + 1, "WIKI_NAV_SELECTIVE_MIN_TERMS MUST"),  # 超上界 = 永不跳过（空操作）
+    ],
+)
+def test_self_check_rejects_invalid_wiki_nav_selective_min_terms(monkeypatch, bad_value, message):
+    """两条边界断言逐条可证伪（模型 on tests/graph/test_self_check.py 的 monkeypatch 范式）。
+
+    自 decisions.py:1300 —— WIKI_NAV_SELECTIVE_MIN_TERMS MUST ∈ [1, ILIKE_MAX_TERMS]，
+    否则超上限会让路由变成「永不跳过」的空操作。monkeypatch 在用例级自动 undo，
+    不污染其它用例对站立值 3 的断言。
+    """
+    monkeypatch.setattr(decisions, "WIKI_NAV_SELECTIVE_MIN_TERMS", bad_value)
+    with pytest.raises(RuntimeError, match=message):
+        decisions.self_check()
+
+
+def test_self_check_passes_at_legal_standing_value(monkeypatch):
+    """恢复合法站立值后 self_check() MUST 通过（证明上面的拒绝路径不是「恒拒绝」）。"""
+    monkeypatch.setattr(decisions, "WIKI_NAV_SELECTIVE_MIN_TERMS", 3)
+    # 不抛异常即通过
+    decisions.self_check()
+
+
 def test_wiki_nav_timeout_is_in_settings_and_cross_role_snapshot():
     """N2：settings 一份真源 + CROSS_ROLE_FIELDS / runtime_config_snapshot 同步。"""
     settings = get_settings()
