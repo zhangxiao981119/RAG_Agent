@@ -1,8 +1,8 @@
 # AGENT_CONTEXT - 给 Agent 的上下文恢复文件
 
 > 这不是给人看的 README，是**上下文恢复文件**。新接手的 Agent 读完应当立刻知道：这是什么项目、哪些口径不能动、当前链路是怎么走的、接下来该做什么。
-> 生成：2026-09-22 ｜ 最近更新：2026-11-07（对齐 2026-11-06 检索词元化 + 章节补全 + 查询扩展 + 误拒重试 + 第 4 步 wiki 导航；迁移 0026，测试 84 个 test_*.py 文件）；`.wiki-creator` 知识库新增 5 条知识条目（3 架构模式 + 2 工程教训）；新增**完整检索链路钉死文档** `code/docs/检索链路全景.md`（含可打印 HTML）；新增**图/wiki 召回「按需路由」opt-in 开关**（`GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE`，默认关，基线零影响，阈值站位待 217 条 A/B 标定）；新增两份参考文档 **`code/docs/GraphRAG检索召回.md`**（三表 Schema / 抽取 / 在线召回 8 步 / 先排重后裁剪 / 三段式 statement_timeout）+ **`code/docs/按需路由设计.md`**（决策契约 / 真值表 / 三常量 self_check 不变量 / 217 条 A/B 标定计划；阈值仍为站位值、217 条 A/B 未跑：Docker 已起但仅 postgres/ocr/worker 在跑、api 容器 Exited、compose 的 selective 开关注入已补齐，但库内仅 1 页 ready wiki 使 hit_cases>=20 假绿防线判结论无效）
-> 交付状态：GraphRAG 第 1/2 步（图数据地基 + 在线图召回 side channel（旁路通道））、LLM Wiki 第 3 步（生成 + 读接口）、第 4 步 wiki 导航参与检索（三段 commit `ea552c0` / `6717a85` / `86f5fc7`）代码均已交付，N1~N6 已裁决；默认 `WIKI_ENABLED=false` 为关闭态，与未实现第 4 步时逐字节等价。**真库效果层未验证**：217 条 A/B、EXPLAIN、P95、26 迁移从零全链均未跑，dev 库仅 1 页 wiki ready，`hit_cases >= 20` 不满足时评测结论判「无效」，「不劣化」未验证，唯一安全交付形态是关闭态。
+> 生成：2026-09-22 ｜ 最近更新：2026-11-07（对齐 2026-11-06 检索词元化 + 章节补全 + 查询扩展 + 误拒重试 + 第 4 步 wiki 导航；迁移 0026，测试 84 个 test_*.py 文件）；`.wiki-creator` 知识库新增 5 条知识条目（3 架构模式 + 2 工程教训）；新增**完整检索链路钉死文档** `code/docs/检索链路全景.md`（含可打印 HTML）；新增**图/wiki 召回「按需路由」opt-in 开关**（`GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE`，默认关，基线零影响，阈值仍为站位值、217 条 A/B 未完成）；新增两份参考文档 **`code/docs/GraphRAG检索召回.md`**（三表 Schema / 抽取 / 在线召回 8 步 / 先排重后裁剪 / 三段式 statement_timeout）+ **`code/docs/按需路由设计.md`**（决策契约 / 真值表 / 三常量 self_check 不变量 / 217 条 A/B 标定计划；阈值仍为站位值、217 条 A/B 未完成：标定前置已补齐（全栈 9 容器 healthy / `WIKI_ENABLED=true` / 19 页 ready wiki / 开关注入 / 镜像重建），但首轮 baseline 因上游 LLM 网关 `insufficient_quota`（账户余额不足）中断且未落库，详见 §6）
+> 交付状态：GraphRAG 第 1/2 步（图数据地基 + 在线图召回 side channel（旁路通道））、LLM Wiki 第 3 步（生成 + 读接口）、第 4 步 wiki 导航参与检索（三段 commit `ea552c0` / `6717a85` / `86f5fc7`）代码均已交付，N1~N6 已裁决；代码与编排默认 `WIKI_ENABLED=false`（关闭态与未实现第 4 步时逐字节等价），本机 `.env` 为标定前置临时设为 `true`。**真库效果层未验证**：217 条 A/B 首轮 baseline 因上游 LLM 网关 `insufficient_quota`（账户余额不足）在第 87 条可答用例中断且未落库，指标作废，「不劣化」未验证，唯一安全交付形态是两个 selective 开关默认关。dev 库现有 19 页 ready / 2 页 failed wiki，`hit_cases >= 20` 已具备数据条件（库内复算 69 条可答用例的期望文档有 ready 页）但仍待实测确认。
 
 ---
 
@@ -104,8 +104,8 @@
 | 澄清阈值 | `decisions.should_clarify` | 70 分，与改写 90 分离 |
 | 检索分段计时 | `infra/metrics.py` | embed / vector_sql / keyword_ilike / keyword_fts / section_recall / rerank 各自 p50/p95 |
 | 完整链路钉死文档 | `code/docs/检索链路全景.md`（+ HTML） | 主链路 + 图召回 / wiki 导航 / 权限四闸门旁路，常量带 `文件:行号`，`CONTRACT_VERSION="v1.1"`，图召回 v1.2 契约 |
-| 图/wiki 按需路由 | `config/settings.py` + `services/retrieve/__init__.py` | `GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE` 默认关；图仅 top1≥0.85 且召回≥8 才跳、wiki 仅词元≥3 才跳，阈值站位待 217 条 A/B 标定 |
-| 图/wiki 按需路由文档 | `code/docs/按需路由设计.md` + `code/docs/GraphRAG检索召回.md` | 决策契约 / 真值表（`_graph_should_recall` / `_wiki_should_nav`）/ 三常量 self_check 不变量 / | 217 条 A/B 标定计划（未跑，阻塞见 §6 状态声明）；图召回三表 Schema（`GraphEntity`/`GraphEntityMention`/`GraphRelation`）、`upsert_subgraph` 合并、在线召回 8 步、先排重后裁剪、三段式 statement_timeout。测试已交付：wiki/graph 两个真库集成文件 + 纯路由单测（真值表）；真库 PG 0026 上 15 例全绿（4 例真库 + 11 例无 DB），并经 3 组变异测试证明可拦回归（ACL 越权 / `:embedding::vector` / 无 DB 参数解析） |
+| 图/wiki 按需路由 | `config/settings.py` + `services/retrieve/__init__.py` | `GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE` 默认关；图仅 top1≥0.85 且召回≥8 才跳、wiki 仅词元≥3 才跳，阈值仍为站位值（217 条 A/B 未完成，详见 按需路由设计.md §6） |
+| 图/wiki 按需路由文档 | `code/docs/按需路由设计.md` + `code/docs/GraphRAG检索召回.md` | 决策契约 / 真值表（`_graph_should_recall` / `_wiki_should_nav`）/ 三常量 self_check 不变量 / | 217 条 A/B 标定计划（首轮 baseline 因上游 LLM 网关余额不足中断、未落库；当前状态见 §6）；图召回三表 Schema（`GraphEntity`/`GraphEntityMention`/`GraphRelation`）、`upsert_subgraph` 合并、在线召回 8 步、先排重后裁剪、三段式 statement_timeout。测试已交付：wiki/graph 两个真库集成文件 + 纯路由单测（真值表）；真库 PG 0026 上 15 例全绿（4 例真库 + 11 例无 DB），并经 3 组变异测试证明可拦回归（ACL 越权 / `:embedding::vector` / 无 DB 参数解析） |
 
 ---
 
@@ -114,6 +114,7 @@
 | 坑 | 根因 | 解法 |
 |---|---|---|
 | **改了源码不生效** | Dockerfile 曾 `pip install .`，site-packages 留了构建快照，运行时优先加载它 | 去掉 `pip install .`，改 `ENV PYTHONPATH=/workspace/apps/api`；改完必须验证 `python -c "import app; print(app.__file__)"` |
+| **只 recreate 容器、没 rebuild 镜像** | `docker compose up -d --force-recreate` 只重建容器，镜像里 `COPY . .` 的源码仍是旧的；2026-11-07 实测容器内 `Settings` 缺两个 selective 字段、`retrieve/__init__.py` 无路由函数 | 改源码后先 `docker compose build api worker migrate` 再 `up -d --force-recreate`；验收用容器内 `Settings.model_fields` + `grep` 路由函数双重核对 |
 | **只重建 api 镜像** | worker 是独立镜像，会静默跑旧解析代码，任务照常返回 indexed | 部署时同 tag 同时 build 两侧 |
 | **SSE 长连接打爆连接池** | `get_db` 的 yield 覆盖整条流，每在途请求长期占 1 条、流式中瞬时 2 条 | 池 20+20 可配、timeout 5s、worker 池 5+5 |
 | **迁移没跑就重建镜像** | 新 SQL 引用新列（如 `c.fts_text`），列不存在直接 500 | 顺序固定：`alembic upgrade head` → 回填脚本 → 重建容器 |
@@ -173,7 +174,7 @@ code/
 │   │   │   └── infra/          metrics · trace · redis/arq 连接池
 │   │   ├── alembic/versions/   26 版迁移（0001~0026）
 │   │   ├── scripts/            eval 链 · calibrate · backfill_fts_text · build_kb_terms · loadtest
-│   │   └── tests/              pytest（80 个 test_*.py 文件；行覆盖 65% 为早期快照）
+│   │   └── tests/              pytest（84 个 test_*.py 文件；行覆盖 65% 为早期快照）
 │   ├── ocr/                    GOT-OCR2.0（扫描件专用，单路串行）
 │   └── web/                    React 18 前端（5 业务页 + 12 管理面板）
 ├── docker-compose.yml          开发 10 服务
