@@ -41,6 +41,33 @@ from app.services.rerank import RerankTimeout, get_rerank_service
 
 logger = logging.getLogger(__name__)
 
+
+def _graph_should_recall(top1_score: float, retrieved_n: int) -> bool:
+    """图召回「按需路由」（GRAPH_RECALL_SELECTIVE，默认关）。
+
+    返回 True = 调用 recall_by_graph；False = 跳过（省一次 DB 往返）。
+    默认关时恒 True —— 与未引入路由逐字节相同，基线零影响。
+    开启时：仅当 top1 高置信 **且** 召回充足同时成立才跳过，
+    见 decisions.GRAPH_SKIP_SCORE / GRAPH_SKIP_MIN_CHUNKS（均为站位值，待 217 条 A/B 标定）。
+    """
+    if not get_settings().graph_recall_selective:
+        return True
+    return not (top1_score >= decisions.GRAPH_SKIP_SCORE and retrieved_n >= decisions.GRAPH_SKIP_MIN_CHUNKS)
+
+
+def _wiki_should_nav(ilike_terms: list[str]) -> bool:
+    """wiki 导航「按需路由」（WIKI_NAV_SELECTIVE，默认关）。
+
+    返回 True = 执行 wiki 导航扩词；False = 跳过（省一次 50ms SELECT）。
+    默认关时恒 True —— 与未引入路由逐字节相同。
+    开启时：查询词元已很丰富（len(ilike_terms) >= decisions.WIKI_NAV_SELECTIVE_MIN_TERMS）则跳过。
+    ★ 方向为占位假设，须经 217 条 A/B 验证；若回归则下调阈值或把 wiki 移到主召回之后。
+    """
+    if not get_settings().wiki_nav_selective:
+        return True
+    return len(ilike_terms) < decisions.WIKI_NAV_SELECTIVE_MIN_TERMS
+
+
 # 下推 SQL 骨架（来自 acl/visibility.py：四闸门 G1~G4）
 # 注意：chunks 表无 deleted_at 列，PUSHDOWN_WHERE_SQL 里的 deleted_at 条件要去掉
 # （手册 §3.3.2 是通用模板，当前 chunks 只有 is_latest 表示版本）
@@ -259,8 +286,10 @@ class RetrievalService:
         wiki_terms: list[str] = []
         wiki_fts_tokens: list[str] = []
         wiki_on = get_settings().wiki_enabled
-
-        if wiki_on and ilike_terms:
+        wiki_run = wiki_on and bool(ilike_terms) and _wiki_should_nav(ilike_terms)
+        if not wiki_run and wiki_on and ilike_terms:
+            metrics.incr("rag.wiki.nav.skipped_by_router")
+        if wiki_run:
             from app.config.wiki_profile import current_wiki_profile
             from app.services.wiki.navigate import load_wiki_nav_page, select_nav_terms
 
@@ -541,56 +570,62 @@ class RetrievalService:
         graph_chunks: list[RetrievedChunk] = []
         graph_candidates: list[RetrievedChunk] = []
         graph_degraded = ""
+        graph_outcome = None
         if get_settings().graph_enabled:
-            # 延迟导入：让「GRAPH_ENABLED=false 时图代码根本没被加载」成为可证事实，
-            # 也避免 retrieve 包与 graph 包在模块级互相 import 成环
-            # （graph.recall 反向依赖本模块的 _WHERE_BASE）。
-            from app.config.graph_profile import current_graph_profile
-            from app.services.graph.recall import recall_by_graph
+            if not _graph_should_recall(retrieved[0].final_score, len(retrieved)):
+                # 按需路由：top1 高置信 + 召回充足，跳过图召回（省一次 DB 往返）。
+                # 此时 graph_outcome 保持 None，下方 path_stats 与 final_id_set 据此跳过。
+                metrics.incr("rag.graph.skipped_by_router")
+            else:
+                # 延迟导入：让「GRAPH_ENABLED=false 时图代码根本没被加载」成为可证事实，
+                # 也避免 retrieve 包与 graph 包在模块级互相 import 成环
+                # （graph.recall 反向依赖本模块的 _WHERE_BASE）。
+                from app.config.graph_profile import current_graph_profile
+                from app.services.graph.recall import recall_by_graph
 
-            t_graph = time.perf_counter()
-            graph_outcome = await recall_by_graph(
-                session,
-                query=query,
-                pushdown=pushdown,
-                timeout_ms=get_settings().graph_retrieve_timeout_ms,
-                # 口径一次请求只取一次：种子与邻居必须同一口径（见 linking 模块说明）
-                profile=current_graph_profile(),
-                # ★ 先排重后裁剪（§9.8 裁决 1）：命中片集合传给图召回，让它把
-                #   重复邻居跳过、不占预算名额 —— 否则权重最高的一跳邻居（恰恰
-                #   最可能在命中片里）会系统性挤掉真正新增的片。
-                exclude_chunk_ids=frozenset(c.chunk_id for c in retrieved),
-            )
-            graph_ms = (time.perf_counter() - t_graph) * 1000
-            stages["graph_recall"] = int(graph_ms)
-            metrics.observe_ms("rag.retrieve.graph_recall", graph_ms)
-            graph_degraded = graph_outcome.degraded_reason
-            graph_candidates = list(graph_outcome.chunks)
-            if graph_degraded:
-                # 图是增强项：失败不阻断主链路，但**必须可见** —— 否则「开了图却一直
-                # 0 召回」只能靠人去翻 SQL 才发现
-                metrics.incr("rag.graph_recall.degraded", reason=graph_degraded)
-            retrieved_ids = {c.chunk_id for c in retrieved}
-            for chunk in graph_candidates:
-                if chunk.chunk_id in retrieved_ids:
-                    # 理论上到不了这里：exclude_chunk_ids 已让 recall 层跳过命中片。
-                    # 保留这道闸是防御性的 —— recall 的契约变了而这里没跟上时，
-                    # 宁可少一片也不许同一片进上下文两次（编号重复、引用错位）。
-                    continue
-                graph_chunks.append(chunk)
-            if graph_chunks:
-                metrics.incr("rag.graph_recall.hit", chunks=len(graph_chunks))
-            logger.info(
-                "图召回",
-                extra={
-                    "seeds": graph_outcome.seed_entity_count,
-                    "candidates": len(graph_candidates),
-                    "chunks": len(graph_chunks),
-                    "degraded_reason": graph_degraded,
-                    "elapsed_ms": graph_outcome.elapsed_ms,
-                    "trace_id": trace.get_trace_id(),
-                },
-            )
+                t_graph = time.perf_counter()
+                graph_outcome = await recall_by_graph(
+                    session,
+                    query=query,
+                    pushdown=pushdown,
+                    timeout_ms=get_settings().graph_retrieve_timeout_ms,
+                    # 口径一次请求只取一次：种子与邻居必须同一口径（见 linking 模块说明）
+                    profile=current_graph_profile(),
+                    # ★ 先排重后裁剪（§9.8 裁决 1）：命中片集合传给图召回，让它把
+                    #   重复邻居跳过、不占预算名额 —— 否则权重最高的一跳邻居（恰恰
+                    #   最可能在命中片里）会系统性挤掉真正新增的片。
+                    exclude_chunk_ids=frozenset(c.chunk_id for c in retrieved),
+                )
+                graph_ms = (time.perf_counter() - t_graph) * 1000
+                stages["graph_recall"] = int(graph_ms)
+                metrics.observe_ms("rag.retrieve.graph_recall", graph_ms)
+                graph_degraded = graph_outcome.degraded_reason
+                graph_candidates = list(graph_outcome.chunks)
+                if graph_degraded:
+                    # 图是增强项：失败不阻断主链路，但**必须可见** —— 否则「开了图却一直
+                    # 0 召回」只能靠人去翻 SQL 才发现
+                    metrics.incr("rag.graph_recall.degraded", reason=graph_degraded)
+                retrieved_ids = {c.chunk_id for c in retrieved}
+                for chunk in graph_candidates:
+                    if chunk.chunk_id in retrieved_ids:
+                        # 理论上到不了这里：exclude_chunk_ids 已让 recall 层跳过命中片。
+                        # 保留这道闸是防御性的 —— recall 的契约变了而这里没跟上时，
+                        # 宁可少一片也不许同一片进上下文两次（编号重复、引用错位）。
+                        continue
+                    graph_chunks.append(chunk)
+                if graph_chunks:
+                    metrics.incr("rag.graph_recall.hit", chunks=len(graph_chunks))
+                logger.info(
+                    "图召回",
+                    extra={
+                        "seeds": graph_outcome.seed_entity_count,
+                        "candidates": len(graph_candidates),
+                        "chunks": len(graph_chunks),
+                        "degraded_reason": graph_degraded,
+                        "elapsed_ms": graph_outcome.elapsed_ms,
+                        "trace_id": trace.get_trace_id(),
+                    },
+                )
 
         # ⑥ 大表分片回捞（表格决策 A1'）：命中纯表格分片时补捞同组其余分片。
         #    回捞片仅作上下文补充 —— 单独存放，不进排序 / 阈值 / 三路贡献统计；
@@ -789,7 +824,7 @@ class RetrievalService:
         #   §14.6 判据 ② 结构性永远无法达成（见设计文档 §9.9 的实测记录）。
         # 关闭图能力时不写这两个键 —— 保持关闭态的 path_stats 与未实现图召回时
         # 逐键相同（基线可比）。
-        if get_settings().graph_enabled:
+        if get_settings().graph_enabled and graph_outcome is not None:
             neighbor_ids = {n.chunk_id for n in graph_outcome.neighbors}
             path_stats["graph_covered"] = len(neighbor_ids & retrieved_ids)
             path_stats["graph_unique"] = len(graph_chunks)

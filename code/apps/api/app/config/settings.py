@@ -151,6 +151,10 @@ class Settings(BaseSettings):
     # ★ 开了但依赖缺失（LLM 密钥 / 迁移未跑 / 后端未实现）→ 拒绝启动（fail-closed），
     #   不会静默降级成「配了不生效」—— 后者的危害远大于服务起不来。
     graph_enabled: bool = False
+    # 图召回「按需路由」开关（默认关）。开启后，仅当 top1 高置信 + 召回充足才跳过图召回
+    # （见 decisions.GRAPH_SKIP_SCORE / GRAPH_SKIP_MIN_CHUNKS），省一次 DB 往返。
+    # 默认关 = 行为与未引入路由逐字节相同（图召回仍每条请求都跑）。标定 217 条后再开。
+    graph_recall_selective: bool = False
     # 图存储后端。当前唯一实现 postgres；neo4j 等其它值是「保留位」，
     # 配了会拒绝启动 —— 静默回落到 postgres 会让你以为在跑 Neo4j，而数据在 PG 里。
     graph_store_backend: str = "postgres"
@@ -173,6 +177,10 @@ class Settings(BaseSettings):
     #   于是被误报成「模型输出非法 JSON」。故只能按调用覆盖。
     graph_extract_max_output_tokens: int = 8_000
     wiki_enabled: bool = False
+    # wiki 导航「按需路由」开关（默认关）。开启后，查询词元已很丰富（len(ilike_terms) >=
+    # decisions.WIKI_NAV_SELECTIVE_MIN_TERMS）时跳过导航扩展（省一次 50ms SELECT）。
+    # 默认关 = 行为与未引入路由逐字节相同。标定 217 条后再开。
+    wiki_nav_selective: bool = False
     # 生成范围。本版仅 doc（一文档一页，可见性 = 该文档的文档级 ACL，天然同构）；
     # kb 是保留值，配了拒绝启动 —— KB 级页要把多篇不同密级的文档摘要合成一个对象，
     # 按生成者权限生成是越权、按读者权限裁剪则每次请求都要重建（见设计文档 §7.5）。

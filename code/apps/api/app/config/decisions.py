@@ -128,6 +128,15 @@ WIKI_NAV_CANDIDATE_PAGE_GUARD: Final[int] = 5_000
 pages_ready 超它、或 rag.retrieve.wiki_nav p95 > 10ms 连续两个观测窗 →
 启动第 4 步设计 §2.1.5 的写侧归一列 + GIN 升级评估（本步不实现）。"""
 
+WIKI_NAV_SELECTIVE_MIN_TERMS: Final[int] = 3
+"""wiki 导航路由（WIKI_NAV_SELECTIVE，默认关）的跳过阈值（站位值，待 217 条 A/B 标定）。
+
+wiki 导航在第 4 步、三路召回之前执行，此刻 retrieved 尚不存在，无法用「主召回弱才扩词」判定；
+故采用**词元数**这一前置信号：当 len(ilike_terms) >= 本值时跳过 wiki 导航（词元已很丰富，
+扩词边际收益低，省一次 50ms SELECT）。len(ilike_terms) 上限 = ILIKE_MAX_TERMS=3，故本值 = 3
+即「只在词元最丰富（3 个）时跳过」，是最保守的活跃值；若标定后想更激进（更多查询跳过），下调即可。
+★ 方向为占位假设，须经 217 条 A/B 验证；若回归召回则下调阈值或改为把 wiki 移到主召回之后（设计 §路由）。"""
+
 LEXICON_FTS_ALIAS_MAX_TERMS: Final[int] = 6
 """词表别名在 tsquery 上的**独立预算**（N6 / C4-F6 修复）。
 
@@ -918,6 +927,18 @@ GRAPH_RECALL_TOKEN_BUDGET: Final[int] = 1_200
 与 SECTION_RECALL_TOKEN_BUDGET 同值：两者都是「锦上添花的上下文」，
 不该比章节补全更贵。"""
 
+GRAPH_SKIP_SCORE: Final[float] = 0.85
+"""图召回路由（GRAPH_RECALL_SELECTIVE，默认关）的跳过阈值（站位值，待 217 条 A/B 标定）。
+
+仅当 top1.final_score >= 本值 **且** len(retrieved) >= GRAPH_SKIP_MIN_CHUNKS 同时成立时，
+才跳过图召回：已通过 0.50 阈值闸门、且高置信 + 召回充足时，图扩展边际收益低，省一次 DB 往返。
+区间 MUST 在 (RELEVANCE_THRESHOLD_VECTOR, 1.0) —— 低于主召回阈值会让本应拒答的请求误走图。"""
+
+GRAPH_SKIP_MIN_CHUNKS: Final[int] = 8
+"""图召回路由的「召回充足」门槛（站位值，待标定）。
+
+retrieved 经 TOP_K_RERANK=8 截断后恒为 8，故该条件常态为真，路由主判据是 GRAPH_SKIP_SCORE。"""
+
 GRAPH_EXTRACT_BATCH_CHUNKS: Final[int] = 4
 """单次抽取 LLM 调用送几个 chunk。
 
@@ -1243,6 +1264,10 @@ def self_check() -> None:
         raise RuntimeError("GRAPH_* 限流常量 MUST 为正 —— 失守会让图邻居淹没上下文")
     if GRAPH_RECALL_MAX_CHUNKS > GRAPH_RETRIEVE_TOP_K:
         raise RuntimeError("GRAPH_RECALL_MAX_CHUNKS MUST <= GRAPH_RETRIEVE_TOP_K（进上下文的不能多于候选）")
+    if not (0.5 < GRAPH_SKIP_SCORE < 1.0):
+        raise RuntimeError("GRAPH_SKIP_SCORE MUST ∈ (0.5, 1.0)：跳过阈值得高于主召回阈值且低于满分")
+    if GRAPH_SKIP_MIN_CHUNKS < 1:
+        raise RuntimeError("GRAPH_SKIP_MIN_CHUNKS MUST >= 1")
     if len(set(GRAPH_ENTITY_TYPES)) != len(GRAPH_ENTITY_TYPES) or not GRAPH_ENTITY_TYPES:
         raise RuntimeError("GRAPH_ENTITY_TYPES MUST 非空且无重复")
     # 抽取批量与资源护栏：批量 0 会让循环空转，护栏 0 会让所有文档被 skipped。
@@ -1272,6 +1297,8 @@ def self_check() -> None:
     if not (WIKI_NAV_MIN_CJK_CHARS <= WIKI_NAV_MAX_TERM_CHARS
             and WIKI_NAV_MIN_ASCII_CHARS <= WIKI_NAV_MAX_TERM_CHARS):
         raise RuntimeError("词元长度下限 MUST <= 上限，否则恒选不出词")
+    if not (1 <= WIKI_NAV_SELECTIVE_MIN_TERMS <= ILIKE_MAX_TERMS):
+        raise RuntimeError("WIKI_NAV_SELECTIVE_MIN_TERMS MUST ∈ [1, ILIKE_MAX_TERMS]：超上限=永不跳过（空操作）")
     # prompt 版本与正文同源（正文在 services/graph/prompts.py）：空版本 = 口径过滤失效
     # —— 检索侧 `prompt_version = :pv` 会匹配到所有历史的空串行。
     from app.config.graph_profile import GRAPH_PROMPT_VERSION
