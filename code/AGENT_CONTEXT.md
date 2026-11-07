@@ -1,7 +1,7 @@
 # AGENT_CONTEXT - 给 Agent 的上下文恢复文件
 
 > 这不是给人看的 README，是**上下文恢复文件**。新接手的 Agent 读完应当立刻知道：这是什么项目、哪些口径不能动、当前链路是怎么走的、接下来该做什么。
-> 生成：2026-09-22 ｜ 最近更新：2026-11-06（对齐检索词元化 + 章节补全 + 查询扩展 + 误拒重试 + 第 4 步 wiki 导航；迁移 0026，测试 80 个 test_*.py 文件）；`.wiki-creator` 知识库新增 5 条知识条目（3 架构模式 + 2 工程教训）
+> 生成：2026-09-22 ｜ 最近更新：2026-11-07（对齐 2026-11-06 检索词元化 + 章节补全 + 查询扩展 + 误拒重试 + 第 4 步 wiki 导航；迁移 0026，测试 80 个 test_*.py 文件）；`.wiki-creator` 知识库新增 5 条知识条目（3 架构模式 + 2 工程教训）；新增**完整检索链路钉死文档** `code/docs/检索链路全景.md`（含可打印 HTML），常量均带 `文件:行号` 可复算
 > 交付状态：GraphRAG 第 1/2 步（图数据地基 + 在线图召回 side channel（旁路通道））、LLM Wiki 第 3 步（生成 + 读接口）、第 4 步 wiki 导航参与检索（三段 commit `ea552c0` / `6717a85` / `86f5fc7`）代码均已交付，N1~N6 已裁决；默认 `WIKI_ENABLED=false` 为关闭态，与未实现第 4 步时逐字节等价。**真库效果层未验证**：217 条 A/B、EXPLAIN、P95、26 迁移从零全链均未跑，dev 库仅 1 页 wiki ready，`hit_cases >= 20` 不满足时评测结论判「无效」，「不劣化」未验证，唯一安全交付形态是关闭态。
 
 ---
@@ -103,6 +103,7 @@
 | 答非所问观测 | 同上 | `rag.answer.low_query_overlap` |
 | 澄清阈值 | `decisions.should_clarify` | 70 分，与改写 90 分离 |
 | 检索分段计时 | `infra/metrics.py` | embed / vector_sql / keyword_ilike / keyword_fts / section_recall / rerank 各自 p50/p95 |
+| 完整链路钉死文档 | `code/docs/检索链路全景.md`（+ HTML） | 主链路 + 图召回 / wiki 导航 / 权限四闸门旁路，常量带 `文件:行号`，`CONTRACT_VERSION="v1.1"`，图召回 v1.2 契约 |
 
 ---
 
