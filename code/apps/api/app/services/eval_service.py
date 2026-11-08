@@ -381,20 +381,24 @@ async def save_eval_run(
 
 
 async def latest_eval_run(
-    session: AsyncSession, tenant_id: uuid.UUID, case_fingerprint: str
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    case_fingerprint: str,
+    *,
+    run_id: uuid.UUID | None = None,
 ) -> EvalRun | None:
     """取最近一条**同一用例集指纹**的运行，作为基线。
 
     指纹不一致的历史运行不纳入 —— 那代表另一批用例，比了会得到误导性结论。
+    `run_id` 非空时按显式 id 取（重跑 A/B 时 MUST 指定，避免只看 created_at DESC
+    把上一次 selective-on 轮误当 baseline）；tenant_id 隔离与指纹过滤始终保留。
     """
+    stmt = select(EvalRun).where(
+        EvalRun.tenant_id == tenant_id,
+        EvalRun.case_fingerprint == case_fingerprint,
+    )
+    if run_id is not None:
+        stmt = stmt.where(EvalRun.id == run_id)
     return (
-        await session.execute(
-            select(EvalRun)
-            .where(
-                EvalRun.tenant_id == tenant_id,
-                EvalRun.case_fingerprint == case_fingerprint,
-            )
-            .order_by(EvalRun.created_at.desc())
-            .limit(1)
-        )
+        await session.execute(stmt.order_by(EvalRun.created_at.desc()).limit(1))
     ).scalar_one_or_none()

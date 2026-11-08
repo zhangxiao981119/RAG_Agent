@@ -360,7 +360,7 @@ async def _retrieve(svc_pair) -> tuple:
 
 @pytest.mark.asyncio
 async def test_selective_skip_skips_recall_when_high_confidence_and_enough(monkeypatch):
-    """开启 selective 且 top1>=0.85 且 召回>=8 → 跳过图召回 + 记 skipped_by_router。"""
+    """开启 selective 且 top1>=0.70 且 召回>=8 → 跳过图召回 + 记 skipped_by_router。"""
     calls = _stub_recall(monkeypatch)
     svc, _, spy = _make_svc(monkeypatch, graph_enabled=True, graph_recall_selective=True)
     # 8 个命中片，top1 高分（final_score == vector_score，rerank 关、governance_weight=0）
@@ -376,7 +376,7 @@ async def test_selective_skip_skips_recall_when_high_confidence_and_enough(monke
 
 @pytest.mark.asyncio
 async def test_selective_skip_recalls_when_low_top1_score(monkeypatch):
-    """top1 低分（0.50 < 0.85）→ 即便召回充足也必须调用图召回。"""
+    """top1 低分（0.50 < 0.70）→ 即便召回充足也必须调用图召回。"""
     calls = _stub_recall(monkeypatch)
     svc, _, spy = _make_svc(monkeypatch, graph_enabled=True, graph_recall_selective=True)
     rows = [_row(uuid.UUID(int=i), vector_score=0.50) for i in range(10, 18)]

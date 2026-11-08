@@ -4,7 +4,7 @@
 
 钉住两件事：
   1. 默认关（graph_recall_selective=False）时恒 True —— 与未引入路由逐字节相同，基线零影响；
-  2. 开启时：仅当 top1.final_score >= GRAPH_SKIP_SCORE(=0.85) **且**
+  2. 开启时：仅当 top1.final_score >= GRAPH_SKIP_SCORE(=0.70) **且**
      retrieved_n >= GRAPH_SKIP_MIN_CHUNKS(=8) 同时成立才跳过，否则仍召回。
      边界都要覆盖：刚好达标 → 跳过；任一维度差一点点 → 召回。
 
@@ -38,21 +38,21 @@ def test_default_off_always_recalls_mid_score(monkeypatch):
 
 # ── 组 2：selective 开启 —— 两维「且」判定，显式覆盖边界 ──
 def test_selective_on_skips_at_exact_boundary(monkeypatch):
-    """边界：top1 == 0.85 且 n == 8 → 跳过（两维同时达标）。"""
+    """边界：top1 == 0.70 且 n == 8 → 跳过（两维同时达标）。"""
     monkeypatch.setattr(get_settings(), "graph_recall_selective", True)
-    assert _graph_should_recall(0.85, 8) is False
+    assert _graph_should_recall(0.70, 8) is False
 
 
 def test_selective_on_recalls_when_score_just_below(monkeypatch):
-    """边界：top1 差一点点（0.849999）即便 n 充足 → 仍召回。"""
+    """边界：top1 差一点点（0.699999）即便 n 充足 → 仍召回。"""
     monkeypatch.setattr(get_settings(), "graph_recall_selective", True)
-    assert _graph_should_recall(0.849999, 8) is True
+    assert _graph_should_recall(0.699999, 8) is True
 
 
 def test_selective_on_recalls_when_chunks_just_below(monkeypatch):
     """边界：n 差一个（7）即便 top1 满分 → 仍召回。"""
     monkeypatch.setattr(get_settings(), "graph_recall_selective", True)
-    assert _graph_should_recall(0.85, 7) is True
+    assert _graph_should_recall(0.70, 7) is True
 
 
 def test_selective_on_skips_when_both_above_boundary(monkeypatch):
@@ -79,8 +79,8 @@ def test_selective_on_recalls_when_both_below(monkeypatch):
 
 # ── 组 3：路由阈值与站位常量一致性 ──
 def test_skip_thresholds_match_standing_constants():
-    """路由判据 MUST 与 decisions 站位常量同源（不要写死 0.85 / 8）。"""
-    assert decisions.GRAPH_SKIP_SCORE == 0.85
+    """路由判据 MUST 与 decisions 站位常量同源（不要写死 0.70 / 8）。"""
+    assert decisions.GRAPH_SKIP_SCORE == 0.70
     assert decisions.GRAPH_SKIP_MIN_CHUNKS == 8
 
 

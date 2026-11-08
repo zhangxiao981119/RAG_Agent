@@ -927,12 +927,15 @@ GRAPH_RECALL_TOKEN_BUDGET: Final[int] = 1_200
 与 SECTION_RECALL_TOKEN_BUDGET 同值：两者都是「锦上添花的上下文」，
 不该比章节补全更贵。"""
 
-GRAPH_SKIP_SCORE: Final[float] = 0.85
-"""图召回路由（GRAPH_RECALL_SELECTIVE，默认关）的跳过阈值（站位值，待 217 条 A/B 标定）。
+GRAPH_SKIP_SCORE: Final[float] = 0.70
+"""图召回路由（GRAPH_RECALL_SELECTIVE，默认关）的跳过阈值（已按 217 条实测定值）。
 
 仅当 top1.final_score >= 本值 **且** len(retrieved) >= GRAPH_SKIP_MIN_CHUNKS 同时成立时，
 才跳过图召回：已通过 0.50 阈值闸门、且高置信 + 召回充足时，图扩展边际收益低，省一次 DB 往返。
-区间 MUST 在 (RELEVANCE_THRESHOLD_VECTOR, 1.0) —— 低于主召回阈值会让本应拒答的请求误走图。"""
+区间 MUST 在 (RELEVANCE_THRESHOLD_VECTOR, 1.0) —— 低于主召回阈值会让本应拒答的请求误走图。
+2026-11-08 实测 217 条 eval_cases（原文 question + 单趟 retrieve() + 全 4 库，vector 口径）
+top1.final_score max=0.8306、p90=0.7427、>=0.70 为 51 条；0.85 触发 0 次。生产链路含 LLM
+改写与 retrieve_chain 多轮，实际触发率须以 /metrics 实测为准；开启 rerank 后本常量必须重新标定。"""
 
 GRAPH_SKIP_MIN_CHUNKS: Final[int] = 8
 """图召回路由的「召回充足」门槛（站位值，待标定）。

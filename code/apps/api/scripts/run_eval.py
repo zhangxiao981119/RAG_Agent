@@ -54,6 +54,7 @@ import argparse
 import asyncio
 import json
 import sys
+import uuid
 from collections import Counter
 from typing import Final
 
@@ -325,6 +326,7 @@ async def run_eval(
     baseline: bool = False,
     max_regression: float = 0.02,
     note: str | None = None,
+    baseline_id: str | None = None,
 ) -> int:
     settings = get_settings()
     base_url = "http://localhost:8000"
@@ -543,8 +545,47 @@ async def run_eval(
             "expanded_terms": wiki_acc["expanded_terms"],
             "degraded_reasons": {},
         }
+        # ── 按需路由 A/B 自证：两个 selective 开关、限流值、本轮结论有效性写进 caliber ──
+        # 这三键既不进 snapshot_for_message()（只覆盖消息级答案口径），也不进
+        # config_fingerprint（CROSS_ROLE_FIELDS 白名单驱动），故在 run_eval 层显式叠加，
+        # 让 eval_runs 落库后可直接查询「这轮开没开路由 / 限流值多少 / 结论能不能用」。
+        caliber["graph_recall_selective"] = bool(settings.graph_recall_selective)
+        caliber["wiki_nav_selective"] = bool(settings.wiki_nav_selective)
+        caliber["chat_rate_limit_per_minute"] = settings.chat_rate_limit_per_minute
+        # validity 三态与「假绿防线」同源：结论无效 ≠ 运行失败，不改变 failed / passed。
+        if not settings.wiki_enabled:
+            caliber["validity"] = "not_applicable_wiki_disabled"
+        elif _wiki_nav_gate_ok(wiki_acc["hit_cases"], wiki_acc["expanded_cases"]):
+            caliber["validity"] = "valid"
+        else:
+            caliber["validity"] = "invalid_wiki_nav_gate"
 
-        if baseline:
+        if baseline_id is not None:
+            # 显式基线：重跑 A/B 时 MUST 指定，避免 latest_eval_run() 只按 created_at DESC
+            # 选到上一次 selective-on 轮，把 on 轮当成 baseline 对比且毫无警告。
+            try:
+                run_uuid = uuid.UUID(baseline_id)
+            except (ValueError, AttributeError, TypeError):
+                print(
+                    f"错误: --baseline-id 不是合法 UUID: {baseline_id!r}；"
+                    f"拒绝回退到 latest_eval_run()。",
+                    file=sys.stderr,
+                )
+                return 1
+            base_row = await latest_eval_run(
+                session, tenant_id, fingerprint, run_id=run_uuid
+            )
+            if base_row is None:
+                print(
+                    f"错误: 显式指定的基线 eval_run 不存在或用例集指纹不匹配"
+                    f"（--baseline-id={baseline_id}，case_fingerprint={fingerprint}）；"
+                    f"拒绝静默退化为「首个基线」。",
+                    file=sys.stderr,
+                )
+                return 1
+            _warn_caliber_drift(base_row.caliber or {}, caliber)
+            failed |= _compare_baseline(base_row.metrics, metrics, max_regression)
+        elif baseline:
             base_row = await latest_eval_run(session, tenant_id, fingerprint)
             if base_row is None:
                 print(f"基线：无同用例集（{fingerprint}）的历史运行，本次作为首个基线")
@@ -584,6 +625,13 @@ if __name__ == "__main__":
         help="允许的最大回退幅度（比率，默认 0.02 即 2 个百分点）",
     )
     parser.add_argument("--note", type=str, default=None, help="本次运行的备注（如版本号）")
+    parser.add_argument(
+        "--baseline-id",
+        type=str,
+        default=None,
+        help="显式指定基线 eval_run 的 UUID；重跑时 MUST 使用，避免 "
+             "latest_eval_run 选到上一次 on 轮",
+    )
     args = parser.parse_args()
     sys.exit(
         asyncio.run(
@@ -593,6 +641,7 @@ if __name__ == "__main__":
                 args.baseline,
                 args.max_regression,
                 args.note,
+                baseline_id=args.baseline_id,
             )
         )
     )
