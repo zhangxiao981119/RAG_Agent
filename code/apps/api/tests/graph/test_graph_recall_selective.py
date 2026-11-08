@@ -38,19 +38,19 @@ def test_default_off_always_recalls_mid_score(monkeypatch):
 
 # ── 组 2：selective 开启 —— 两维「且」判定，显式覆盖边界 ──
 def test_selective_on_skips_at_exact_boundary(monkeypatch):
-    """边界：top1 等于阈值常量、召回数等于门槛常量 → 跳过（两维同时达标）。"""
+    """边界：top1 等于 GRAPH_SKIP_SCORE 且 n 等于 GRAPH_SKIP_MIN_CHUNKS → 跳过"""
     monkeypatch.setattr(get_settings(), "graph_recall_selective", True)
     assert _graph_should_recall(decisions.GRAPH_SKIP_SCORE, decisions.GRAPH_SKIP_MIN_CHUNKS) is False
 
 
 def test_selective_on_recalls_when_score_just_below(monkeypatch):
-    """边界：top1 低于阈值常量一点点、召回数充足 → 仍召回。"""
+    """边界：top1 低于阈值常量一点点，即便 n 充足 → 仍召回"""
     monkeypatch.setattr(get_settings(), "graph_recall_selective", True)
     assert _graph_should_recall(decisions.GRAPH_SKIP_SCORE - 1e-6, decisions.GRAPH_SKIP_MIN_CHUNKS) is True
 
 
 def test_selective_on_recalls_when_chunks_just_below(monkeypatch):
-    """边界：召回数比门槛常量少一个、top1 达标 → 仍召回。"""
+    """边界：n 比阈值常量少 1，即便 top1 达标 → 仍召回"""
     monkeypatch.setattr(get_settings(), "graph_recall_selective", True)
     assert _graph_should_recall(decisions.GRAPH_SKIP_SCORE, decisions.GRAPH_SKIP_MIN_CHUNKS - 1) is True
 
