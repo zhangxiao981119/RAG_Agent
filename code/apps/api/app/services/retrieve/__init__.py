@@ -48,7 +48,8 @@ def _graph_should_recall(top1_score: float, retrieved_n: int) -> bool:
     返回 True = 调用 recall_by_graph；False = 跳过（省一次 DB 往返）。
     默认关时恒 True —— 与未引入路由逐字节相同，基线零影响。
     开启时：仅当 top1 高置信 **且** 召回充足同时成立才跳过，
-    见 decisions.GRAPH_SKIP_SCORE / GRAPH_SKIP_MIN_CHUNKS（均为站位值，待 217 条 A/B 标定）。
+    见 decisions.GRAPH_SKIP_SCORE / GRAPH_SKIP_MIN_CHUNKS：GRAPH_SKIP_SCORE 已按 217 条
+    eval_cases 实测分布定值（原文口径，生产触发率以 /metrics 实测为准）；GRAPH_SKIP_MIN_CHUNKS 仍为站位值。
     """
     if not get_settings().graph_recall_selective:
         return True

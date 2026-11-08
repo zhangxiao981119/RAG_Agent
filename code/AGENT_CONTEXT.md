@@ -104,7 +104,7 @@
 | 澄清阈值 | `decisions.should_clarify` | 70 分，与改写 90 分离 |
 | 检索分段计时 | `infra/metrics.py` | embed / vector_sql / keyword_ilike / keyword_fts / section_recall / rerank 各自 p50/p95 |
 | 完整链路钉死文档 | `code/docs/检索链路全景.md`（+ HTML） | 主链路 + 图召回 / wiki 导航 / 权限四闸门旁路，常量带 `文件:行号`，`CONTRACT_VERSION="v1.1"`，图召回 v1.2 契约 |
-| 图/wiki 按需路由 | `config/settings.py` + `services/retrieve/__init__.py` | `GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE` 默认关；图仅 top1≥0.70 且召回≥8 才跳、wiki 仅词元≥3 才跳；图方向阈值已按 217 条实测定值（0.70），wiki 方向阈值仍为站位值（详见 按需路由设计.md §2.1 / §6） |
+| 图/wiki 按需路由 | `config/settings.py` + `services/retrieve/__init__.py` | `GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE` 默认关；图仅 top1≥0.70 且召回≥8 才跳、wiki 仅词元≥3 才跳；`GRAPH_SKIP_SCORE=0.70` 已按 217 条实测定值（原文口径，生产触发率须以 /metrics 复核），`WIKI_NAV_SELECTIVE_MIN_TERMS=3` 仍为站位值（依据见 按需路由设计.md §2.1） |
 | 图/wiki 按需路由文档 | `code/docs/按需路由设计.md` + `code/docs/GraphRAG检索召回.md` | 决策契约 / 真值表（`_graph_should_recall` / `_wiki_should_nav`）/ 三常量 self_check 不变量 / | 217 条 A/B 标定计划（首轮 baseline 因上游 LLM 网关余额不足中断、未落库；当前状态见 §6）；图召回三表 Schema（`GraphEntity`/`GraphEntityMention`/`GraphRelation`）、`upsert_subgraph` 合并、在线召回 8 步、先排重后裁剪、三段式 statement_timeout。测试已交付：wiki/graph 两个真库集成文件 + 纯路由单测（真值表）；真库 PG 0026 上 15 例全绿（4 例真库 + 11 例无 DB），并经 3 组变异测试证明可拦回归（ACL 越权 / `:embedding::vector` / 无 DB 参数解析） |
 
 ---
