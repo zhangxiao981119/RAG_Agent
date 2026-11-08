@@ -1,8 +1,8 @@
 # AGENT_CONTEXT - 给 Agent 的上下文恢复文件
 
 > 这不是给人看的 README，是**上下文恢复文件**。新接手的 Agent 读完应当立刻知道：这是什么项目、哪些口径不能动、当前链路是怎么走的、接下来该做什么。
-> 生成：2026-09-22 ｜ 最近更新：2026-11-07（对齐 2026-11-06 检索词元化 + 章节补全 + 查询扩展 + 误拒重试 + 第 4 步 wiki 导航；迁移 0026，测试 84 个 test_*.py 文件）；`.wiki-creator` 知识库新增 5 条知识条目（3 架构模式 + 2 工程教训）；新增**完整检索链路钉死文档** `code/docs/检索链路全景.md`（含可打印 HTML）；新增**图/wiki 召回「按需路由」opt-in 开关**（`GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE`，默认关，基线零影响，阈值仍为站位值、217 条 A/B 未完成）；新增两份参考文档 **`code/docs/GraphRAG检索召回.md`**（三表 Schema / 抽取 / 在线召回 8 步 / 先排重后裁剪 / 三段式 statement_timeout）+ **`code/docs/按需路由设计.md`**（决策契约 / 真值表 / 三常量 self_check 不变量 / 217 条 A/B 标定计划；阈值仍为站位值、217 条 A/B 未完成：标定前置已补齐（全栈 9 容器 healthy / `WIKI_ENABLED=true` / 19 页 ready wiki / 开关注入 / 镜像重建），但首轮 baseline 因上游 LLM 网关 `insufficient_quota`（账户余额不足）中断且未落库，详见 §6）
-> 交付状态：GraphRAG 第 1/2 步（图数据地基 + 在线图召回 side channel（旁路通道））、LLM Wiki 第 3 步（生成 + 读接口）、第 4 步 wiki 导航参与检索（三段 commit `ea552c0` / `6717a85` / `86f5fc7`）代码均已交付，N1~N6 已裁决；代码与编排默认 `WIKI_ENABLED=false`（关闭态与未实现第 4 步时逐字节等价），本机 `.env` 为标定前置临时设为 `true`。**真库效果层未验证**：217 条 A/B 首轮 baseline 因上游 LLM 网关 `insufficient_quota`（账户余额不足）在第 87 条可答用例中断且未落库，指标作废，「不劣化」未验证，唯一安全交付形态是两个 selective 开关默认关。dev 库现有 19 页 ready / 2 页 failed wiki，`hit_cases >= 20` 已具备数据条件（库内复算 69 条可答用例的期望文档有 ready 页）但仍待实测确认。
+> 生成：2026-09-22 ｜ 最近更新：**2026-11-08**（三轮 217 条 A/B 收尾：`GRAPH_SKIP_SCORE=0.70` 已按实测定值并在生产触发；新增 `--baseline-id` 显式基线、`caliber` 四项自证字段与 `validity` 三态；开态未通过「不劣化」，两个 selective 开关维持默认关）。历史：对齐 2026-11-06 检索词元化 + 章节补全 + 查询扩展 + 误拒重试 + 第 4 步 wiki 导航；迁移 0026，测试 84 个 test_*.py 文件；`.wiki-creator` 知识库新增 5 条知识条目（3 架构模式 + 2 工程教训）；**完整检索链路钉死文档** `code/docs/检索链路全景.md`（含可打印 HTML）；**图/wiki 召回「按需路由」opt-in 开关**（`GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE`，默认关，基线零影响）；两份参考文档 **`code/docs/GraphRAG检索召回.md`**（三表 Schema / 抽取 / 在线召回 8 步 / 先排重后裁剪 / 三段式 statement_timeout）+ **`code/docs/按需路由设计.md`**（决策契约 / 真值表 / 三常量 self_check 不变量 / 三轮 A/B 实测结果，见 §5.5 / §6）。
+> 交付状态：GraphRAG 第 1/2 步（图数据地基 + 在线图召回 side channel（旁路通道））、LLM Wiki 第 3 步（生成 + 读接口）、第 4 步 wiki 导航参与检索（三段 commit `ea552c0` / `6717a85` / `86f5fc7`）代码均已交付，N1~N6 已裁决；代码与编排默认 `WIKI_ENABLED=false`（关闭态与未实现第 4 步时逐字节等价），本机 `.env` 为标定临时设为 `true`。**真库效果层已实测、结论是「不劣化」不成立**：2026-11-08 三轮 217 条 A/B 全部落库（`20d43188` 关态 / `069ce6c0` 开态·0.85 / `f7ac0809` 开态·0.70 + 显式基线），拒答 99.06% / 99.06% / 98.11%、漏答 0.00% / 0.90% / 1.80%、命中三轮均 100%；开态 `hit_cases` 15 / 17 未过 `WIKI_NAV_MIN_HIT_CASES=20`（门槛不改），`validity=invalid_wiki_nav_gate`，`passed=True` 不代表门禁通过。**唯一安全交付形态仍是两个 selective 开关默认关、不得常开**。dev 库 19 页 ready / 2 页 failed wiki；EXPLAIN / P95 / 26 迁移从零全链仍未跑。三轮数字见 `code/docs/按需路由设计.md` §5.5。
 
 ---
 
@@ -105,7 +105,7 @@
 | 检索分段计时 | `infra/metrics.py` | embed / vector_sql / keyword_ilike / keyword_fts / section_recall / rerank 各自 p50/p95 |
 | 完整链路钉死文档 | `code/docs/检索链路全景.md`（+ HTML） | 主链路 + 图召回 / wiki 导航 / 权限四闸门旁路，常量带 `文件:行号`，`CONTRACT_VERSION="v1.1"`，图召回 v1.2 契约 |
 | 图/wiki 按需路由 | `config/settings.py` + `services/retrieve/__init__.py` | `GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE` 默认关；图仅 top1≥0.70 且召回≥8 才跳、wiki 仅词元≥3 才跳；`GRAPH_SKIP_SCORE=0.70` 已按 217 条实测定值（原文口径，生产触发率须以 /metrics 复核），`WIKI_NAV_SELECTIVE_MIN_TERMS=3` 仍为站位值（依据见 按需路由设计.md §2.1） |
-| 图/wiki 按需路由文档 | `code/docs/按需路由设计.md` + `code/docs/GraphRAG检索召回.md` | 决策契约 / 真值表（`_graph_should_recall` / `_wiki_should_nav`）/ 三常量 self_check 不变量 / | 217 条 A/B 标定计划（首轮 baseline 因上游 LLM 网关余额不足中断、未落库；当前状态见 §6）；图召回三表 Schema（`GraphEntity`/`GraphEntityMention`/`GraphRelation`）、`upsert_subgraph` 合并、在线召回 8 步、先排重后裁剪、三段式 statement_timeout。测试已交付：wiki/graph 两个真库集成文件 + 纯路由单测（真值表）；真库 PG 0026 上 15 例全绿（4 例真库 + 11 例无 DB），并经 3 组变异测试证明可拦回归（ACL 越权 / `:embedding::vector` / 无 DB 参数解析） |
+| 图/wiki 按需路由文档 | `code/docs/按需路由设计.md` + `code/docs/GraphRAG检索召回.md` | 决策契约 / 真值表（`_graph_should_recall` / `_wiki_should_nav`）/ 三常量 self_check 不变量 / **三轮 217 条 A/B 实测结果与遗留缺口（§5.5 / §6）**；图召回三表 Schema（`GraphEntity`/`GraphEntityMention`/`GraphRelation`）、`upsert_subgraph` 合并、在线召回 8 步、先排重后裁剪、三段式 statement_timeout。测试已交付：wiki/graph 两个真库集成文件 + 纯路由单测（真值表）；真库 PG 0026 上 15 例全绿（4 例真库 + 11 例无 DB），并经 3 组变异测试证明可拦回归（ACL 越权 / `:embedding::vector` / 无 DB 参数解析）。**第三轮日志中文乱码，逐 case 明细只恢复到 147/217 行，不得据此下逐题结论** |
 
 ---
 
@@ -189,7 +189,7 @@ code/
 
 1. **先读 `README.md`**（项目全貌，含设计取舍与已知边界），再读本文件。两者冲突时以代码为准，并顺手修正文档。
 2. **不要凭记忆改口径**：阈值、预算、配额一律回 `app/config/decisions.py`，那里有 `self_check()` 会在启动时拒绝坏值。
-3. **改检索链路前先跑评测**：`scripts/run_eval.py`，217 条用例，看 `eval_runs` 最新基线（当前拒答 100% / 漏答 0% / 命中 100%）。任何"优化"若让这三个数变差，就要说明理由。
+3. **改检索链路前先跑评测**：`scripts/run_eval.py`，217 条用例。**别看 `eval_runs` "最新一行"** —— `latest_eval_run()` 按 `tenant_id + case_fingerprint` 取 `created_at DESC`，开态轮落库后会盖掉关态基线；重跑对比必须显式传 `--baseline-id <关态 run_id>`（当前有效关态基线 `20d43188-0a69-4944-89c3-d9a62f7b017e`，拒答 99.06% / 漏答 0.00% / 命中 100%）。判断质量看 `caliber.validity` 与三项指标趋势，**`passed=True` 只表示脚本跑完，不代表门禁通过**。任何"优化"若让这三个数变差，就要说明理由。
 4. **改关键词切分要两侧同时生效**：同时改 `keyword_text.py`、跑 `backfill_fts_text.py`、重建 api 与 worker。
 5. **提交前跑**：`ruff check` + 容器内 `pytest`（638 passed 是当前基线）。
 6. 仓库已托管：Gitee `origin`、GitHub `github`（GitHub 需走本机 Clash 代理 `127.0.0.1:7897`）。
@@ -207,3 +207,8 @@ code/
 | 生产未编排 OCR | prod compose 12 服务不含 ocr，扫描件入库需自行加 |
 | 单 uvicorn worker | QPS 平台约 4.5，瓶颈在这里；需先改 prometheus multiprocess 再谈扩容 |
 | 关键词是 2-gram 非分词 | 同义词/词形变化靠 `kb_terms` 与向量兜，不是语言学分词 |
+| 图 / wiki 按需路由未达「不劣化」 | 2026-11-08 三轮 217 条 A/B：开态漏答率 0.90% / 1.80%（关态 0.00%）、`hit_cases` 15 / 17 未过门槛 20。`GRAPH_SKIP_SCORE=0.70` 已定值并在生产触发，但两个 selective 开关**必须维持默认关**，不得常开 |
+| `caliber` 配置自证不完整 | `build_caliber_snapshot()` 不调用 `runtime_config_snapshot()`，`config_fingerprint()` 只哈希 `CROSS_ROLE_FIELDS` 白名单，不含两个 selective 开关与 `chat_rate_limit_per_minute`；本轮靠 `run_eval.py` 落库前叠加 4 个键自证，且这 3 个配置值取自**评测脚本进程**的 `get_settings()`，不是从 api 服务端回读，compose 单独覆盖 api 时会失真 |
+| wiki 假绿门槛不阻断落库 | `WIKI_NAV_MIN_HIT_CASES=20` 不满足时只打印「本轮评测结论无效」，不改 `failed` / `passed` / `return failed`。按 2026-11-08 裁决**不改门槛数值**，改用 `caliber.validity` 三态标注 |
+| 第三轮评测日志编码损失 | `.workbuddy/eval_round3.log` 中文乱码（启动命令漏设 UTF-8 输出编码），逐 case 明细不可靠；聚合结论以 `eval_runs` 落库行与 `/metrics` 为准。Windows 下跑评测前须先设 `[Console]::OutputEncoding = UTF8` |
+| EXPLAIN / P95 / 26 迁移从零全链 | 仍未跑，不得写成已验收 |

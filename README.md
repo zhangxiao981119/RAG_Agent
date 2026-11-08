@@ -11,7 +11,7 @@
 
 上传企业文档（PDF / Word / PPT / Excel / Markdown / 纯文本 / 图片）→ 解析、**内嵌图视觉转录**、分块、向量化 → **带引用溯源的流式问答**。内置组织架构权限隔离、chunk 级密级管控、**三级记忆层**、知识治理四维审查、审计追溯、配额限流、提示注入防护与灰度开关 —— 面向**数据不允许出内网**的政企私有化场景设计。
 
-在此之上，本轮按分步路线交付了三条新能力：**GraphRAG（图检索增强，用实体关系图补充向量检索）** 的图数据地基与在线图召回**旁路（side channel，独立于主排序链路的上下文通道）**、**LLM Wiki（由大模型生成的文档级知识页）** 的生成与读接口，以及**按命中位置开窗的引用预览**。wiki 参与检索（分步路线第 4 步）代码已交付（三段 commit `ea552c0` / `6717a85` / `86f5fc7`），默认 `WIKI_ENABLED=false` 关闭态与未实现时逐字节等价；**真库效果层未验证**（217 条 A/B、EXPLAIN、P95、26 迁移从零全链均未跑），见[十四、已知边界](#十四已知边界明确说清不做什么)。
+在此之上，本轮按分步路线交付了三条新能力：**GraphRAG（图检索增强，用实体关系图补充向量检索）** 的图数据地基与在线图召回**旁路（side channel，独立于主排序链路的上下文通道）**、**LLM Wiki（由大模型生成的文档级知识页）** 的生成与读接口，以及**按命中位置开窗的引用预览**。wiki 参与检索（分步路线第 4 步）代码已交付（三段 commit `ea552c0` / `6717a85` / `86f5fc7`），默认 `WIKI_ENABLED=false` 关闭态与未实现时逐字节等价。**2026-11-08 已完成三轮 217 条 A/B**：关态 / 开态·阈值 0.85 / 开态·阈值 0.70 均已落库；`GRAPH_SKIP_SCORE=0.70` 已按实测定值并在生产链路触发（图跳过 51/182 = 28.0%），但开态两轮的漏答率 0.00% → 0.90% → 1.80% 呈可观测回退，且 `hit_cases` 15 / 17 均未过 wiki 假绿门槛 20，故**「不劣化」不成立、两个 selective 开关仍必须默认关、不得常开**。EXPLAIN、P95、26 迁移从零全链仍未跑，见[十四、已知边界](#十四已知边界明确说清不做什么)与 [`code/docs/按需路由设计.md`](code/docs/按需路由设计.md) §6。
 
 ---
 
@@ -144,7 +144,7 @@
 | **LLM Wiki 生成**（第 3 步） | 迁移 `0026` 建 `wiki_pages` 单表（JSONB 存 `sections` / `key_terms`）；解析后 arq 异步任务生成文档级知识页；幂等键为「文档 + 生成模型 + 提示词版本 + 内容哈希」，重索引在**同一事务**删旧页；`rebuild_wiki.py` 支持全量 / 换口径 / 只补失败 | [services/wiki](code/apps/api/app/services/wiki/) · [scripts/rebuild_wiki.py](code/apps/api/scripts/rebuild_wiki.py) |
 | **Wiki 读接口与权限** | 列表 / 详情两端点；详情要求页对应文档存在至少一条过四闸门的 chunk；页不存在 / 生成失败 / 无可见 chunk **统一 404**（不用 403 泄露存在性）；`WIKI_ENABLED=false` 默认关闭，端点 404 且零 SQL；系统能力页展示 `ready` / `stale` / `failed` 计数 | [api/wiki.py](code/apps/api/app/api/wiki.py) · [api/system.py](code/apps/api/app/api/system.py) |
 
-> **分步路线状态**：四步代码均已交付（第 4 步三段 commit `ea552c0` / `6717a85` / `86f5fc7`），N1~N6 已裁决；第 1/2/3 步已通过独立验证。**第 4 步真库效果层未验证**：代码与编排默认 `WIKI_ENABLED=false`，关闭态与未实现第 4 步时逐字节等价；本机 `.env` 为标定前置临时设为 `true`。217 条 A/B 首轮 baseline 因上游 LLM 网关 `insufficient_quota`（账户余额不足）中断且未落库，指标作废；dev 库现有 19 页 ready / 2 页 failed wiki，`hit_cases >= 20` 已具备数据条件但仍待实测，「不劣化」结论未验证。唯一安全交付形态是两个 selective 开关默认关。设计见 [02-design/第4步-wiki导航增量设计.md](02-design/第4步-wiki导航增量设计.md)。
+> **分步路线状态**：四步代码均已交付（第 4 步三段 commit `ea552c0` / `6717a85` / `86f5fc7`），N1~N6 已裁决；第 1/2/3 步已通过独立验证。**第 4 步真库效果层已实测但未通过「不劣化」**：2026-11-08 完成三轮 217 条 A/B（关态 baseline `20d43188` / 开态·0.85 `069ce6c0` / 开态·0.70 `f7ac0809`），拒答正确率 99.06% / 99.06% / 98.11%，漏答率 0.00% / 0.90% / 1.80%，命中率三轮均 100%；第三轮 `1.80% < 2%` 只是卡进容差，报告同时打印「假绿防线未过 / 本轮评测结论无效」，三行 `passed=True` 都不代表门禁通过。dev 库 19 页 ready / 2 页 failed wiki，开态 `hit_cases` 15 / 17 均未达 `WIKI_NAV_MIN_HIT_CASES=20`（门槛数值按裁决不改），故开态轮结论按 `caliber.validity=invalid_wiki_nav_gate` 记无效而非通过。代码与编排默认 `WIKI_ENABLED=false`，关闭态与未实现第 4 步时逐字节等价；本机 `.env` 仅为标定临时设为 `true`。**唯一安全交付形态仍是两个 selective 开关默认关**。设计见 [02-design/第4步-wiki导航增量设计.md](02-design/第4步-wiki导航增量设计.md) 与 [code/docs/按需路由设计.md](code/docs/按需路由设计.md) §6。
 
 ### 规模
 
@@ -155,7 +155,7 @@
 | 解析 | **8 类格式 / 13 个扩展名**，四类文档支持内嵌图转录 |
 | 测试 | **84 个测试文件**（`tests/` 下 `test_*.py`）；第 3 步独立验证 **520 用例全过**（P0=0 / P1=0 / P2=3），见 [04-test/测试报告-第3步-wiki.md](04-test/测试报告-第3步-wiki.md) |
 | 评测 | **217 条** eval 用例（111 可答 + 106 不可答） |
-| 图与 Wiki | 迁移 0024 / 0025（实体图） + 0026（`wiki_pages`）；在线图召回旁路、文档级 LLM Wiki 生成与读接口已交付；第 4 步导航检索代码已交付（默认关闭，真库效果层未验证） |
+| 图与 Wiki | 迁移 0024 / 0025（实体图） + 0026（`wiki_pages`）；在线图召回旁路、文档级 LLM Wiki 生成与读接口已交付；第 4 步导航检索代码已交付（默认关闭）；2026-11-08 三轮 217 条 A/B 已跑完并落库，开态存在漏答回退、不得常开 |
 | 容器 | 开发 10 服务、生产 12 服务（含迁移 / 网关 / 监控）一键启动 |
 
 ---
@@ -658,7 +658,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 
 首次启动自动执行：数据库迁移（0001~0026）→ 初始化默认租户 + admin 账号 + 公开知识库 → 下载 bge-m3 / bge-reranker 到本地缓存。
 
-> **可选能力默认关闭**：`GRAPH_ENABLED=false`（图召回）与 `WIKI_ENABLED=false`（LLM Wiki）。开启前先确认迁移 0024~0026 已执行，并阅读 [code/docs/DEPLOY.md](code/docs/DEPLOY.md)。`WIKI_GENERATOR_MODEL` 留空会回落 `LLM_MODEL`，若主模型是推理模型会导致 wiki 生成必然失败。
+> **可选能力默认关闭**：`GRAPH_ENABLED=false`（图召回）、`WIKI_ENABLED=false`（LLM Wiki），以及 2026-11-08 标定的两个按需路由开关 `GRAPH_RECALL_SELECTIVE=false` / `WIKI_NAV_SELECTIVE=false`。开启前先确认迁移 0024~0026 已执行，并阅读 [code/docs/DEPLOY.md](code/docs/DEPLOY.md)。`WIKI_GENERATOR_MODEL` 留空会回落 `LLM_MODEL`，若主模型是推理模型会导致 wiki 生成必然失败。**两个 selective 开关在 2026-11-08 的 217 条 A/B 中未通过「不劣化」，生产不得常开**，依据见 [`code/docs/按需路由设计.md`](code/docs/按需路由设计.md) §6。
 
 | 内置账号 | 密码 | 角色 |
 |------|------|------|
@@ -864,6 +864,24 @@ code/
 
 > 诚实口径：100% 是当前快照，不是永久保证。温度固定 0 也不保证同一输出（上游是第三方网关），重跑会出现 ±1 条抖动。判断质量要看趋势与归因，不要盯单次数字。
 
+#### 13.3.1 图 / wiki 按需路由三轮 A/B（2026-11-08）
+
+上表是 2026-10-25 的主链路线；下面是按需路由开关的 A/B，走 `scripts/run_eval.py` 打生产 SSE 链路、每轮 217 条、共用 `CHAT_RATE_LIMIT_PER_MINUTE=120` 与 1s 节流，均落 `eval_runs`（`case_fingerprint=e3971ec25d63`）。**两条评测链路口径不同，禁止横向比较**。
+
+| 轮次 | `run_id` 前缀 | selective | `GRAPH_SKIP_SCORE` | 拒答正确率 | 漏答率 | 命中率 | `hit_cases` | `expanded_terms` | `graph_covered` / `graph_unique` |
+|---|---|---|---|---|---|---|---|---|---|
+| 关态 baseline | `20d43188` | off / off | — | 99.06% | **0.00%** | 100% | 37 | 126 | 104 / 43 |
+| 开态·0.85 | `069ce6c0` | on / on | 0.85 | 99.06% | 0.90% | 100% | 15 | 58 | 99 / 44 |
+| 开态·0.70 + 显式基线 | `f7ac0809` | on / on | 0.70 | 98.11% | **1.80%** | 100% | 17 | 56 | 60 / 34 |
+
+> 数字来源：`eval_runs` 最新三行（拒答 / 漏答 / 命中 / `hit_cases` / `expanded_terms`，见 `.workbuddy/round3_result.txt` 与 `.workbuddy/selective_final.txt`）；`graph_covered` / `graph_unique` 与 wiki 观测取各轮报告聚合行。第三行额外带 `caliber` 自证字段：`graph_recall_selective=true` / `wiki_nav_selective=true` / `chat_rate_limit_per_minute=120` / `validity=invalid_wiki_nav_gate`；前两行是旧格式，无这四项。
+
+- **0.85 永不触发**：217 条 `eval_cases.question` 原文 + 单趟 `retrieve()` + 全 4 库、vector 口径下 `top1.final_score` 分布 `min=0.3180 / p25=0.5431 / p50=0.6285 / p75=0.6940 / p90=0.7427 / p95=0.7632 / max=0.8306`；`>=0.85` 为 0 条、`>=0.70` 为 51 条，故定值 0.70。这是**离线口径**，生产链路含 LLM 改写与 `retrieve_chain()` 多轮，触发率必须以 `/metrics` 为准；开启 rerank 后须重新标定。
+- **生产触发已验证**：第三轮末 `/metrics` `rag_gate_passed_total=184`、`rag_retrieve_graph_recall_seconds_count=133`、`rag_graph_skipped_by_router_total=51`；扣掉 smoke 的 2 次 gate passed 与 2 次 graph recall 后 `182 = 131 + 51` 守恒，图跳过率 `51/182 = 28.0%`，与离线预测 `51/176 = 29.0%` 量级吻合。开态·0.85 轮 `gate_passed=181`、`graph_recall_count=181`、无 `graph_skipped` 计数器，反证该轮零跳过。
+- **「不劣化」不成立**：漏答率 0.00% → 0.90% → 1.80% 单调上升；`1.80% < 2%` 只是卡进 `--max-regression 0.02` 容差，且三轮报告都打印「假绿防线未过：`hit_cases` 需 >= 20 → 本轮评测结论无效」，但 `passed=True` 仍落库。**`passed` 只表示脚本运行完成，不表示门禁通过**，判断质量必须看 `caliber.validity`。
+- **结论**：`GRAPH_SKIP_SCORE=0.70` 作为阈值定值保留（它确实让路由在生产生效），但两个 selective 开关继续默认关、不得常开；`GRAPH_SKIP_MIN_CHUNKS=8` 与 `WIKI_NAV_SELECTIVE_MIN_TERMS=3` 仍是站位值。要把路由常开，须先补真实 wiki 页让 `hit_cases >= 20`、重跑 A/B 并证明三项指标不回退。
+- **已知口径损失**：第三轮日志因启动命令漏设 UTF-8 输出编码导致中文乱码，`gb18030` / `gbk` / `cp936` 严格逆转均失败，fallback 只恢复 147/217 行且含 313 个替换字符，**逐 case 明细不可靠，不得据此下逐题结论**；聚合数字以 `eval_runs` 落库行与 `/metrics` 为准。
+
 用例集不是手写几条凑数，而是「候选 → 检索预检 → 入库 → 跑批 → 标定」五段，目的是**不让语料里根本没有依据的问题混进评测集**（否则测出来的只是标注错误）：
 
 | 步骤 | 脚本 | 做什么 |
@@ -942,7 +960,7 @@ code/
 | 章节补全有固定预算 | 每节 ≤3 片、全局 1200 token；超预算只补前面的高分节，后面的不补 | 提高前先评估上下文里"补全片 vs 答案片"的比例，别把答案挤出去 |
 | `kb_terms` 靠规则抽取 | 只抽「字母-数字型号」与「缩写(全称)」两种形态，同义词、口语别名叫不出来 | 加人工维护的词表界面，或离线小模型扩词 |
 | 记忆写入过滤是启发式的 | 正则能挡住大部分片段泄漏，但挡不住"换个说法的绕过" | 已用 `kind` 字段做读取侧白名单兜底；后续可加小模型做写入侧分类 |
-| 第 4 步真库效果层未验证 | 导航检索代码已交付（三段 commit `ea552c0` / `6717a85` / `86f5fc7`），默认 `WIKI_ENABLED=false` 关闭态零 SQL、与未实现时逐字节等价；置 true 后检索侧只在命中 ready wiki 页时按独立预算扩展词元，一条导航 SQL 两路复用，`summary` / `sections` 不进上下文。**217 条 A/B 首轮 baseline 因上游 LLM 网关 `insufficient_quota`（账户余额不足）中断且未落库**；dev 库现有 19 页 ready / 2 页 failed wiki，`hit_cases >= 20` 已具备数据条件但仍待实测，「不劣化」结论未验证，唯一安全形态是两个 selective 开关默认关 | 见 [02-design/第4步-wiki导航增量设计.md](02-design/第4步-wiki导航增量设计.md) 与 [04-test/测试报告-第4步wiki导航.md](04-test/测试报告-第4步wiki导航.md) |
+| 第 4 步真库效果层已实测但未通过「不劣化」 | 导航检索代码已交付（三段 commit `ea552c0` / `6717a85` / `86f5fc7`），默认 `WIKI_ENABLED=false` 关闭态零 SQL、与未实现时逐字节等价。**2026-11-08 三轮 217 条 A/B 已跑完并落库**：漏答率 0.00% → 0.90% → 1.80% 单调上升，`hit_cases` 37 → 15 → 17 均未达 `WIKI_NAV_MIN_HIT_CASES=20`（门槛按裁决不改），开态轮记 `validity=invalid_wiki_nav_gate`；`GRAPH_SKIP_SCORE=0.70` 已在生产触发（图跳过 51/182），但「不劣化」结论不成立。EXPLAIN、P95、26 迁移从零全链仍未跑 | 两个 selective 开关维持默认关；若要把路由常开，须先补真实 wiki 页让 `hit_cases >= 20`、重跑 A/B 并证明三项指标不回退；见 [`code/docs/按需路由设计.md`](code/docs/按需路由设计.md) §6 |
 | 图召回刻意不参与排序 | side channel 的分数恒 0、不进 RRF / 阈值 / 拒答，所以它**不会**改善命中率指标，只提供额外上下文 | 若要它影响排序，需重新定契约并重跑 217 条基线，不能悄悄改 |
 | wiki 与图能力默认关闭 | `WIKI_ENABLED=false` / `GRAPH_ENABLED=false`；开启时启动自检 fail-closed。`WIKI_GENERATOR_MODEL` 留空回落 `LLM_MODEL`，若主模型是推理模型则生成必然失败 | 显式指定普通对话模型；详见 [code/docs/DEPLOY.md](code/docs/DEPLOY.md) |
 
@@ -1034,7 +1052,7 @@ M6 安全加固功能默认关闭，到「灰度开关」面板手动创建规�
 旧行为是 `snippet = content[:200]`：一条 447 字的 chunk 里同时有报销、上班时间、入职流程，答案在中段，片头 200 字全是报销。现已改为按命中位置开窗（`hit_snippet`）。注意这是**纯展示字段**，中文 2-gram 兜底时窗口仍可能偏向常见词，不保证一定框住证据；引用片本身才是有依据的原文。
 
 **Q: 怎么启用 LLM Wiki？wiki 页会影响检索吗？**
-设 `WIKI_ENABLED=true` 并**显式**设置 `WIKI_GENERATOR_MODEL` 为普通对话模型（留空会回落 `LLM_MODEL`，推理模型会让生成必然失败），确认迁移 0026 已执行，再跑 `rebuild_wiki.py --all`。`WIKI_ENABLED=false` 时零 SQL、wiki 页不参与检索；置 true 后第 4 步导航才生效（只在命中 ready wiki 页时按独立预算扩展词元，`summary` / `sections` 不进上下文）。**真库效果层未验证**：2026-11-07 首轮 217 条 A/B baseline 因上游 LLM 网关 `insufficient_quota`（账户余额不足）中断且未落库，指标作废；dev 库现有 19 页 ready / 2 页 failed wiki，`hit_cases >= 20` 已具备数据条件但仍待实测。生产启用前须补齐两轮 217 条 A/B，详见 `code/docs/按需路由设计.md` §6。
+设 `WIKI_ENABLED=true` 并**显式**设置 `WIKI_GENERATOR_MODEL` 为普通对话模型（留空会回落 `LLM_MODEL`，推理模型会让生成必然失败），确认迁移 0026 已执行，再跑 `rebuild_wiki.py --all`。`WIKI_ENABLED=false` 时零 SQL、wiki 页不参与检索；置 true 后第 4 步导航才生效（只在命中 ready wiki 页时按独立预算扩展词元，`summary` / `sections` 不进上下文）。**生产仍不建议常开**：2026-11-08 三轮 217 条 A/B 已完成并落库，开态漏答率 0.90% / 1.80%（关态 0.00%），且 `hit_cases` 15 / 17 未过假绿门槛 20，报告判「本轮评测结论无效」，`caliber.validity=invalid_wiki_nav_gate`；`passed=True` 只表示脚本运行完成，不代表门禁通过。详见 `code/docs/按需路由设计.md` §6。
 
 **Q: wiki 读接口为什么返回 404 而不是 403？**
 页不存在、生成失败、无可见 chunk 三种情况统一 404，避免用 403 泄露「这个文档存在但你不能看」。详情端点还会要求该文档至少有一条过四闸门权限的 chunk。
@@ -1046,8 +1064,8 @@ M6 安全加固功能默认关闭，到「灰度开关」面板手动创建规�
 有，见 [`code/docs/检索链路全景.md`](code/docs/检索链路全景.md)（含可打印 [`code/docs/检索链路全景.html`](code/docs/检索链路全景.html)）。文档按「请求进入 → 三路召回 + 权限四闸门 → RRF(k=60) → 章节补全 → 重排 → 0.50 阈值 → 拒答 → 图召回 / wiki 导航旁路 → path_stats 埋点」主线，所有常量均标注 `文件:行号` 可回源码复算；口径版本 `CONTRACT_VERSION="v1.1"`，图召回 v1.2 为追加子项。
 
 **Q: 图召回 / wiki 导航有「按需路由」（判别该不该走）吗？**
-有，但**默认关**（`GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE`，均在 `code/apps/api/app/config/settings.py`）。开启后：图召回仅当 top1 高置信（≥ `GRAPH_SKIP_SCORE=0.85`）且召回充足（≥ `GRAPH_SKIP_MIN_CHUNKS=8`）才跳过；wiki 导航仅当查询词元已很丰富（≥ `WIKI_NAV_SELECTIVE_MIN_TERMS=3`）才跳过（wiki 在第 4 步、主召回之前执行，retrieved 尚不存在，故用前置词元数信号）。两个阈值均为**站位值，217 条 A/B 未完成**；默认关时行为与未引入路由逐字节相同，基线零影响。标定前置（完整 compose 栈 / `WIKI_ENABLED=true` / 19 页 ready wiki / 开关注入 / 镜像重建）已补齐，但 2026-11-07 首轮 baseline 因上游 LLM 网关 `insufficient_quota`（账户余额不足）在第 87 条可答用例中断且未落库，阈值维持站位值、两个开关继续默认关，详见 `code/docs/按需路由设计.md` §6。
-机制与常量详见 [`code/docs/按需路由设计.md`](code/docs/按需路由设计.md)（决策契约 / 真值表 / 不变量 / 标定计划）；图召回 / wiki 的三表 Schema、抽取写入、在线召回 8 步流程见 [`code/docs/GraphRAG检索召回.md`](code/docs/GraphRAG检索召回.md)。
+有，但**默认关且不得常开**（`GRAPH_RECALL_SELECTIVE` / `WIKI_NAV_SELECTIVE`，均在 `code/apps/api/app/config/settings.py`）。开启后：图召回仅当 top1 高置信（≥ `GRAPH_SKIP_SCORE=0.70`）且召回充足（≥ `GRAPH_SKIP_MIN_CHUNKS=8`）才跳过；wiki 导航仅当查询词元已很丰富（≥ `WIKI_NAV_SELECTIVE_MIN_TERMS=3`）才跳过（wiki 在第 4 步、主召回之前执行，`retrieved` 尚不存在，故用前置词元数信号）。`0.70` 已于 2026-11-08 按 217 条 `top1.final_score` 分布定值（原站位值 `0.85` 下 `max=0.8306`，永不触发），生产 `/metrics` 实测图跳过 51/182 = 28.0%；`8` 与 `3` 仍是站位值。默认关时行为与未引入路由逐字节相同，基线零影响。**三轮 A/B 结论是「不劣化」不成立**（漏答率 0.00% → 0.90% → 1.80%），故两个开关继续默认关；开启 rerank 后须重新标定。详见 `code/docs/按需路由设计.md` §6。
+机制与常量详见 [`code/docs/按需路由设计.md`](code/docs/按需路由设计.md)（决策契约 / 真值表 / 不变量 / 三轮 A/B 实测结果与遗留缺口）；图召回 / wiki 的三表 Schema、抽取写入、在线召回 8 步流程见 [`code/docs/GraphRAG检索召回.md`](code/docs/GraphRAG检索召回.md)。
 
 </details>
 

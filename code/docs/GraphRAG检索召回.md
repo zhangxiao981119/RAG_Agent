@@ -179,7 +179,7 @@ for neighbor in neighbors:
 - 接入点（`retrieve/__init__.py`）：
   - 图门（`:574-578`）：`if get_settings().graph_enabled:` 且 `not _graph_should_recall(retrieved[0].final_score, len(retrieved))` → `metrics.incr("rag.graph.skipped_by_router")`，跳过 `recall_by_graph`。
   - wiki 门（`:288-291`）：`wiki_run = wiki_on and bool(ilike_terms) and _wiki_should_nav(ilike_terms)`；若 `wiki_on and ilike_terms` 但被路由跳过 → `metrics.incr("rag.wiki.nav.skipped_by_router")`。
-- **路由阈值（2026-11-08 图方向已定值）**：`GRAPH_SKIP_SCORE=0.70`（`decisions.py:930`）、`GRAPH_SKIP_MIN_CHUNKS=8`（`decisions.py:937`，仍为站位值）、`WIKI_NAV_SELECTIVE_MIN_TERMS=3`（`decisions.py:131`，仍为站位值）。定值依据：实测 217 条 `eval_cases`（原文 `question` + 单趟 `retrieve()` + 全 4 库、vector 口径）`top1.final_score` `max=0.8306` / `p90=0.7427` / `>=0.70` 为 51 条 / 原 `>=0.85` 触发 0 次。**原文口径 ≠ 生产口径**：生产链路含 LLM 改写与 `retrieve_chain()` 多轮，实际触发率须以 `/metrics` 实测为准，开启 rerank 后须重新标定（`按需路由设计.md` §2.1）。
+- **路由阈值（2026-11-08 图方向已定值）**：`GRAPH_SKIP_SCORE=0.70`（`decisions.py:930`）、`GRAPH_SKIP_MIN_CHUNKS=8`（`decisions.py:940`，仍为站位值）、`WIKI_NAV_SELECTIVE_MIN_TERMS=3`（`decisions.py:131`，仍为站位值）。定值依据：实测 217 条 `eval_cases`（原文 `question` + 单趟 `retrieve()` + 全 4 库、vector 口径）`top1.final_score` `max=0.8306` / `p90=0.7427` / `>=0.70` 为 51 条 / 原 `>=0.85` 触发 0 次。**原文口径 ≠ 生产口径**：生产链路含 LLM 改写与 `retrieve_chain()` 多轮，实际触发率须以 `/metrics` 实测为准，开启 rerank 后须重新标定（`按需路由设计.md` §2.1）。
 
 ---
 
