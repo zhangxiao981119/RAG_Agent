@@ -229,6 +229,23 @@ services:
       timeout: 5s
       retries: 20
 
+  # 独立 MCP 协议适配服务：仅做请求头映射与主 API 转发，不发布宿主端口
+  mcp:
+    build:
+      context: .
+      dockerfile: apps/mcp/Dockerfile
+    restart: unless-stopped
+    environment:
+      KNOWLEDGE_API_BASE_URL: ${KNOWLEDGE_API_BASE_URL:-http://api:8000/api}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
   # arq 异步解析 worker（M2 §6 任务 2 / M6 任务 1 同步 cron）
   worker:
     build:

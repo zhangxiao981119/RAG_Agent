@@ -222,6 +222,24 @@ services:
       retries: 20
       start_period: 120s
 
+  # 独立 MCP 协议适配服务：只在容器内网可达，不进入 Caddy 反代
+  mcp:
+    build:
+      context: .
+      dockerfile: apps/mcp/Dockerfile
+    restart: unless-stopped
+    environment:
+      KNOWLEDGE_API_BASE_URL: ${KNOWLEDGE_API_BASE_URL:-http://api:8000/api}
+    depends_on:
+      api:
+        condition: service_healthy
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
   # arq 异步解析 worker
   worker:
     build:

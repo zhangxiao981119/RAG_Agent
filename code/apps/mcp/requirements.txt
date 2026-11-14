@@ -1,0 +1,5 @@
+# PyPI 使用阿里云镜像，与仓库内独立服务构建方式一致
+-i https://mirrors.aliyun.com/pypi/simple/
+fastmcp==4.2.0
+httpx==0.28.1
+uvicorn[standard]==0.54.0
