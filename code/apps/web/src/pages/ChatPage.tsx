@@ -31,6 +31,8 @@ import {
   StopOutlined,
 } from '@ant-design/icons'
 
+import { createFrameBatcher } from '../utils/frameBatcher'
+
 import {
   adoptAnswer,
   ChatEvent,
@@ -87,6 +89,8 @@ type Message = {
   images?: string[]
   /** assistant 消息形态（meta 事件带回），image 时回答区展示「图片提问」标 */
   modality?: 'text' | 'image'
+  /** 本轮原始知识库范围，重试时不能误用当前新选择的范围 */
+  kbIds?: string[]
 }
 
 type Props = { currentUser: User }
@@ -275,11 +279,18 @@ export function ChatPage({ currentUser }: Props) {
     }
   }
 
-  /** 重试：用原问题（含原图，M7）重新提问。 */
+  /** 重试：复用原问答与 assistant 消息；后端按消息状态决定回放或重新执行。 */
   function handleRetry(msg: Message) {
     const q = findQuestionOf(msg.id)
-    if (q && (q.text || (q.images && q.images.length > 0))) void askQuestion(q.text, q.images)
-    else message.warning('未找到原始问题')
+    if (!msg.messageId) {
+      message.warning('缺少原回答标识，请刷新后重试')
+      return
+    }
+    if (q && (q.text || (q.images && q.images.length > 0))) {
+      void askQuestion(q.text, q.images, msg)
+    } else {
+      message.warning('未找到原始问题')
+    }
   }
 
   /** 新建对话：清空消息 + 重置会话 id。 */
@@ -327,12 +338,14 @@ export function ChatPage({ currentUser }: Props) {
           refusedReason: refused && typeof meta.reason === 'string' ? meta.reason : undefined,
           refusedMessage: refused ? '知识库中未找到相关内容' : undefined,
           done: true,
+          networkError: meta.interrupted === true,
           messageId: m.id,
           suggestions: refused ? [] : suggestions,
           // 历史消息的 trace_id 落在 meta 里（后端 _persist_assistant 单点注入）
           traceId: typeof meta.trace_id === 'string' ? meta.trace_id : undefined,
           // 历史形态（M7）：image 时回答区同样展示「图片提问」标
           modality: meta.modality === 'image' ? 'image' : undefined,
+          kbIds: Array.isArray(meta.request_kb_ids) ? meta.request_kb_ids : undefined,
         }
       })
       setMessages(
@@ -361,19 +374,41 @@ export function ChatPage({ currentUser }: Props) {
     }
   }
 
-  async function askQuestion(question: string, images: string[] = []) {
+  async function askQuestion(question: string, images: string[] = [], retryMsg?: Message) {
     if ((!question && images.length === 0) || streaming) return
 
-    const userMsg: Message = {
-      id: `u_${Date.now()}`,
-      role: 'user',
-      text: question,
-      // 带图提问：缩略图随气泡展示（仅当前会话内存，不落库，INV-M-03）
-      images: images.length > 0 ? images : undefined,
+    const assistantMsg: Message = retryMsg ?? {
+      id: `a_${Date.now()}`,
+      role: 'assistant',
+      text: '',
+      loading: true,
+      kbIds: [...selectedKbs],
     }
-    const assistantMsg: Message = { id: `a_${Date.now()}`, role: 'assistant', text: '', loading: true }
-    setMessages((prev) => [...prev, userMsg, assistantMsg])
-    setInput('')
+    if (retryMsg) {
+      // 原位重试：保留气泡 id 与 messageId，清掉上一轮部分正文和终态标志。
+      setMessages((prev) => prev.map((m) => m.id === retryMsg.id ? {
+        ...m,
+        text: '',
+        citations: undefined,
+        suggestions: [],
+        loading: true,
+        done: false,
+        refused: false,
+        refusedReason: undefined,
+        refusedMessage: undefined,
+        networkError: false,
+      } : m))
+    } else {
+      const userMsg: Message = {
+        id: `u_${Date.now()}`,
+        role: 'user',
+        text: question,
+        // 带图提问：缩略图随气泡展示（仅当前会话内存，不落库，INV-M-03）
+        images: images.length > 0 ? images : undefined,
+      }
+      setMessages((prev) => [...prev, userMsg, assistantMsg])
+      setInput('')
+    }
     setStreaming(true)
 
     const controller = new AbortController()
@@ -389,14 +424,18 @@ export function ChatPage({ currentUser }: Props) {
     let suggestions: string[] = []
     let modality: 'text' | 'image' | undefined
 
-    // delta 直接渲染（真流式透传，不再用打字机缓冲）
-    const appendDelta = (chunk: string) => {
-      fullText += chunk
+    // delta 只累积到内存，每帧最多渲染一次：token 到达频率远高于屏幕刷新率，
+    // 逐个 setState 会让一帧内重复渲染同一气泡，低端机上表现为整页卡顿。
+    const batcher = createFrameBatcher(() => {
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantMsg.id ? { ...m, loading: false, text: fullText } : m,
         ),
       )
+    })
+    const appendDelta = (chunk: string) => {
+      fullText += chunk
+      batcher.schedule()
     }
 
     const handler = (event: ChatEvent) => {
@@ -447,7 +486,15 @@ export function ChatPage({ currentUser }: Props) {
     }
 
     try {
-      await mockAsk(question, selectedKbs, conversationIdRef.current, handler, controller.signal, images)
+      await mockAsk(
+        question,
+        retryMsg?.kbIds ?? selectedKbs,
+        conversationIdRef.current,
+        handler,
+        controller.signal,
+        images,
+        retryMsg?.messageId,
+      )
       // 正常结束（含 refused）：统一收尾
       setMessages((prev) =>
         prev.map((m) => {
@@ -490,6 +537,8 @@ export function ChatPage({ currentUser }: Props) {
       )
     } finally {
       // 主动停止在 catch 内 return，finally 仍会执行，统一回收流式态
+      // 终态的 setMessages 已写入完整 fullText，取消未执行的帧不会丢内容。
+      batcher.cancel()
       setStreaming(false)
       abortRef.current = null
     }

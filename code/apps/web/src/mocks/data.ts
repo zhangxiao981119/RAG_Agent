@@ -3,6 +3,8 @@
 // 接口 schema 对齐手册 §5.2
 // ============================================================
 
+import { createSSEParser } from '../utils/sseParser'
+
 export type Citation = {
   n: number
   chunk_id: string
@@ -439,7 +441,7 @@ export type ConversationMessage = {
   content: string
   citations: Citation[]
   // meta 增补 reason（拒答原因，如 IMAGE_NO_CONTENT / VISION_UNAVAILABLE）与 modality（M7 形态）
-  meta: { suggestions?: string[]; refused?: boolean; trace_id?: string; reason?: string; modality?: string }
+  meta: { suggestions?: string[]; refused?: boolean; interrupted?: boolean; trace_id?: string; reason?: string; modality?: string; request_kb_ids?: string[] }
   created_at: string
 }
 
@@ -470,11 +472,14 @@ export async function askChat(
   signal?: AbortSignal,
   /** M7 带图提问：data URL 数组（ImageRef.data_url 契约）；缺省/空数组 = 纯文本形态 */
   images?: string[],
+  /** 中断重试：复用原 assistant 消息，禁止另起一问一答 */
+  retryMessageId?: string,
 ): Promise<void> {
   const body = JSON.stringify({
     question,
     kb_ids: kbIds,
     conversation_id: conversationId,
+    retry_message_id: retryMessageId,
     images: (images ?? []).map((data_url) => ({ data_url })),
   })
   let response = await fetch('/api/chat/ask', withAuth({
@@ -505,32 +510,12 @@ export async function askChat(
   }
 
   const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
+  const events = createSSEParser()
 
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    // SSE 事件块以双换行分隔
-    const blocks = buffer.split('\n\n')
-    buffer = blocks.pop() || ''
-    for (const block of blocks) {
-      const lines = block.split('\n')
-      let event = ''
-      let data = ''
-      for (const line of lines) {
-        if (line.startsWith('event: ')) event = line.slice(7).trim()
-        else if (line.startsWith('data: ')) data = line.slice(6)
-      }
-      if (event && data) {
-        try {
-          onEvent({ event, data: JSON.parse(data) } as ChatEvent)
-        } catch (e) {
-          console.error('SSE 解析失败', e, data)
-        }
-      }
-    }
+    for (const event of events.push(value)) onEvent(event as ChatEvent)
   }
 }
 
