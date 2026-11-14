@@ -27,14 +27,15 @@
 | [六、多模态解析](#六多模态解析图表与扫描件) | 八类格式、内嵌图转录、图片式表格、质量门禁、水印清理 |
 | [七、知识治理](#七知识治理四维审查) | 四维评分、检索加权、独立任务与失败降级 |
 | [八、性能实测](#八性能实测与架构约束) | 压测数据、连接池缺陷、视觉链路吞吐天花板 |
-| [九、容器拓扑与技术栈](#九容器拓扑与技术栈) | 10 服务拓扑、技术选型 |
+| [九、容器拓扑与技术栈](#九容器拓扑与技术栈) | 11 服务拓扑、技术选型 |
 | [十、快速启动](#十快速启动) | 三条命令跑起来 |
-| [十一、功能清单](#十一功能清单) | F01–F47（含 GraphRAG / LLM Wiki 增量） |
+| [十一、功能清单](#十一功能清单) | F01–F54（含 GraphRAG / LLM Wiki / 企业集成与 MCP 增量） |
 | [十二、目录结构](#十二目录结构) | 代码地图 |
 | [十三、工程质量](#十三工程质量) | 契约驱动开发、评测门禁、自检发现的缺陷 |
 | [十四、已知边界](#十四已知边界明确说清不做什么) | 明确说清不做什么 |
 | [十五、部署](#十五部署) | 本地 / 内网 / 外网 / 生产 |
 | [十六、常见问题](#十六常见问题) | 常见问题 |
+| [十七、企业集成与 MCP](#十七企业集成与-mcp) | 同步 ask/search API、双认证与三重权限交集、会话隔离、独立 MCP Server |
 
 ---
 
@@ -151,12 +152,12 @@
 | 维度 | 数字 |
 |---|---|
 | 前端 | React 18 + TypeScript，**5 个业务页面 + 12 个管理面板** |
-| 后端 | FastAPI，**23 个 REST 路由模块 / 83 个接口 / 26 版 Alembic 迁移（0001~0026）** |
+| 后端 | FastAPI，**24 个 REST 路由模块 / 88 个接口 / 27 版 Alembic 迁移（0001~0027）** |
 | 解析 | **8 类格式 / 13 个扩展名**，四类文档支持内嵌图转录 |
 | 测试 | **84 个测试文件**（`tests/` 下 `test_*.py`）；第 3 步独立验证 **520 用例全过**（P0=0 / P1=0 / P2=3），见 [04-test/测试报告-第3步-wiki.md](04-test/测试报告-第3步-wiki.md) |
 | 评测 | **217 条** eval 用例（111 可答 + 106 不可答） |
 | 图与 Wiki | 迁移 0024 / 0025（实体图） + 0026（`wiki_pages`）；在线图召回旁路、文档级 LLM Wiki 生成与读接口已交付；第 4 步导航检索代码已交付（默认关闭）；2026-11-08 三轮 217 条 A/B 已跑完并落库，开态存在漏答回退、不得常开 |
-| 容器 | 开发 10 服务、生产 12 服务（含迁移 / 网关 / 监控）一键启动 |
+| 容器 | 开发 11 服务、生产 13 服务（含迁移 / MCP / 网关 / 监控）一键启动 |
 
 ---
 
@@ -220,6 +221,17 @@
 ```
 
 > **图召回不在这张主链图里**：它走**旁路（side channel）** —— 命中后追加进上下文，但分数恒 0、不进 RRF 融合 / 重排 / 0.50 阈值 / 拒答判定。所以打开 `GRAPH_ENABLED` 不改变任何一条命中分数，也不改变「答还是拒」的结论，只是给模型多几片相关材料；关图时零 SQL。失败时降级到 0 路并写 `graph_degraded_reason`，评测侧可见。
+
+**流式可靠性**
+
+| 问题 | 处理 |
+|---|---|
+| 中间层空闲断连 | 检索 / 生成等待期间每 15 秒下发 `: ping` 注释心跳，前端解析器天然忽略 |
+| 客户端断流 | 已生成正文随 assistant 消息落库并标 `interrupted`；恢复后不重跑检索与生成 |
+| 重试重复计费 | `retry_message_id` 复用原 assistant 消息；消息仍 `generating=true` 时重试返回 409 |
+| 终态重复处理 | 终态只从数据库回放，不重复敏感词、检索、生成与配额扣减 |
+| 中文跨包乱码 | 前端 `TextDecoder` 增量解码；同步集成 API 使用 `codecs` 增量解码器 |
+| 高频 token 渲染抖动 | delta 先累积到内存，`requestAnimationFrame` 每帧最多渲染一次 |
 
 ### 4.3 三级记忆层
 
@@ -621,9 +633,11 @@ Markdown 与 HTML 里的 `<img>` 有两种命运，取决于有没有 `alt`：
       └──────────┘  └──────────┘  └──────────┘
            │
       ┌────▼─────┐
-      │ migrate  │  ── 一次性迁移任务（0001~0026）
+      │ migrate  │  ── 一次性迁移任务（0001~0027）
       └──────────┘
 ```
+
+MCP 适配服务（`apps/mcp`，FastMCP Streamable HTTP）挂在 `api` 之后，只做身份头映射与 HTTP 转发；容器内监听 `:8000`，不发布宿主端口，也不经过网关。
 
 生产环境在开发拓扑上补 2 个：`gateway`（Caddy，TLS 终止）、`prometheus` + `grafana`（指标与看板）。
 
@@ -635,10 +649,11 @@ Markdown 与 HTML 里的 `<img>` 有两种命运，取决于有没有 `alt`：
 | 后端 | FastAPI · Python 3.12 · asyncpg · SQLAlchemy · Alembic |
 | 数据/存储 | PostgreSQL 16 + pgvector 0.7 · Redis 7（缓存 + 令牌桶 + arq 队列）· MinIO |
 | AI | bge-m3（1024 维）· bge-reranker-v2-m3（本地 CPU 推理，默认关）· OpenAI 兼容 LLM / **多模态视觉模型** · OCR 服务（扫描件，可选） |
-| 图与知识组织 | GraphRAG（实体关系图 + 在线 side channel 召回）· LLM Wiki（`wiki_pages` JSONB）· Alembic 迁移 0024–0026 |
+| 图与知识组织 | GraphRAG（实体关系图 + 在线 side channel 召回）· LLM Wiki（`wiki_pages` JSONB）· Alembic 迁移 0024–0027 |
+| 集成与 MCP | 同步 ask / search JSON API（应用凭证 + 用户 JWT 双认证）· FastMCP 4.2 Streamable HTTP 独立服务（仅容器内网） |
 | 文档解析 | pdfplumber · PyMuPDF · python-docx · **python-pptx** · openpyxl · xlrd · Pillow（质量门禁） |
-| 部署 | Docker Compose（开发 10 服务 / 生产 12 服务）· Nginx（web 静态与反代）· Caddy（生产 TLS 入口，内网自签） |
-| 工程 / CI | GitHub Actions（push master 与所有 PR：后端 `ruff + pytest`、前端 `tsc + vite build`）· 依赖锁定（`requirements.lock` / `package-lock.json`）· 基础镜像按 `sha256` digest 固定 |
+| 部署 | Docker Compose（开发 11 服务 / 生产 13 服务）· Nginx（web 静态与反代）· Caddy（生产 TLS 入口，内网自签） |
+| 工程 / CI | GitHub Actions（push master 与所有 PR：后端 `ruff + pytest`、前端 `tsc + vite build + vitest`）· 依赖锁定（`requirements.lock` / `package-lock.json`）· 基础镜像按 `sha256` digest 固定 |
 
 ---
 
@@ -656,7 +671,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 # 健康  http://localhost:8000/api/health（全绿=正常）
 ```
 
-首次启动自动执行：数据库迁移（0001~0026）→ 初始化默认租户 + admin 账号 + 公开知识库 → 下载 bge-m3 / bge-reranker 到本地缓存。
+首次启动自动执行：数据库迁移（0001~0027）→ 初始化默认租户 + admin 账号 + 公开知识库 → 下载 bge-m3 / bge-reranker 到本地缓存。
 
 > **可选能力默认关闭**：`GRAPH_ENABLED=false`（图召回）、`WIKI_ENABLED=false`（LLM Wiki），以及 2026-11-08 标定的两个按需路由开关 `GRAPH_RECALL_SELECTIVE=false` / `WIKI_NAV_SELECTIVE=false`。开启前先确认迁移 0024~0026 已执行，并阅读 [code/docs/DEPLOY.md](code/docs/DEPLOY.md)。`WIKI_GENERATOR_MODEL` 留空会回落 `LLM_MODEL`，若主模型是推理模型会导致 wiki 生成必然失败。**两个 selective 开关在 2026-11-08 的 217 条 A/B 中未通过「不劣化」，生产不得常开**，依据见 [`code/docs/按需路由设计.md`](code/docs/按需路由设计.md) §6。
 
@@ -724,7 +739,7 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 | F29 | **上下文治理** | 短期 3 轮 + 长期画像（≤20 条）+ 32K 预算 + 递归压缩 + 压缩 ≥3 次 SSE 提示新开对话 |
 | F30 | **三级记忆层** | 短期/长期/永久分层契约 + 11 条写入过滤器 + 来源 trace 反查清除 + 用户可查看/可删除（物理删除） |
 | F31 | **思维链分级** | `COT_MODE`（off/adaptive/full）；adaptive 复用 Query 改写分判断复杂度；推理链不外发、仅落库审计 |
-| F32 | 前端体验 | 上传进度、批量删除、列表分页、SSE 断网提示与一键重试（保留已流出文本）、带图提问 |
+| F32 | 前端体验 | 上传进度、批量删除、列表分页、SSE 断网提示与一键重试（保留已流出文本）、带图提问；跨包增量解码与逐帧合并渲染 |
 
 ### 工程与运营
 
@@ -750,6 +765,18 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 | F45 | **引用预览命中开窗** | `hit_snippet` 按 query 词元命中位置开窗（长词元优先 + 中文 2-gram 兜底），不再固定取片头 200 字 |
 | F46 | **LLM Wiki 生成** | 迁移 0026 `wiki_pages`；解析后异步生成文档级知识页；幂等键含内容哈希；重索引同事务删页；`rebuild_wiki.py` 三种模式 |
 | F47 | **Wiki 读接口** | 列表 / 详情两端点 + 系统能力页计数；详情按四闸门过滤；404 三合一不泄露存在性；`WIKI_ENABLED` 默认关闭 |
+
+### 企业集成与 MCP
+
+| 编号 | 功能 | 说明 |
+|------|------|------|
+| F48 | **同步问答 / 检索 API** | `POST /api/integrations/ask`、`POST /api/integrations/search`；内部消费同一条 SSE 事件流，不复制 RAG 链路 |
+| F49 | **双认证** | 应用凭证（`X-Application-Id` + `X-Application-Key`，SHA-256 哈希存储）与真实用户 JWT 双认证；请求体禁止声明 `user_id` |
+| F50 | **三重知识库交集** | 应用白名单 ∩ 用户授权 ∩ 请求 `kb_ids`；集成模式不沿用 admin 的库级豁免，检索仍按真实用户密级与主体下推 |
+| F51 | **会话与记忆隔离** | `integration_conversations` 绑定应用与真实用户，跨应用 / 跨用户 / Web 复用一律 404；不读写全局用户画像 |
+| F52 | **双限流双配额** | 应用全局与应用内用户两层限流；应用日 token / 日消息与用户、租户配额同时校验；Redis 故障返回 503 |
+| F53 | **MCP 协议适配** | 独立 FastMCP Server 暴露 `knowledge_ask` / `knowledge_search`，只做身份头映射与 HTTP 转发，不持有 RAG 逻辑；仅容器内网可达 |
+| F54 | **SSE 可靠性** | 15 秒注释心跳、断流部分正文落库、`retry_message_id` 幂等重试、终态数据库回放、`generating` 时 409 |
 
 **管理面板（admin 可见，共 12 个）**：组织架构 / 用户管理 / 用户组 / 角色管理 / 审计日志 / 系统监控（P50/P95/P99 + 拒答率）/ 评估门禁 / **知识治理（四维评分 + 重跑）** / 配额管理 / 敏感词 / 灰度开关 / 提示词版本。
 
@@ -779,16 +806,18 @@ code/
 │   │   │   ├── schemas/         # Pydantic 请求/响应模型
 │   │   │   ├── infra/           # 指标 / 链路追踪 / Redis 与 arq 连接池
 │   │   │   └── config/          # 配置 + 全局口径（decisions.py / index_profile.py / 启动自检）
-│   │   ├── alembic/versions/    # 26 版数据库迁移（0001~0026）
+│   │   ├── alembic/versions/    # 27 版数据库迁移（0001~0027）
 │   │   ├── scripts/             # 评测 / 标定 / 压测 / 重算 / 图数据补建 / wiki 重建脚本
-│   │   └── tests/               # pytest（84 个测试文件）
+│   │   └── tests/               # pytest（API / 解析 / 检索 / 权限 / 集成 / MCP）
+│   ├── mcp/                     # MCP 适配服务（FastMCP Streamable HTTP，内网）
 │   ├── ocr/                     # 扫描件 OCR 服务（GOT-OCR2.0）
 │   └── web/                     # 前端
 │       ├── src/pages/           # 5 个业务页面
 │       ├── src/pages/admin/     # 12 个管理面板
+│       ├── src/utils/           # SSE 增量解析器 / 逐帧批处理器（含 vitest 用例）
 │       └── Dockerfile           # 多阶段构建：Vite → Nginx
-├── docker-compose.yml           # 开发环境（10 服务）
-├── docker-compose.prod.yml      # 生产环境（12 服务）
+├── docker-compose.yml           # 开发环境（11 服务）
+├── docker-compose.prod.yml      # 生产环境（13 服务）
 ├── docker-compose.loadtest.yml  # 压测 overlay（隔离上游 + 抬限流）
 ├── ops/                         # Caddyfile · Prometheus 抓取 · Grafana 看板与告警
 ├── scripts/                     # init-prod / release / backup 一键脚本
@@ -819,7 +848,7 @@ code/
 
 ### 13.2 日常工程约束
 
-- **数据库迁移可进可退**：26 版 Alembic 迁移（0001~0026），支持 downgrade；其中 0024 / 0025 为图数据表、0026 为 `wiki_pages`
+- **数据库迁移可进可退**：27 版 Alembic 迁移（0001~0027），支持 downgrade；其中 0024 / 0025 为图数据表、0026 为 `wiki_pages`、0027 为集成应用与会话表
 - **三层回滚体系**：灰度开关秒级回滚（零停服）→ Alembic 迁移回滚 → 镜像回滚
 - **可观测性**：标准指标 + `/metrics`（路径标签用路由模板，避免高基数）；7 条核心 SLO 告警（存活 / 健康 / 5xx 错误率 / 重排降级 / 拒答率 / 首 token 超时 / P95 延迟）
 - **日志与链路追踪**：JSON 结构化日志（`LOG_LEVEL` 控制）+ `trace_id` 贯穿请求 → 审计 → 异步任务
@@ -977,7 +1006,9 @@ code/
 
 生产验收清单（F1-F5）、升级与回滚决策树、双镜像重建注意事项见 [code/docs/DEPLOY.md](code/docs/DEPLOY.md)。
 
-**可选能力开关**：`GRAPH_ENABLED`（图召回旁路）与 `WIKI_ENABLED`（LLM Wiki）默认 `false`。开启前先确认迁移 0024~0026 已执行，历史文档用 `python -m scripts.backfill_graph --all` 补建图数据、用 `python -m scripts.rebuild_wiki --all` 生成 wiki 页。两者开启时启动自检为 fail-closed，缺表 / 缺 LLM Key / 模型解析为空会直接拒绝启动。配置清单见 [code/docs/DEPLOY.md](code/docs/DEPLOY.md)。
+**可选能力开关**：`GRAPH_ENABLED`（图召回旁路）与 `WIKI_ENABLED`（LLM Wiki）默认 `false`。开启前先确认迁移 0024~0027 已执行，历史文档用 `python -m scripts.backfill_graph --all` 补建图数据、用 `python -m scripts.rebuild_wiki --all` 生成 wiki 页。两者开启时启动自检为 fail-closed，缺表 / 缺 LLM Key / 模型解析为空会直接拒绝启动。配置清单见 [code/docs/DEPLOY.md](code/docs/DEPLOY.md)。
+
+**企业集成**：迁移 0027 新增 `integration_applications` 与 `integration_conversations`，须先执行 `alembic upgrade head`。MCP 服务随 Compose 启动，仅容器内网可达（不发布宿主端口、不在网关暴露路由）；`KNOWLEDGE_API_BASE_URL` 默认 `http://api:8000/api`。外部系统接入方式见[十七、企业集成与 MCP](#十七企业集成与-mcp)。
 
 ---
 
@@ -1068,6 +1099,79 @@ M6 安全加固功能默认关闭，到「灰度开关」面板手动创建规�
 机制与常量详见 [`code/docs/按需路由设计.md`](code/docs/按需路由设计.md)（决策契约 / 真值表 / 不变量 / 三轮 A/B 实测结果与遗留缺口）；图召回 / wiki 的三表 Schema、抽取写入、在线召回 8 步流程见 [`code/docs/GraphRAG检索召回.md`](code/docs/GraphRAG检索召回.md)。
 
 </details>
+
+---
+
+## 十七、企业集成与 MCP
+
+把知识库开放给企业内其他项目调用时，真实调用人身份不能由调用方在请求体里声明。本项目的做法是**应用凭证 + 用户 JWT 双认证**，权限、配额与审计全部按真实用户执行。
+
+### 17.1 两种接入方式
+
+| 方式 | 入口 | 适用 |
+|---|---|---|
+| 同步 JSON API | `POST /api/integrations/ask`、`POST /api/integrations/search` | 企业内其他系统直接调用 |
+| MCP | `apps/mcp` 容器内 `/mcp`（Streamable HTTP） | 支持 MCP 的 AI 工具链 |
+
+两条路径共用主 API 的问答与检索实现：同步 ask 消费同一条 SSE 事件流，search 直接复用检索服务，MCP 只做协议与请求头适配，不复制 RAG 链路。
+
+### 17.2 认证与权限
+
+调用方必须同时具备：
+
+1. **真实用户 JWT**：`Authorization: Bearer <token>`，用户身份只从这里解析。
+2. **应用凭证**：`X-Application-Id` + `X-Application-Key`。
+
+`application_key` 只在创建应用时返回一次，数据库仅保存 SHA-256 哈希。应用必须与 JWT 用户属于同一租户且状态为 `active`。
+
+知识库范围取三者交集：
+
+```
+应用白名单 ∩ 用户授权 ∩ 请求 kb_ids
+```
+
+集成模式不沿用 Web 端 admin 的库级豁免；检索仍按真实用户的密级与部门主体在 SQL 层下推过滤。请求模型为 `extra="forbid"`，额外传 `user_id` 或权限字段直接返回 422。
+
+### 17.3 应用管理
+
+| 接口 | 说明 |
+|---|---|
+| `POST /api/integrations/applications` | 创建应用，响应含一次性明文 `application_key` |
+| `GET /api/integrations/applications` | 当前租户应用列表（不含密钥） |
+| `POST /api/integrations/applications/{id}/disable` | 禁用应用 |
+
+创建参数：`name`、`kb_ids`、`rate_limit_per_minute`（默认 60）、`daily_token_limit`（默认 200000）、`daily_message_limit`（默认 1000）。
+
+### 17.4 同步问答调用
+
+```bash
+curl -X POST http://localhost:8000/api/integrations/ask \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H "X-Application-Id: $APP_ID" \
+  -H "X-Application-Key: $APP_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"question":"住宿报销标准是多少？","kb_ids":["<kb-uuid>"]}'
+```
+
+响应包含 `conversation_id`、`message_id`、`answer`、`citations`、`refused`、`refuse_reason`、`usage`、`suggestions`。传入上一轮的 `conversation_id` 即可续接同一会话；检索接口返回 `items` 列表。
+
+### 17.5 MCP 工具
+
+| 工具 | 参数 | 返回 |
+|---|---|---|
+| `knowledge_ask` | `question`、`kb_ids`、`conversation_id?` | 同同步问答响应 |
+| `knowledge_search` | `query`、`kb_ids` | `items` 列表 |
+
+MCP 入站头 `X-User-Token` / `X-Application-Id` / `X-Application-Key` 由适配层转换为 `Authorization: Bearer` 与两个应用头，再转发到主 API。工具签名中不存在 `user_id` 或任何权限参数。
+
+MCP 容器监听 `:8000`，服务地址为 `http://mcp:8000/mcp`，健康检查 `/health`。它不发布宿主端口，也不在网关暴露路由；外部系统需与它位于同一内网或 Docker 网络。
+
+### 17.6 隔离、限流与审计
+
+- 集成会话写入 `integration_conversations`，绑定 `tenant_id / application_id / user_id`。跨应用、跨用户、Web 与集成双向复用均返回 404。
+- 集成链路不读取也不写入全局用户画像 `User.memory`，只使用当前隔离会话的历史。
+- 同时执行应用级与用户 / 租户级限流和配额；Redis 不可用时明确返回 503，不静默放行。
+- 所有问答与检索审计的 detail 都带 `application_id`，可从审计表反查调用应用。
 
 ---
 
