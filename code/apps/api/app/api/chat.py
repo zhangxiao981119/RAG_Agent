@@ -31,7 +31,14 @@ from app.config import decisions
 from app.config.settings import get_settings
 from app.database import SessionLocal
 from app.infra import trace
-from app.models import Conversation, KnowledgeBase, Message, User
+from app.models import (
+    Conversation,
+    IntegrationApplication,
+    IntegrationConversation,
+    KnowledgeBase,
+    Message,
+    User,
+)
 from app.schemas.chat import ChatAskRequest, ImageRef
 from app.services import audit
 from app.services import feature_flag as flag_service
@@ -96,6 +103,41 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 
+async def _with_heartbeat(
+    events: AsyncIterator[str], interval_seconds: float = 15.0,
+) -> AsyncIterator[str]:
+    """在等待检索或生成时发送 SSE 注释心跳，并正确传播断连取消。
+
+    心跳使用 ``: ping`` 注释行，不是业务事件，现有前端解析器会自然忽略。
+    每次只推进底层迭代器一次；等待超时不会取消正在执行的检索或生成。
+    """
+    iterator = events.__aiter__()
+    while True:
+        next_event = asyncio.create_task(anext(iterator))
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {next_event}, timeout=interval_seconds
+                )
+                if done:
+                    break
+                yield ": ping\n\n"
+            # wait 不取消底层任务；超时与事件完成同时发生时也必须先取回原事件。
+            event = next_event.result()
+        except StopAsyncIteration:
+            return
+        except BaseException:
+            # 客户端断连时，取消底层事件流，让其中的 CancelledError 分支落库。
+            if not next_event.done():
+                next_event.cancel()
+            try:
+                await next_event
+            except (StopAsyncIteration, asyncio.CancelledError):
+                pass
+            raise
+        yield event
+
+
 def _retrieval_observation(result: RetrievalResult) -> dict:
     """检索侧观测字段 —— SSE 追加字段的**唯一构造点**（§14.6 可测化）。
 
@@ -123,6 +165,67 @@ def _retrieval_observation(result: RetrievalResult) -> dict:
     }
 
 
+def _replay_assistant_response(
+    conversation_id: uuid.UUID,
+    assistant: Message,
+) -> StreamingResponse:
+    """把已落库的终态 assistant 消息重新编码为 SSE，不执行任何 RAG 环节。"""
+    stored_meta = assistant.meta
+
+    async def replay_stream() -> AsyncIterator[str]:
+        yield _sse("meta", {
+            "conversation_id": str(conversation_id),
+            "message_id": str(assistant.id),
+            "stage": "replay",
+            "trace_id": trace.get_trace_id(),
+            "modality": stored_meta.get("modality", "text"),
+        })
+        observation = stored_meta.get("retrieval_observation", {})
+        if stored_meta.get("refused"):
+            reason = stored_meta.get("reason", "NO_RELEVANT_CONTENT")
+            message = {
+                "NEED_CLARIFICATION": "问题不够明确，请补充具体对象或背景后重试",
+                "IMAGE_NO_CONTENT": "图片中未识别到可读内容",
+                "VISION_UNAVAILABLE": "图片理解服务暂时不可用，请稍后重试",
+                "LLM_TIMEOUT": "响应较慢，请重试",
+                "LLM_ERROR": "生成服务异常，请稍后重试",
+                "SENSITIVE_OUTPUT": "回答内容包含敏感词，已被拦截",
+                "QUOTA_EXCEEDED_USER_DAILY_TOKEN": "今日配额已用尽，请明日再试",
+                "QUOTA_EXCEEDED_USER_DAILY_MSG": "今日配额已用尽，请明日再试",
+                "QUOTA_EXCEEDED_TENANT_DAILY_TOKEN": "今日配额已用尽，请明日再试",
+                "QUOTA_EXCEEDED_TENANT_MONTHLY_TOKEN": "今日配额已用尽，请明日再试",
+                "QUOTA_EXCEEDED_APPLICATION_DAILY_TOKEN": "今日配额已用尽，请明日再试",
+                "QUOTA_EXCEEDED_APPLICATION_DAILY_MSG": "今日配额已用尽，请明日再试",
+                "VECTOR_STORE_DOWN": "知识库暂时不可用，请稍后重试",
+                "INTERNAL_ERROR": "服务暂时异常，请稍后重试",
+            }.get(reason, "知识库中未找到相关内容")
+            yield _sse("refused", {
+                "reason": reason,
+                "message": message,
+                **observation,
+            })
+            return
+        if assistant.citations:
+            yield _sse("citations", {"citations": assistant.citations})
+        if assistant.content:
+            yield _sse("delta", {"text": assistant.content})
+        yield _sse("done", {
+            "finish_reason": "stopped",
+            "grounding": {
+                "stripped_sentences": stored_meta.get("grounding_stripped", 0),
+            },
+            "usage": stored_meta.get("usage", {}),
+            "suggestions": stored_meta.get("suggestions", []),
+            **observation,
+        })
+
+    return StreamingResponse(
+        replay_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # 历史答案中的旧引用编号标记，如 [1]、[12]
 _CITATION_MARK_RE = re.compile(r"\[\d+\]")
 
@@ -137,6 +240,21 @@ def _strip_citation_marks(content: str) -> str:
     return _CITATION_MARK_RE.sub("", content)
 
 
+def _integration_kb_ids(
+    requested_kb_ids: list[uuid.UUID],
+    user: CurrentUser,
+    application: IntegrationApplication,
+) -> list[uuid.UUID]:
+    """返回应用白名单、真实用户授权和请求知识库的三重交集。"""
+    application_kb_ids = {uuid.UUID(kb_id) for kb_id in application.kb_ids}
+    authorized_kb_ids = set(user.authorized_kb_ids)
+    return [
+        kb_id
+        for kb_id in requested_kb_ids
+        if kb_id in application_kb_ids and kb_id in authorized_kb_ids
+    ]
+
+
 @router.post("/chat/ask")
 async def chat_ask(
     payload: ChatAskRequest,
@@ -144,18 +262,38 @@ async def chat_ask(
     session: AsyncSession = Depends(get_db),
     _: None = Depends(check_chat_rate_limit),
 ) -> StreamingResponse:
+    return await _chat_ask_impl(payload, user, session)
+
+
+async def _chat_ask_impl(
+    payload: ChatAskRequest,
+    user: CurrentUser,
+    session: AsyncSession,
+    integration: IntegrationApplication | None = None,
+) -> StreamingResponse:
+    """Web 与集成问答共用主链路，集成模式额外约束会话、权限和配额。"""
+    async def audit_record(tenant_id, user_id, action, **kwargs) -> None:
+        detail = dict(kwargs.pop("detail", None) or {})
+        if integration is not None:
+            detail["application_id"] = str(integration.id)
+        await audit.record(
+            tenant_id, user_id, action, detail=detail, **kwargs
+        )
+
     # ── M7 带图提问：形态判定 + 入参校验（StreamingResponse 之前，可 400）──
     # 图片路径过全仓唯一形态判定点（记 rag.router.decision 指标，INV-M-01）；
     # 纯文本是聊天缺省形态，直接用枚举，不调 detect（无显式信号会抛 UnknownModalityError）
     modality = detect(has_images=True) if payload.images else Modality.TEXT
     _validate_images(payload.images)
 
-    # admin 豁免 G2 库级授权校验；普通用户求交集（手册 §3.2.7 G2）
-    if user.clearance >= 40:
+    # 集成模式不使用 admin 豁免，严格取应用白名单、用户授权和请求库的三重交集。
+    if integration is not None:
+        effective_kb_ids = _integration_kb_ids(payload.kb_ids, user, integration)
+    elif user.clearance >= 40:
         effective_kb_ids = list(payload.kb_ids)
     else:
         effective_kb_ids = [
-            kb for kb in payload.kb_ids if kb in user.authorized_kb_ids
+            kb_id for kb_id in payload.kb_ids if kb_id in user.authorized_kb_ids
         ]
     if not effective_kb_ids:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
@@ -169,6 +307,90 @@ async def chat_ask(
     ).scalars().all()
     if len(kb_rows) != len(effective_kb_ids):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="部分知识库不存在")
+
+    # 集成会话只能在原应用、原用户下继续使用，普通 Web 会话也不能跨入口复用。
+    if payload.conversation_id is not None:
+        integration_conv = await session.get(
+            IntegrationConversation, payload.conversation_id
+        )
+        if integration is not None:
+            if (
+                integration_conv is None
+                or integration_conv.tenant_id != user.tenant_id
+                or integration_conv.application_id != integration.id
+                or integration_conv.user_id != user.user_id
+            ):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
+        elif integration_conv is not None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
+
+    # 重试先定位并校验原问答。终态立即回放，敏感词、配额、检索与生成均不重复执行。
+    retry_assistant: Message | None = None
+    user_msg: Message | None = None
+    conv: Conversation | None = None
+    if payload.retry_message_id is not None:
+        if payload.conversation_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="重试必须携带 conversation_id",
+            )
+        conv = await session.get(Conversation, payload.conversation_id)
+        if conv is None or conv.tenant_id != user.tenant_id or conv.user_id != user.user_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
+        retry_assistant = await session.get(Message, payload.retry_message_id)
+        if (
+            retry_assistant is None
+            or retry_assistant.tenant_id != user.tenant_id
+            or retry_assistant.conversation_id != conv.id
+            or retry_assistant.role != "assistant"
+        ):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="原回答不存在")
+        if retry_assistant.meta.get("generating") is True:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="原回答仍在生成中，请稍后重试",
+            )
+
+        # 同一事务创建的 user/assistant 时间戳相同；原始问题因此按 assistant
+        # 时间取最近一条 user。之后若已有新消息，则原问答不再是可原位重试的最新问答。
+        user_msg = (
+            await session.execute(
+                select(Message)
+                .where(
+                    Message.conversation_id == conv.id,
+                    Message.role == "user",
+                    Message.created_at <= retry_assistant.created_at,
+                )
+                .order_by(Message.created_at.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        later_message = (
+            await session.execute(
+                select(Message.id)
+                .where(
+                    Message.conversation_id == conv.id,
+                    Message.created_at > retry_assistant.created_at,
+                )
+                .limit(1)
+            )
+        ).scalars().first()
+        original_kb_ids = {
+            uuid.UUID(kb_id)
+            for kb_id in retry_assistant.meta.get("request_kb_ids", [])
+        }
+        if (
+            user_msg is None
+            or later_message is not None
+            or user_msg.content != payload.question
+            or original_kb_ids != set(payload.kb_ids)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="原问题、知识库范围或最新消息已变化，不能原位重试",
+            )
+        if retry_assistant.meta.get("interrupted") is not True:
+            return _replay_assistant_response(conv.id, retry_assistant)
 
     # ── M6 续篇：敏感词输入侧检查（feature flag 守护）─────────
     # 命中即拒答（走 refused 事件，不留替换痕迹）
@@ -192,7 +414,7 @@ async def chat_ask(
                     "reason": "SENSITIVE_INPUT",
                     "message": "问题包含敏感词，已被拦截",
                 })
-                await audit.record(
+                await audit_record(
                     user.tenant_id, user.user_id, "chat.sensitive.block",
                     object_type="conversation", object_id=None,
                     detail={"word": word, "side": "input"},
@@ -203,48 +425,76 @@ async def chat_ask(
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
-    # 复用或创建 conversation
+    # 复用或创建 conversation；中断重试不再创建任何消息行。
     conversation_id = payload.conversation_id
-    if conversation_id is not None:
-        conv = await session.get(Conversation, conversation_id)
-        if conv is None or conv.tenant_id != user.tenant_id or conv.user_id != user.user_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
-    else:
-        conv = Conversation(
-            tenant_id=user.tenant_id,
-            user_id=user.user_id,
-            title=payload.question[:50],
-        )
-        session.add(conv)
-        await session.flush()
+    request_meta = {
+        "generating": True,
+        "request_kb_ids": sorted(str(kb_id) for kb_id in payload.kb_ids),
+        "modality": modality.value,
+    }
+    if retry_assistant is not None:
+        # 此处 conv / user_msg 已在上方完成归属、原问题和最新消息校验。
+        assert conv is not None and user_msg is not None
         conversation_id = conv.id
+        message_id = retry_assistant.id
+        retry_assistant.content = ""
+        retry_assistant.citations = []
+        retry_assistant.meta = request_meta
+        await session.commit()
+        await session.refresh(conv)
+    else:
+        if conversation_id is not None:
+            conv = await session.get(Conversation, conversation_id)
+            if conv is None or conv.tenant_id != user.tenant_id or conv.user_id != user.user_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
+        else:
+            conv = Conversation(
+                tenant_id=user.tenant_id,
+                user_id=user.user_id,
+                title=payload.question[:50],
+            )
+            session.add(conv)
+            await session.flush()
+            conversation_id = conv.id
+            if integration is not None:
+                session.add(
+                    IntegrationConversation(
+                        conversation_id=conv.id,
+                        tenant_id=user.tenant_id,
+                        application_id=integration.id,
+                        user_id=user.user_id,
+                    )
+                )
 
-    # 写 user message，并预占位 assistant message（同一事务提交）。
-    # meta 下发的 message_id 立即指向真实行：流式中断/异常也不会留下无主引用，
-    # 流结束后由 _persist_assistant 按 id 更新这一占位行。
-    message_id = uuid.uuid4()
-    user_msg = Message(
-        tenant_id=user.tenant_id,
-        conversation_id=conversation_id,
-        role="user",
-        content=payload.question,
-    )
-    assistant_placeholder = Message(
-        id=message_id,
-        tenant_id=user.tenant_id,
-        conversation_id=conversation_id,
-        role="assistant",
-        content="",
-        citations=[],
-        meta={"generating": True},
-    )
-    session.add_all([user_msg, assistant_placeholder])
-    await session.commit()
-    await session.refresh(conv)
+        # 写 user message，并预占位 assistant message（同一事务提交）。
+        # meta 下发的 message_id 立即指向真实行，断连后可按该 id 原位重试。
+        message_id = uuid.uuid4()
+        user_msg = Message(
+            tenant_id=user.tenant_id,
+            conversation_id=conversation_id,
+            role="user",
+            content=payload.question,
+        )
+        assistant_placeholder = Message(
+            id=message_id,
+            tenant_id=user.tenant_id,
+            conversation_id=conversation_id,
+            role="assistant",
+            content="",
+            citations=[],
+            meta=request_meta,
+        )
+        session.add_all([user_msg, assistant_placeholder])
+        await session.commit()
+        await session.refresh(conv)
 
     async def event_stream() -> AsyncIterator[str]:
         import time as _time
         _t0 = _time.monotonic()
+        # 断连时只保存已经实际下发的正文与引用，不保存模型缓冲区里的不可见内容。
+        partial_text = ""
+        partial_citations: list[dict] = []
+        partial_observation: dict = {}
         try:
 
             # meta 事件（M7 起增补 modality，事件顺序不变：meta→stage→citations→delta...→done/refused）
@@ -279,7 +529,7 @@ async def chat_ask(
                         meta={"refused": True, "reason": "IMAGE_NO_CONTENT",
                               "modality": modality.value},
                     )
-                    await audit.record(
+                    await audit_record(
                         user.tenant_id, user.user_id, "chat.ask",
                         object_type="conversation", object_id=str(conversation_id),
                         detail={
@@ -304,7 +554,7 @@ async def chat_ask(
                         meta={"refused": True, "reason": "VISION_UNAVAILABLE",
                               "modality": modality.value},
                     )
-                    await audit.record(
+                    await audit_record(
                         user.tenant_id, user.user_id, "chat.ask",
                         object_type="conversation", object_id=str(conversation_id),
                         detail={
@@ -386,7 +636,7 @@ async def chat_ask(
                     meta={"refused": True, "reason": "NEED_CLARIFICATION"},
                 )
                 _total_ms = int((_time.monotonic() - _t0) * 1000)
-                await audit.record(
+                await audit_record(
                     user.tenant_id, user.user_id, "chat.ask",
                     object_type="conversation", object_id=str(conversation_id),
                     detail={
@@ -399,7 +649,7 @@ async def chat_ask(
                         "rewrite_score": rewrite_score,
                     },
                 )
-                await audit.record(
+                await audit_record(
                     user.tenant_id, user.user_id, "chat.ask.metric",
                     object_type="conversation", object_id=str(conversation_id),
                     detail={
@@ -436,7 +686,15 @@ async def chat_ask(
                         "reason": "VECTOR_STORE_DOWN",
                         "message": "知识库暂时不可用，请稍后重试",
                     })
+                    await _persist_assistant(
+                        conversation_id, user, message_id,
+                        text="", refused=True, citations=[],
+                        meta={"refused": True, "reason": "VECTOR_STORE_DOWN"},
+                    )
                     return
+
+            # 检索完成后即使生成阶段断连，也能把本轮观测随部分答案一起落库。
+            partial_observation = _retrieval_observation(result)
 
             # 链式检索：多轮时补一个 stage 事件（前端 SSE switch 无 stage 分支，
             # 未知 stage 会被忽略，新增取值安全）—— 先于 retrieving 告知走了多轮
@@ -465,11 +723,16 @@ async def chat_ask(
                 await _persist_assistant(
                     conversation_id, user, message_id,
                     text="", refused=True, citations=[],
-                    meta={"stage_ms": result.stage_ms, "refused": True},
+                    meta={
+                        "stage_ms": result.stage_ms,
+                        "refused": True,
+                        "reason": result.refuse_reason,
+                        "retrieval_observation": partial_observation,
+                    },
                     chain_mode=result.chain_mode,
                 )
                 # 审计：拒答也记录（refused=True 无引用）
-                await audit.record(
+                await audit_record(
                     user.tenant_id, user.user_id, "chat.ask",
                     object_type="conversation", object_id=str(conversation_id),
                     detail={
@@ -492,7 +755,7 @@ async def chat_ask(
                     "conversation_id": str(conversation_id),
                 })
                 # M6 可观测：指标持久化（供 P95 聚合查询）
-                await audit.record(
+                await audit_record(
                     user.tenant_id, user.user_id, "chat.ask.metric",
                     object_type="conversation", object_id=str(conversation_id),
                     detail={
@@ -512,12 +775,13 @@ async def chat_ask(
             # 不再按条数硬压缩（DB 已放开到 500 行），统一交给后面的
             # ensure_context_within_limit 按 token budget 裁剪 + 超限压缩
 
-            # 3. 读用户画像
+            # 集成会话只使用当前隔离会话历史，不读取 Web 入口的长期用户画像。
             user_memory: dict = {}
-            async with SessionLocal() as mem_session:
-                u = await mem_session.get(User, user.user_id)
-                if u and u.memory:
-                    user_memory = u.memory or {}
+            if integration is None:
+                async with SessionLocal() as mem_session:
+                    u = await mem_session.get(User, user.user_id)
+                    if u and u.memory:
+                        user_memory = u.memory or {}
 
             # ── M6 续篇：配额检查 + 四级降级（feature flag 守护）─────
             # feature flag 关闭 → 跳过配额检查，用原 history/memory
@@ -576,35 +840,49 @@ async def chat_ask(
 
             degraded_from = "none"
             effective_chunks = current_chunks  # context 检查后的 chunks 作为初始值
-            quota_enabled = await flag_service.is_enabled(
+            quota_refuse_reason: str | None = None
+            if integration is not None:
+                quota_refuse_reason = await quota_service.check_application_quota(
+                    integration, question_for_pipeline, history, memory_prompt, effective_chunks,
+                )
+
+            # 集成调用始终同时执行应用与真实用户配额，Web 仍沿用原灰度开关。
+            quota_enabled = integration is not None or await flag_service.is_enabled(
                 user.tenant_id, decisions.QUOTA_FEATURE_KEY, user.dept_path, user.user_id,
             )
-            if quota_enabled:
+            plan = None
+            if quota_refuse_reason is None and quota_enabled:
                 plan = await quota_service.check_and_degrade(
                     user.tenant_id, user.user_id,
                     question_for_pipeline, history, memory_prompt, effective_chunks,
                 )
                 if plan.refused:
-                    yield _sse("refused", {
-                        "reason": plan.refuse_reason,
-                        "message": "今日配额已用尽，请明日再试",
-                    })
-                    await _persist_assistant(
-                        conversation_id, user, message_id,
-                        text="", refused=True, citations=[],
-                        meta={
-                            "stage_ms": result.stage_ms,
-                            "refused": True,
-                            "reason": plan.refuse_reason,
-                        },
-                        chain_mode=result.chain_mode,
-                    )
-                    await audit.record(
-                        user.tenant_id, user.user_id, "chat.quota.exceeded",
-                        object_type="conversation", object_id=str(conversation_id),
-                        detail={"reason": plan.refuse_reason},
-                    )
-                    return
+                    quota_refuse_reason = plan.refuse_reason
+
+            if quota_refuse_reason is not None:
+                yield _sse("refused", {
+                    "reason": quota_refuse_reason,
+                    "message": "今日配额已用尽，请明日再试",
+                })
+                await _persist_assistant(
+                    conversation_id, user, message_id,
+                    text="", refused=True, citations=[],
+                    meta={
+                        "stage_ms": result.stage_ms,
+                        "refused": True,
+                        "reason": quota_refuse_reason,
+                        "retrieval_observation": partial_observation,
+                    },
+                    chain_mode=result.chain_mode,
+                )
+                await audit_record(
+                    user.tenant_id, user.user_id, "chat.quota.exceeded",
+                    object_type="conversation", object_id=str(conversation_id),
+                    detail={"reason": quota_refuse_reason},
+                )
+                return
+
+            if plan is not None:
                 # 用降级方案替换原参数
                 history = plan.history
                 memory_prompt = plan.memory_prompt
@@ -644,10 +922,11 @@ async def chat_ask(
                 }
                 for i, c in enumerate(effective_chunks)
             ]
+            partial_citations = citations_payload
             yield _sse("citations", {"citations": citations_payload})
 
             # 审计：谁在何时问了什么、引用到哪些文档（手册 F4 / M5 任务 3）
-            await audit.record(
+            await audit_record(
                 user.tenant_id, user.user_id, "chat.ask",
                 object_type="conversation", object_id=str(conversation_id),
                 detail={
@@ -693,6 +972,7 @@ async def chat_ask(
                     # 以第一个**非空** delta 为准：空 delta 不代表用户看到内容
                     if stream_evt.text and _ttft_ms is None:
                         _ttft_ms = int((_time.monotonic() - _t0) * 1000)
+                    partial_text += stream_evt.text
                     yield _sse("delta", {"text": stream_evt.text})
                 elif stream_evt.type == "refused":
                     gen_result = stream_evt
@@ -727,6 +1007,7 @@ async def chat_ask(
                         "refused": True,
                         "reason": reason,
                         "grounding_stripped": gen_result.stripped_sentences,
+                        "retrieval_observation": partial_observation,
                     },
                     chain_mode=result.chain_mode,
                 )
@@ -741,7 +1022,7 @@ async def chat_ask(
                     "grounding_stripped": gen_result.stripped_sentences,
                     "conversation_id": str(conversation_id),
                 })
-                await audit.record(
+                await audit_record(
                     user.tenant_id, user.user_id, "chat.ask.metric",
                     object_type="conversation", object_id=str(conversation_id),
                     detail={
@@ -763,9 +1044,30 @@ async def chat_ask(
                 await quota_service._incr_usage(
                     user.tenant_id, user.user_id,
                     tokens=final_usage.get("prompt_tokens", 0) + final_usage.get("completion_tokens", 0),
+                    application_id=integration.id if integration is not None else None,
                 )
             except Exception:
                 logger.warning("quota._incr_usage 失败，忽略", exc_info=True)
+
+            # 终态必须先落库再发 done：客户端收到 done 即可安全刷新或回放，
+            # 不会出现「流已完成但数据库仍是 generating」的窗口。
+            await _persist_assistant(
+                conversation_id, user, message_id,
+                text=final_text, refused=False, citations=citations_payload,
+                meta={
+                    "stage_ms": result.stage_ms,
+                    "grounding_stripped": final_stripped,
+                    "usage": final_usage,
+                    "suggestions": final_suggestions,
+                    "quota_degraded_from": degraded_from,
+                    "retrieval_observation": partial_observation,
+                    # 思维链只落库、不外发（decisions.COT_REASONING_EXPOSED = False）。
+                    # 落库前**必须脱敏**：推理里常直接抄 <context> 内容，
+                    # 那里面可能带手机号/身份证（正文走 mask_pii，推理链不经过那条路）。
+                    "reasoning": mask_pii(final_reasoning) if final_reasoning else "",
+                },
+                chain_mode=result.chain_mode,
+            )
 
             yield _sse("done", {
                 "finish_reason": "stopped",
@@ -792,7 +1094,7 @@ async def chat_ask(
                 "completion_tokens": final_usage.get("completion_tokens", 0),
                 "conversation_id": str(conversation_id),
             })
-            await audit.record(
+            await audit_record(
                 user.tenant_id, user.user_id, "chat.ask.metric",
                 object_type="conversation", object_id=str(conversation_id),
                 detail={
@@ -809,27 +1111,27 @@ async def chat_ask(
                 },
             )
 
-            # 持久化
-            await _persist_assistant(
-                conversation_id, user, message_id,
-                text=final_text, refused=False, citations=citations_payload,
-                meta={
-                    "stage_ms": result.stage_ms,
-                    "grounding_stripped": final_stripped,
-                    "usage": final_usage,
-                    "suggestions": final_suggestions,
-                    "quota_degraded_from": degraded_from,
-                    # 思维链只落库、不外发（decisions.COT_REASONING_EXPOSED = False）。
-                    # 落库前**必须脱敏**：推理里常直接抄 <context> 内容，
-                    # 那里面可能带手机号/身份证（正文走 mask_pii，推理链不经过那条路）。
-                    "reasoning": mask_pii(final_reasoning) if final_reasoning else "",
-                },
-                chain_mode=result.chain_mode,
-            )
+            # 集成入口不写长期用户画像，避免不同应用和 Web 入口之间记忆串联。
+            if integration is None:
+                asyncio.create_task(
+                    _update_user_memory(user.user_id, payload.question, final_text)
+                )
 
-            # 后台更新用户画像（不阻塞流式响应）
-            asyncio.create_task(_update_user_memory(user.user_id, payload.question, final_text))
-
+        except asyncio.CancelledError:
+            # 客户端断连不是拒答：保存已流出的部分正文，允许用同一 message_id 重试。
+            try:
+                await _persist_interrupted(
+                    message_id,
+                    text=partial_text,
+                    citations=partial_citations,
+                    meta={
+                        "modality": modality.value,
+                        "retrieval_observation": partial_observation,
+                    },
+                )
+            except Exception:
+                logger.exception("持久化中断 assistant 消息失败")
+            raise
         except Exception as exc:
             # 顶层兜底：event_stream 任何未捕获异常都会导致已持久化的 user 消息
             # 没有对应的 assistant 回复（孤立 user 消息）。这里持久化一个失败
@@ -854,7 +1156,7 @@ async def chat_ask(
 
 
     return StreamingResponse(
-        event_stream(),
+        _with_heartbeat(event_stream()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -888,7 +1190,38 @@ async def _persist_assistant(
         caliber = await snapshot_for_message(user.tenant_id, chain_mode)
         # trace_id 在此单点注入：正常 / 拒答各条落库路径自动带上，前端历史里可复制
         msg.meta = {
-            **meta, "refused": refused, "caliber": caliber,
+            **msg.meta,
+            **meta,
+            "generating": False,
+            "refused": refused,
+            "caliber": caliber,
+            "trace_id": trace.get_trace_id(),
+        }
+        await session.commit()
+
+
+async def _persist_interrupted(
+    message_id: uuid.UUID,
+    text: str,
+    citations: list[dict],
+    meta: dict,
+) -> None:
+    """把仍在生成的占位行标记为中断，并保留客户端已经看到的部分答案。
+
+    若原消息已经由其他路径写成终态则不再改动，避免断连清理覆盖 done/refused。
+    """
+    async with SessionLocal() as session:
+        msg = await session.get(Message, message_id)
+        if msg is None or msg.meta.get("generating") is not True:
+            return
+        msg.content = text
+        msg.citations = citations
+        msg.meta = {
+            **msg.meta,
+            **meta,
+            "generating": False,
+            "interrupted": True,
+            "refused": False,
             "trace_id": trace.get_trace_id(),
         }
         await session.commit()
@@ -947,7 +1280,15 @@ async def list_conversations(
                 func.coalesce(last_msg_sq.c.last_at, Conversation.created_at).label("last_at"),
             )
             .outerjoin(last_msg_sq, last_msg_sq.c.conversation_id == Conversation.id)
-            .where(Conversation.tenant_id == user.tenant_id, Conversation.user_id == user.user_id)
+            .outerjoin(
+                IntegrationConversation,
+                IntegrationConversation.conversation_id == Conversation.id,
+            )
+            .where(
+                Conversation.tenant_id == user.tenant_id,
+                Conversation.user_id == user.user_id,
+                IntegrationConversation.conversation_id.is_(None),
+            )
             .order_by(desc("last_at"))
             .limit(50)
         )
@@ -975,7 +1316,13 @@ async def get_conversation_messages(
     assistant 消息，此类消息视为本次回答作废，不在历史中展示。
     """
     conv = await session.get(Conversation, conversation_id)
-    if conv is None or conv.tenant_id != user.tenant_id or conv.user_id != user.user_id:
+    integration_conv = await session.get(IntegrationConversation, conversation_id)
+    if (
+        conv is None
+        or conv.tenant_id != user.tenant_id
+        or conv.user_id != user.user_id
+        or integration_conv is not None
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
     rows = (
         await session.execute(
@@ -1009,7 +1356,13 @@ async def delete_conversation(
 ) -> None:
     """删除会话（级联删除消息）。"""
     conv = await session.get(Conversation, conversation_id)
-    if conv is None or conv.tenant_id != user.tenant_id or conv.user_id != user.user_id:
+    integration_conv = await session.get(IntegrationConversation, conversation_id)
+    if (
+        conv is None
+        or conv.tenant_id != user.tenant_id
+        or conv.user_id != user.user_id
+        or integration_conv is not None
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
     await session.delete(conv)
     await session.commit()

@@ -30,6 +30,8 @@ class ChatAskRequest(BaseModel):
     kb_ids: list[uuid.UUID]
     question: str
     conversation_id: uuid.UUID | None = None
+    # 中断重试：复用原 assistant 消息；终态消息直接回放，不重复检索与生成
+    retry_message_id: uuid.UUID | None = None
     # 带图提问（M7 WU-M-07）：默认空 = 纯文本形态
     # 数量 / 单图大小校验在端点层做（规范要求超限返 400，pydantic 校验失败是 422）
     images: list[ImageRef] = []

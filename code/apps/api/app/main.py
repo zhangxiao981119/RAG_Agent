@@ -24,6 +24,7 @@ from app.api.finetune import router as finetune_router
 from app.api.groups import router as groups_router
 from app.api.health import router as health_router
 from app.api.jobs import router as jobs_router
+from app.api.integrations import router as integrations_router
 from app.api.kbs import router as kbs_router
 from app.api.me import router as me_router
 from app.api.messages import router as messages_router
@@ -364,6 +365,7 @@ app.include_router(kbs_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
 app.include_router(jobs_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
+app.include_router(integrations_router, prefix="/api")
 app.include_router(messages_router, prefix="/api")
 app.include_router(finetune_router, prefix="/api")
 app.include_router(audit_router, prefix="/api")

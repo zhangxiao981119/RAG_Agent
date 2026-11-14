@@ -463,6 +463,65 @@ class GraphRelation(Base):
     )
 
 
+class IntegrationApplication(Base):
+    """企业应用凭证与可访问知识库范围。"""
+
+    __tablename__ = "integration_applications"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    # 高熵随机密钥只保存 SHA-256 哈希，明文仅在创建响应中出现一次。
+    key_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    kb_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    rate_limit_per_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    daily_token_limit: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    daily_message_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active','disabled')", name="ck_integration_app_status"),
+        CheckConstraint("rate_limit_per_minute > 0", name="ck_integration_app_rate_positive"),
+        CheckConstraint("daily_token_limit > 0", name="ck_integration_app_token_positive"),
+        CheckConstraint("daily_message_limit > 0", name="ck_integration_app_message_positive"),
+        UniqueConstraint("tenant_id", "name", name="uq_integration_app_tenant_name"),
+        Index("idx_integration_app_tenant", "tenant_id", "status"),
+    )
+
+
+class IntegrationConversation(Base):
+    """集成会话与调用应用、真实用户的绑定关系。"""
+
+    __tablename__ = "integration_conversations"
+
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    application_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("integration_applications.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_integration_conversation_subject",
+            "tenant_id",
+            "application_id",
+            "user_id",
+            "created_at",
+        ),
+    )
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 

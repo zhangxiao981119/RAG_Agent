@@ -22,7 +22,7 @@ from app.config import decisions
 from app.config.settings import get_settings
 from app.database import SessionLocal
 from app.infra.redis_client import get_redis
-from app.models import AuditLog, TenantQuota
+from app.models import AuditLog, IntegrationApplication, TenantQuota
 from app.services.memory import compress_history
 from app.services.retrieve.base import RetrievedChunk
 
@@ -33,6 +33,8 @@ _K_USER_TOKENS = "quota:tokens:user:{user_id}:{date}"        # 单用户今日 t
 _K_TENANT_TOKENS_DAY = "quota:tokens:tenant:{tenant_id}:{date}"  # 租户今日 token
 _K_TENANT_TOKENS_MONTH = "quota:tokens:tenant_month:{tenant_id}:{month}"  # 租户本月 token
 _K_USER_MSG = "quota:messages:user:{user_id}:{date}"         # 单用户今日问答次数
+_K_APP_TOKENS = "quota:tokens:integration:{application_id}:{date}"  # 应用今日 token
+_K_APP_MSG = "quota:messages:integration:{application_id}:{date}"   # 应用今日问答次数
 
 # TTL（秒）：36h 跨日窗口足够，月度 35 天
 _TTL_DAY = 36 * 3600
@@ -233,14 +235,41 @@ def _estimate_request_tokens(
     return total
 
 
+async def check_application_quota(
+    application: IntegrationApplication,
+    question: str,
+    history: list[dict],
+    memory_prompt: str,
+    chunks: list[RetrievedChunk],
+) -> str | None:
+    """检查应用日配额，返回拒绝原因；未超限返回 None。"""
+    date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    token_key = _K_APP_TOKENS.format(application_id=application.id, date=date_str)
+    message_key = _K_APP_MSG.format(application_id=application.id, date=date_str)
+    redis = await _get_redis()
+    try:
+        pipe = redis.pipeline()
+        pipe.get(token_key)
+        pipe.get(message_key)
+        used_tokens, used_messages = await pipe.execute()
+    finally:
+        await redis.aclose()
+
+    estimate = _estimate_request_tokens(question, history, memory_prompt, chunks)
+    if int(used_tokens or 0) + estimate > application.daily_token_limit:
+        return "QUOTA_EXCEEDED_APPLICATION_DAILY_TOKEN"
+    if int(used_messages or 0) + 1 > application.daily_message_limit:
+        return "QUOTA_EXCEEDED_APPLICATION_DAILY_MSG"
+    return None
+
+
 async def _incr_usage(
     tenant_id: uuid.UUID,
     user_id: uuid.UUID,
     tokens: int,
+    application_id: uuid.UUID | None = None,
 ) -> None:
-    """回答完成后累加用量。Redis 不可用 → 不影响主流程（audit_logs 已写入 metric）。"""
-    if tokens <= 0:
-        return
+    """回答完成后累加用户、租户及可选应用的用量。"""
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%Y%m%d")
     month_str = now.strftime("%Y%m")
@@ -251,13 +280,23 @@ async def _incr_usage(
         pipe.incrby(_K_USER_MSG.format(user_id=user_id, date=date_str), 1)
         pipe.incrby(_K_TENANT_TOKENS_DAY.format(tenant_id=tenant_id, date=date_str), tokens)
         pipe.incrby(_K_TENANT_TOKENS_MONTH.format(tenant_id=tenant_id, month=month_str), tokens)
-        # 首次写入设 TTL
-        for k in (
+        daily_keys = [
             _K_USER_TOKENS.format(user_id=user_id, date=date_str),
             _K_USER_MSG.format(user_id=user_id, date=date_str),
             _K_TENANT_TOKENS_DAY.format(tenant_id=tenant_id, date=date_str),
-        ):
-            pipe.expire(k, _TTL_DAY)
+        ]
+        if application_id is not None:
+            app_token_key = _K_APP_TOKENS.format(
+                application_id=application_id, date=date_str
+            )
+            app_message_key = _K_APP_MSG.format(
+                application_id=application_id, date=date_str
+            )
+            pipe.incrby(app_token_key, tokens)
+            pipe.incrby(app_message_key, 1)
+            daily_keys.extend([app_token_key, app_message_key])
+        for key in daily_keys:
+            pipe.expire(key, _TTL_DAY)
         pipe.expire(
             _K_TENANT_TOKENS_MONTH.format(tenant_id=tenant_id, month=month_str),
             _TTL_MONTH,
