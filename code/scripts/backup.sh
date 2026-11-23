@@ -11,11 +11,17 @@ DOCKER="${BACKUP_DOCKER:-docker}"
 COMPOSE="$DOCKER compose -p kagent -f docker-compose.prod.yml"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${BACKUP_DIR:-backups}/${STAMP}"
-mkdir -p "$OUT_DIR"
+mkdir -p "$(dirname "$OUT_DIR")"
+# 不用 mkdir -p：同一秒内重复执行必须显式失败，而不是悄悄覆盖上一次备份
+mkdir "$OUT_DIR"
 OUT_ABS="$(cd "$OUT_DIR" && pwd)"
 
 # RPO 政策值：每日一次全库 dump（政策值，非实测；窗口与 RTO 数字待标定）
 RPO_POLICY="每日一次全库 dump（政策值，非实测）"
+
+# 窗口从枚举开始计时：容器未起/枚举失败同样是备份耗时的一部分
+START_EPOCH="$(date +%s)"
+START_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 echo "[备份] 目标目录：${OUT_ABS}"
 
@@ -30,9 +36,6 @@ if [ -z "$DATABASES" ]; then
   echo "[备份] 失败：未枚举到任何业务数据库（检查 postgres 容器是否在运行）" >&2
   exit 1
 fi
-
-START_EPOCH="$(date +%s)"
-START_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 db_names=()
 db_seconds=()

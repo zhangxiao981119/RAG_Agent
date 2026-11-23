@@ -305,13 +305,15 @@ docker compose -p kagent -f docker-compose.prod.yml exec -T postgres \
   < backups/XXXXXXXX-XXXXXX/db_kagent.dump
 # 每个 db_<库名>.dump 按上例恢复到同名库；manifest.txt 里有库清单与每库耗时
 
-# 2. 恢复 MinIO 文件
+# 2. 恢复 MinIO 文件（与 5.1 推荐脚本产物同名同目录）
 docker run --rm -v kagent_minio_data:/data -v "$PWD":/backup alpine \
-  sh -c "cd /data && tar xzf /backup/backup-minio-XXXXXXXX-XXXXXX.tar.gz"
+  sh -c "cd /data && tar xzf /backup/backups/XXXXXXXX-XXXXXX/minio-data.tar.gz"
 
 # 3. 重启应用让连接与缓存刷新
 docker compose -p kagent -f docker-compose.prod.yml restart api worker
 ```
+
+> 有效备份的判据是 `backups/<时间戳>/manifest.txt` 存在且 `database_count` 与实库一致；清单缺失或中途失败的目录一律视为无效，不得用于恢复。
 
 ### 5.3 整卷级灾备（冷备）
 

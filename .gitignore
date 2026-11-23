@@ -39,6 +39,11 @@ compose.override.local.yml
 # Logs
 *.log
 
+# 备份产物（含完整数据库内容，公开仓库绝不入库）
+code/backups/
+backup-pg-*.dump
+backup-minio-*.tar.gz
+
 # Git backup
 .git_bak/
 
