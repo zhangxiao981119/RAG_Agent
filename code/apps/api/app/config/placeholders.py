@@ -72,9 +72,12 @@ PLACEHOLDERS: Final[tuple[Placeholder, ...]] = (
     # ── 数据层路由（Step 5）────────────────────────────────────────
     Placeholder(
         name="DB_CONN_RESERVED",
-        value=10,
+        value=20,
         owner="db_router",
-        note="待实测标定 · 框架 §3A.4 明确它是「设定值不是实测」；给 PG 预留的连接数",
+        note=(
+            "待实测标定 · 框架 §3A.4 明确它是「设定值不是实测」；"
+            "默认 20 = 迁移 1 / pg_dump 1~2 / 监控 1~2 / psql 排障若干"
+        ),
     ),
     Placeholder(
         name="DB_WORKER_CONN_TOTAL",

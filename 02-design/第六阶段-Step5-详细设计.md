@@ -33,7 +33,7 @@
 | **I-5-0p** | `tests/scenario/pg_helpers.py::prepare_schema()` 的基线是 **`head`** → 新增 0030 会被测试库自动吸收，**不需要改测试基建** | `tests/scenario/pg_helpers.py:179-215` |
 | **I-5-0q** | `tests/config/test_db_pool.py` 有 4 条断言钉住池口径：`pool.size()==settings.db_pool_size`、`_max_overflow`/`_timeout` 同源、`timeout ≤ 10`、`pool+overflow ≥ 20 且 ≤ 45` | `tests/config/test_db_pool.py:25-59` |
 | **I-5-0r** | `scenario_versions.kb_ids` 是 **JSONB 数组**（元素全为字符串，CHECK C-B2 守），**一个 kb 可出现在多个场景**；`state='published'` 由部分唯一索引保证**每场景至多 1 个已发布版本** | `0028_add_scenarios.py:166`、`:218-224`；`entities.py:476` |
-| **I-5-0s** | 框架稿的容量算式：`40 × N × K + 10 ≤ 100 − 预留(10)`；`40 = pool_size 20 + max_overflow 20`；worker 侧 10 条（compose `DB_POOL_SIZE=5`+`DB_MAX_OVERFLOW=5`）；`预留=10` 是**设定值不是实测** | `统一RAG平台-场景化配置-框架设计-v1.md:307-426`（§3A.4） |
+| **I-5-0s** | 框架稿的容量算式：`40 × N × K + 10 ≤ 100 − 预留(20) = 80`；`40 = pool_size 20 + max_overflow 20`；worker 侧 10 条（compose `DB_POOL_SIZE=5`+`DB_MAX_OVERFLOW=5`）；`预留=20` 是**设定值不是实测** | `统一RAG平台-场景化配置-框架设计-v1.md:307-426`（§3A.4） |
 
 ### 0.2 本步做 / 不做
 
@@ -165,7 +165,7 @@
 | **F-4** | **修正 2**：D1 验收信号①「所有行库位 = `default`」**字面不可落地** —— CHECK 是 `^kb_[a-z0-9_]{2,40}$`，`'default'` 会被 DB 拒绝 | `entities.py:576-577` | **需修正**：改为「`db_binding IS NOT NULL` 的行数 = 0」，展示层用虚拟键 `'default'`（§A.3.1.4） |
 | **F-5** | §3A.9 三章对齐：`db_binding` = **库位逻辑键**（不是连接串）；与 `kb_logical_key` 集合**成对出现**，「库位由知识集合所属场景推出，不单独配置」 | `:520-531` | 一致。**这句话正是否决「KB 加列」的原文依据**（§A.3.1） |
 | **F-6** | §3A.9：库位**不新增 MCP 入参**；`凭证 → 场景 → 库位` 三段全在服务端完成；调用方无任何方式指定库 | `:520-531`、I-7 `:489` | 一致。本设计把这条落成 I-5-5（不新增查询）与「无 API 写路径」（I-5-0j） |
-| **F-7** | §3A.4 容量算式：`40 × N × K + 10 ≤ 100 − 预留(10)`；`预留=10` 是设定值；`30 并发` 是占位值且「换池必须重测」 | `:307-426` | 一致。本设计把它落成启动闸门（§B.4） |
+| **F-7** | §3A.4 容量算式：`40 × N × K + 10 ≤ 100 − 预留(20) = 80`；`预留=20` 是设定值，预算 80；`30 并发` 是占位值且「换池必须重测」 | `:307-426` | 一致。本设计把它落成启动闸门（§B.4） |
 | **F-8** | §8 Q10/Q11：隔离档位 = **温档**（同实例不同 database），一期就分到 database | `:855-856` | 一致。**这条决定了「桶的粒度 = database」**，也决定了 DSN 必须按 database 给 |
 | **F-9** | §7.2 Step 5 禁止事项：「禁止在开启路由的同时迁库」；「禁止让路由层猜库（解析不到就报错，不回落默认库）」 | `:834` | 一致，落成 I-5-4 + §E 的顺序约束 |
 | **F-10** | 路由输入**零新增查询**（I-5-0i）：`s.db_binding` 已在 `LOOKUP_SQL` 里，`ScenarioSnapshot.db_binding` 已在快照里 | `resolver.py:78`、`snapshot.py:152/253/356` | **主理人未提，但这是本步最关键的一条**：没有它，「不新增任何查询」根本无法达成 |
@@ -327,19 +327,19 @@ async with db_router.data_session(db_key) as data_session:               # 数�
 per_bucket_total = db_pool_size + db_max_overflow = 20 + 20 = 40      # settings.py:58-59
 K                = 1 + 非 default 库位键数（启动期由白名单算出，运行期不变）
 needed           = 40 × N × K + worker_total(10)                      # 框架 §3A.4 算式
-闸门              needed ≤ max_connections(100) − reserved(10) = 90
-→ K_max (N=1, P=40) = floor(80 / 40) = 2
-→ K_max (N=2, P=40) = floor(80 / 80) = 1
-→ 若每桶降到 P=20：K_max(N=1)=4、K_max(N=2)=2
+闸门              needed ≤ max_connections(100) − reserved(20) = 80
+→ K_max (N=1, P=40) = floor((80 − 10) / 40) = 1
+→ K_max (N=2, P=40) = floor((80 − 10) / 80) = 0（任何 K 都超）
+→ 若每桶降到 P=20：K_max(N=1)=3、K_max(N=2)=1
 ```
 
 | 场景 | 代入 | `needed` | 判定 |
 |---|---|---|---|
-| **Step 5（本步）** | N=1, K=1, P=40 | 40×1×1+10 = **50** | ✅ 通过（占预算 50/90 = 56%，与今天**完全一样**） |
+| **Step 5（本步）** | N=1, K=1, P=40 | 40×1×1+10 = **50** | ✅ 通过（占预算 50/80 = 63%，与今天**完全一样**） |
 | Step 6 首个场景迁出（推荐配置） | N=1, K=2, **P=20** | 20×1×2+10 = **50** | ✅ 通过（**连接总数不变**：把 40 摊成 2×20） |
-| Step 6 首个场景迁出（图省事不调池） | N=1, K=2, P=40 | 40×1×2+10 = **90** | ⚠️ 恰好触顶，**零余量**（PG 还有 `superuser_reserved_connections` 默认 3；任何临时连接都会挤爆） |
+| Step 6 首个场景迁出（图省事不调池） | N=1, K=2, P=40 | 40×1×2+10 = **90** | ❌ 超限 → **拒绝启动**（90 > 80，零余量配置不再放行） |
 | 2 副本 + 分库 | N=2, K=2, P=40 | **170** | ❌ 超限 → **拒绝启动** |
-| 2 副本 + 分库（调池后） | N=2, K=2, P=20 | 20×2×2+10 = **90** | ⚠️ 触顶 |
+| 2 副本 + 分库（调池后） | N=2, K=2, P=20 | 20×2×2+10 = **90** | ❌ 超限 → **拒绝启动**；须降到每桶 15（15×2×2+10 = 70） |
 | 3 库位 | N=1, K=3, P=40 | **130** | ❌ 超限 → 拒绝启动 |
 
 **Step 5 的硬断言**（D1 验收信号①「连接池实例数与现状相同」的可执行形态）：
@@ -348,7 +348,7 @@ needed           = 40 × N × K + worker_total(10)                      # 框架
 rep = db_router.register_default()           # 关闭态：把现有 engine 登记为 default 桶
 assert rep.bucket_count == 1
 assert rep.total_connections == settings.db_pool_size + settings.db_max_overflow == 40
-assert rep.needed_connections == 50 and rep.budget == 90
+assert rep.needed_connections == 50 and rep.budget == 80
 assert db_router.created_engine_count() == 0  # 一个引擎都没多建（C-2）
 ```
 
@@ -531,7 +531,7 @@ Step 6 要分两个库，就由**部署**改 `DB_POOL_SIZE=10 DB_MAX_OVERFLOW=10
 | 项 | 内容 |
 |---|---|
 | **推荐** | `K=2` 时把 `DB_POOL_SIZE=10 / DB_MAX_OVERFLOW=10`（每桶 20），**连接总数保持 50** |
-| 备选 1 | 不调池（每桶 40）→ `needed=90`，**恰好触顶、零余量** |
+| 备选 1 | 不调池（每桶 40）→ `needed=90 > 预算 80`，**直接拒绝启动** |
 | 备选 2 | 分库同时加副本（N=2, K=2, P=40 → 170，**直接超限**） |
 | 不裁决的后果 | 在 Load 之前不会有人发现。**推荐值的代价必须一起接受**：每库并发 ~30 → ~20（池 20 的实测崩点是 c=20），**必须重跑阶梯压测** |
 
@@ -739,8 +739,9 @@ scene_db_dsn: dict[str, str] = {}
 # ── 连接预算闸门（数值全部来自框架 §3A.4 的算式，见设计文档 §A.3.4）──
 # ★ 100 是 PG 默认值，本项目未覆盖该参数；启动期会 SHOW max_connections 比对，取较小者。
 db_max_connections_for_budget: int = 100
-# ★ 预留 10 是**设定值不是实测**（框架 §3A.4 原文）；已登记为站位值。
-db_conn_reserved: int = 10
+# ★ 预留 20 = 迁移 1 / pg_dump 1~2 / 监控 1~2 / psql 排障若干，**设定值不是实测**
+#   （框架 §3A.4 原文）；已登记为站位值；预算 = 100 − 20 = 80。
+db_conn_reserved: int = 20
 # ★ worker 侧 10 条（compose DB_POOL_SIZE=5 + DB_MAX_OVERFLOW=5）。
 db_worker_conn_total: int = 10
 # ★ 副本数应用自己不知道（无共享状态）→ 只能由部署声明；默认 1 是保守值（闸门偏松）。
@@ -760,7 +761,7 @@ db_replicas_expected: int = 1
 
 | 名字 | 值 | note（写给运维看） |
 |---|---|---|
-| `DB_CONN_RESERVED` | `10` | 待实测标定 · 框架 §3A.4 明确它是「设定值不是实测」；给 PG 预留的连接数 |
+| `DB_CONN_RESERVED` | `20` | 待实测标定 · 框架 §3A.4 明确它是「设定值不是实测」；默认 20 = 迁移 1 / pg_dump 1~2 / 监控 1~2 / psql 排障若干 |
 | `DB_WORKER_CONN_TOTAL` | `10` | 待编排核对 · 当前 compose 给 worker 的是 5+5；改编排必须同步改它，否则闸门算错 |
 | `DB_REPLICAS_EXPECTED` | `1` | 待部署标定 · 应用不知道自己有几个副本，闸门偏松是刻意的（宁可偏松也不要拒绝启动） |
 
@@ -918,8 +919,8 @@ if int(actual) != settings.db_max_connections_for_budget:
 #### B.4.3 横幅一行（谁看：部署者）
 
 ```
-DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 预算 50/90 ·
-          max_connections 实测=100 · 站位值 DB_CONN_RESERVED=10 …
+DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 预算 50/80 ·
+          max_connections 实测=100 · 站位值 DB_CONN_RESERVED=20 …
 ```
 
 关闭态**必打**（哪怕全是默认值）：它是"当时开关是开还是关"的唯一留痕。开启态额外打一行键清单 + 每个键的**来源**（`env:SCENE_DB_DSN[kb_finance]`），**不打 DSN 值**。
@@ -1066,7 +1067,7 @@ DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 
 | # | 假绿形态 | Step 5 的具体规避 |
 |---|---|---|
 | ① | 断言过宽（`pytest.raises(Exception)` 接住别的错） | 全部负向用例断言**精确类型 + 精确 code**（`DbRouteError.code`）；**不新增任何 `pytest.raises` 于约束断言**（受 `test_0028_migration.py:225-264` 约束：跨源文件只允许一处 `pytest.raises`，在 `expect_violation` 内） |
-| ② | 常量相等导致不可观测 | 期望值**一律写字面量**（`40` / `50` / `90` / `'default'`），**不用** `settings.db_pool_size + settings.db_max_overflow` 当期望（那会随 settings 变而自动通过 → 测的是 const == const） |
+| ② | 常量相等导致不可观测 | 期望值**一律写字面量**（`40` / `50` / `90`（needed）/ `80`（budget）/ `'default'`），**不用** `settings.db_pool_size + settings.db_max_overflow` 当期望（那会随 settings 变而自动通过 → 测的是 const == const） |
 | ③ | 接缝被 monkeypatch 掉（测的是"我传了"不是"链路收到了"） | `resolve_db_key` 的用例**不 monkeypatch settings**（它是纯函数）；`engine_for` 的用例**断言对象身份**而不是"参数相等" |
 | ④ | 并发测试其实没并发 | **没有并发用例**（C-5 的峰值检出需要压测夹具 → 明确标「需你定验证方式」）。**这一项诚实标注为 N/A**，不凑数 |
 
@@ -1080,7 +1081,7 @@ DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 
 | **T-5-2** | 关闭态不建引擎（**I-5-3 / C-2**） | `register_from_settings()` 后 `report.created_engines == 0`、`report.bucket_count == 1`、`report.total_connections == 40` | 在 `register_from_settings` 里加 `_build_engine(dsn)`（"先把桶建好"）→ `created_engines` > 0 → 红 |
 | **T-5-3** | 默认引擎对象恒等（**C-1**） | `engine_for('default') is app.database.engine` | 改成 `engine_for` 内部 `create_async_engine(settings.database_url, ...)`（参数完全一样）→ `is` 为假 → 红。**这是本步最容易滑进去的一步** |
 | **T-5-4** | 预算算术（**I-5-6**） | 4 组参数化：`(P=40,N=1,K=1) → needed 50`、`(40,1,2) → 90`、`(20,1,2) → 50`、`(40,2,2) → 170`；断言 `needed` 逐字面量相等 | 把 `+ worker_total` 漏掉 → 第一格 40 ≠ 50 → 红。把 `× replicas` 漏掉 → 第四格 90 ≠ 170 → 红 |
-| **T-5-5** | 超预算必须 raise（**I-5-6**） | `(40,2,2)` 时 `check_connection_budget()` raise `RuntimeError`，且消息里**含三个数字与三条处置**（正则断言 `170`、`90`、`DB_POOL_SIZE`） | 把 `if needed > budget` 改成 `>=` 或删掉 → `(40,1,2)=90` 也会 raise（应通过）或 170 也通过 → 红 |
+| **T-5-5** | 超预算必须 raise（**I-5-6**） | `(40,2,2)` 时 `check_connection_budget()` raise `RuntimeError`，且消息里**含三个数字与三条处置**（正则断言 `170`、`80`、`DB_POOL_SIZE`）；另有边界用例：needed 50 == budget 50 放行、needed 51 拒绝 | 把 `>` 改成 `>=` → 新边界用例（needed 50 == budget 50）也会 raise → 红；把预算错当 100 → 90 通过 → 红 |
 | **T-5-6** | 未注册键 fail-closed（**I-5-4**） | 关闭态 `engine_for('kb_unknown')` raise `DbRouteError`，`code == 'DB_ROUTE_KEY_UNKNOWN'`；**且**断言它**不是**返回默认引擎 | 把 `except` 分支改成 `return _REGISTRY['default'].engine`（"容错"）→ 红。**这条是"禁止猜库"的唯一守卫** |
 | **T-5-7** | `data_session` 零调用点（**C-5 的结构版**） | AST 扫 `app/` 全部 `.py`：`data_session` 的**定义**只在 `db_router.py`；**调用**为 0（`tests/` 除外） | 把 `data_session` 接进 `integration_ask`（哪怕只加一行注释掉不算，得真调用）→ 红。**这条同时是 Step 5「开路由」的物理门禁** |
 | **T-5-8** | 开关只启动期读（**§B.2.4**） | AST 扫 `db_router.py`：`scene_db_split_enabled` 只出现在 `register_from_settings` 与 `_report` 内，**不得**出现在 `engine_for` / `data_session` 的函数体里 | 在 `engine_for` 里加 `if get_settings().scene_db_split_enabled:` → 红（那会把开关变成每请求读的运行期状态） |
@@ -1176,7 +1177,7 @@ DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 
 | **2** | **错误回喂**：失败如何回到调用方，如何分类？ | 三分类（§B.5）：① **代码/部署错** → 启动期 `RuntimeError` **拒绝启动**（T1 纪律：`main.py:120-125`）——预算超限、DSN 非法、键格式非法；② **数据错** → WARN + metric，**永不 raise**（T2 纪律）—— 关闭态下 `db_binding` 非 NULL（复用 S-7）；③ **运行期路由错** → `DB_ROUTE_KEY_UNKNOWN` **500 fail-closed**，**禁止**返回空结果或回落默认库（I-5-4）。**禁止**把"查不到库位"变成 200+空 citations：那会让配置错误伪装成"知识库没内容"，而后者在本系统里是**合法业务态**（`retrieve` 回 0 行 → 拒答），两者在观测上不可区分。 |
 | **3** | **幂等** | 全部对象**天然幂等**：两个视图 + 一个函数是只读；`resolve_db_key` 是纯函数；`register_from_settings` 重复调用是"重建同一张注册表"（Step 5 关闭态无副作用，因为它不建引擎）；`check_connection_budget` 是纯算术；盘点脚本只读。**唯一的非幂等动作是 Step 6 的搬数据** → 不在本步。 |
 | **4** | **证据版本绑定** | 四层绑定里，Step 5 属于**第 0 层**（「数据住哪」），不进 §4 的四层（向量 / 分块 / 抽取 / wiki）。**评估结论的版本绑定 N/A**：本步不触碰 `eval_runs` / `caliber` / `messages.caliber`。**但**它给未来的评估引入一个新的可比性边界：**跨库的两次评测不可直接比较"库性能"**（不同的 `shared_buffers` / 数据量 / 索引状态）→ 登记为 U-5-9。 |
-| **5** | **成本 / 缓存 / 体感（经济性三视角）** | **成本**：模型成本 **= 0**（本步零 LLM/embedding/rerank 调用 → **模型组合与任务-模型分派表 N/A**）。真实成本是**连接预算**（§A.3.4.1 全表代入）：Step 5 `50/90`，与今天**完全相同**；Step 6 推荐配置仍 `50/90`（把 40 摊成 2×20）。**缓存**：不新增、不失效任何既有缓存；但**必须指出一个新耦合** —— resolver 的**进程内 60s 行缓存**是库位键的事实来源，所以「改 `db_binding` → 生效」有一个 **60s × 副本数** 的不可控窗口（F-12 / R-2 / U-5-1）。**体感**：Step 5 **零影响**（不进请求路径）；Step 6 起每桶容量下降 → 每库在途上限 ~30 → ~20（池 20 的实测崩点），**必须重跑阶梯压测**（框架 §3A.4 注 1：换池必须重测）。 |
+| **5** | **成本 / 缓存 / 体感（经济性三视角）** | **成本**：模型成本 **= 0**（本步零 LLM/embedding/rerank 调用 → **模型组合与任务-模型分派表 N/A**）。真实成本是**连接预算**（§A.3.4.1 全表代入）：Step 5 `50/80`，与今天**完全相同**；Step 6 推荐配置：N=1/K=2/每桶 20 → `50/80`（把 40 摊成 2×20）；若 N=2/K=2 须每桶降到 15 → `70/80`。**缓存**：不新增、不失效任何既有缓存；但**必须指出一个新耦合** —— resolver 的**进程内 60s 行缓存**是库位键的事实来源，所以「改 `db_binding` → 生效」有一个 **60s × 副本数** 的不可控窗口（F-12 / R-2 / U-5-1）。**体感**：Step 5 **零影响**（不进请求路径）；Step 6 起每桶容量下降 → 每库在途上限 ~30 → ~20（池 20 的实测崩点），**必须重跑阶梯压测**（框架 §3A.4 注 1：换池必须重测）。 |
 | **6** | **可观测性的"谁看"** | 三处按**读者**分工：① **启动横幅一行** → 部署者（改 `.env` 后必然看第一屏；也是"当时开关是开还是关"的唯一留痕）；② **盘点脚本退出码** → CI/cron（唯一能"自动发现"的通道）；③ **复用 S-7 的既有 WARN** → 运维在启动日志里看到"db_binding 配了不生效"。**没有一处依赖"有人主动盯着"**。**没有新增 metrics 打点**（本步不产生运行期指标；且 4B 已裁决不加 Gauge，避免动 `tests/test_metrics_and_rerank.py:80` 的键集断言）。 |
 | **7** | **迁移 / 锁** | §A.3.6：**不加列** → 无 fast default、无 `SET NOT NULL`、无回填；`CREATE VIEW` 只取基表 `ACCESS SHARE` → **不阻塞基表读写**；`downgrade` 纯 DDL **无数据可丢**。若将来必须加列：fast default 是 **O(1)** 但**仍取 ACCESS EXCLUSIVE**，且本项目的事务边界是"一个 HTTP 请求（含整条 SSE 流）"→ **锁等待可长达整条流的时长**，并触发**锁队列头阻塞**；因此必须 `lock_timeout` + 无流量窗口 + 分三步（§A.3.6.3）。 |
 | **8** | **回滚** | §E：**有序的两步**（先改事实 `db_binding=NULL`，再关功能）。开关**不能**单独当回滚用（数据已搬时关开关 = 制造"一半文档查不到"）。 |
@@ -1243,10 +1244,10 @@ DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 
 | 【源】 | 迁移头 = 0029；`prepare_schema()` 基线 = `head` | `0029_...py:38`；`tests/scenario/pg_helpers.py:179-215` |
 | 【源】 | `test_db_pool.py` 4 条池断言 | `tests/config/test_db_pool.py:25-59` |
 | 【源】 | `scenario_versions.kb_ids` 是 JSONB 数组；published 部分唯一 | `0028_add_scenarios.py:166`、`:218-224`、`:181-271` |
-| 【源】 | 容量算式与 `预留=10` 是设定值；`30 并发` 是占位值 | 框架稿 `:307-426` |
+| 【源】 | 容量算式与 `预留=20`（预算 80）是设定值；`30 并发` 是占位值 | 框架稿 `:307-426` |
 | **【推导】得出的** | 「同一 session 身兼控制面与数据面」及其连接账目 | §A.3.2.1 / §A.3.2.2 |
 | 【推导】 | 「每在途长期占 1 条」的机制是"只读事务整条流不结束" | §A.3.2.4（依据 `database.py:11-14` 的实测注释） |
-| 【推导】 | `K_max = floor(80 / (P × N))` 及其四组代入 | §A.3.4.1 |
+| 【推导】 | `K_max = floor(70 / (P × N))`（70 = 预算 80 − 10 worker）及其四组代入 | §A.3.4.1 |
 | 【推导】 | 「每桶参数」而非「全局预算分摊」（否则 `test_db_pool.py:29` 必红） | §A.3.4.2 |
 | 【推导】 | 不做 LRU 的四条理由与三问 | §A.3.4.4 |
 | 【推导】 | `NULL` 表示默认库的四条理由（含 CHECK 冲突这一硬事实） | §A.3.1.4 |
@@ -1265,6 +1266,6 @@ DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 
 | **DQ5-3** | 路由输入通道 | 显式 acquire point，键取自 `ScenarioSnapshot.db_binding` | 拆 DI → 并发 ~30→~20；contextvar → 静默查错库 |
 | **DQ5-4** | `kb_catalog` | Step 5 不建，改 `v_scenario_db_routing` + 冲突检测 | 交付一个不可证伪的视图，且版本口径必改 |
 | **DQ5-5** | 池超限行为 | 启动期拒绝启动 + 未注册键 500；**不做 LRU** | 运行期池不可枚举 + 用户答案可能被截断 |
-| **DQ5-6** | Step 6 每桶池容量 | `K=2` 时每桶 20（总连接仍 50） | 每桶 40 → 90/90 零余量；不调池则并发直接减半 |
+| **DQ5-6** | Step 6 每桶池容量 | `K=2` 时每桶 20（总连接仍 50） | 每桶 40 → 90/80 超限被拒；不调池则并发直接减半 |
 | **DQ5-7** | 开关语义 | 关闭态 = 路由功能不存在；只启动期读一次；进 `CROSS_ROLE_FIELDS` | 「开关是开是关」不可回答；api/worker 不一致无人发现 |
 | **DQ5-8** | 是否加 admin 端点 | 不加，用盘点脚本退出码 | 要动 `_EXPECTED_ROUTES`（加严但破坏"路由表零改动"证据） |

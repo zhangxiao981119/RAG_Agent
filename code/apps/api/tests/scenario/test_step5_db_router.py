@@ -109,7 +109,7 @@ def test_t5_6_unregistered_key_fails_closed(monkeypatch):
                 "db_replicas_expected": 1,
                 "scene_db_split_enabled": False,
             },
-            (40, 1, 50, 90),
+            (40, 1, 50, 80),
         ),
         (
             {
@@ -119,7 +119,7 @@ def test_t5_6_unregistered_key_fails_closed(monkeypatch):
                 "scene_db_split_enabled": True,
                 "scene_db_dsn": {"kb_ab": _DSN},
             },
-            (40, 2, 90, 90),
+            (40, 2, 90, 80),
         ),
         (
             {
@@ -129,7 +129,7 @@ def test_t5_6_unregistered_key_fails_closed(monkeypatch):
                 "scene_db_split_enabled": True,
                 "scene_db_dsn": {"kb_ab": _DSN},
             },
-            (20, 2, 50, 90),
+            (20, 2, 50, 80),
         ),
         (
             {
@@ -139,7 +139,7 @@ def test_t5_6_unregistered_key_fails_closed(monkeypatch):
                 "scene_db_split_enabled": True,
                 "scene_db_dsn": {"kb_ab": _DSN},
             },
-            (40, 2, 170, 90),
+            (40, 2, 170, 80),
         ),
     ],
 )
@@ -167,18 +167,68 @@ def test_t5_5_over_budget_raises_and_equal_budget_passes(monkeypatch):
 
     message = str(excinfo.value)
     assert "170" in message
-    assert "90" in message
+    assert "80" in message
     assert "DB_POOL_SIZE" in message
 
-    # 边界：40×2(副本)×1(库位)+10 = 90 == 预算 90 → 允许通过
+    # 边界（口径 B）：预算 70−20 = 50；40×1(副本)×1(库位)+10 = 50 == 50 → 允许通过
     edge = Settings(
         db_pool_size=20,
         db_max_overflow=20,
-        db_replicas_expected=2,
+        db_replicas_expected=1,
+        db_worker_conn_total=10,
+        db_max_connections_for_budget=70,
+        db_conn_reserved=20,
         scene_db_split_enabled=False,
     )
     monkeypatch.setattr(db_router, "get_settings", lambda: edge)
     db_router.check_connection_budget()  # 不抛即通过
+
+    # 相邻用例：同预算下 needed 51 > 50 → 必须拒绝（覆盖"等于放行、超过拒绝"两侧）
+    over_edge = Settings(
+        db_pool_size=20,
+        db_max_overflow=20,
+        db_replicas_expected=1,
+        db_worker_conn_total=11,
+        db_max_connections_for_budget=70,
+        db_conn_reserved=20,
+        scene_db_split_enabled=False,
+    )
+    monkeypatch.setattr(db_router, "get_settings", lambda: over_edge)
+    with pytest.raises(RuntimeError) as edge_excinfo:
+        db_router.check_connection_budget()
+    assert "51" in str(edge_excinfo.value)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# S6-1 口径 B 回归（预留 20 / 预算 80）
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_s6_1_default_arithmetic_is_50_over_80():
+    """默认参数下四元组必须是 (40, 1, 50, 80)。"""
+    assert db_router._arithmetic(Settings()) == (40, 1, 50, 80)
+
+
+def test_s6_1_one_replica_two_keys_with_default_pool_rejected(monkeypatch):
+    """默认每桶 40、N=1、K=2 → needed 90 > 80，必须拒绝并给出三个可调项。"""
+    s = Settings(
+        db_pool_size=20,
+        db_max_overflow=20,
+        db_replicas_expected=1,
+        scene_db_split_enabled=True,
+        scene_db_dsn={"kb_ab": _DSN},
+    )
+    monkeypatch.setattr(db_router, "get_settings", lambda: s)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        db_router.check_connection_budget()
+
+    message = str(excinfo.value)
+    assert "90" in message
+    assert "80" in message
+    assert "DB_POOL_SIZE" in message
+    assert "减库位" in message
+    assert "减副本" in message
 
 
 # ══════════════════════════════════════════════════════════════════════

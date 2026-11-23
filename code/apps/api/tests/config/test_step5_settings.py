@@ -21,7 +21,7 @@ def test_defaults_are_off_and_conservative():
     assert s.scene_db_split_enabled is False
     assert s.scene_db_dsn == {}
     assert s.db_max_connections_for_budget == 100
-    assert s.db_conn_reserved == 10
+    assert s.db_conn_reserved == 20
     assert s.db_worker_conn_total == 10
     assert s.db_replicas_expected == 1
 
@@ -67,7 +67,7 @@ def test_db_router_placeholders_registered():
     assert placeholders.names_for("db_router") == frozenset(
         {"DB_CONN_RESERVED", "DB_WORKER_CONN_TOTAL", "DB_REPLICAS_EXPECTED"}
     )
-    assert placeholders.value_of("DB_CONN_RESERVED") == 10
+    assert placeholders.value_of("DB_CONN_RESERVED") == 20
     assert placeholders.value_of("DB_WORKER_CONN_TOTAL") == 10
     assert placeholders.value_of("DB_REPLICAS_EXPECTED") == 1
 
@@ -75,9 +75,16 @@ def test_db_router_placeholders_registered():
 def test_placeholders_mirror_settings():
     """站位值镜像 MUST 等于 settings 对应字段（两边都锚定字面量）。"""
     s = Settings()
-    assert placeholders.value_of("DB_CONN_RESERVED") == s.db_conn_reserved == 10
+    assert placeholders.value_of("DB_CONN_RESERVED") == s.db_conn_reserved == 20
     assert placeholders.value_of("DB_WORKER_CONN_TOTAL") == s.db_worker_conn_total == 10
     assert placeholders.value_of("DB_REPLICAS_EXPECTED") == s.db_replicas_expected == 1
+
+
+def test_s6_1_reserved_default_rebaselined_to_20():
+    """S6-1 口径 B 回归：预留 20 → 预算 80（挡下 90 零余量配置）。"""
+    s = Settings()
+    assert s.db_conn_reserved == 20
+    assert s.db_max_connections_for_budget - s.db_conn_reserved == 80
 
 
 def test_banner_line_renders_three_names():

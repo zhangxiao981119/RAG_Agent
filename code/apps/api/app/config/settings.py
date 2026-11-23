@@ -78,8 +78,9 @@ class Settings(BaseSettings):
     # ── 连接预算闸门（数值全部来自框架 §3A.4 的算式）──
     # ★ 100 是 PG 默认值，本项目未覆盖该参数；启动期会 SHOW max_connections 比对，取较小者。
     db_max_connections_for_budget: int = 100
-    # ★ 预留 10 是**设定值不是实测**（已登记为站位值）。
-    db_conn_reserved: int = 10
+    # ★ 预留 20 = 迁移 1 / pg_dump 1~2 / 监控 1~2 / psql 排障若干，
+    #   这是**设定值不是实测**（已登记为站位值）；预算 = 100 − 20 = 80。
+    db_conn_reserved: int = 20
     # ★ worker 侧 10 条（compose DB_POOL_SIZE=5 + DB_MAX_OVERFLOW=5）。
     db_worker_conn_total: int = 10
     # ★ 副本数应用自己不知道（无共享状态）→ 只能由部署声明；默认 1 是保守值（闸门偏松）。
