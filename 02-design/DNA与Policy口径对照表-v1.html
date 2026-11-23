@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DNA / Policy / Binding 口径对照表</title>
+<style>
+:root {
+  --ink: #1a1a1a; --muted: #5a5a5a; --line: #c9c9c9; --line-strong: #8a8a8a;
+  --band: #f4f2ec; --warn: #993c1d; --hard: #a32d2d; --soft: #185fa5;
+}
+* { box-sizing: border-box; }
+html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+body {
+  margin: 0 auto; padding: 14mm 12mm; max-width: 210mm;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  font-size: 9.2pt; line-height: 1.52; color: var(--ink); background: #fff;
+}
+h1 { font-size: 15.5pt; font-weight: 600; margin: 0 0 6pt; letter-spacing: .3px; }
+h2 {
+  font-size: 10.6pt; font-weight: 600; margin: 11pt 0 5pt;
+  padding-left: 7pt; border-left: 3pt solid var(--ink);
+}
+h3 { font-size: 9.8pt; font-weight: 600; margin: 8pt 0 4pt; }
+p { margin: 4pt 0; }
+ul, ol { margin: 4pt 0; padding-left: 15pt; }
+li { margin: 2.5pt 0; }
+strong { font-weight: 600; }
+code {
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 8.4pt; background: var(--band); padding: .5pt 2.5pt; border-radius: 2pt;
+  white-space: nowrap;
+}
+blockquote {
+  margin: 6pt 0; padding: 6pt 9pt; background: var(--band);
+  border-left: 3pt solid var(--line-strong); font-size: 9pt;
+}
+blockquote p { margin: 2pt 0; }
+hr { border: 0; border-top: .6pt solid var(--line); margin: 9pt 0; }
+table {
+  width: 100%; border-collapse: collapse; margin: 5pt 0 7pt;
+  font-size: 8.1pt; line-height: 1.42; page-break-inside: auto;
+}
+thead { display: table-header-group; }
+tr { page-break-inside: avoid; }
+th {
+  text-align: left; font-weight: 600; color: #fff; background: #2c2c2a;
+  padding: 3.5pt 4pt; border: .6pt solid #2c2c2a;
+}
+td { padding: 3.2pt 4pt; border: .6pt solid var(--line); vertical-align: top; }
+tbody tr:nth-child(even) td { background: #faf9f6; }
+pre { line-height: 125%; }
+td.linenos .normal { color: #666666; background-color: transparent; padding-left: 5px; padding-right: 5px; }
+span.linenos { color: #666666; background-color: transparent; padding-left: 5px; padding-right: 5px; }
+td.linenos .special { color: #000000; background-color: #ffffc0; padding-left: 5px; padding-right: 5px; }
+span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 5px; padding-right: 5px; }
+.highlight .hll { background-color: #ffffcc }
+.highlight { background: #f0f0f0; }
+.highlight .c { color: #60A0B0; font-style: italic } /* Comment */
+.highlight .err { border: 1px solid #F00 } /* Error */
+.highlight .k { color: #007020; font-weight: bold } /* Keyword */
+.highlight .o { color: #666 } /* Operator */
+.highlight .ch { color: #60A0B0; font-style: italic } /* Comment.Hashbang */
+.highlight .cm { color: #60A0B0; font-style: italic } /* Comment.Multiline */
+.highlight .cp { color: #007020 } /* Comment.Preproc */
+.highlight .cpf { color: #60A0B0; font-style: italic } /* Comment.PreprocFile */
+.highlight .c1 { color: #60A0B0; font-style: italic } /* Comment.Single */
+.highlight .cs { color: #60A0B0; background-color: #FFF0F0 } /* Comment.Special */
+.highlight .gd { color: #A00000 } /* Generic.Deleted */
+.highlight .ge { font-style: italic } /* Generic.Emph */
+.highlight .ges { font-weight: bold; font-style: italic } /* Generic.EmphStrong */
+.highlight .gr { color: #F00 } /* Generic.Error */
+.highlight .gh { color: #000080; font-weight: bold } /* Generic.Heading */
+.highlight .gi { color: #00A000 } /* Generic.Inserted */
+.highlight .go { color: #888 } /* Generic.Output */
+.highlight .gp { color: #C65D09; font-weight: bold } /* Generic.Prompt */
+.highlight .gs { font-weight: bold } /* Generic.Strong */
+.highlight .gu { color: #800080; font-weight: bold } /* Generic.Subheading */
+.highlight .gt { color: #04D } /* Generic.Traceback */
+.highlight .kc { color: #007020; font-weight: bold } /* Keyword.Constant */
+.highlight .kd { color: #007020; font-weight: bold } /* Keyword.Declaration */
+.highlight .kn { color: #007020; font-weight: bold } /* Keyword.Namespace */
+.highlight .kp { color: #007020 } /* Keyword.Pseudo */
+.highlight .kr { color: #007020; font-weight: bold } /* Keyword.Reserved */
+.highlight .kt { color: #902000 } /* Keyword.Type */
+.highlight .m { color: #40A070 } /* Literal.Number */
+.highlight .s { color: #4070A0 } /* Literal.String */
+.highlight .na { color: #4070A0 } /* Name.Attribute */
+.highlight .nb { color: #007020 } /* Name.Builtin */
+.highlight .nc { color: #0E84B5; font-weight: bold } /* Name.Class */
+.highlight .no { color: #60ADD5 } /* Name.Constant */
+.highlight .nd { color: #555; font-weight: bold } /* Name.Decorator */
+.highlight .ni { color: #D55537; font-weight: bold } /* Name.Entity */
+.highlight .ne { color: #007020 } /* Name.Exception */
+.highlight .nf { color: #06287E } /* Name.Function */
+.highlight .nl { color: #002070; font-weight: bold } /* Name.Label */
+.highlight .nn { color: #0E84B5; font-weight: bold } /* Name.Namespace */
+.highlight .nt { color: #062873; font-weight: bold } /* Name.Tag */
+.highlight .nv { color: #BB60D5 } /* Name.Variable */
+.highlight .ow { color: #007020; font-weight: bold } /* Operator.Word */
+.highlight .w { color: #BBB } /* Text.Whitespace */
+.highlight .mb { color: #40A070 } /* Literal.Number.Bin */
+.highlight .mf { color: #40A070 } /* Literal.Number.Float */
+.highlight .mh { color: #40A070 } /* Literal.Number.Hex */
+.highlight .mi { color: #40A070 } /* Literal.Number.Integer */
+.highlight .mo { color: #40A070 } /* Literal.Number.Oct */
+.highlight .sa { color: #4070A0 } /* Literal.String.Affix */
+.highlight .sb { color: #4070A0 } /* Literal.String.Backtick */
+.highlight .sc { color: #4070A0 } /* Literal.String.Char */
+.highlight .dl { color: #4070A0 } /* Literal.String.Delimiter */
+.highlight .sd { color: #4070A0; font-style: italic } /* Literal.String.Doc */
+.highlight .s2 { color: #4070A0 } /* Literal.String.Double */
+.highlight .se { color: #4070A0; font-weight: bold } /* Literal.String.Escape */
+.highlight .sh { color: #4070A0 } /* Literal.String.Heredoc */
+.highlight .si { color: #70A0D0; font-style: italic } /* Literal.String.Interpol */
+.highlight .sx { color: #C65D09 } /* Literal.String.Other */
+.highlight .sr { color: #235388 } /* Literal.String.Regex */
+.highlight .s1 { color: #4070A0 } /* Literal.String.Single */
+.highlight .ss { color: #517918 } /* Literal.String.Symbol */
+.highlight .bp { color: #007020 } /* Name.Builtin.Pseudo */
+.highlight .fm { color: #06287E } /* Name.Function.Magic */
+.highlight .vc { color: #BB60D5 } /* Name.Variable.Class */
+.highlight .vg { color: #BB60D5 } /* Name.Variable.Global */
+.highlight .vi { color: #BB60D5 } /* Name.Variable.Instance */
+.highlight .vm { color: #BB60D5 } /* Name.Variable.Magic */
+.highlight .il { color: #40A070 } /* Literal.Number.Integer.Long */
+@page { size: A4 portrait; margin: 6mm 7mm; }
+@media print {
+  body { padding: 0; max-width: none; font-size: 8.35pt; line-height: 1.38; }
+  table { font-size: 7.45pt; line-height: 1.31; margin: 2.5pt 0 4pt; }
+  th, td { padding: 2.3pt 3.1pt; }
+  code { font-size: 7.1pt; padding: 0 2pt; }
+  blockquote { padding: 3.5pt 7pt; margin: 3.5pt 0; font-size: 7.7pt; }
+  h1 { font-size: 13pt; margin: 0 0 3pt; }
+  h2 { margin: 5.5pt 0 2.5pt; font-size: 9.4pt; padding-left: 6pt; border-left-width: 2.5pt; }
+  h3 { font-size: 8.6pt; margin: 4pt 0 2pt; }
+  hr { margin: 5pt 0; }
+  p { margin: 2.5pt 0; }
+  ul, ol { margin: 2pt 0; padding-left: 13pt; }
+  li { margin: 1pt 0; }
+  a { color: inherit; text-decoration: none; }
+}
+</style>
+</head>
+<body>
+<blockquote>
+<p><strong>唯一判据</strong>：改了这个值，<strong>已落库的派生数据是否还有效</strong>？
+仍然有效 → <strong>Policy</strong>（下一请求生效）｜不再同构 → <strong>DNA</strong>（必须重算 + 检索期按指纹过滤）｜不产出派生数据 → <strong>Binding</strong>（改错是越权）</p>
+</blockquote>
+<p><strong>版本</strong>：v1 · 2026-11-21 ｜ <strong>对应代码</strong>：<code>app/config/index_profile.py</code>、<code>graph_profile.py</code>、<code>wiki_profile.py</code>、<code>decisions.py</code></p>
+<hr />
+<h2 id="一dna-逐值对照改动后的具体后果">一、DNA 逐值对照（改动后的具体后果）</h2>
+<table>
+<thead>
+<tr>
+<th>值</th>
+<th>出厂默认</th>
+<th>改动的具体后果</th>
+<th>需重算？</th>
+<th>检索期怎么变</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>embedding_model</code></td>
+<td><code>bge-m3</code></td>
+<td>向量空间整体改变，新旧向量<strong>不同构</strong>，余弦相似度失去意义</td>
+<td><strong>全量重算</strong> <code>chunks.embedding</code></td>
+<td><strong>向量路拒检</strong>：旧 chunk 查不到 → 主检索退化为「仅关键词」</td>
+</tr>
+<tr>
+<td><code>embedding_dim</code></td>
+<td><code>1024</code></td>
+<td>维度改变，而 <code>chunks.embedding</code> 是 <code>vector(1024)</code>，<strong>维度写死在 DDL 里</strong></td>
+<td>全量重算 + <strong>改表结构</strong>（新迁移）</td>
+<td>同 <code>embedding_model</code>；且迁移未跑时写入直接失败</td>
+</tr>
+<tr>
+<td><code>EMBEDDING_TEXT_VERSION</code></td>
+<td><code>etext-v1</code></td>
+<td>喂给模型的<strong>文本公式</strong>变了（例如是否拼 <code>heading_path</code> 前缀），<strong>维度不变、语义已漂</strong></td>
+<td><strong>全量重算</strong> <code>chunks.embedding</code></td>
+<td><strong>向量路拒检</strong>。这条最隐蔽：维度没变，漏加过滤就是「静默劣化」——不报错，只是答不准</td>
+</tr>
+<tr>
+<td><code>CHUNK_TARGET_TOKENS</code> / <code>CHUNK_MAX_TOKENS</code> / <code>CHUNK_OVERLAP_TOKENS</code></td>
+<td><code>400</code> / <code>800</code> / <code>60</code></td>
+<td>派生出的 <code>chunker_version</code>（形如 <code>c400-800-60</code>）变化；只改<strong>分块边界</strong>，向量仍可比较。副作用是「章节补全 / 表格回捞」的边界会错位</td>
+<td><strong>建议重切</strong>（不强制）</td>
+<td><strong>不拒检</strong>：旧 chunk 100% 仍可检，只是边界是旧口径</td>
+</tr>
+<tr>
+<td><code>graph_extractor_model</code></td>
+<td>空 → 跟随 <code>llm_model</code>（<code>deepseek-v4-flash</code>）</td>
+<td>抽出的实体 / 关系集合不同构</td>
+<td><strong>重抽图</strong>（不必重算向量）</td>
+<td><strong>图路拒检</strong>：该文档的图不参与召回，其余三路照常</td>
+</tr>
+<tr>
+<td><code>GRAPH_PROMPT_VERSION</code></td>
+<td><code>gprompt-v1</code></td>
+<td>抽取 prompt <strong>正文</strong>的语义版本变了</td>
+<td>同上</td>
+<td>同上</td>
+</tr>
+<tr>
+<td><code>wiki_generator_model</code></td>
+<td>空 → 跟随 <code>llm_model</code></td>
+<td>wiki 导航页内容不同构</td>
+<td><strong>重生成 wiki</strong></td>
+<td><strong>wiki 导航拒检</strong>：查不到页 → 少一次扩词；主链不受影响</td>
+</tr>
+<tr>
+<td><code>WIKI_PROMPT_VERSION</code></td>
+<td><code>wprompt-v1</code></td>
+<td>wiki prompt 正文版本变了</td>
+<td>同上</td>
+<td>同上</td>
+</tr>
+<tr>
+<td><code>CONTRACT_VERSION</code></td>
+<td><code>v1.1</code></td>
+<td>契约语义变化，<strong>不影响任何已落库数据</strong></td>
+<td><strong>不重算</strong></td>
+<td>不拒检；但<strong>评测基线失效</strong>（跨版本结果不可比）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="二三种拒绝不是一回事">二、三种「拒绝」不是一回事</h2>
+<table>
+<thead>
+<tr>
+<th>语义</th>
+<th>触发</th>
+<th>表现</th>
+<th>纪律</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>拒检（排除）</strong></td>
+<td>向量 / 图 / wiki 三列口径不等</td>
+<td>稳定复现的<strong>空集</strong></td>
+<td>必须空集 + 拒答，<strong>禁止返回低分片</strong>（低分片等于「看起来有过答案」，会被模型当依据）</td>
+</tr>
+<tr>
+<td><strong>旁路失效</strong></td>
+<td>图或 wiki 口径不等</td>
+<td>主检索照常，只少一路</td>
+<td>无需告警到阻断级；属「这篇文档图路暂不生效」</td>
+</tr>
+<tr>
+<td><strong>仅建议重切</strong></td>
+<td>只有 <code>chunker_version</code> 不等</td>
+<td>检索完全正常</td>
+<td>只在 <code>needs_reindex</code> 视图里暴露；<strong>不得据此拒绝检索</strong></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>硬 DNA / 软 DNA 的分界</strong>：硬 DNA 不匹配 → <strong>排除</strong>；软 DNA（只有 <code>chunker_version</code>）不匹配 → <strong>照常可检</strong>。
+两者都是 DNA（都要求重算），区别只在<strong>检索期要不要拒绝</strong>。</p>
+</blockquote>
+<hr />
+<h2 id="三policy-binding-对照同表速查">三、Policy / Binding 对照（同表速查）</h2>
+<table>
+<thead>
+<tr>
+<th>类</th>
+<th>典型值</th>
+<th>改了之后</th>
+<th>重算</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Policy</strong></td>
+<td><code>recall_top_k</code>、<code>rerank_enabled</code>、<code>relevance_threshold</code>、<code>graph_enabled</code>、<code>wiki_enabled</code>、上下文预算、历史轮数</td>
+<td>下一请求立即生效</td>
+<td><strong>零</strong></td>
+<td>效果变差，可 A/B 归因</td>
+</tr>
+<tr>
+<td><strong>Binding</strong></td>
+<td>知识集合 <code>kb_ids</code>、库位 <code>db_logical_key</code>、凭证 / 调用方、场景默认模型</td>
+<td>下一请求生效</td>
+<td><strong>零</strong></td>
+<td>改错是<strong>越权</strong>（不是效果差）；连接串<strong>绝不下沉</strong>到场景配置</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="四四条最容易犯的误判">四、四条最容易犯的误判</h2>
+<ol>
+<li><strong>「维度没变，所以改了文本公式也安全」</strong> —— 错。公式变了向量就漂了，而维度检查拦不住。这正是 <code>EMBEDDING_TEXT_VERSION</code> 必须<strong>人工 bump</strong> 的原因：代码无法自动感知语义变更。</li>
+<li><strong>「<code>chunker_version</code> 也是 DNA，所以检索期也该过滤」</strong> —— 错。它是<strong>软</strong> DNA；加了过滤会让「只调了分块参数」的部署立刻丢掉全部旧召回。</li>
+<li><strong>「分库能解决口径互相污染」</strong> —— 错。分库之后每个库自带一套口径，平台<strong>再也答不出「这个部署的向量空间是什么」</strong>，指纹从平台级不变量退化成每库私事。</li>
+<li><strong>「<code>chunker_version</code> 不是 DNA」</strong> —— 也错。它<strong>是</strong> DNA（改了要重切），只是不硬过滤。两件事别混。</li>
+</ol>
+<hr />
+<h2 id="五回滚dna-变更没有回滚">五、回滚：DNA 变更<strong>没有回滚</strong></h2>
+<p>重算是不可逆的（解析 → 分块 → 嵌入 → 抽取 → wiki 全链重跑），无法撤回。唯一的「回滚」是把常量改回旧值<strong>再重算一次</strong>——这等于两次全量成本。</p>
+<p>所以 DNA 变更的正确做法是：<strong>先在旁路代次上重建、双读比对通过，再切换</strong>；而不是改了出事再改回来。</p>
+<hr />
+<h2 id="六一句话记住">六、一句话记住</h2>
+<blockquote>
+<p>改了要重算的是 <strong>DNA</strong>；重算完还<strong>必须拒绝旧数据</strong>的是<strong>硬 DNA</strong>；只要求「建议重算」、检索照常的是<strong>软 DNA</strong>。</p>
+</blockquote>
+</body>
+</html>

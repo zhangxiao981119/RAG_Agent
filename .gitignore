@@ -72,3 +72,7 @@ table_recognition_contest/
 # 竞赛实现方案（同批内容，含完整架构与数据契约）
 # 比赛进行中，推到公开仓库等于公开方案；同批排除，赛后再议。
 表格识别竞赛-实现方案.*
+
+# 专家团技能包（本地研发工具，安装到全局技能目录即可，不入库）
+agent-harness-expert/
+agent-harness-expert-*.zip
