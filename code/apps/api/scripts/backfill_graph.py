@@ -10,6 +10,10 @@
     python -m scripts.backfill_graph --recaliber    # 只重抽口径不匹配的文档
     python -m scripts.backfill_graph --document <id>
     python -m scripts.backfill_graph --all --kb-id <id> --limit 50
+    python -m scripts.backfill_graph --all --db-key kb_finance   # 指定库位（默认 default）
+
+★ `--db-key` 是**目标库位**，不做「找不到就回落默认库」的探测：选错库位是运维错误，
+  静默回落只会把绑定库的补建变成默认库的空跑。
 
 幂等：每篇文档都走「先 delete_by_document 再 upsert_subgraph」，重复执行终态一致。
 断点续跑：逐篇提交（每篇一个事务），中断后再跑一遍即可 —— 选中条件是**状态驱动**的
@@ -35,9 +39,8 @@ from sqlalchemy import select, text
 
 from app.config.graph_profile import current_graph_profile
 from app.config.settings import get_settings
-from app.database import SessionLocal
 from app.models import Document
-from app.services.db_scope import locate_row_db_key, open_job_session
+from app.services.db_scope import open_job_session
 from app.services.graph.extract import GraphExtractSkip
 from app.workers.graph_job import extract_and_store
 
@@ -83,7 +86,7 @@ def _base_select(mode: str):
     return stmt.order_by(Document.created_at)
 
 
-async def _check() -> int:
+async def _check(db_key: str) -> int:
     """就绪度体检。返回退出码（0 = 就绪）。
 
     ★ 分母 MUST 与 `_base_select()` 的选取条件同一批文档（`status='indexed'`）：
@@ -93,7 +96,7 @@ async def _check() -> int:
       那类文档单独计数（`未索引(不参与)`），它们属于解析链路的账。
     """
     params = _params()
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         row = (
             await session.execute(
                 text(
@@ -221,7 +224,7 @@ async def _run(mode: str, args: argparse.Namespace) -> int:
     if args.limit:
         stmt = stmt.limit(args.limit)
 
-    async with SessionLocal() as session:
+    async with open_job_session(args.db_key) as session:
         rows = (await session.execute(stmt, _params())).all()
     if not rows:
         print("没有需要处理的文档（已按当前口径完成）")
@@ -238,14 +241,7 @@ async def _run(mode: str, args: argparse.Namespace) -> int:
 
     ok = skipped = failed = 0
     for index, (document_id, filename) in enumerate(rows, start=1):
-        # 库位解析：关闭态零 SQL 直接 default；开启态按主键顺序探测。
-        # 本脚本的选取查询只读默认库，绑定库文档不在本轮范围（见模块说明）。
-        async with SessionLocal() as session:
-            db_key = await locate_row_db_key(session, Document, document_id)
-        if db_key is None:
-            failed += 1
-            print(f"  [{index}/{len(rows)}] FAILED {document_id} {filename}: 不在任何库位")
-            continue
+        db_key = args.db_key
         try:
             status = await extract_and_store(document_id, db_key)
         except GraphExtractSkip as exc:
@@ -288,8 +284,12 @@ async def main(args: argparse.Namespace) -> int:
         )
         return 2
 
+    # 脚本是独立进程：不注册库位的话，--db-key 指定的场景库取不到绑定（fail-closed）
+    from app.infra.db_router import register_from_settings
+    register_from_settings()
+
     if args.check:
-        return await _check()
+        return await _check(args.db_key)
 
     mode = "all"
     if args.pending:
@@ -310,5 +310,9 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="只列出，不写库")
     parser.add_argument("--show", type=int, default=20, help="dry-run 最多列出多少篇")
     parser.add_argument("--check", action="store_true", help="只统计就绪度（未就绪退出码 1）")
+    parser.add_argument(
+        "--db-key", dest="db_key", default="default",
+        help="目标库位键（默认 default；多库位部署按 SCENE_DB_DSN 的键指定，不回落默认库）",
+    )
     _args = parser.parse_args()
     raise SystemExit(asyncio.run(main(_args)))

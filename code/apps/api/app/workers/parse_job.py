@@ -667,6 +667,14 @@ class WorkerSettings:
         from app.services.scenario.self_check import check_scenario_constants
 
         decisions.self_check()
+        # ── 数据层库位注册（Step 5/6）──
+        # ★ worker 是独立进程：api 的启动注册不会带过来。不在这里注册，
+        #   队列负载里的 db_key 在 worker 侧取不到绑定（DB_ROUTE_KEY_UNKNOWN），
+        #   写路径全部失败，治理 cron 也只能看到 default。
+        #   预算闸门与 api 同源：纯算术、零 IO，超预算直接拒绝启动；关闭态零建引擎。
+        from app.infra.db_router import check_connection_budget, register_from_settings
+        check_connection_budget()
+        register_from_settings()
         # 场景化配置的**常量类**自检（Step 3）：纯内存、无 DB，api 与 worker 两侧都跑。
         # ★ 只跑常量类（T1），不跑数据类（T2）：worker 不检索、不读任何策略，
         #   跑全场景扫描是纯加启动成本与 DB 压力，且它没有一条路径能从那结论受益。

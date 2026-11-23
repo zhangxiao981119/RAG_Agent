@@ -68,21 +68,24 @@ def env(monkeypatch):
     monkeypatch.undo()
 
 
-def _args() -> argparse.Namespace:
+def _args(db_key: str = "default") -> argparse.Namespace:
     return argparse.Namespace(
-        document=None, kb_id=None, limit=0, dry_run=False, show=20
+        document=None, kb_id=None, limit=0, dry_run=False, show=20, db_key=db_key
     )
 
 
-def _install(monkeypatch, documents: dict, rows: list[tuple]) -> None:
-    monkeypatch.setattr(bg, "SessionLocal", lambda: _FakeSession(documents, rows))
+def _install(monkeypatch, documents: dict, rows: list[tuple]) -> list[str]:
+    """替换数据面入口，返回按库位打开会话的先后记录。"""
+    opened: list[str] = []
 
     @asynccontextmanager
-    async def _job_session(_db_key: str):  # noqa: ARG001
-        # worker 数据面入口：脚本按主键定位库位后透传 db_key
+    async def _job_session(db_key: str):
+        # 脚本按 --db-key 显式开会话（不做「找不到就回落默认库」的探测）
+        opened.append(db_key)
         yield _FakeSession(documents, rows)
 
     monkeypatch.setattr(bg, "open_job_session", _job_session)
+    return opened
 
 
 @pytest.mark.asyncio
@@ -142,6 +145,35 @@ async def test_success_is_recorded_as_done(env, monkeypatch, capsys):
 
     assert exit_code == 0
     assert "成功 1 · 跳过 0 · 失败 0" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_db_key_is_forwarded_to_sessions_and_extract(env, monkeypatch, capsys):
+    """`--db-key` 必须贯穿选取会话与抽取调用（不存在回落默认库的兜底）。"""
+    doc_id = uuid.uuid4()
+    documents = {doc_id: _FakeDocument("pending")}
+    opened = _install(monkeypatch, documents, [(doc_id, "ok.pdf")])
+    seen: list[str] = []
+
+    async def _ok(_document_id, db_key):
+        seen.append(db_key)
+        return "succeeded"
+
+    monkeypatch.setattr(bg, "extract_and_store", _ok)
+
+    exit_code = await bg._run("all", _args(db_key="kb_finance"))
+
+    assert exit_code == 0
+    assert opened == ["kb_finance"]
+    assert seen == ["kb_finance"]
+    assert "成功 1 · 跳过 0 · 失败 0" in capsys.readouterr().out
+
+
+def test_main_registers_db_router():
+    """脚本是独立进程：必须在 main 里注册库位，否则 --db-key 的场景库取不到绑定。"""
+    import inspect
+
+    assert "register_from_settings()" in inspect.getsource(bg.main)
 
 
 def test_all_mode_excludes_skipped_documents():

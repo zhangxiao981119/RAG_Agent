@@ -29,10 +29,9 @@ from sqlalchemy import select, update
 from app.config import decisions
 from app.config.prompts import NO_ANSWER_TEXT, render_prompt
 from app.config.settings import get_settings
-from app.database import SessionLocal
 from app.infra import metrics, trace
 from app.infra.arq_pool import get_arq_pool
-from app.infra.db_router import DEFAULT_DB_KEY
+from app.infra.db_router import registered_db_keys
 from app.models import Chunk, Document, GovernanceJob
 from app.services.db_scope import open_job_session, require_job_db_key
 from app.services.llm import get_llm_service
@@ -216,13 +215,31 @@ async def review_document(
 
 
 async def scan_and_enqueue(ctx: dict[str, Any]) -> int:
-    """cron 扫描：pending 且解析完成的文档批量建 GovernanceJob + 入队。
+    """cron 扫描：对**每个已注册库位**扫 pending 文档，批量建 GovernanceJob + 入队。
 
-    enqueue 在 commit 之前执行 —— 任一入队失败整体回滚，无 zombie job（口径同 _sync_one_file）。
-    返回本轮建的任务数。
+    关闭态注册表只有 default 一个键，行为与接线前等价；开启态逐个库位扫描，
+    绑定库的 governance_jobs 才不会被漏掉。
+    单库扫描失败不拖垮其它库，但 MUST 记 ERROR（带 db_key），禁止静默吞掉。
+    enqueue 在 commit 之前执行 —— 任一入队失败该库整体回滚，无 zombie job。
+    返回本轮建的任务总数。
     """
     trace.set_trace_id(trace.new_trace_id())
-    async with SessionLocal() as session:
+    total = 0
+    for db_key in registered_db_keys():
+        try:
+            total += await _scan_one_db(db_key)
+        except Exception:
+            logger.error(
+                "governance.scan.db_failed", extra={"db_key": db_key}, exc_info=True
+            )
+    metrics.incr("governance.scan.enqueued", total)
+    logger.info("governance.scan.enqueued", extra={"count": total})
+    return total
+
+
+async def _scan_one_db(db_key: str) -> int:
+    """扫描单个库位的 pending 文档并建 job / 入队，返回该库建的任务数。"""
+    async with open_job_session(db_key) as session:
         rows = (
             await session.execute(
                 select(Document.id, Document.tenant_id)
@@ -247,17 +264,13 @@ async def scan_and_enqueue(ctx: dict[str, Any]) -> int:
 
         pool = await get_arq_pool()
         for job in jobs:
-            # 扫描查询本身走 SessionLocal（默认库），行即来自默认库 ——
-            # 绑定库文档的治理扫描不在本步骤范围，库位键如实传 default。
+            # 行来自哪个库位就把该库位键如实传给执行任务，否则 worker 会去默认库找 job
             await pool.enqueue_job(
-                "execute_governance_job", str(job.id), trace.get_trace_id(), DEFAULT_DB_KEY,
+                "execute_governance_job", str(job.id), trace.get_trace_id(), db_key,
                 # 队列名必须与 WorkerSettings.queue_name 同源（arq 默认队列是 arq:queue）
                 _queue_name=get_settings().arq_queue_name,
             )
         await session.commit()
-
-    metrics.incr("governance.scan.enqueued", len(jobs))
-    logger.info("governance.scan.enqueued", extra={"count": len(jobs)})
     return len(jobs)
 
 

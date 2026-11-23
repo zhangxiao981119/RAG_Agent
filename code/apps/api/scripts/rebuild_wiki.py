@@ -8,6 +8,10 @@
     python -m scripts.rebuild_wiki --stale-only   # 只重建 stale / failed 的页（重试没成的）
     python -m scripts.rebuild_wiki --document <id>
     python -m scripts.rebuild_wiki --all --kb-id <id> --limit 50
+    python -m scripts.rebuild_wiki --all --db-key kb_finance   # 指定库位（默认 default）
+
+★ `--db-key` 是**目标库位**，不做「找不到就回落默认库」的探测：选错库位是运维错误，
+  静默回落只会把绑定库的重建变成默认库的空跑。
 
 幂等：build_and_store 的幂等键 (document_id, generator_model, prompt_version,
 content_hash) —— hash 相同直接跳过（不调 LLM），所以 --all 的实际 LLM 调用数
@@ -34,9 +38,8 @@ from sqlalchemy import select, text
 
 from app.config.settings import get_settings
 from app.config.wiki_profile import current_wiki_profile
-from app.database import SessionLocal
 from app.models import Document
-from app.services.db_scope import locate_row_db_key
+from app.services.db_scope import open_job_session
 from app.services.wiki.build import WikiBuildSkip
 from app.workers.graph_job import build_and_store
 
@@ -87,7 +90,7 @@ async def _run(args: argparse.Namespace) -> int:
     if args.limit:
         stmt = stmt.limit(args.limit)
 
-    async with SessionLocal() as session:
+    async with open_job_session(args.db_key) as session:
         rows = (await session.execute(stmt, _params())).all()
     if not rows:
         print("没有需要处理的文档（页已按当前口径就绪）")
@@ -104,14 +107,8 @@ async def _run(args: argparse.Namespace) -> int:
 
     ok = skipped = failed = 0
     for index, (document_id, filename) in enumerate(rows, start=1):
-        # 库位解析：关闭态零 SQL 直接 default；开启态按主键顺序探测。
-        # 本脚本的选取查询只读默认库，绑定库文档不在本轮范围（与 backfill_graph 同）。
-        async with SessionLocal() as session:
-            db_key = await locate_row_db_key(session, Document, document_id)
-        if db_key is None:
-            print(f"[{index}/{len(rows)}] FAIL {filename}: 不在任何库位")
-            failed += 1
-            continue
+        # 目标库位由 --db-key 显式指定：不做「找不到就回落默认库」的探测
+        db_key = args.db_key
         try:
             result = await build_and_store(document_id, db_key)
         except WikiBuildSkip:
@@ -154,6 +151,10 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None, help="最多处理 N 篇")
     parser.add_argument("--dry-run", action="store_true", help="只列出将处理的文档")
     parser.add_argument("--show", type=int, default=20, help="dry-run 最多列出的条数")
+    parser.add_argument(
+        "--db-key", dest="db_key", default="default",
+        help="目标库位键（默认 default；多库位部署按 SCENE_DB_DSN 的键指定，不回落默认库）",
+    )
     args = parser.parse_args()
 
     if not get_settings().wiki_enabled:
@@ -163,6 +164,10 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    # 脚本是独立进程：不注册库位的话，--db-key 指定的场景库取不到绑定（fail-closed）
+    from app.infra.db_router import register_from_settings
+    register_from_settings()
 
     return asyncio.run(_run(args))
 

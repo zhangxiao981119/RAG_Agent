@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import os
 import subprocess
@@ -75,19 +76,6 @@ def test_rebuild_wiki_script_all_modes_fail_closed_when_disabled(mode_args):
 
 
 # ── 幂等命中的计数语义（遗留项 1 收尾）─────────────────────────
-
-
-class _CM:
-    """把假 session 包成 async context manager（替代 SessionLocal）。"""
-
-    def __init__(self, session) -> None:
-        self._session = session
-
-    async def __aenter__(self):
-        return self._session
-
-    async def __aexit__(self, *exc):
-        return False
 
 
 class _ExecResult:
@@ -204,6 +192,18 @@ def test_build_and_store_real_build_still_reports_succeeded(monkeypatch):
     assert result == "succeeded"
 
 
+def test_rebuild_wiki_script_registers_db_router():
+    """脚本是独立进程：必须在 main 里注册库位，否则 --db-key 的场景库取不到绑定。"""
+    import inspect
+
+    spec = importlib.util.spec_from_file_location(
+        "rebuild_wiki_script_register", API_ROOT / "scripts" / "rebuild_wiki.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert "register_from_settings()" in inspect.getsource(mod.main)
+
+
 def test_rebuild_wiki_script_counts_idempotent_as_skipped(monkeypatch, capsys):
     """脚本汇总：幂等命中 → 「跳过 1」而非「成功 1」。"""
     spec = importlib.util.spec_from_file_location(
@@ -218,24 +218,27 @@ def test_rebuild_wiki_script_counts_idempotent_as_skipped(monkeypatch, capsys):
         async def execute(self, stmt, params=None):
             return _ExecResult(rows=[(doc_id, "某文档.pdf")])
 
-    monkeypatch.setattr(mod, "SessionLocal",
-                        lambda: _CM(_ScriptSession()))
-
-    async def _locate(session, model, pk):  # noqa: ANN001, ARG001
-        return "default"
-
-    monkeypatch.setattr(mod, "locate_row_db_key", _locate)
-
     async def _fake_build(document_id, db_key):  # noqa: ARG001
         return "skipped_idempotent"
 
+    opened: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def _job_session(db_key: str):
+        # 脚本按 --db-key 显式开会话（不做「找不到就回落默认库」的探测）
+        opened.append(db_key)
+        yield _ScriptSession()
+
+    monkeypatch.setattr(mod, "open_job_session", _job_session)
     monkeypatch.setattr(mod, "build_and_store", _fake_build)
 
     args = SimpleNamespace(recaliber=False, stale_only=False, document=None,
-                           kb_id=None, limit=None, dry_run=False, show=20)
+                           kb_id=None, limit=None, dry_run=False, show=20,
+                           db_key="default")
     exit_code = asyncio.run(mod._run(args))
     out = capsys.readouterr().out
     assert exit_code == 0
+    assert opened == ["default"]
     assert "完成：成功 0 / 跳过 1 / 失败 0" in out
     assert "未调 LLM" in out
 
@@ -254,21 +257,28 @@ def test_rebuild_wiki_script_counts_succeeded_as_ok(monkeypatch, capsys):
         async def execute(self, stmt, params=None):
             return _ExecResult(rows=[(doc_id, "某文档.pdf")])
 
-    monkeypatch.setattr(mod, "SessionLocal", lambda: _CM(_ScriptSession()))
+    opened: list[str] = []
+    built: list[str] = []
 
-    async def _locate(session, model, pk):  # noqa: ANN001, ARG001
-        return "default"
-
-    monkeypatch.setattr(mod, "locate_row_db_key", _locate)
+    @contextlib.asynccontextmanager
+    async def _job_session(db_key: str):
+        opened.append(db_key)
+        yield _ScriptSession()
 
     async def _fake_build(document_id, db_key):  # noqa: ARG001
+        built.append(db_key)
         return "succeeded"
 
+    monkeypatch.setattr(mod, "open_job_session", _job_session)
     monkeypatch.setattr(mod, "build_and_store", _fake_build)
 
     args = SimpleNamespace(recaliber=False, stale_only=False, document=None,
-                           kb_id=None, limit=None, dry_run=False, show=20)
+                           kb_id=None, limit=None, dry_run=False, show=20,
+                           db_key="kb_finance")
     exit_code = asyncio.run(mod._run(args))
     out = capsys.readouterr().out
     assert exit_code == 0
+    # `--db-key` 必须贯穿选取会话与构建调用（不存在回落默认库的兜底）
+    assert opened == ["kb_finance"]
+    assert built == ["kb_finance"]
     assert "完成：成功 1 / 跳过 0 / 失败 0" in out

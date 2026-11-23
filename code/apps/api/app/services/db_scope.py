@@ -204,17 +204,19 @@ async def locate_row_db_key(
     """按主键定位一行在哪个库位（D-S6-3-2 顺序探测）。
 
     - 关闭态：直接返回 `"default"`，零 SQL（分库关闭时所有行都在默认库）；
-    - 开启态：先查控制库（默认库），命中即 `"default"`；否则按
-      `registered_db_keys()` 的顺序逐个数据面探测。0 命中 → None（调用方 404）；
-      1 命中 → 该键；≥2 命中 → `DbScopeError(DB_SCOPE_AMBIGUOUS)`（同一主键
-      出现在两个库，无法判定，不替调用方挑一个）。
+    - 开启态：扫描控制库（默认库）与 `registered_db_keys()` 中每个非 default
+      库位，**全部命中都要收集，不在控制库命中时短路** —— 短路会让「控制库与
+      场景库同主键」被静默判成 default，永远触发不了歧义保护。
+      0 命中 → None（调用方 404）；1 命中 → 该键；≥2 命中 →
+      `DbScopeError(DB_SCOPE_AMBIGUOUS)`（同一主键出现在多个库，无法判定，
+      不替调用方挑一个）。
     """
     if not get_settings().scene_db_split_enabled:
         return DEFAULT_DB_KEY
-    if await control_session.get(model, pk) is not None:
-        return DEFAULT_DB_KEY
 
     hits: list[str] = []
+    if await control_session.get(model, pk) is not None:
+        hits.append(DEFAULT_DB_KEY)
     for db_key in registered_db_keys():
         if db_key == DEFAULT_DB_KEY:
             continue

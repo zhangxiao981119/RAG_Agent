@@ -5,7 +5,8 @@
      → `JOB_DB_KEY_MISSING`（禁止回落默认库）；
   2. 6 个 worker 入口缺 db_key → `JOB_DB_KEY_MISSING`；
   3. 链式入队负载透传 db_key（parse 段链 / graph / wiki）；
-  4. `locate_row_db_key`：关闭态零 SQL 直接 default；开启态 0/1/2 命中；
+  4. `locate_row_db_key`：关闭态零 SQL 直接 default；开启态不短路扫描控制库 +
+     全部已注册库位，0/1/2 命中（控制库与场景库同主键判歧义）；
   5. 按 ID 寻址端点：数据面会话按定位键打开、404、歧义 500。
 """
 from __future__ import annotations
@@ -130,6 +131,17 @@ async def test_parse_worker_forwards_key_to_job_session(monkeypatch):
     assert seen == ["kb_a"]
 
 
+def test_worker_startup_registers_db_router():
+    """worker 是独立进程：不自己注册库位，队列里的 db_key 在 worker 侧取不到绑定。"""
+    import inspect
+
+    from app.workers.parse_job import WorkerSettings
+
+    source = inspect.getsource(WorkerSettings.on_startup)
+    assert "register_from_settings()" in source
+    assert "check_connection_budget()" in source
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 3. 链式入队透传 db_key
 # ══════════════════════════════════════════════════════════════════════
@@ -229,13 +241,14 @@ async def test_locate_closed_state_returns_default_without_sql(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_locate_enabled_control_hit_returns_default(monkeypatch):
+async def test_locate_enabled_control_hit_probes_all_keys_and_returns_default(monkeypatch):
+    """控制库命中也不短路：仍要探完所有已注册库位（否则双库同主键无法判歧义）。"""
     probes: list[str] = []
 
     @asynccontextmanager
     async def _fake_data_session(db_key: str):
         probes.append(db_key)
-        yield _ProbeSession(hit=True)
+        yield _ProbeSession(hit=False)
 
     monkeypatch.setattr(
         db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
@@ -244,7 +257,28 @@ async def test_locate_enabled_control_hit_returns_default(monkeypatch):
     monkeypatch.setattr(db_scope, "data_session", _fake_data_session)
 
     assert await db_scope.locate_row_db_key(_ProbeSession(hit=True), Document, "pk") == "default"
-    assert probes == []
+    assert probes == ["kb_a"]
+
+
+@pytest.mark.asyncio
+async def test_locate_enabled_control_and_scene_same_pk_is_ambiguous(monkeypatch):
+    """控制库与场景库同主键 → 歧义（不得因为控制库先命中就静默返回 default）。"""
+
+    @asynccontextmanager
+    async def _fake_data_session(db_key: str):
+        yield _ProbeSession(hit=True)
+
+    monkeypatch.setattr(
+        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
+    )
+    monkeypatch.setattr(db_scope, "registered_db_keys", lambda: ("default", "kb_a"))
+    monkeypatch.setattr(db_scope, "data_session", _fake_data_session)
+
+    with pytest.raises(DbScopeError) as excinfo:
+        await db_scope.locate_row_db_key(_ProbeSession(hit=True), Document, "pk")
+
+    assert excinfo.value.code == "DB_SCOPE_AMBIGUOUS"
+    assert excinfo.value.detail["db_keys"] == ["default", "kb_a"]
 
 
 @pytest.mark.asyncio

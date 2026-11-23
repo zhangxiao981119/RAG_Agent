@@ -1,6 +1,6 @@
 """WU-M-15 四维审查测试 —— 判据 / 合成 / 任务语义 / 不变量检查点。
 
-边界全替身：SessionLocal、arq 池、LLM、提示词解析全部 monkeypatch，
+边界全替身：数据面会话、arq 池、LLM、提示词解析全部 monkeypatch，
 零网络零 DB。钉住十二件事：
   1. 时效性规则：过期 0 分 / 未生效低分 / created_at 分档衰减
   2. weight 合成：四维加权均值 -50，范围 [-50, +50]
@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -165,6 +166,7 @@ class Harness:
         self.llm_output: str | Exception = _LLM_JSON
         self.commits = 0
         self.events: list[str] = []  # enqueue / commit / update 事件序
+        self.session_keys: list[str] = []  # 数据面会话按库位打开的先后顺序
 
     def put(self, *objs) -> None:
         for obj in objs:
@@ -175,14 +177,10 @@ class Harness:
 def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     h = Harness()
 
-    def _session():
-        # SessionLocal 是同步工厂：调用即返回 AsyncSession（生产同款语义），
-        # 不能写成 async 函数 —— 那会返回 coroutine，async with 直接炸
-        return FakeSession(h)
-
     @asynccontextmanager
-    async def _job_session(db_key: str):  # noqa: ARG001
+    async def _job_session(db_key: str):
         # worker 数据面入口：db_key 由队列负载透传（本文件只关心会话替身）
+        h.session_keys.append(db_key)
         yield FakeSession(h)
 
     async def _pool():
@@ -194,7 +192,6 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     async def _resolve(key, tenant_id=None):  # noqa: ANN001, ARG001
         return "审查提示词模板 {content}"
 
-    monkeypatch.setattr(governance, "SessionLocal", _session)
     monkeypatch.setattr(governance, "open_job_session", _job_session)
     monkeypatch.setattr(governance, "get_arq_pool", _pool)
     monkeypatch.setattr(governance, "get_llm_service", _llm)
@@ -351,7 +348,8 @@ async def test_execute_job_idempotent_when_done(harness: Harness) -> None:
 
 
 @pytest.mark.asyncio
-async def test_scan_enqueues_pending_docs(harness: Harness) -> None:
+async def test_scan_enqueues_pending_docs(harness: Harness, monkeypatch) -> None:
+    monkeypatch.setattr(governance, "registered_db_keys", lambda: ("default",))
     doc = _doc(governance_status="pending")
     harness.put(doc)
     harness.select_rows.append([(doc.id, doc.tenant_id)])
@@ -375,11 +373,56 @@ async def test_scan_enqueues_pending_docs(harness: Harness) -> None:
 
 
 @pytest.mark.asyncio
-async def test_scan_no_pending_is_noop(harness: Harness) -> None:
+async def test_scan_no_pending_is_noop(harness: Harness, monkeypatch) -> None:
+    monkeypatch.setattr(governance, "registered_db_keys", lambda: ("default",))
     harness.select_rows.append([])
 
     assert await governance.scan_and_enqueue({}) == 0
     assert harness.enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_scan_covers_every_registered_db_key(harness: Harness, monkeypatch) -> None:
+    """开启态逐库位扫描：每个键各建 job，并把该库位键传给执行任务。"""
+    monkeypatch.setattr(governance, "registered_db_keys", lambda: ("default", "kb_a"))
+    doc_default = _doc(governance_status="pending")
+    doc_scene = _doc(id=uuid.uuid4(), governance_status="pending")
+    harness.put(doc_default, doc_scene)
+    harness.select_rows.append([(doc_default.id, doc_default.tenant_id)])
+    harness.select_rows.append([(doc_scene.id, doc_scene.tenant_id)])
+
+    count = await governance.scan_and_enqueue({})
+
+    assert count == 2
+    assert harness.session_keys[0] == "default"
+    assert "kb_a" in harness.session_keys
+    assert [args[3] for args, _ in harness.enqueued] == ["default", "kb_a"]
+
+
+@pytest.mark.asyncio
+async def test_scan_db_failure_logs_and_continues(
+    harness: Harness, monkeypatch, caplog
+) -> None:
+    """单库扫描失败不得拖垮其它库，且 ERROR 日志必须带 db_key。"""
+    monkeypatch.setattr(governance, "registered_db_keys", lambda: ("default", "kb_a"))
+    visits: list[str] = []
+
+    async def _scan(db_key: str) -> int:
+        visits.append(db_key)
+        if db_key == "default":
+            raise RuntimeError("库位不可用")
+        return 1
+
+    monkeypatch.setattr(governance, "_scan_one_db", _scan)
+
+    with caplog.at_level(logging.ERROR, logger=governance.__name__):
+        count = await governance.scan_and_enqueue({})
+
+    assert count == 1
+    assert visits == ["default", "kb_a"]
+    record = next(r for r in caplog.records if r.levelno == logging.ERROR)
+    assert record.db_key == "default"
+    assert record.exc_info is not None
 
 
 # ── 10~11. 不变量检查点 ───────────────────────────────────
