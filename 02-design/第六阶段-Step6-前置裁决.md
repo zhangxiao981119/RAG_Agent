@@ -431,8 +431,8 @@ Step 6 必须把"路由到场景库"的请求改成两段：
 | 项 | 状态 | 处置 |
 |---|---|---|
 | docker daemon | 可用（Server 29.4.0） | 无需处置 |
-| `code-postgres-1` | **Exited(255)，OOMKilled=false** | 标"阻塞，需先核实"：先查退出原因，再 `docker start code-postgres-1` |
-| `code-worker-1` | **Restarting 循环**，日志为 `redis.exceptions.ConnectionError`（redis 不可达） | 标"阻塞"：演练前必须停 worker，避免写入污染数据 |
+| `code-postgres-1` | 运行中（2026-11-23 演练时 `pg_isready` 通过） | 无需处置；此前的 Exited(255) 已恢复 |
+| `code-worker-1` | 演练未依赖 worker | 本次 D0-D9 不经过解析写入，未复核其状态 |
 | 独立实例 | 无 | 本机不验，留热档 |
 
 ### 5.3 演练步骤与判据
@@ -454,9 +454,28 @@ Step 6 必须把"路由到场景库"的请求改成两段：
 
 ### 5.4 阻塞项声明
 
-- `code-postgres-1` 异常退出（255）原因未查明前，D1 之后的所有步骤不做。
-- worker 的 redis 不通是**既有环境问题**，与 Step 6 无关，但会干扰演练（解析写入），演练前必须停掉。
-- 真独立实例、多副本 60s 分叉、N 库备份窗口三项本机不可验，明确标"不覆盖"。
+- ~~`code-postgres-1` 异常退出（255）原因未查明前，D1 之后的所有步骤不做。~~ 2026-11-23 演练时容器已恢复运行，D0-D9 已完成。
+- worker 的 redis 不通是**既有环境问题**，与 Step 6 无关；本次演练不经过 worker，未涉及。
+- 真独立实例、多副本 60s 分叉、N 库并行备份窗口三项本机不可验，明确标"不覆盖"。
+
+### 5.5 演练结果（2026-11-23，本机 `code-postgres-1`）
+
+| 步 | 结果 | 证据（摘要） |
+|---|---|---|
+| D0 环境 | PASS | `pg_isready` → `accepting connections` |
+| D1 基线 | PASS | `max_connections=100`、`shared_buffers=128MB`、`version_num=0030` |
+| D2 建库 | PASS | `CREATE DATABASE kagent_finance` |
+| D3 迁移 | PASS | 场景库 `alembic upgrade head` → `0030`；控制面表 `tenants=0 / knowledge_bases=0` |
+| D4 手术 + 守卫 | PASS | 删除跨库 FK 17 条、安装触发器 5 个；三项校验全 PASS（FK 0 / 守卫 0 / 触发器 5/5） |
+| D5 禁写触发器 | PASS | `INSERT INTO tenants` 被拒（`控制面表 tenants 在场景库恒为空且禁止写入`），事后 `tenants=0` |
+| D6 预算回归 | PASS | `test_step5_db_router.py + test_step5_settings.py` → 25 passed |
+| D7 搬迁 | PASS | 技术知识库 10 表逐表 PASS（documents 8 / chunks 561 / kb_terms 467 / entities 365 / mentions 387 / relations 158 / wiki 6 / parse_jobs 8 / segments 0 / governance 24）；关键词探测 `control_hits=2 == scene_hits=2` |
+| D8 观测 | PASS（基线） | 体积 `kagent=88.5MB`、`kagent_finance=26.7MB`；两库 `SHOW shared_buffers` 均为 128MB；演练时场景库连接 0、控制库 2（未接入检索流量，连接落点待上线观测） |
+| D9 恢复 | PASS | 控制库 `pg_dump -Fc` → 临时库 `pg_restore`：`version=0030 / kbs=4 / docs=26 / chunks=580 / users=30` 两侧完全相等；随后清理并 DROP 演练库 |
+
+演练收尾：用 S6-6 清理脚本把场景库 10 表删至 0、孤儿检查两向为空，再 DROP `kagent_finance` 与 `kagent_restore_check`；控制库行数保持 `kbs=4 / docs=26 / chunks=580` 未变。
+
+未覆盖（本机不可验）：真独立实例的缓存争用/RSS 峰值、独立故障域、N 库并行备份窗口、多副本 60s 分叉；以及"接入检索流量后的连接落点"（需应用以分库态启动）。
 
 ---
 
