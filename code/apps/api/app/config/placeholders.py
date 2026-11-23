@@ -53,6 +53,13 @@ PLACEHOLDERS: Final[tuple[Placeholder, ...]] = (
         owner="scenario",
         note="待运维发布节奏标定 · 改场景后最长 60s 才生效",
     ),
+    # ── 租户治理（Step 7）──────────────────────────────────────────
+    Placeholder(
+        name="TENANT_DB_SCOPE_CACHE_TTL_SECONDS",
+        value=60.0,
+        owner="tenant",
+        note="待运维治理节奏标定 · 改租户库白名单后最长 60s 才生效",
+    ),
     # ── chunk 口径分布（Step 4B-1）──────────────────────────────────
     # ★ 这两个值都直接决定"会不会误报/会不会卡启动"，而两者都没有真实运维数据
     #   可标定（`框架设计-v1.md:1294` 至今把"告警阈值"列为待定项）。登记在这里，

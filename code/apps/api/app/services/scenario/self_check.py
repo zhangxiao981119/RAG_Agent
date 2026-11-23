@@ -327,8 +327,10 @@ async def check_scenario_data(
 async def _load_all_published(session: AsyncSession) -> list[ScenarioRow]:
     """读出全部已发布版本行（跨租户，启动期一次性扫描；见 `SCAN_SQL` 的三条约束）。"""
     result = await session.execute(text(SCAN_SQL))
-    # 复用 resolver 的行折叠：别名一致 ⇒ 解析逻辑必须只有一份
-    return [resolver._row_from(row._mapping) for row in result.all()]  # noqa: SLF001
+    # 复用 resolver 的行折叠：别名一致 ⇒ 解析逻辑必须只有一份。
+    # `governed=True`：自检本来就该看到治理列（SCAN_SQL 未选时 `.get` 返回 None，
+    # 与「未配置治理」同义）；若传 False 会把已选中的钉定/上限当作不存在。
+    return [resolver._row_from(row._mapping, governed=True) for row in result.all()]  # noqa: SLF001
 
 
 def _scan_one(

@@ -26,6 +26,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import placeholders
+from app.config.settings import get_settings
 from app.infra import metrics
 from app.models import IntegrationApplication
 from app.services.scenario.errors import COMPONENT
@@ -102,6 +103,55 @@ WHERE s.tenant_id = :tenant_id
   （fail-closed），而不是把别人的版本当自己的用。
 """
 
+LOOKUP_GOVERNED_SQL = """
+SELECT
+    s.id            AS scenario_id,
+    s.tenant_id     AS tenant_id,
+    s.scenario_key  AS scenario_key,
+    s.status        AS status,
+    s.is_builtin    AS is_builtin,
+    s.db_binding    AS db_binding,
+    s.pinned_version        AS pinned_version,
+    s.recall_top_k_max      AS recall_top_k_max,
+    s.threshold_vector_min  AS threshold_vector_min,
+    s.threshold_rerank_min  AS threshold_rerank_min,
+    s.rerank_allowed        AS rerank_allowed,
+    v.version       AS version,
+    v.state         AS version_state,
+    v.policy        AS policy,
+    v.kb_ids        AS kb_ids,
+    v.binding_mode  AS binding_mode,
+    v.dna_declared  AS dna_declared,
+    v.checksum      AS checksum
+FROM scenarios s
+JOIN scenario_versions v
+  ON v.scenario_id = s.id
+ AND v.tenant_id   = :tenant_id
+ AND (
+      (s.pinned_version IS NULL AND v.state = 'published')
+   OR (s.pinned_version IS NOT NULL
+       AND v.version = s.pinned_version
+       AND v.state IN ('published','archived'))
+ )
+WHERE s.tenant_id = :tenant_id
+  AND ((CAST(:scenario_id AS uuid) IS NULL AND s.is_builtin)
+       OR s.id = CAST(:scenario_id AS uuid))
+"""
+"""治理开启（`TENANT_GOVERNANCE_ENABLED=true`）时的解析 SQL。
+
+与 `LOOKUP_SQL` 的唯一差别是版本选择：
+  · 未钉定 → 已发布版本（与关闭态逐字节同一口径）；
+  · 已钉定 → 只认该版本号，`published`/`archived` 都接受。
+    archived 必须接受：钉定就是「即使后来发布了新版，也继续按旧版跑」，
+    否则归档旧版会让所有钉定客户端立刻 500。
+
+★ 版本条件写在 JOIN 内而不是 WHERE：写在 WHERE 会让「钉定版本被删」变成
+  「查不到行」，而调用方无法区分「场景不存在」与「版本被删」—— 两者的诊断值不同。
+  JOIN 内过滤后同样是查不到行（由 build_snapshot 报 R1），但 SQL 语义更直白。
+★ `s.tenant_id = :tenant_id` 与双端 tenant_id 条件与 `LOOKUP_SQL` 完全一致，
+  这条防线不因开启治理而放宽。
+"""
+
 
 def clear_cache() -> None:
     """清空行缓存（**仅供测试**，等价于让 TTL 立即到期）。"""
@@ -132,8 +182,13 @@ def _cache_put(key: tuple[uuid.UUID, uuid.UUID | None], row: ScenarioRow) -> Non
     _CACHE[key] = (time.monotonic(), row)
 
 
-def _row_from(mapping) -> ScenarioRow:
-    """把 SQL 结果行折叠成不可变行对象（JSONB 侧保持驱动的原生形态）。"""
+def _row_from(mapping, *, governed: bool) -> ScenarioRow:
+    """把 SQL 结果行折叠成不可变行对象（JSONB 侧保持驱动的原生形态）。
+
+    `governed=False` 时**显式忽略**治理列：关闭态即便结果里带了这些键
+    （测试替身 / 未来 SQL 调整）也不得让钉定生效 —— 开关语义由这里兜住，
+    而不是依赖「原 SQL 恰好没选这几列」这个易碎前提。
+    """
     return ScenarioRow(
         tenant_id=mapping["tenant_id"],
         scenario_id=mapping["scenario_id"],
@@ -147,6 +202,12 @@ def _row_from(mapping) -> ScenarioRow:
         binding_mode=mapping["binding_mode"],
         dna_declared=mapping["dna_declared"] or {},
         checksum=mapping["checksum"],
+        pinned_version=mapping.get("pinned_version") if governed else None,
+        recall_top_k_max=mapping.get("recall_top_k_max") if governed else None,
+        threshold_vector_min=mapping.get("threshold_vector_min") if governed else None,
+        threshold_rerank_min=mapping.get("threshold_rerank_min") if governed else None,
+        rerank_allowed=mapping.get("rerank_allowed") if governed else None,
+        version_state=(mapping.get("version_state") if governed else None) or "published",
     )
 
 
@@ -159,7 +220,11 @@ async def _load_published(
       · `scenario_id is None` + 无行 → 内置行缺失（同值兜底，R5 表外分支）；
       · `scenario_id` 非 None + 无行 → 配置损坏（R1，500，不兜底）。
     """
-    stmt = sa.text(LOOKUP_SQL).bindparams(
+    # 开关在**请求期**读取而不是 import 期：测试与运维都需要在不重启进程的情况下
+    # 观察两种口径；关闭态走原 SQL，因此多一次布尔判断、不多一次查询。
+    governed = get_settings().tenant_governance_enabled
+    sql = LOOKUP_GOVERNED_SQL if governed else LOOKUP_SQL
+    stmt = sa.text(sql).bindparams(
         tenant_id=tenant_id,
         scenario_id=scenario_id,
     )
@@ -170,7 +235,7 @@ async def _load_published(
     # 唯一索引（每场景至多一个 published / 每租户至多一个内置）保证至多一行；
     # 万一出现多行（索引被绕过），取首行而不是抛错：解析路径不因脏数据变成 500，
     # 该异常本身由巡检 SQL 发现（设计文档 §A.6 障碍 3 的同类做法）。
-    return _row_from(rows[0]._mapping)
+    return _row_from(rows[0]._mapping, governed=governed)
 
 
 async def resolve_scenario(

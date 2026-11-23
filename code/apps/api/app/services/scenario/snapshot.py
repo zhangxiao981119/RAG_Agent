@@ -31,6 +31,7 @@ from app.config.index_profile import IndexProfile, current_index_profile
 from app.config.wiki_profile import WikiProfile, current_wiki_profile
 from app.services.scenario.errors import ScenarioCode, ScenarioError
 from app.services.scenario.policy_spec import POLICY_FIELDS, type_ok
+from app.services.tenant.governance import EMPTY_CAPS, TenantPolicyCaps
 
 BUILTIN_SCENARIO_KEY = "default"
 """内置场景保留 key（迁移 0028 创建）。应用层 MUST 拒绝其它场景改用这个 key。"""
@@ -157,6 +158,24 @@ class ScenarioRow:
     # 声明镜像：**不参与解析**，只为审计与「代码 bump 了但迁移没跟」的漂移检测留存
     dna_declared: Mapping[str, object]
     checksum: str
+    # ── Step 7 治理列（关闭 TENANT_GOVERNANCE_ENABLED 时恒为默认值）──────
+    # 钉定版本：None = 跟随已发布版本；非空 = 只解析该版本（published/archived 均可）
+    pinned_version: int | None = None
+    recall_top_k_max: int | None = None
+    threshold_vector_min: float | None = None
+    threshold_rerank_min: float | None = None
+    rerank_allowed: bool | None = None
+    # 实际解析到的版本状态；未开启治理时恒为 'published'
+    version_state: str = "published"
+
+    def to_caps(self) -> TenantPolicyCaps:
+        """把四个租户上限列折叠成值对象（全 None = 不限制）。"""
+        return TenantPolicyCaps(
+            recall_top_k_max=self.recall_top_k_max,
+            threshold_vector_min=self.threshold_vector_min,
+            threshold_rerank_min=self.threshold_rerank_min,
+            rerank_allowed=self.rerank_allowed,
+        )
 
     @property
     def declared_kb_ids(self) -> tuple[uuid.UUID, ...]:
@@ -255,6 +274,10 @@ class ScenarioSnapshot:
     # ── 来源（审计/排障用；决定 R5 与 R6 在日志里可区分）───────────
     source: Literal["builtin_row", "builtin_fallback", "application"]
 
+    # ── Step 7 治理（关闭开关时 caps 为空、version_source 恒 published）────
+    caps: TenantPolicyCaps = EMPTY_CAPS
+    version_source: Literal["published", "pinned"] = "published"
+
     @property
     def fingerprint(self) -> str:
         """场景口径指纹 = sha1(key|version|index.fingerprint|canonical_policy)[:12]。
@@ -264,14 +287,16 @@ class ScenarioSnapshot:
         是两种配置，但只在前者需要区分时才有意义 —— 这里按声明原样算，
         两者会得到不同指纹，符合「配置不同即版本不同」的预期。
         """
-        raw = "|".join(
-            (
-                self.scenario_key,
-                str(self.version),
-                self.index.fingerprint,
-                _canonical_policy(self.policy),
-            )
-        )
+        parts = [
+            self.scenario_key,
+            str(self.version),
+            self.index.fingerprint,
+            _canonical_policy(self.policy),
+        ]
+        # 空 caps 不参与拼接：关闭治理时指纹必须与 Step 6 逐字节相同
+        if not self.caps.is_empty():
+            parts.append(_canonical_json(self.caps.declared()))
+        raw = "|".join(parts)
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
@@ -341,6 +366,9 @@ def _builtin_identity() -> dict[str, object]:
         "db_binding": None,
         "policy": ScenarioPolicy(),
         "source": "builtin_fallback",
+        # 内置行缺失时没有任何治理数据可读：空 caps + 已发布口径
+        "caps": EMPTY_CAPS,
+        "version_source": "published",
     }
 
 
@@ -356,6 +384,8 @@ def _identity_from_row(row: ScenarioRow, *, source: str) -> dict[str, object]:
         "db_binding": row.db_binding,
         "policy": row.to_policy(),
         "source": source,
+        "caps": row.to_caps(),
+        "version_source": "pinned" if row.pinned_version is not None else "published",
     }
 
 

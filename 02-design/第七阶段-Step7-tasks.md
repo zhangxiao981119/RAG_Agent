@@ -48,7 +48,7 @@
 
 ---
 
-## S7-2 治理读取 + 快照 + 开关
+## [x] S7-2 治理读取 + 快照 + 开关
 
 **文件**
 - `code/apps/api/app/config/settings.py`：新增 `tenant_governance_enabled: bool = False`，注释写“关闭态不读 tenants、不读钉定列”。

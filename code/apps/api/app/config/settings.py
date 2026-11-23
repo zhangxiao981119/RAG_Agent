@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     #   启动期校验；'default' 是保留虚拟键，不得作为键出现（它指现有库）。
     # ★ 值含凭据 → MUST 逐值脱敏后才进快照，永不进日志明文/响应体。
     scene_db_dsn: dict[str, str] = {}
+    # ── 租户治理（Step 7）────────────────────────────────────
+    # ★ 默认 false：关闭态**不读 tenants.allowed_db_keys、不读钉定列**，
+    #   解析走 Step 6 的 LOOKUP_SQL / _MAP_SQL，与未引入治理层逐字段等价。
+    # ★ 开启态才启用：场景钉定版本（pinned_version）、租户策略收紧（caps）、
+    #   库可见性上限（allowed_db_keys）。开启前 MUST 先跑 0031 迁移。
+    tenant_governance_enabled: bool = False
     # ── 连接预算闸门（数值全部来自框架 §3A.4 的算式）──
     # ★ 100 是 PG 默认值，本项目未覆盖该参数；启动期会 SHOW max_connections 比对，取较小者。
     db_max_connections_for_budget: int = 100

@@ -99,10 +99,13 @@ def clear_scenario_cache():
       等价于让 TTL 立即到期，是缓存本来的生命周期的一部分。
     """
     from app.services.scenario.resolver import clear_cache
+    from app.services.tenant.governance import invalidate_allowed_db_keys
 
     clear_cache()
+    invalidate_allowed_db_keys()
     yield
     clear_cache()
+    invalidate_allowed_db_keys()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -124,6 +127,10 @@ class FakeResult:
     def all(self) -> list[Any]:
         return list(self._rows)
 
+    def first(self) -> Any | None:
+        """治理读取（`get_allowed_db_keys`）只取首行；空结果返回 None。"""
+        return self._rows[0] if self._rows else None
+
 
 class FakeSession:
     """按脚本返回「场景 + 已发布版本」行的假 Session。
@@ -135,7 +142,9 @@ class FakeSession:
         self.rows = list(rows or [])
         self.statements: list[Any] = []
 
-    async def execute(self, stmt) -> FakeResult:
+    async def execute(self, stmt, params: dict[str, Any] | None = None) -> FakeResult:
+        # `params` 只为治理读取（`get_allowed_db_keys` 用绑定参数）而接受；
+        # resolver 的调用仍只传 stmt，行为不变。
         self.statements.append(stmt)
         return FakeResult([FakeRow(row) for row in self.rows])
 
