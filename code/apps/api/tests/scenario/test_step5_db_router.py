@@ -251,12 +251,13 @@ def _callee_name(func: ast.expr) -> str | None:
     return None
 
 
-def test_t5_7_data_session_has_single_call_site_in_db_scope_and_single_definition():
-    """S6-4 重写：data_session 的调用点白名单 = 只有 app/services/db_scope.py 一处。
+def test_t5_7_data_session_has_two_call_sites_in_db_scope_and_single_definition():
+    """S6-3 重写：data_session 的调用点白名单 = app/services/db_scope.py 的两处。
 
-    Step 5 的形态是"零调用点"；Step 6 接线后唯一允许的调用点是请求层数据面入口
-    `db_scope.open_data_session`。破坏方式（必须变红）：
-      · 在 api/kbs.py 或别处再 `async with data_session(...)` → 调用点变 2 → 红；
+    Step 5 的形态是"零调用点"；Step 6 接线后的允许调用点只有请求层
+    `db_scope.open_data_session` 与 worker 侧 `db_scope.open_job_session`。
+    破坏方式（必须变红）：
+      · 在 api/kbs.py 或别处再 `async with data_session(...)` → 调用点变 3 → 红；
       · 把 db_scope 的调用搬去别的模块 → 白名单路径不匹配 → 红；
       · 复制一份 `def data_session` → 定义文件数变 2 → 红。
     """
@@ -274,11 +275,11 @@ def test_t5_7_data_session_has_single_call_site_in_db_scope_and_single_definitio
             ):
                 definition_files.append(path)
 
-    assert len(call_sites) == 1, (
-        f"data_session 在 app/ 内必须只有 1 个调用点（db_scope.py），实际：{call_sites}"
+    assert len(call_sites) == 2, (
+        f"data_session 在 app/ 内必须只有 2 个调用点（db_scope.py），实际：{call_sites}"
     )
-    assert call_sites[0].resolve() == _DB_SCOPE_PATH.resolve(), (
-        f"data_session 的唯一调用点必须是 {_DB_SCOPE_PATH}，实际：{call_sites[0]}"
+    assert all(path.resolve() == _DB_SCOPE_PATH.resolve() for path in call_sites), (
+        f"data_session 的调用点必须都在 {_DB_SCOPE_PATH}，实际：{call_sites}"
     )
     assert len(definition_files) == 1, f"data_session 必须只定义一次，实际：{definition_files}"
     assert definition_files[0].resolve() == _DB_ROUTER_PATH.resolve()

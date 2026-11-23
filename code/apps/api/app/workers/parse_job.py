@@ -37,6 +37,7 @@ from app.infra import trace
 from app.infra.arq_pool import get_arq_pool
 from app.models import Chunk, Document, ParseJob, ParseSegment
 from app.services.chunk import chunk_blocks, to_embedding_text
+from app.services.db_scope import open_job_session, require_job_db_key
 from app.services.embedding import get_embedding_service
 from app.services.governance import execute_governance_job, scan_and_enqueue
 from app.services.graph.purge import purge_derived
@@ -97,11 +98,11 @@ def _segment_select(parse_job_id: uuid.UUID, segment_index: int):
 
 
 async def _mark_document_failure(
-    parse_job_id: uuid.UUID, exc: BaseException, settings: Any
+    parse_job_id: uuid.UUID, exc: BaseException, settings: Any, db_key: str
 ) -> str:
     """普通路径/聚合路径的失败处理：写 last_error；重试次数用尽置 dead，
     否则置 queued 并抛 Retry（arq 按 2**attempts 秒退避）。"""
-    async with SessionLocal() as fail_session:
+    async with open_job_session(db_key) as fail_session:
         retry_job = await fail_session.get(ParseJob, parse_job_id)
         if retry_job is None:
             raise exc
@@ -121,7 +122,11 @@ async def _mark_document_failure(
 
 
 async def _mark_segment_failure(
-    parse_job_id: uuid.UUID, segment_index: int, exc: BaseException, settings: Any
+    parse_job_id: uuid.UUID,
+    segment_index: int,
+    exc: BaseException,
+    settings: Any,
+    db_key: str,
 ) -> str:
     """段失败处理：重试计数用**段**的 attempts（段才是重试单元）。
 
@@ -129,7 +134,7 @@ async def _mark_segment_failure(
     否则 → 段置 failed + job 置 queued，抛 Retry（arq 重跑同一段）。
     ★ 段记录一定已在本段开始前创建（见 run_parse_segment），故 attempts 总有值。
     """
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         job = await session.get(ParseJob, parse_job_id)
         if job is None:
             raise exc
@@ -158,7 +163,7 @@ async def _mark_segment_failure(
 
 
 async def _index_document(
-    parse_job_id: uuid.UUID, doc_ext: dict[str, Any], data: bytes
+    parse_job_id: uuid.UUID, doc_ext: dict[str, Any], data: bytes, db_key: str
 ) -> str:
     """普通文档的完整路径：解析 → 分块 → 嵌入 → 写 chunks → 成功。
 
@@ -183,9 +188,9 @@ async def _index_document(
         texts = [to_embedding_text(c) for c in chunks]
         vectors = await embedding_service.embed(texts)
     except Exception as exc:
-        return await _mark_document_failure(parse_job_id, exc, settings)
+        return await _mark_document_failure(parse_job_id, exc, settings, db_key)
 
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         # ★ 图派生数据清理 MUST 与下面的 chunks 写入在**同一事务**内，且必须在
         #   `DELETE chunks` **之前**：chunk 一删，提及就被级联带走，affected 实体集合
         #   变成空集 → 孤儿实体与 doc_freq 再也算不出来（图里留着边、一条提及都没有，
@@ -233,14 +238,18 @@ async def _index_document(
 
     # ★ 入队在**提交成功之后**：先入队再提交会出现「任务已跑、chunks 还看不见」，
     #   worker 抽到一个空文档并把它标成 skipped（此后永远不重抽）。
-    await enqueue_graph_extract(doc_ext["id"])
+    await enqueue_graph_extract(doc_ext["id"], db_key)
     # wiki 页（第 3 步）：与图抽取同款「提交后入队」；关闭能力时内部直接返回 False
-    await enqueue_wiki_build(doc_ext["id"])
+    await enqueue_wiki_build(doc_ext["id"], db_key)
     return "succeeded"
 
 
 async def _advance_segment_chain(
-    parse_job_id: uuid.UUID, segment_index: int, pages_total: int, trace_id: str | None
+    parse_job_id: uuid.UUID,
+    segment_index: int,
+    pages_total: int,
+    trace_id: str | None,
+    db_key: str,
 ) -> None:
     """本段成功后推进串行链：还有下一段则入队下一段，否则入队聚合任务。
 
@@ -252,19 +261,23 @@ async def _advance_segment_chain(
     next_index = segment_index + 1
     if next_index * decisions.OCR_MAX_SCAN_PAGES < pages_total:
         await pool.enqueue_job(
-            "run_parse_segment", str(parse_job_id), next_index, trace_id,
+            "run_parse_segment", str(parse_job_id), next_index, trace_id, db_key,
             _queue_name=queue,
         )
     else:
         await pool.enqueue_job(
-            "run_parse_finalize", str(parse_job_id), trace_id, _queue_name=queue
+            "run_parse_finalize", str(parse_job_id), trace_id, db_key, _queue_name=queue
         )
 
 
 async def run_parse_segment(
-    ctx: dict[str, Any], job_id: str, segment_index: int = 0, trace_id: str | None = None
+    ctx: dict[str, Any],
+    job_id: str,
+    segment_index: int = 0,
+    trace_id: str | None = None,
+    db_key: str | None = None,
 ) -> str:
-    """分段流水线入口。job_id 是 parse_jobs.id；trace_id 由入队方透传。
+    """分段流水线入口。job_id 是 parse_jobs.id；trace_id / db_key 由入队方透传。
 
     首段（segment_index=0）先做**路径判定**：
       · 非扫描件 → 直接走完整路径（_index_document），不建段记录；
@@ -272,13 +285,15 @@ async def run_parse_segment(
     后续段（segment_index>0）按 pages_total 计算本段页区间并 OCR。
 
     ★ 分 3 段 session：锁任务 → 网络调用（OCR，无 session）→ 写段结果。
+    ★ db_key 缺失 → JOB_DB_KEY_MISSING（禁止回落默认库写数据）。
     """
     trace.set_trace_id(trace_id or trace.new_trace_id())
+    db_key = require_job_db_key(db_key)
     parse_job_id = uuid.UUID(job_id)
     settings = get_settings()
 
     # ── 第一段：锁任务 + 取文档字段 ────────────────────
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         job = await session.get(ParseJob, parse_job_id)
         if job is None:
             logger.warning("parse_job not found, mark as dead: %s", job_id)
@@ -310,7 +325,9 @@ async def run_parse_segment(
         storage = await get_storage()
         data = await storage.get_object(doc_ext["storage_key"])
     except Exception as exc:
-        return await _mark_segment_failure(parse_job_id, segment_index, exc, settings)
+        return await _mark_segment_failure(
+            parse_job_id, segment_index, exc, settings, db_key
+        )
 
     ext = str(doc_ext["ext"]).lower()
 
@@ -324,10 +341,10 @@ async def run_parse_segment(
             page_count = len(page_texts)
         if not scanned:
             # 普通文档：完整路径一次跑完，不分段
-            return await _index_document(parse_job_id, doc_ext, data)
+            return await _index_document(parse_job_id, doc_ext, data, db_key)
         # 扫描件：落 pages_total（页区间计算依据）
         if pages_total != page_count:
-            async with SessionLocal() as session:
+            async with open_job_session(db_key) as session:
                 job = await session.get(ParseJob, parse_job_id)
                 job.pages_total = page_count
                 await session.commit()
@@ -336,7 +353,7 @@ async def run_parse_segment(
     # ── 扫描件分段：先建/取段记录（重试计数单元），再做永久性校验 ──
     page_start, page_end = _segment_bounds(segment_index, pages_total)
 
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         segment = await session.scalar(_segment_select(parse_job_id, segment_index))
         if segment is not None and segment.status == "succeeded":
             # 段已完成（上次「入队下一段」失败导致重入）：跳过 OCR，只推进链条
@@ -364,7 +381,7 @@ async def run_parse_segment(
         ensure_ocr_ready()
         ensure_scanned_page_count(pages_total)
     except ParseError as exc:
-        async with SessionLocal() as session:
+        async with open_job_session(db_key) as session:
             job = await session.get(ParseJob, parse_job_id)
             job.status = "dead"
             job.last_error = f"{type(exc).__name__}: {exc}"
@@ -384,11 +401,11 @@ async def run_parse_segment(
             page_texts = await ocr_scanned_pages(data, page_start, page_end)
         except Exception as exc:
             return await _mark_segment_failure(
-                parse_job_id, segment_index, exc, settings
+                parse_job_id, segment_index, exc, settings, db_key
             )
 
         # ── 第三段：写段结果 + 累加进度 ────────────────────
-        async with SessionLocal() as session:
+        async with open_job_session(db_key) as session:
             segment = await session.scalar(_segment_select(parse_job_id, segment_index))
             segment.page_texts = page_texts
             segment.status = "succeeded"
@@ -399,14 +416,21 @@ async def run_parse_segment(
 
     # ── 推进串行链：下一段 / 聚合 ──────────────────────
     try:
-        await _advance_segment_chain(parse_job_id, segment_index, pages_total, trace_id)
+        await _advance_segment_chain(
+            parse_job_id, segment_index, pages_total, trace_id, db_key
+        )
     except Exception as exc:
-        return await _mark_segment_failure(parse_job_id, segment_index, exc, settings)
+        return await _mark_segment_failure(
+            parse_job_id, segment_index, exc, settings, db_key
+        )
     return "succeeded"
 
 
 async def run_parse_finalize(
-    ctx: dict[str, Any], job_id: str, trace_id: str | None = None
+    ctx: dict[str, Any],
+    job_id: str,
+    trace_id: str | None = None,
+    db_key: str | None = None,
 ) -> str:
     """聚合任务：全部段成功后，按全局页序归并 → 标题识别 → 分块 → 嵌入 → 写 chunks。
 
@@ -414,13 +438,15 @@ async def run_parse_finalize(
       MUST NOT 拿残缺页序去入库（缺页知识会冒充完整知识）。
     ★ 标题累积只在聚合期做（blocks_from_page_texts），保证跨段标题延续。
     ★ 段结果已落库：聚合重试只重跑嵌入/写库，不重复 OCR。
+    ★ db_key 缺失 → JOB_DB_KEY_MISSING（禁止回落默认库写数据）。
     """
     trace.set_trace_id(trace_id or trace.new_trace_id())
+    db_key = require_job_db_key(db_key)
     parse_job_id = uuid.UUID(job_id)
     settings = get_settings()
 
     # ── 第一段：锁任务 + 读全部段（无 IO 的归并数据）──────
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         job = await session.get(ParseJob, parse_job_id)
         if job is None:
             logger.warning("parse_job not found, mark as dead: %s", job_id)
@@ -471,7 +497,7 @@ async def run_parse_finalize(
     if problems:
         # 段数据不一致属**不可自愈**的状态损坏（重试读到的还是同样的段），直接 dead
         exc = ParseError("分段聚合校验失败：" + "；".join(problems))
-        async with SessionLocal() as session:
+        async with open_job_session(db_key) as session:
             job = await session.get(ParseJob, parse_job_id)
             job.status = "dead"
             job.last_error = f"{type(exc).__name__}: {exc}"
@@ -497,10 +523,10 @@ async def run_parse_finalize(
         texts = [to_embedding_text(c) for c in chunks]
         vectors = await embedding_service.embed(texts)
     except Exception as exc:
-        return await _mark_document_failure(parse_job_id, exc, settings)
+        return await _mark_document_failure(parse_job_id, exc, settings, db_key)
 
     # ── 第三段：写 chunks + 更新状态 ──────────────────────
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         # ★ 同 _index_document：purge 与 chunks 写入同事务，且必须在 DELETE chunks 之前
         await purge_derived(session, document_id=doc_ext["id"])
         await session.execute(delete(Chunk).where(Chunk.document_id == doc_ext["id"]))
@@ -538,8 +564,8 @@ async def run_parse_finalize(
         await session.commit()
 
     # ★ 同 _index_document：提交成功后才入队（先入队会抽到看不见的 chunks）
-    await enqueue_graph_extract(doc_ext["id"])
-    await enqueue_wiki_build(doc_ext["id"])
+    await enqueue_graph_extract(doc_ext["id"], db_key)
+    await enqueue_wiki_build(doc_ext["id"], db_key)
     return "succeeded"
 
 
@@ -555,11 +581,19 @@ async def run_sync_all(ctx: dict[str, Any]) -> int:
 
 
 async def run_sync_source(
-    ctx: dict[str, Any], source_id: str, trace_id: str | None = None
+    ctx: dict[str, Any],
+    source_id: str,
+    trace_id: str | None = None,
+    db_key: str | None = None,
 ) -> int:
-    """手动触发单个同步源（HTTP trigger_sync 入队，避免阻塞 API 事件循环）。"""
+    """手动触发单个同步源（HTTP trigger_sync 入队，避免阻塞 API 事件循环）。
+
+    ★ SyncSource 是控制面表，仍走 SessionLocal；文件写入在 sync_source 内按
+      db_key 切到数据面会话。db_key 缺失 → JOB_DB_KEY_MISSING。
+    """
     # 绑定入队方透传的 trace_id（缺失则新生成），worker 日志与触发请求同链
     trace.set_trace_id(trace_id or trace.new_trace_id())
+    db_key = require_job_db_key(db_key)
     from app.services.sync_service import sync_source
     from app.models import SyncSource
 
@@ -572,7 +606,7 @@ async def run_sync_source(
         # detach 交给 sync_source 内部自己管理 session
         session.expunge(source)
 
-    new_count = await sync_source(source)
+    new_count = await sync_source(source, db_key)
     logger.info("sync.manual.complete", extra={
         "source_id": source_id,
         "new_count": new_count,

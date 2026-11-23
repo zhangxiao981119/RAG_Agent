@@ -29,7 +29,6 @@ import pytest
 from app.config import decisions
 from app.config.graph_profile import GraphProfile
 from app.services import retrieve as retrieve_mod
-from app.services.graph import extract as extract_mod
 from app.services.graph import recall as recall_mod
 from app.services.graph.base import (
     ExtractedEntity,
@@ -39,10 +38,9 @@ from app.services.graph.base import (
     GraphNeighbor,
 )
 from app.services.graph.extract import normalize_name_key
-from app.services.graph.postgres_store import PostgresGraphStore, get_graph_store
+from app.services.graph.postgres_store import get_graph_store
 from app.services.graph.recall import GraphRecallOutcome, recall_by_graph
 from app.services.retrieve import RetrievalService
-from app.services.retrieve.base import RetrievedChunk
 from tests.fake_settings import fake_settings
 
 TENANT = uuid.UUID(int=9)

@@ -37,6 +37,7 @@ from app.config.graph_profile import current_graph_profile
 from app.config.settings import get_settings
 from app.database import SessionLocal
 from app.models import Document
+from app.services.db_scope import locate_row_db_key, open_job_session
 from app.services.graph.extract import GraphExtractSkip
 from app.workers.graph_job import extract_and_store
 
@@ -187,15 +188,15 @@ async def _check() -> int:
     return 0 if not_ready == 0 else 1
 
 
-async def _mark_failed(document_id: uuid.UUID) -> None:
-    async with SessionLocal() as session:
+async def _mark_failed(document_id: uuid.UUID, db_key: str) -> None:
+    async with open_job_session(db_key) as session:
         document = await session.get(Document, document_id)
         if document is not None:
             document.graph_status = "failed"
             await session.commit()
 
 
-async def _mark_skipped(document_id: uuid.UUID) -> None:
+async def _mark_skipped(document_id: uuid.UUID, db_key: str) -> None:
     """把文档标成「明确跳过」（零分片 / 超分片上限）。
 
     ★ MUST 与 failed 分开落库：`--all` 的选取条件只排除 skipped，failed 会被每次重选。
@@ -204,7 +205,7 @@ async def _mark_skipped(document_id: uuid.UUID) -> None:
     ★ `extract_and_store` 自己不管状态机（只做「抽 → 写三表 → 置 done」），
       所以这里必须由脚本写状态；arq 侧对应的是 run_graph_extract 的 skip 分支。
     """
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         document = await session.get(Document, document_id)
         if document is not None:
             document.graph_status = "skipped"
@@ -237,21 +238,29 @@ async def _run(mode: str, args: argparse.Namespace) -> int:
 
     ok = skipped = failed = 0
     for index, (document_id, filename) in enumerate(rows, start=1):
+        # 库位解析：关闭态零 SQL 直接 default；开启态按主键顺序探测。
+        # 本脚本的选取查询只读默认库，绑定库文档不在本轮范围（见模块说明）。
+        async with SessionLocal() as session:
+            db_key = await locate_row_db_key(session, Document, document_id)
+        if db_key is None:
+            failed += 1
+            print(f"  [{index}/{len(rows)}] FAILED {document_id} {filename}: 不在任何库位")
+            continue
         try:
-            status = await extract_and_store(document_id)
+            status = await extract_and_store(document_id, db_key)
         except GraphExtractSkip as exc:
             # ★ MUST 排在 `except Exception` 之前：GraphExtractSkip 表达的是
             #   「这篇文档不该抽」（零分片 / 超护栏），不是「这次没抽成」。
             #   归到 failed 会让它被 --all 每轮重选、永远修不好，且 --check 的
             #   「失败 N / 跳过 0」把可忽略的跳过报成需要人工处理的失败。
-            await _mark_skipped(document_id)
+            await _mark_skipped(document_id, db_key)
             skipped += 1
             print(f"  [{index}/{len(rows)}] skip   {document_id} {filename}（{exc}）")
             continue
         except Exception as exc:
             # 单篇失败不中断整轮：其余文档照常补建，失败项在结尾汇总
             #（与 arq 的「单条失败不阻塞其他文档」同一口径）。
-            await _mark_failed(document_id)
+            await _mark_failed(document_id, db_key)
             failed += 1
             print(f"  [{index}/{len(rows)}] FAILED {document_id} {filename}: "
                   f"{type(exc).__name__}: {exc}")

@@ -14,6 +14,7 @@ monkeypatch，零网络零 DB。钉住八件事：
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -146,12 +147,18 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     async def _get_pool():
         return FakePool(h.sink)
 
+    @asynccontextmanager
+    async def _open_job_session(db_key: str):  # noqa: ARG001
+        # worker 数据面入口：db_key 由同步调用方透传，这里只关心会话替身
+        yield FakeSession(h.sink)
+
     monkeypatch.setattr(sync_service, "open_web_session", _open_session)
     monkeypatch.setattr(sync_service, "probe_source", _probe)
     monkeypatch.setattr(sync_service, "discover_pages", _discover)
     monkeypatch.setattr(sync_service, "fetch_page", _fetch)
     monkeypatch.setattr(sync_service, "get_storage", _get_storage)
     monkeypatch.setattr(sync_service, "get_arq_pool", _get_pool)
+    monkeypatch.setattr(sync_service, "open_job_session", _open_job_session)
     monkeypatch.setattr(sync_service, "SessionLocal", lambda: FakeSession(h.sink))
     return h
 
@@ -187,7 +194,7 @@ async def test_first_sync_indexes_pages_as_v1(harness: Harness):
         URL_B: _page(URL_B, "<p>B</p>", '"e-b"'),
     }
 
-    count = await sync_service.sync_source(source)
+    count = await sync_service.sync_source(source, "default")
 
     assert count == 2
     docs = harness.docs()
@@ -211,11 +218,11 @@ async def test_unchanged_etag_skips_reindex(harness: Harness):
     source = _web_source()
     harness.discover_result = [URL_A]
     harness.fetch_map = {URL_A: _page(URL_A, "<p>A</p>", '"e-a"')}
-    await sync_service.sync_source(source)
+    await sync_service.sync_source(source, "default")
     docs_after_first = len(harness.docs())
     enq_after_first = len(harness.sink["enqueued"])
 
-    count = await sync_service.sync_source(source)  # 同 ETag 再同步
+    count = await sync_service.sync_source(source, "default")  # 同 ETag 再同步
 
     assert count == 0
     # DoD（WU-M-14）：二次同步未变更页面 last_sync_count == 0
@@ -229,12 +236,12 @@ async def test_content_change_builds_version_chain(harness: Harness):
     source = _web_source()
     harness.discover_result = [URL_A]
     harness.fetch_map = {URL_A: _page(URL_A, "<p>v1</p>", '"e1"')}
-    await sync_service.sync_source(source)
+    await sync_service.sync_source(source, "default")
     old_doc = harness.docs()[0]
     old_gid = old_doc.doc_group_id
 
     harness.fetch_map = {URL_A: _page(URL_A, "<p>v2</p>", '"e2"')}
-    count = await sync_service.sync_source(source)
+    count = await sync_service.sync_source(source, "default")
 
     assert count == 1
     docs = harness.docs()
@@ -253,11 +260,11 @@ async def test_disappeared_page_soft_invalidated(harness: Harness):
     source = _web_source()
     harness.discover_result = [URL_A]
     harness.fetch_map = {URL_A: _page(URL_A, "<p>A</p>", '"e-a"')}
-    await sync_service.sync_source(source)
+    await sync_service.sync_source(source, "default")
     doc = harness.docs()[0]
 
     harness.discover_result = []  # 页面从站点消失
-    count = await sync_service.sync_source(source)
+    count = await sync_service.sync_source(source, "default")
 
     assert count == 0
     # 无 DELETE —— 只有 update 软失效（INV-M-09）
@@ -271,14 +278,14 @@ async def test_reappeared_page_revives_without_new_version(harness: Harness):
     source = _web_source()
     harness.discover_result = [URL_A]
     harness.fetch_map = {URL_A: _page(URL_A, "<p>A</p>", '"e-a"')}
-    await sync_service.sync_source(source)
+    await sync_service.sync_source(source, "default")
     doc = harness.docs()[0]
 
     harness.discover_result = []
-    await sync_service.sync_source(source)
+    await sync_service.sync_source(source, "default")
 
     harness.discover_result = [URL_A]  # 页面重现，内容未变
-    count = await sync_service.sync_source(source)
+    count = await sync_service.sync_source(source, "default")
 
     assert count == 0  # 复活不建新版本
     revive = [p for p in harness.sink["updates"] if doc.id in p.values() and p.get("is_latest") is True]
@@ -292,7 +299,7 @@ async def test_web_auth_error_records_last_error(harness: Harness):
     source = _web_source()
     harness.probe_error = WebAuthError("入口页鉴权失败（HTTP 401）")
 
-    count = await sync_service.sync_source(source)
+    count = await sync_service.sync_source(source, "default")
 
     assert count == 0
     assert "WebAuthError" in (source.last_error or "")
@@ -304,11 +311,11 @@ async def test_fetch_failure_not_treated_as_gone(harness: Harness):
     source = _web_source()
     harness.discover_result = [URL_A]
     harness.fetch_map = {URL_A: _page(URL_A, "<p>A</p>", '"e-a"')}
-    await sync_service.sync_source(source)
+    await sync_service.sync_source(source, "default")
     updates_before = len(harness.sink["updates"])
 
     harness.fetch_map = {URL_A: WebFetchError("页面抓取失败（HTTP 500）")}
-    count = await sync_service.sync_source(source)
+    count = await sync_service.sync_source(source, "default")
 
     assert count == 0
     assert len(harness.sink["updates"]) == updates_before  # 无任何翻转（不误判消失）
@@ -323,12 +330,12 @@ async def test_truncated_discovery_skips_retirement(harness: Harness, monkeypatc
         URL_A: _page(URL_A, "<p>A</p>", '"e-a"'),
         URL_B: _page(URL_B, "<p>B</p>", '"e-b"'),
     }
-    await sync_service.sync_source(source)
+    await sync_service.sync_source(source, "default")
 
     # 截断轮：max_pages=1，只有 A 被发现，B 其实还在站上
     settings = sync_service.get_settings()
     monkeypatch.setattr(settings, "web_max_pages_per_sync", 1)
     harness.discover_result = [URL_A]
-    await sync_service.sync_source(source)
+    await sync_service.sync_source(source, "default")
 
     assert source.synced_files[URL_B]["gone"] is False  # 截断轮不判消失

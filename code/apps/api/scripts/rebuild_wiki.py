@@ -36,6 +36,7 @@ from app.config.settings import get_settings
 from app.config.wiki_profile import current_wiki_profile
 from app.database import SessionLocal
 from app.models import Document
+from app.services.db_scope import locate_row_db_key
 from app.services.wiki.build import WikiBuildSkip
 from app.workers.graph_job import build_and_store
 
@@ -103,8 +104,16 @@ async def _run(args: argparse.Namespace) -> int:
 
     ok = skipped = failed = 0
     for index, (document_id, filename) in enumerate(rows, start=1):
+        # 库位解析：关闭态零 SQL 直接 default；开启态按主键顺序探测。
+        # 本脚本的选取查询只读默认库，绑定库文档不在本轮范围（与 backfill_graph 同）。
+        async with SessionLocal() as session:
+            db_key = await locate_row_db_key(session, Document, document_id)
+        if db_key is None:
+            print(f"[{index}/{len(rows)}] FAIL {filename}: 不在任何库位")
+            failed += 1
+            continue
         try:
-            result = await build_and_store(document_id)
+            result = await build_and_store(document_id, db_key)
         except WikiBuildSkip:
             result = "skipped"
         except Exception as exc:  # 脚本视角：一篇失败不拖垮整批（与 backfill_graph 同款）

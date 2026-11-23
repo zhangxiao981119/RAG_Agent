@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import inspect
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -179,6 +180,11 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
         # 不能写成 async 函数 —— 那会返回 coroutine，async with 直接炸
         return FakeSession(h)
 
+    @asynccontextmanager
+    async def _job_session(db_key: str):  # noqa: ARG001
+        # worker 数据面入口：db_key 由队列负载透传（本文件只关心会话替身）
+        yield FakeSession(h)
+
     async def _pool():
         return FakePool(h)
 
@@ -189,6 +195,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
         return "审查提示词模板 {content}"
 
     monkeypatch.setattr(governance, "SessionLocal", _session)
+    monkeypatch.setattr(governance, "open_job_session", _job_session)
     monkeypatch.setattr(governance, "get_arq_pool", _pool)
     monkeypatch.setattr(governance, "get_llm_service", _llm)
     monkeypatch.setattr(governance, "resolve_prompt", _resolve)
@@ -246,7 +253,7 @@ async def test_review_success(harness: Harness) -> None:
     harness.put(doc)
     harness.select_rows.append([("制度正文", "费用报销"), ("附则", None)])
 
-    report = await governance.review_document(doc.id, doc.tenant_id)
+    report = await governance.review_document(doc.id, doc.tenant_id, "default")
 
     # 四维分数落库（INV-M-11：只写治理字段）
     assert doc.freshness_score == 90
@@ -274,7 +281,7 @@ async def test_review_empty_content_short_circuits_llm(harness: Harness) -> None
     harness.put(doc)
     harness.select_rows.append([])  # 无 chunk
 
-    report = await governance.review_document(doc.id, doc.tenant_id)
+    report = await governance.review_document(doc.id, doc.tenant_id, "default")
 
     assert harness.llm_calls == []  # 代码短路，不调 LLM
     for dim in ("authority", "consistency", "completeness"):
@@ -290,7 +297,7 @@ async def test_review_bad_llm_output_leaves_fields_clean(harness: Harness) -> No
     harness.llm_output = "抱歉，我无法输出 JSON"
 
     with pytest.raises(governance.GovernanceError):
-        await governance.review_document(doc.id, doc.tenant_id)
+        await governance.review_document(doc.id, doc.tenant_id, "default")
 
     # 治理字段不被污染（异常发生在落库前）
     assert doc.governance_status == "running"
@@ -306,7 +313,7 @@ async def test_review_llm_missing_dim_rejected(harness: Harness) -> None:
     harness.llm_output = '{"authority": {"score": 80, "basis": "x"}}'  # 缺两个维度
 
     with pytest.raises(governance.GovernanceError, match="consistency"):
-        await governance.review_document(doc.id, doc.tenant_id)
+        await governance.review_document(doc.id, doc.tenant_id, "default")
 
 
 # ── 7~9. 任务语义 ─────────────────────────────────────────
@@ -321,7 +328,7 @@ async def test_execute_job_retry_exhausted_degrades(harness: Harness) -> None:
     harness.select_rows.append([("正文", None)])
     harness.llm_output = governance.GovernanceError("LLM 不可用")
 
-    result = await governance.execute_governance_job({}, str(job.id))
+    result = await governance.execute_governance_job({}, str(job.id), None, "default")
 
     assert result == "dead"
     assert job.status == "dead"
@@ -336,7 +343,7 @@ async def test_execute_job_idempotent_when_done(harness: Harness) -> None:
     job = _job(doc)
     harness.put(doc, job)
 
-    result = await governance.execute_governance_job({}, str(job.id))
+    result = await governance.execute_governance_job({}, str(job.id), None, "default")
 
     assert result == "succeeded"
     assert job.status == "succeeded"
@@ -356,10 +363,12 @@ async def test_scan_enqueues_pending_docs(harness: Harness) -> None:
     job = harness.added[0]
     assert isinstance(job, GovernanceJob)
     assert job.document_id == doc.id
-    # 入队参数与 flush 后的 job.id 一致（第 3 位是透传的 trace_id），且 enqueue 先于 commit（无 zombie）
+    # 入队参数与 flush 后的 job.id 一致（第 2 位 trace_id、第 3 位库位键），
+    # 且 enqueue 先于 commit（无 zombie）
     args, kwargs = harness.enqueued[0]
     assert args[:2] == ("execute_governance_job", str(job.id))
-    assert len(args) == 3
+    assert len(args) == 4
+    assert args[3] == "default"
     # 队列名必须与 WorkerSettings.queue_name 同源，否则任务进默认队列无人消费
     assert kwargs == {"_queue_name": "arq:parse"}
     assert harness.events.index("enqueue") < harness.events.index("commit")

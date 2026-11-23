@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import uuid
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -76,6 +77,13 @@ def _args() -> argparse.Namespace:
 def _install(monkeypatch, documents: dict, rows: list[tuple]) -> None:
     monkeypatch.setattr(bg, "SessionLocal", lambda: _FakeSession(documents, rows))
 
+    @asynccontextmanager
+    async def _job_session(_db_key: str):  # noqa: ARG001
+        # worker 数据面入口：脚本按主键定位库位后透传 db_key
+        yield _FakeSession(documents, rows)
+
+    monkeypatch.setattr(bg, "open_job_session", _job_session)
+
 
 @pytest.mark.asyncio
 async def test_skip_is_recorded_as_skipped_not_failed(env, monkeypatch, capsys):
@@ -83,7 +91,7 @@ async def test_skip_is_recorded_as_skipped_not_failed(env, monkeypatch, capsys):
     documents = {doc_id: _FakeDocument("pending")}
     _install(monkeypatch, documents, [(doc_id, "empty.pdf")])
 
-    async def _raise_skip(_document_id):
+    async def _raise_skip(_document_id, _db_key):
         raise GraphExtractSkip("文档无已索引分片（内容为空或尚未解析）")
 
     monkeypatch.setattr(bg, "extract_and_store", _raise_skip)
@@ -106,7 +114,7 @@ async def test_real_failure_still_recorded_as_failed(env, monkeypatch, capsys):
     documents = {doc_id: _FakeDocument("pending")}
     _install(monkeypatch, documents, [(doc_id, "broken.pdf")])
 
-    async def _raise_error(_document_id):
+    async def _raise_error(_document_id, _db_key):
         raise RuntimeError("LLM 输出非法 JSON")
 
     monkeypatch.setattr(bg, "extract_and_store", _raise_error)
@@ -125,7 +133,7 @@ async def test_success_is_recorded_as_done(env, monkeypatch, capsys):
     documents = {doc_id: _FakeDocument("pending")}
     _install(monkeypatch, documents, [(doc_id, "ok.pdf")])
 
-    async def _ok(_document_id):
+    async def _ok(_document_id, _db_key):
         return "succeeded"
 
     monkeypatch.setattr(bg, "extract_and_store", _ok)

@@ -13,8 +13,6 @@ MUST NOT 改生产代码；本文件只测纯函数，不触 DB。每个用例�
 """
 from __future__ import annotations
 
-import pytest
-
 from app.config import decisions
 from app.config.settings import get_settings
 from app.services.retrieve import _graph_should_recall

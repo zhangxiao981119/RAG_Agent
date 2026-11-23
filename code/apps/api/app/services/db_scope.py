@@ -1,4 +1,4 @@
-"""请求层数据面入口（Step 6 S6-3/S6-4）：控制面解析库位 → 数据面执行。
+"""请求层 / worker 数据面入口（Step 6 S6-3/S6-4）：控制面解析库位 → 数据面执行。
 
 两条纪律，缺一不可：
 
@@ -29,20 +29,26 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import get_settings
-from app.infra.db_router import DEFAULT_DB_KEY, data_session
+from app.infra.db_router import DEFAULT_DB_KEY, data_session, registered_db_keys
 
 # 一次请求跨多个库位（本期不支持跨库检索/跨库写入）
 DB_SCOPE_MULTI_KEY: Final[str] = "DB_SCOPE_MULTI_KEY"
-# 按 ID 探测命中多个库（D-S6-3-2 顺序探测的预留码，本步骤不实现探测）
+# 按 ID 顺序探测时同一主键命中多个库位（D-S6-3-2）
 DB_SCOPE_AMBIGUOUS: Final[str] = "DB_SCOPE_AMBIGUOUS"
+# worker 收到的队列负载缺少 db_key（D-S6-3-1）
+JOB_DB_KEY_MISSING: Final[str] = "JOB_DB_KEY_MISSING"
 
 __all__ = [
     "DB_SCOPE_MULTI_KEY",
     "DB_SCOPE_AMBIGUOUS",
+    "JOB_DB_KEY_MISSING",
     "DbScopeError",
     "resolve_kb_db_key",
     "map_kb_db_keys",
     "open_data_session",
+    "open_job_session",
+    "require_job_db_key",
+    "locate_row_db_key",
 ]
 
 
@@ -168,3 +174,59 @@ async def open_data_session(
     await control_session.commit()
     async with data_session(db_key) as session:
         yield session
+
+
+def require_job_db_key(db_key: str | None) -> str:
+    """worker 侧库位键校验：缺失/非字符串即显式失败（禁止回落默认库）。"""
+    if not isinstance(db_key, str) or not db_key:
+        raise DbScopeError(JOB_DB_KEY_MISSING, {"db_key": repr(db_key)})
+    return db_key
+
+
+@asynccontextmanager
+async def open_job_session(db_key: str) -> AsyncIterator[AsyncSession]:
+    """按队列负载携带的 db_key 打开数据面会话（worker 唯一的数据面入口）。
+
+    - worker 没有控制面会话可复用，因此 `"default"` 也走 `data_session`；
+    - db_key 缺失/非法直接抛 `DbScopeError(JOB_DB_KEY_MISSING)` —— 不回落默认库，
+      否则会在错误库位写出"成功"的假象数据。
+    """
+    key = require_job_db_key(db_key)
+    async with data_session(key) as session:
+        yield session
+
+
+async def locate_row_db_key(
+    control_session: AsyncSession,
+    model: type,
+    pk: object,
+) -> str | None:
+    """按主键定位一行在哪个库位（D-S6-3-2 顺序探测）。
+
+    - 关闭态：直接返回 `"default"`，零 SQL（分库关闭时所有行都在默认库）；
+    - 开启态：先查控制库（默认库），命中即 `"default"`；否则按
+      `registered_db_keys()` 的顺序逐个数据面探测。0 命中 → None（调用方 404）；
+      1 命中 → 该键；≥2 命中 → `DbScopeError(DB_SCOPE_AMBIGUOUS)`（同一主键
+      出现在两个库，无法判定，不替调用方挑一个）。
+    """
+    if not get_settings().scene_db_split_enabled:
+        return DEFAULT_DB_KEY
+    if await control_session.get(model, pk) is not None:
+        return DEFAULT_DB_KEY
+
+    hits: list[str] = []
+    for db_key in registered_db_keys():
+        if db_key == DEFAULT_DB_KEY:
+            continue
+        async with open_job_session(db_key) as session:
+            if await session.get(model, pk) is not None:
+                hits.append(db_key)
+
+    if not hits:
+        return None
+    if len(hits) > 1:
+        raise DbScopeError(
+            DB_SCOPE_AMBIGUOUS,
+            {"model": model.__name__, "pk": str(pk), "db_keys": hits},
+        )
+    return hits[0]

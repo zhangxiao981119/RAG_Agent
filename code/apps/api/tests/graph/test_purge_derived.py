@@ -211,21 +211,28 @@ def test_purge_runs_before_chunk_delete_in_same_transaction(func_name, docstring
         "否则提及已被级联删除，孤儿实体与 doc_freq 再也算不出来"
     )
 
-    # 两者都必须位于某个 `async with SessionLocal() as session:` 块内（同事务）。
-    # 判据：找最近的 AsyncWith 祖先，其上下文表达式是 SessionLocal()。
-    def _inside_session_local(target_line: int) -> bool:
+    # 两者都必须位于同一个数据面会话块内（同事务）：步 6 起 worker 数据面入口
+    # 从 SessionLocal 换成 open_job_session(db_key)，语义不变（同一事务）。
+    # 判据：找最近的 AsyncWith 祖先，其上下文表达式是 SessionLocal() 或
+    # open_job_session(...)。
+    def _inside_session_block(target_line: int) -> bool:
         for node in ast.walk(function):
             if isinstance(node, ast.AsyncWith) and node.lineno <= target_line <= getattr(
                 node, "end_lineno", node.lineno
             ):
                 for item in node.items:
                     expr = item.context_expr
-                    if isinstance(expr, ast.Call) and getattr(expr.func, "id", "") == "SessionLocal":
+                    if not isinstance(expr, ast.Call):
+                        continue
+                    callee = expr.func
+                    if getattr(callee, "id", "") == "SessionLocal":
+                        return True
+                    if getattr(callee, "id", "") == "open_job_session":
                         return True
         return False
 
-    assert _inside_session_local(purge_line), (
-        f"{func_name}：purge_derived 不在 SessionLocal 事务块内 —— "
+    assert _inside_session_block(purge_line), (
+        f"{func_name}：purge_derived 不在数据面会话事务块内 —— "
         "清理与 chunks 写入分属两个事务会让「chunks 已换、图数据还是旧的」成为可能"
     )
-    assert _inside_session_local(delete_line), f"{func_name}：DELETE chunks 不在 SessionLocal 事务块内"
+    assert _inside_session_block(delete_line), f"{func_name}：DELETE chunks 不在数据面会话事务块内"

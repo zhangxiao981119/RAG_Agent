@@ -32,7 +32,9 @@ from app.config.settings import get_settings
 from app.database import SessionLocal
 from app.infra import metrics, trace
 from app.infra.arq_pool import get_arq_pool
+from app.infra.db_router import DEFAULT_DB_KEY
 from app.models import Chunk, Document, GovernanceJob
+from app.services.db_scope import open_job_session, require_job_db_key
 from app.services.llm import get_llm_service
 from app.services.prompt_registry import resolve_prompt
 
@@ -123,16 +125,19 @@ def _normalize_llm_scores(parsed: dict) -> dict[str, dict[str, Any]]:
     return dims
 
 
-async def review_document(document_id: uuid.UUID, tenant_id: uuid.UUID) -> dict:
+async def review_document(
+    document_id: uuid.UUID, tenant_id: uuid.UUID, db_key: str
+) -> dict:
     """对单文档执行四维审查并落库，返回 governance_report。
 
     分两段 session：读文档/chunks（提取标量）→ 审查 → 写治理字段。
     审查文本从 chunks 拼接（带 heading_path 前缀），超出上限截断。
+    ★ documents / chunks 是数据面表，按调用方透传的 db_key 开会话。
     """
     now = datetime.now(timezone.utc)
 
     # ── 第一段：读文档与 chunks（提取标量，session 外使用）──
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         doc = await session.get(Document, document_id)
         if doc is None:
             raise GovernanceError("document not found")
@@ -184,7 +189,7 @@ async def review_document(document_id: uuid.UUID, tenant_id: uuid.UUID) -> dict:
     }
 
     # ── 第二段：写治理字段（INV-M-11：只写治理列，不改原文）──
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         doc = await session.get(Document, document_id)
         if doc is None:
             raise GovernanceError("document not found")
@@ -242,8 +247,10 @@ async def scan_and_enqueue(ctx: dict[str, Any]) -> int:
 
         pool = await get_arq_pool()
         for job in jobs:
+            # 扫描查询本身走 SessionLocal（默认库），行即来自默认库 ——
+            # 绑定库文档的治理扫描不在本步骤范围，库位键如实传 default。
             await pool.enqueue_job(
-                "execute_governance_job", str(job.id), trace.get_trace_id(),
+                "execute_governance_job", str(job.id), trace.get_trace_id(), DEFAULT_DB_KEY,
                 # 队列名必须与 WorkerSettings.queue_name 同源（arq 默认队列是 arq:queue）
                 _queue_name=get_settings().arq_queue_name,
             )
@@ -255,19 +262,25 @@ async def scan_and_enqueue(ctx: dict[str, Any]) -> int:
 
 
 async def execute_governance_job(
-    ctx: dict[str, Any], job_id: str, trace_id: str | None = None
+    ctx: dict[str, Any],
+    job_id: str,
+    trace_id: str | None = None,
+    db_key: str | None = None,
 ) -> str:
-    """arq 任务入口。job_id 是 governance_jobs.id 字符串；trace_id 由入队方透传。
+    """arq 任务入口。job_id 是 governance_jobs.id 字符串；trace_id / db_key 由入队方透传。
 
     分三段 session：锁任务 → 审查（网络调用，无 session）→ 写完成状态。
     失败重试 max_attempts 次后进死信（status=dead），文档治理状态置 failed
     （降级为「未审查」——INV-M-12：知识仍按基础分可检索）。
+    ★ documents / governance_jobs / chunks 是数据面表，按 db_key 开会话；
+      db_key 缺失 → JOB_DB_KEY_MISSING。
     """
     trace.set_trace_id(trace_id or trace.new_trace_id())
+    db_key = require_job_db_key(db_key)
     gov_job_id = uuid.UUID(job_id)
 
     # ── 第一段：锁任务 + 置 running ───────────────────────
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         job = await session.get(GovernanceJob, gov_job_id)
         if job is None:
             logger.warning("governance_job not found: %s", job_id)
@@ -299,10 +312,10 @@ async def execute_governance_job(
 
     # ── 第二段：审查（无 session，LLM 调用可能十几秒）──────
     try:
-        await review_document(document_id, tenant_id)
+        await review_document(document_id, tenant_id, db_key)
     except Exception as exc:
         # 审查异常 —— 开新 session 写回失败状态 + 重试计数
-        async with SessionLocal() as fail_session:
+        async with open_job_session(db_key) as fail_session:
             retry_job = await fail_session.get(GovernanceJob, gov_job_id)
             if retry_job is None:
                 raise
@@ -321,7 +334,7 @@ async def execute_governance_job(
             raise Retry(defer=2 ** retry_job.attempts) from exc
 
     # ── 第三段：任务完成 ─────────────────────────────────
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         job = await session.get(GovernanceJob, gov_job_id)
         job.status = "succeeded"
         job.finished_at = datetime.now(timezone.utc)

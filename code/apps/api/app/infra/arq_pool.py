@@ -21,7 +21,8 @@
 from app.infra.arq_pool import get_arq_pool
 
 pool = await get_arq_pool()
-await pool.enqueue_job("run_parse_segment", str(job_id), 0)
+# 位置参数顺序必须与 worker 入口签名一致；db_key 决定 worker 写哪个库
+await pool.enqueue_job("run_parse_segment", str(job_id), 0, trace_id, db_key)
 ```
 
 > ★ **调用方 MUST NOT 调用 `close()`。**

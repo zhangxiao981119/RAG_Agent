@@ -26,10 +26,10 @@ from arq import Retry
 
 from app.config.graph_profile import current_graph_profile
 from app.config.settings import get_settings
-from app.database import SessionLocal
 from app.infra import metrics, trace
 from app.infra.arq_pool import get_arq_pool
 from app.models import Document
+from app.services.db_scope import open_job_session, require_job_db_key
 from app.services.graph.extract import (
     GraphExtractError,
     GraphExtractSkip,
@@ -46,13 +46,14 @@ def _now() -> datetime:
 
 
 async def enqueue_graph_extract(
-    document_id: uuid.UUID | str, trace_id: str | None = None
+    document_id: uuid.UUID | str, db_key: str, trace_id: str | None = None
 ) -> bool:
     """把一篇文档的图抽取入队。返回是否真的入队（关闭能力时返回 False）。
 
     ★ 为什么入队失败**不能**让解析任务失败：文档已经 indexed 且可检索，
       图只是附加能力。入队失败打点 + 告警，由补建脚本兜底
       （graph_status 仍是 'pending' → backfill_graph 会选中它）。
+    ★ 队列负载 MUST 携带 db_key：worker 在哪个库读文档/写图数据由它决定。
     """
     if not get_settings().graph_enabled:
         return False
@@ -62,6 +63,7 @@ async def enqueue_graph_extract(
             "run_graph_extract",
             str(document_id),
             trace_id or trace.get_trace_id(),
+            db_key,
             _queue_name=get_settings().arq_queue_name,
         )
         return True
@@ -75,7 +77,7 @@ async def enqueue_graph_extract(
         return False
 
 
-async def extract_and_store(document_id: uuid.UUID) -> str:
+async def extract_and_store(document_id: uuid.UUID, db_key: str) -> str:
     """抽取一篇文档并落库（**不含**状态机与重试口径）。返回 'succeeded' / 'dead'。
 
     单独抽出来的理由：arq 任务与补建脚本 MUST 走同一条写入路径。
@@ -85,7 +87,7 @@ async def extract_and_store(document_id: uuid.UUID) -> str:
     ★ 本函数不处理 graph_status='running' 的前置写入与失败置 failed —— 那是调用方的
       状态机职责（arq 有重试语义，脚本是一次性执行）。
     """
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         if await session.get(Document, document_id) is None:
             logger.warning(
                 "graph extract: document not found", extra={"document_id": str(document_id)}
@@ -95,7 +97,7 @@ async def extract_and_store(document_id: uuid.UUID) -> str:
 
     # 同一事务写三表 + 文档状态：状态先变 done 而数据没写进去 = 图永久为空
     # 且补建脚本不再选中它（最坏的一种「静默」）。
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         document = await session.get(Document, document_id)
         if document is None:
             logger.warning(
@@ -135,7 +137,10 @@ async def extract_and_store(document_id: uuid.UUID) -> str:
 
 
 async def run_graph_extract(
-    ctx: dict[str, Any], document_id: str, trace_id: str | None = None
+    ctx: dict[str, Any],
+    document_id: str,
+    trace_id: str | None = None,
+    db_key: str | None = None,
 ) -> str:
     """arq 任务入口。document_id 是 documents.id 字符串。"""
     # ★ 关闭能力时**一行代码都不执行**（连 session 都不开）：
@@ -144,12 +149,13 @@ async def run_graph_extract(
         return "disabled"
 
     trace.set_trace_id(trace_id or trace.new_trace_id())
+    db_key = require_job_db_key(db_key)
     doc_id = uuid.UUID(document_id)
     profile = current_graph_profile()
     settings = get_settings()
 
     # ── 第一段：锁状态 + 幂等短路 ─────────────────────────
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         document = await session.get(Document, doc_id)
         if document is None:
             logger.warning("graph extract: document not found", extra={"document_id": document_id})
@@ -166,10 +172,10 @@ async def run_graph_extract(
 
     # ── 第二段：抽取 + 落库（LLM 调用期间不持 session）────
     try:
-        return await extract_and_store(doc_id)
+        return await extract_and_store(doc_id, db_key)
     except GraphExtractSkip as exc:
         # 明确跳过：重试无意义（内容为空 / 超护栏），且必须可见（不能静默当 done）
-        async with SessionLocal() as session:
+        async with open_job_session(db_key) as session:
             document = await session.get(Document, doc_id)
             if document is not None:
                 document.graph_status = "skipped"
@@ -181,7 +187,7 @@ async def run_graph_extract(
         )
         return "skipped"
     except Exception as exc:
-        return await _mark_failed(doc_id, document_id, exc, ctx, settings)
+        return await _mark_failed(doc_id, document_id, exc, ctx, settings, db_key)
 
 
 async def _mark_failed(
@@ -190,13 +196,14 @@ async def _mark_failed(
     exc: BaseException,
     ctx: dict[str, Any],
     settings: Any,
+    db_key: str,
 ) -> str:
     """失败处理：置 documents.graph_status='failed'，未用尽重试则抛 Retry。
 
     ★ 「置 failed」与「抛 Retry」顺序不能反：抛 Retry 后本次运行就结束了，
       状态若还停在 running，看板上会永远显示「抽取中」（卡死的假象）。
     """
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         document = await session.get(Document, doc_id)
         if document is not None:
             document.graph_status = "failed"
@@ -226,7 +233,7 @@ async def _mark_failed(
 
 
 async def enqueue_wiki_build(
-    document_id: uuid.UUID | str, trace_id: str | None = None
+    document_id: uuid.UUID | str, db_key: str, trace_id: str | None = None
 ) -> bool:
     """把一篇文档的 wiki 页生成入队。返回是否真的入队（关闭能力时返回 False）。
 
@@ -245,6 +252,7 @@ async def enqueue_wiki_build(
             "run_wiki_build",
             str(document_id),
             trace_id or trace.get_trace_id(),
+            db_key,
             _queue_name=get_settings().arq_queue_name,
         )
         return True
@@ -258,7 +266,7 @@ async def enqueue_wiki_build(
         return False
 
 
-async def build_and_store(document_id: uuid.UUID) -> str:
+async def build_and_store(document_id: uuid.UUID, db_key: str) -> str:
     """生成一篇文档的 wiki 页并落库（**不含**幂等判定与重试口径）。
 
     单独抽出来的理由与 extract_and_store 相同：arq 任务与 rebuild_wiki 脚本
@@ -275,7 +283,7 @@ async def build_and_store(document_id: uuid.UUID) -> str:
     )
 
     # ① 读输入 + 幂等判定（§9.4：四元组相同 → 跳过，不调 LLM）
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         document = await session.get(Document, document_id)
         if document is None:
             logger.warning(
@@ -300,13 +308,13 @@ async def build_and_store(document_id: uuid.UUID) -> str:
     except WikiBuildError:
         # 失败留痕（status='failed'）：rebuild_wiki --stale-only 与管理端统计
         # 由此看见「生成了但没成」；已有 ready 页不动（旧页仍真实，优于清零）
-        async with SessionLocal() as session:
+        async with open_job_session(db_key) as session:
             await record_failed_page(session, document_id=document_id,
                                      content_hash=wiki_input.content_hash)
         raise
 
     # ③ 落页：DELETE 旧页 + INSERT 新页，同一事务
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         document = await session.get(Document, document_id)
         if document is None:
             logger.warning(
@@ -332,7 +340,10 @@ async def build_and_store(document_id: uuid.UUID) -> str:
 
 
 async def run_wiki_build(
-    ctx: dict[str, Any], document_id: str, trace_id: str | None = None
+    ctx: dict[str, Any],
+    document_id: str,
+    trace_id: str | None = None,
+    db_key: str | None = None,
 ) -> str:
     """arq 任务入口。document_id 是 documents.id 字符串。
 
@@ -340,16 +351,18 @@ async def run_wiki_build(
       关闭态必须与未引入本能力时逐字节等价。
     ★ 重试语义与图抽取对齐：LLM 瞬时失败按 arq 重试（只重试生成本身，
       文档已 indexed，与解析解耦）；无分片（skip）重试无意义，直接返回。
+    ★ db_key 缺失 → JOB_DB_KEY_MISSING（禁止回落默认库写数据）。
     """
     if not get_settings().wiki_enabled:
         return "disabled"
 
     trace.set_trace_id(trace_id or trace.new_trace_id())
+    db_key = require_job_db_key(db_key)
     doc_id = uuid.UUID(document_id)
     settings = get_settings()
 
     try:
-        return await build_and_store(doc_id)
+        return await build_and_store(doc_id, db_key)
     except WikiBuildSkip as exc:
         metrics.incr("wiki.build.skipped")
         logger.warning(

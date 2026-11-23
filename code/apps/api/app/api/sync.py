@@ -22,6 +22,7 @@ from app.models import KnowledgeBase, SyncSource
 from app.schemas.sync import SyncSourceCreate, SyncSourceOut, SyncSourceUpdate, SyncResult
 from app.services import audit
 from app.services.crypto import encrypt_credential
+from app.services.db_scope import DbScopeError, resolve_kb_db_key
 
 router = APIRouter(tags=["sync-sources"])
 
@@ -212,10 +213,22 @@ async def trigger_sync(
     if source is None or source.tenant_id != user.tenant_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
 
+    # 库位由已认证上下文（源所属 kb）解析：多库位 → 409，不替调用方挑库
+    try:
+        db_key = await resolve_kb_db_key(session, user.tenant_id, [source.kb_id])
+    except DbScopeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "KB_SCOPE_CONFLICT: 无法确定同步写入库位"
+                f"（code={exc.code}, detail={exc.detail}）"
+            ),
+        ) from exc
+
     settings = get_settings()
-    # 透传 trace_id，让 worker 日志与本次触发请求同链
+    # 透传 trace_id，让 worker 日志与本次触发请求同链；db_key 决定 worker 写哪个库
     await request.app.state.arq_pool.enqueue_job(
-        "run_sync_source", str(source_id), trace.get_trace_id(),
+        "run_sync_source", str(source_id), trace.get_trace_id(), db_key,
         _queue_name=settings.arq_queue_name,
     )
 

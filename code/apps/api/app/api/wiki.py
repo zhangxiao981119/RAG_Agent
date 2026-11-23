@@ -20,7 +20,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config.settings import get_settings
-from app.services.db_scope import open_data_session, resolve_kb_db_key
+from app.models import WikiPage
+from app.services.db_scope import (
+    DbScopeError,
+    locate_row_db_key,
+    open_data_session,
+    resolve_kb_db_key,
+)
 
 router = APIRouter(tags=["wiki"])
 
@@ -178,32 +184,44 @@ async def get_wiki_page(
     else:
         kb_ids = list(user.authorized_kb_ids)
 
-    row = (
-        await session.execute(
-            text(_PAGE_VISIBLE_SQL.format(where_base=_WHERE_BASE)),
-            {
-                "page_id": page_id,
-                "tenant_id": user.tenant_id,
-                "clearance": user.clearance,
-                "authorized_kb_ids": kb_ids,
-                "user_subjects": user.subjects,
-            },
-        )
-    ).first()
+    # 两段式（S6-3 / D-S6-3-2）：先按 page_id 顺序探测库位（关闭态零 SQL），
+    # 再在数据面会话执行 wiki_pages / chunks 的可见性查询；控制面表留在控制会话。
+    try:
+        db_key = await locate_row_db_key(session, WikiPage, page_id)
+    except DbScopeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"DB_SCOPE_AMBIGUOUS: {exc.detail}",
+        ) from exc
     # 404 三合一：不做「页在但你没权」与「页不在」的区分（§9.6 ③）
-    if row is None:
+    if db_key is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
 
-    return WikiPageDetail(
-        id=row.id,
-        document_id=row.document_id,
-        title=row.title,
-        summary=row.summary,
-        sections=list(row.sections or []),
-        key_terms=list(row.key_terms or []),
-        caliber={
-            "generator_model": row.generator_model,
-            "prompt_version": row.prompt_version,
-        },
-        disclaimer=WIKI_PAGE_DISCLAIMER,
-    )
+    async with open_data_session(session, db_key) as data_plane:
+        row = (
+            await data_plane.execute(
+                text(_PAGE_VISIBLE_SQL.format(where_base=_WHERE_BASE)),
+                {
+                    "page_id": page_id,
+                    "tenant_id": user.tenant_id,
+                    "clearance": user.clearance,
+                    "authorized_kb_ids": kb_ids,
+                    "user_subjects": user.subjects,
+                },
+            )
+        ).first()
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+        return WikiPageDetail(
+            id=row.id,
+            document_id=row.document_id,
+            title=row.title,
+            summary=row.summary,
+            sections=list(row.sections or []),
+            key_terms=list(row.key_terms or []),
+            caliber={
+                "generator_model": row.generator_model,
+                "prompt_version": row.prompt_version,
+            },
+            disclaimer=WIKI_PAGE_DISCLAIMER,
+        )

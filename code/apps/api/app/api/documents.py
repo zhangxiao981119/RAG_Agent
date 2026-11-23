@@ -25,6 +25,11 @@ from app.schemas.documents import (
 )
 # 预览提取服务（所有上传格式统一转纯文本）
 from app.services import audit
+from app.services.db_scope import (
+    DbScopeError,
+    locate_row_db_key,
+    open_data_session,
+)
 from app.services.parse.image_parser import IMAGE_EXTS
 from app.services.preview import PreviewError, extract_preview_text
 from app.services.storage import get_storage
@@ -138,27 +143,58 @@ async def _doc_provenance(
     }
 
 
+async def _locate_doc_db_key(session: AsyncSession, doc_id: uuid.UUID) -> str:
+    """按 ID 定位文档库位：0 命中 → 404；≥2 命中 → 500（DB_SCOPE_AMBIGUOUS）。
+
+    关闭态下 `locate_row_db_key` 直接返回 "default"（零 SQL），行为与接线前等价。
+    """
+    try:
+        db_key = await locate_row_db_key(session, Document, doc_id)
+    except DbScopeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"DB_SCOPE_AMBIGUOUS: {exc.detail}",
+        ) from exc
+    if db_key is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+    return db_key
+
+
 @router.get("/documents/{doc_id}", response_model=DocumentDetail)
 async def get_document(
     doc_id: uuid.UUID,
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> DocumentDetail:
-    doc = await _get_visible_document(doc_id, user, session)
+    db_key = await _locate_doc_db_key(session, doc_id)
 
-    # chunk 预览（前 20 条）—— P-a：chunk 级 G1/G3/G4 过滤（admin 豁免），
-    # 只回有权片段；is_latest 限定最新版本
-    stmt = (
-        select(Chunk)
-        .where(
-            Chunk.document_id == doc_id,
-            Chunk.is_latest.is_(True),
-            *_chunk_gate(user),
+    # 数据面：文档 + chunk 预览（前 20 条）—— P-a：chunk 级 G1/G3/G4 过滤
+    # （admin 豁免），只回有权片段；is_latest 限定最新版本
+    async with open_data_session(session, db_key) as data_plane:
+        doc = await _get_visible_document(doc_id, user, data_plane)
+        stmt = (
+            select(Chunk)
+            .where(
+                Chunk.document_id == doc_id,
+                Chunk.is_latest.is_(True),
+                *_chunk_gate(user),
+            )
+            .order_by(Chunk.chunk_index)
+            .limit(20)
         )
-        .order_by(Chunk.chunk_index)
-        .limit(20)
-    )
-    chunks = (await session.execute(stmt)).scalars().all()
+        chunks = (await data_plane.execute(stmt)).scalars().all()
+        previews = [
+            ChunkPreview(
+                id=c.id,
+                chunk_index=c.chunk_index,
+                content=c.content,
+                heading_path=c.heading_path,
+                page_no=c.page_no,
+                token_count=c.token_count,
+            )
+            for c in chunks
+        ]
+    # 控制面：溯源（knowledge_bases / users）在数据面会话之外
     provenance = await _doc_provenance(doc, user, session)
     return DocumentDetail(
         id=doc.id,
@@ -180,17 +216,7 @@ async def get_document(
         governance_report=doc.governance_report,
         effective_at=doc.effective_at,
         expire_at=doc.expire_at,
-        chunks=[
-            ChunkPreview(
-                id=c.id,
-                chunk_index=c.chunk_index,
-                content=c.content,
-                heading_path=c.heading_path,
-                page_no=c.page_no,
-                token_count=c.token_count,
-            )
-            for c in chunks
-        ],
+        chunks=previews,
     )
 
 
@@ -201,18 +227,20 @@ async def get_document_governance(
     session: AsyncSession = Depends(get_db),
 ) -> GovernanceDetail:
     """单文档四维审查结论（M7 REST 清单：可见该文档即可读）。"""
-    doc = await _get_visible_document(doc_id, user, session)
-    return GovernanceDetail(
-        document_id=doc.id,
-        governance_status=doc.governance_status,
-        freshness_score=doc.freshness_score,
-        authority_score=doc.authority_score,
-        consistency_score=doc.consistency_score,
-        completeness_score=doc.completeness_score,
-        governance_report=doc.governance_report,
-        effective_at=doc.effective_at,
-        expire_at=doc.expire_at,
-    )
+    db_key = await _locate_doc_db_key(session, doc_id)
+    async with open_data_session(session, db_key) as data_plane:
+        doc = await _get_visible_document(doc_id, user, data_plane)
+        return GovernanceDetail(
+            document_id=doc.id,
+            governance_status=doc.governance_status,
+            freshness_score=doc.freshness_score,
+            authority_score=doc.authority_score,
+            consistency_score=doc.consistency_score,
+            completeness_score=doc.completeness_score,
+            governance_report=doc.governance_report,
+            effective_at=doc.effective_at,
+            expire_at=doc.expire_at,
+        )
 
 
 @router.post(
@@ -234,36 +262,41 @@ async def rerun_document_governance(
     """
     if user.clearance < 40:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
-    doc = await _get_visible_document(doc_id, user, session)
-    if doc.status != "indexed":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="NOT_INDEXED: 文档尚未解析完成，无法审查",
-        )
-    if doc.governance_status in ("pending", "running"):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="REVIEW_IN_PROGRESS: 审查已排队或进行中",
-        )
+    db_key = await _locate_doc_db_key(session, doc_id)
+    async with open_data_session(session, db_key) as data_plane:
+        doc = await _get_visible_document(doc_id, user, data_plane)
+        if doc.status != "indexed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="NOT_INDEXED: 文档尚未解析完成，无法审查",
+            )
+        if doc.governance_status in ("pending", "running"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="REVIEW_IN_PROGRESS: 审查已排队或进行中",
+            )
 
-    doc.governance_status = "pending"
-    job = GovernanceJob(tenant_id=user.tenant_id, document_id=doc.id)
-    session.add(job)
-    await session.flush()
-    # 复用 app lifespan 建好的 arq 池（口径同 upload/sync 入队）
-    await request.app.state.arq_pool.enqueue_job(
-        "execute_governance_job", str(job.id), trace.get_trace_id(),
-        # 队列名必须与 WorkerSettings.queue_name 同源（arq 默认队列是 arq:queue）
-        _queue_name=get_settings().arq_queue_name,
-    )
-    await session.commit()
+        doc.governance_status = "pending"
+        job = GovernanceJob(tenant_id=user.tenant_id, document_id=doc.id)
+        data_plane.add(job)
+        await data_plane.flush()
+        # 复用 app lifespan 建好的 arq 池（口径同 upload/sync 入队）；
+        # 负载携带 db_key，worker 据此在正确库位执行
+        await request.app.state.arq_pool.enqueue_job(
+            "execute_governance_job", str(job.id), trace.get_trace_id(), db_key,
+            # 队列名必须与 WorkerSettings.queue_name 同源（arq 默认队列是 arq:queue）
+            _queue_name=get_settings().arq_queue_name,
+        )
+        result_doc_id, result_job_id, filename = doc.id, job.id, doc.filename
+        await data_plane.commit()
 
+    # 审计走独立会话（控制面），不在数据面会话内
     await audit.record(
         user.tenant_id, user.user_id, "governance.rerun",
-        object_type="document", object_id=str(doc_id),
-        detail={"job_id": str(job.id), "filename": doc.filename},
+        object_type="document", object_id=str(result_doc_id),
+        detail={"job_id": str(result_job_id), "filename": filename},
     )
-    return GovernanceRerunResponse(document_id=doc.id, job_id=job.id)
+    return GovernanceRerunResponse(document_id=result_doc_id, job_id=result_job_id)
 
 
 def _content_disposition(filename: str, disposition: str = "inline") -> str:
@@ -291,65 +324,67 @@ async def get_document_raw(
     ★ 响应只含对象字节 / 渲染结果，不出现 S3_ENDPOINT / 签名串 ——
       MinIO 直连地址与 presigned URL 一律不出网（INV-M-16 红线）。
     """
-    doc = await _get_visible_document(doc_id, user, session)
-    # P-b：整份原文（字节/逐页渲染/提取文本）需文档全可见 —— 任一片段
-    # 对用户不可见即拒绝，防止「引用可见片段 + 下载整份泄露无权片段」
-    await _ensure_doc_fully_visible(doc_id, user, session)
+    db_key = await _locate_doc_db_key(session, doc_id)
+    async with open_data_session(session, db_key) as data_plane:
+        doc = await _get_visible_document(doc_id, user, data_plane)
+        # P-b：整份原文（字节/逐页渲染/提取文本）需文档全可见 —— 任一片段
+        # 对用户不可见即拒绝，防止「引用可见片段 + 下载整份泄露无权片段」
+        await _ensure_doc_fully_visible(doc_id, user, data_plane)
 
-    # ── ① 图片：流式转发原始字节 ──────────────────────────────
-    if doc.ext.lower() in IMAGE_EXTS:
-        storage = await get_storage()
-        byte_stream, content_type = await storage.open_object(doc.storage_key)
-        return StreamingResponse(
-            byte_stream,
-            media_type=content_type,
-            headers={"Content-Disposition": _content_disposition(doc.filename)},
-        )
+        # ── ① 图片：流式转发原始字节 ──────────────────────────────
+        if doc.ext.lower() in IMAGE_EXTS:
+            storage = await get_storage()
+            byte_stream, content_type = await storage.open_object(doc.storage_key)
+            return StreamingResponse(
+                byte_stream,
+                media_type=content_type,
+                headers={"Content-Disposition": _content_disposition(doc.filename)},
+            )
 
-    # ── ② PDF 指定页：渲染该页 PNG（扫描件/文本层 PDF 同样支持逐页回链）──
-    if doc.ext.lower() == "pdf" and page is not None:
+        # ── ② PDF 指定页：渲染该页 PNG（扫描件/文本层 PDF 同样支持逐页回链）──
+        if doc.ext.lower() == "pdf" and page is not None:
+            storage = await get_storage()
+            data = await storage.get_object(doc.storage_key)
+            try:
+                import pymupdf
+
+                with pymupdf.open(stream=data, filetype="pdf") as pdf:
+                    if page > pdf.page_count:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="PAGE_OUT_OF_RANGE",
+                        )
+                    png = pdf[page - 1].get_pixmap(dpi=150).tobytes("png")
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                    detail=f"PDF 打开失败: {exc}",
+                ) from exc
+            return Response(
+                content=png,
+                media_type="image/png",
+                headers={
+                    "Content-Disposition": _content_disposition(doc.filename, "inline")
+                },
+            )
+
+        # ── ③ 文本系（及不带 page 的 PDF）：提取纯文本（列表预览现行行为）──
         storage = await get_storage()
         data = await storage.get_object(doc.storage_key)
         try:
-            import pymupdf
-
-            with pymupdf.open(stream=data, filetype="pdf") as pdf:
-                if page > pdf.page_count:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="PAGE_OUT_OF_RANGE",
-                    )
-                png = pdf[page - 1].get_pixmap(dpi=150).tobytes("png")
-        except HTTPException:
-            raise
-        except Exception as exc:
+            text = extract_preview_text(doc.ext, data)
+        except PreviewError as exc:
             raise HTTPException(
                 status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-                detail=f"PDF 打开失败: {exc}",
-            ) from exc
+                detail=str(exc),
+            )
         return Response(
-            content=png,
-            media_type="image/png",
-            headers={
-                "Content-Disposition": _content_disposition(doc.filename, "inline")
-            },
+            content=text,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": _content_disposition(doc.filename)},
         )
-
-    # ── ③ 文本系（及不带 page 的 PDF）：提取纯文本（列表预览现行行为）──
-    storage = await get_storage()
-    data = await storage.get_object(doc.storage_key)
-    try:
-        text = extract_preview_text(doc.ext, data)
-    except PreviewError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=str(exc),
-        )
-    return Response(
-        content=text,
-        media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": _content_disposition(doc.filename)},
-    )
 
 
 @router.get("/documents/{doc_id}/parse-preview")
@@ -365,57 +400,59 @@ async def get_document_parse_preview(
       视觉调用，且与库内结果可能因口径漂移不一致）。
     ★ raw_url 一律相对路径（INV-M-16），多页扫描件逐页给 page_raw_urls。
     """
-    doc = await _get_visible_document(doc_id, user, session)
+    db_key = await _locate_doc_db_key(session, doc_id)
+    async with open_data_session(session, db_key) as data_plane:
+        doc = await _get_visible_document(doc_id, user, data_plane)
 
-    # P-a 同口径：解析预览是 chunk 内容出口，同样只回有权片段（admin 豁免）
-    rows = (
-        (await session.execute(
-            select(Chunk)
-            .where(
-                Chunk.document_id == doc.id,
-                Chunk.tenant_id == doc.tenant_id,
-                Chunk.is_latest.is_(True),
-                *_chunk_gate(user),
-            )
-            .order_by(Chunk.chunk_index)
-        ))
-        .scalars()
-        .all()
-    )
-
-    blocks = [
-        ParsePreviewBlock(
-            index=idx,
-            page_no=chunk.page_no,
-            # chunks 表未落 is_table（解析链路内存信号）；按扩展名推断仅作
-            # 预览样式提示 —— xlsx/xls 整文档皆为表格块，图片/扫描件的视觉
-            # 转录与 pdf/docx 混合文档的内嵌表格不标（注释即边界承诺）
-            is_table=doc.ext.lower() in ("xls", "xlsx"),
-            text=chunk.content,
+        # P-a 同口径：解析预览是 chunk 内容出口，同样只回有权片段（admin 豁免）
+        rows = (
+            (await data_plane.execute(
+                select(Chunk)
+                .where(
+                    Chunk.document_id == doc.id,
+                    Chunk.tenant_id == doc.tenant_id,
+                    Chunk.is_latest.is_(True),
+                    *_chunk_gate(user),
+                )
+                .order_by(Chunk.chunk_index)
+            ))
+            .scalars()
+            .all()
         )
-        for idx, chunk in enumerate(rows)
-    ]
 
-    raw_url = f"/api/documents/{doc.id}/raw"
-    if doc.ext.lower() == "pdf":
-        # 扫描件每页至少一块（页级转录失败会整份 ParseError），文本层 PDF
-        # 同理有页级 page_no —— max(page_no) 即有效页数
-        page_count = max((c.page_no or 1) for c in rows) if rows else 1
-        page_raw_urls = [f"{raw_url}?page={n}" for n in range(1, page_count + 1)]
-    else:
-        page_count = 1
-        page_raw_urls = [raw_url]
+        blocks = [
+            ParsePreviewBlock(
+                index=idx,
+                page_no=chunk.page_no,
+                # chunks 表未落 is_table（解析链路内存信号）；按扩展名推断仅作
+                # 预览样式提示 —— xlsx/xls 整文档皆为表格块，图片/扫描件的视觉
+                # 转录与 pdf/docx 混合文档的内嵌表格不标（注释即边界承诺）
+                is_table=doc.ext.lower() in ("xls", "xlsx"),
+                text=chunk.content,
+            )
+            for idx, chunk in enumerate(rows)
+        ]
 
-    return ParsePreviewResponse(
-        document_id=doc.id,
-        modality="image" if doc.ext.lower() in IMAGE_EXTS else "text",
-        source=ParsePreviewSource(
-            raw_url=raw_url,
-            page_count=page_count,
-            page_raw_urls=page_raw_urls,
-        ),
-        blocks=blocks,
-    )
+        raw_url = f"/api/documents/{doc.id}/raw"
+        if doc.ext.lower() == "pdf":
+            # 扫描件每页至少一块（页级转录失败会整份 ParseError），文本层 PDF
+            # 同理有页级 page_no —— max(page_no) 即有效页数
+            page_count = max((c.page_no or 1) for c in rows) if rows else 1
+            page_raw_urls = [f"{raw_url}?page={n}" for n in range(1, page_count + 1)]
+        else:
+            page_count = 1
+            page_raw_urls = [raw_url]
+
+        return ParsePreviewResponse(
+            document_id=doc.id,
+            modality="image" if doc.ext.lower() in IMAGE_EXTS else "text",
+            source=ParsePreviewSource(
+                raw_url=raw_url,
+                page_count=page_count,
+                page_raw_urls=page_raw_urls,
+            ),
+            blocks=blocks,
+        )
 
 
 @router.delete("/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -426,28 +463,37 @@ async def delete_document(
 ) -> None:
     # G1/G2/租户校验 + 管理权判定（P-c）：可见 ≠ 可删 —— 仅 admin /
     # 库 owner / 上传者本人可删，普通只读成员 403
-    doc = await _get_visible_document(doc_id, user, session)
+    db_key = await _locate_doc_db_key(session, doc_id)
+    # 数据面①：可见性校验
+    async with open_data_session(session, db_key) as data_plane:
+        doc = await _get_visible_document(doc_id, user, data_plane)
+    # 控制面：管理权（可能读 knowledge_bases），在数据面会话之外
     await _ensure_doc_manageable(doc, user, session)
 
-    # 软删 document
-    doc.deleted_at = datetime.now(timezone.utc)
-    doc.is_latest = False
-    # 软删 chunks：is_latest=false（不物理删，保留历史回答引用可读）
-    await session.execute(
-        update(Chunk).where(Chunk.document_id == doc_id).values(is_latest=False)
-    )
-    await session.commit()
+    # 数据面②：软删 document + chunks
+    async with open_data_session(session, db_key) as data_plane:
+        doc = await data_plane.get(Document, doc_id)
+        if doc is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+        doc.deleted_at = datetime.now(timezone.utc)
+        doc.is_latest = False
+        # 软删 chunks：is_latest=false（不物理删，保留历史回答引用可读）
+        await data_plane.execute(
+            update(Chunk).where(Chunk.document_id == doc_id).values(is_latest=False)
+        )
+        filename, kb_id, storage_key = doc.filename, doc.kb_id, doc.storage_key
+        await data_plane.commit()
 
     # 审计：删除文档（记录文件名便于追溯）
     await audit.record(
         user.tenant_id, user.user_id, "doc.delete",
         object_type="document", object_id=str(doc_id),
-        detail={"filename": doc.filename, "kb_id": str(doc.kb_id)},
+        detail={"filename": filename, "kb_id": str(kb_id)},
     )
 
     # 清理对象存储（best-effort）
     try:
         storage = await get_storage()
-        await storage.delete_object(doc.storage_key)
+        await storage.delete_object(storage_key)
     except Exception:
         pass

@@ -27,6 +27,7 @@ from app.database import SessionLocal
 from app.infra import trace
 from app.infra.arq_pool import get_arq_pool
 from app.models import Document, ParseJob, SyncSource
+from app.services.db_scope import DbScopeError, open_job_session, resolve_kb_db_key
 from app.services.storage import get_storage
 from app.services.sync.web_fetcher import (
     FetchResult,
@@ -135,10 +136,12 @@ async def _sync_one_file(
     source: SyncSource,
     rel_path: str,
     file_info: dict,
+    db_key: str,
 ) -> uuid.UUID:
     """将单个文件同步到目标知识库（存 MinIO -> 建 Document -> 建 ParseJob -> 入队 arq）。
 
     每个文件用独立 session + 事务：enqueue_job 失败时整体回滚，避免 zombie job。
+    documents / parse_jobs 是数据面表，走 open_job_session(db_key)；入队负载透传 db_key。
     """
     settings = get_settings()
 
@@ -157,7 +160,7 @@ async def _sync_one_file(
     await storage.put_object(storage_key, data, "application/octet-stream")
 
     # 独立 session + 事务：enqueue_job 必须在 commit 之前成功，否则整体回滚
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         # 建 Document
         document = Document(
             tenant_id=source.tenant_id,
@@ -199,7 +202,7 @@ async def _sync_one_file(
         # MUST NOT 在此关闭池 —— 池是进程级共享资源，关掉会让后续所有入队重新建连
         # 透传当前 trace_id：手动触发时=请求 trace，cron 触发时=该轮新 trace
         await pool.enqueue_job(
-            "run_parse_segment", str(parse_job.id), 0, trace.get_trace_id(),
+            "run_parse_segment", str(parse_job.id), 0, trace.get_trace_id(), db_key,
             _queue_name=settings.arq_queue_name,
         )
 
@@ -224,6 +227,7 @@ async def _sync_web_page(
     doc_group_id: uuid.UUID,
     version: int,
     content_hash: str,
+    db_key: str,
 ) -> uuid.UUID:
     """将单个抓取页面入库（版本链）：MinIO → Document → ParseJob → arq 入队。
 
@@ -243,7 +247,7 @@ async def _sync_web_page(
     storage = await get_storage()
     await storage.put_object(storage_key, result.content, "text/html")
 
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         if version > 1:
             # 版本链：旧版本全部软失效，与新版本插入同事务提交
             await session.execute(
@@ -286,7 +290,7 @@ async def _sync_web_page(
 
         pool = await get_arq_pool()
         await pool.enqueue_job(
-            "run_parse_segment", str(parse_job.id), 0, trace.get_trace_id(),
+            "run_parse_segment", str(parse_job.id), 0, trace.get_trace_id(), db_key,
             _queue_name=settings.arq_queue_name,
         )
         await session.commit()
@@ -303,18 +307,18 @@ async def _sync_web_page(
     return document.id
 
 
-async def _set_doc_latest(doc_id: uuid.UUID, is_latest: bool) -> None:
+async def _set_doc_latest(doc_id: uuid.UUID, is_latest: bool, db_key: str) -> None:
     """单文档 is_latest 翻转（消失页复活用，独立小事务）。"""
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         await session.execute(
             update(Document).where(Document.id == doc_id).values(is_latest=is_latest)
         )
         await session.commit()
 
 
-async def _retire_doc_group(doc_group_id: uuid.UUID) -> None:
+async def _retire_doc_group(doc_group_id: uuid.UUID, db_key: str) -> None:
     """整组软失效（INV-M-09：页面消失只置 is_latest=false，不物理 DELETE）。"""
-    async with SessionLocal() as session:
+    async with open_job_session(db_key) as session:
         await session.execute(
             update(Document)
             .where(Document.doc_group_id == doc_group_id, Document.is_latest.is_(True))
@@ -323,7 +327,7 @@ async def _retire_doc_group(doc_group_id: uuid.UUID) -> None:
         await session.commit()
 
 
-async def _sync_web_source(source: SyncSource) -> int:
+async def _sync_web_source(source: SyncSource, db_key: str) -> int:
     """web 源同步主流程（M7 WU-M-14，INV-M-08 / INV-M-09）。
 
     流程：会话 → 探活 → 发现 → 并发抓取 → 三级指纹增量 → 变更页版本链入库
@@ -376,7 +380,7 @@ async def _sync_web_source(source: SyncSource) -> int:
         if entry and _fingerprint_unchanged(entry, result, content_hash):
             if entry.get("gone"):
                 # 消失页重现且内容未变：复活最新版，不重复建版本
-                await _set_doc_latest(uuid.UUID(entry["doc_id"]), True)
+                await _set_doc_latest(uuid.UUID(entry["doc_id"]), True, db_key)
                 entry["gone"] = False
             continue
 
@@ -388,7 +392,9 @@ async def _sync_web_source(source: SyncSource) -> int:
             doc_group_id = uuid.uuid4()
             version = 1
         try:
-            doc_id = await _sync_web_page(source, url, result, doc_group_id, version, content_hash)
+            doc_id = await _sync_web_page(
+                source, url, result, doc_group_id, version, content_hash, db_key
+            )
             synced[url] = {
                 "doc_group_id": str(doc_group_id),
                 "version": version,
@@ -416,7 +422,7 @@ async def _sync_web_source(source: SyncSource) -> int:
             if url in discovered_set or entry.get("gone"):
                 continue
             try:
-                await _retire_doc_group(uuid.UUID(entry["doc_group_id"]))
+                await _retire_doc_group(uuid.UUID(entry["doc_group_id"]), db_key)
                 entry["gone"] = True
             except Exception as exc:
                 logger.error("sync.web.retire_failed", extra={"url": url, "error": str(exc)})
@@ -441,15 +447,19 @@ async def _sync_web_source(source: SyncSource) -> int:
     return new_count
 
 
-async def sync_source(source: SyncSource) -> int:
-    """同步一个源，返回新增/更新的文件数。"""
+async def sync_source(source: SyncSource, db_key: str) -> int:
+    """同步一个源，返回新增/更新的文件数。
+
+    ★ db_key 由调用方（worker / cron）从已认证上下文或库位解析结果透传；
+      文件写入走数据面会话，sync_sources（控制面）仍用 SessionLocal。
+    """
     # 1. 获取文件列表 / web 全流程（web 源为独立函数，见 _sync_web_source）
     try:
         if source.source_type == "web":
             # M7 WU-M-14：web 源抛出的 WebAuthError / WebFetchError 不在此捕获，
             # 上抛到本函数既有 except 统一持久化 last_error 并中断
             # （DoD：鉴权失败不进入后续步骤，口径与 local/git 异常分支一致）
-            return await _sync_web_source(source)
+            return await _sync_web_source(source, db_key)
 
         patterns = _parse_patterns(source.file_patterns)
         if source.source_type == "local":
@@ -478,31 +488,32 @@ async def sync_source(source: SyncSource) -> int:
     synced: dict = dict(source.synced_files or {})
     new_count = 0
 
+    # 数据面：逐文件独立会话写入（不与控制面会话并行占用连接）
+    for rel_path, file_info in files.items():
+        existing = synced.get(rel_path)
+        # 指纹对比：mtime + size 都没变就跳过
+        if existing and existing.get("mtime") == file_info["mtime"] and existing.get("size") == file_info["size"]:
+            continue
+
+        # 新文件或变更文件 —— _sync_one_file 内部用独立 session，enqueue_job 失败整体回滚
+        try:
+            doc_id = await _sync_one_file(source, rel_path, file_info, db_key)
+            synced[rel_path] = {
+                "mtime": file_info["mtime"],
+                "size": file_info["size"],
+                "doc_id": str(doc_id),
+            }
+            new_count += 1
+        except Exception as exc:
+            logger.error(
+                "sync.file.failed",
+                extra={"file_path": rel_path, "error": str(exc)},
+            )
+
+    # 控制面：持久化同步进度（独立短事务）
     async with SessionLocal() as session:
         # source 可能来自外部 session，merge 到当前 session 以保证持久化
         source = await session.merge(source)
-        for rel_path, file_info in files.items():
-            existing = synced.get(rel_path)
-            # 指纹对比：mtime + size 都没变就跳过
-            if existing and existing.get("mtime") == file_info["mtime"] and existing.get("size") == file_info["size"]:
-                continue
-
-            # 新文件或变更文件 —— _sync_one_file 内部用独立 session，enqueue_job 失败整体回滚
-            try:
-                doc_id = await _sync_one_file(source, rel_path, file_info)
-                synced[rel_path] = {
-                    "mtime": file_info["mtime"],
-                    "size": file_info["size"],
-                    "doc_id": str(doc_id),
-                }
-                new_count += 1
-            except Exception as exc:
-                logger.error(
-                    "sync.file.failed",
-                    extra={"file_path": rel_path, "error": str(exc)},
-                )
-
-        # 更新 sync_source
         source.synced_files = synced
         source.last_synced_at = datetime.now(timezone.utc)
         source.last_sync_count = new_count
@@ -521,17 +532,37 @@ async def sync_source(source: SyncSource) -> int:
 
 
 async def sync_all_active_sources() -> int:
-    """扫描所有 active 状态的同步源并同步。供 arq cron job 调用。"""
+    """扫描所有 active 状态的同步源并同步。供 arq cron job 调用。
+
+    ★ 库位只由已认证上下文推出：逐个源用其 kb_id 在控制库解析库位；
+      多库位（同一 kb 命中多个已发布场景）→ 该源跳过并记日志 ——
+      不替调用方挑一个库，也不回落默认库。
+    """
     async with SessionLocal() as session:
         result = await session.execute(
             select(SyncSource).where(SyncSource.status == "active")
         )
         sources = list(result.scalars().all())
+        resolved: list[tuple[SyncSource, str]] = []
+        for source in sources:
+            try:
+                db_key = await resolve_kb_db_key(session, source.tenant_id, [source.kb_id])
+            except DbScopeError as exc:
+                logger.warning(
+                    "sync.source.multi_db_skipped",
+                    extra={
+                        "source_id": str(source.id),
+                        "code": exc.code,
+                        "detail": exc.detail,
+                    },
+                )
+                continue
+            resolved.append((source, db_key))
 
     total_new = 0
-    for source in sources:
+    for source, db_key in resolved:
         try:
-            total_new += await sync_source(source)
+            total_new += await sync_source(source, db_key)
         except Exception as exc:
             logger.error(
                 "sync.source.error",

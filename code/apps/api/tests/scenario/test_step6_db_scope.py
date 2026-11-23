@@ -291,7 +291,7 @@ def test_db_scope_error_carries_code_and_detail():
 
 
 def test_ambiguous_code_exists_for_id_probing():
-    """D-S6-3-2 的预留码：本步骤不实现探测，但码必须已存在且可判定。"""
+    """D-S6-3-2 的顺序探测错误码：同一主键命中多个库位时抛出。"""
     assert db_scope.DB_SCOPE_AMBIGUOUS == "DB_SCOPE_AMBIGUOUS"
     err = DbScopeError(db_scope.DB_SCOPE_AMBIGUOUS, {"probed": ["default", "kb_a"]})
     assert err.code == "DB_SCOPE_AMBIGUOUS"

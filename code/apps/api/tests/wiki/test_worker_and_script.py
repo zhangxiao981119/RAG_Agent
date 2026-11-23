@@ -135,7 +135,7 @@ def _stub_wiki_env(monkeypatch):
 
     def _session_factory(page_row_holder):
         @contextlib.asynccontextmanager
-        async def _cm():
+        async def _cm(_db_key):  # noqa: ARG001
             yield _DbSession(page_row_holder[0])
 
         return _cm
@@ -164,7 +164,7 @@ def test_build_and_store_idempotent_hit_returns_distinguishable_value(monkeypatc
     doc = uuid.uuid4()
     # 第一遍（无已有页）拿真实算出的 content_hash
     holder = [None]
-    monkeypatch.setattr(graph_job, "SessionLocal", _factory(holder))
+    monkeypatch.setattr(graph_job, "open_job_session", _factory(holder))
     prepared = asyncio.run(
         build_module.prepare_wiki_input(_DbSession(None), document_id=doc)
     )
@@ -174,7 +174,7 @@ def test_build_and_store_idempotent_hit_returns_distinguishable_value(monkeypatc
                                 prompt_version="wprompt-v1",
                                 content_hash=wiki_input.content_hash)
     holder[0] = ready_row
-    result = asyncio.run(graph_job.build_and_store(doc))
+    result = asyncio.run(graph_job.build_and_store(doc, "default"))
     assert result == "skipped_idempotent"
 
 
@@ -183,7 +183,7 @@ def test_build_and_store_real_build_still_reports_succeeded(monkeypatch):
     —— 计数语义改动不许波及正常成功路径。"""
     _factory = _stub_wiki_env(monkeypatch)
     holder = [None]
-    monkeypatch.setattr(graph_job, "SessionLocal", _factory(holder))
+    monkeypatch.setattr(graph_job, "open_job_session", _factory(holder))
 
     async def _fake_write(session, *, document, wiki_input, generated):
         return None
@@ -200,7 +200,7 @@ def test_build_and_store_real_build_still_reports_succeeded(monkeypatch):
     monkeypatch.setattr(build_module, "generate_page_content", _fake_generate)
 
     doc = uuid.uuid4()
-    result = asyncio.run(graph_job.build_and_store(doc))
+    result = asyncio.run(graph_job.build_and_store(doc, "default"))
     assert result == "succeeded"
 
 
@@ -221,7 +221,12 @@ def test_rebuild_wiki_script_counts_idempotent_as_skipped(monkeypatch, capsys):
     monkeypatch.setattr(mod, "SessionLocal",
                         lambda: _CM(_ScriptSession()))
 
-    async def _fake_build(document_id):
+    async def _locate(session, model, pk):  # noqa: ANN001, ARG001
+        return "default"
+
+    monkeypatch.setattr(mod, "locate_row_db_key", _locate)
+
+    async def _fake_build(document_id, db_key):  # noqa: ARG001
         return "skipped_idempotent"
 
     monkeypatch.setattr(mod, "build_and_store", _fake_build)
@@ -251,7 +256,12 @@ def test_rebuild_wiki_script_counts_succeeded_as_ok(monkeypatch, capsys):
 
     monkeypatch.setattr(mod, "SessionLocal", lambda: _CM(_ScriptSession()))
 
-    async def _fake_build(document_id):
+    async def _locate(session, model, pk):  # noqa: ANN001, ARG001
+        return "default"
+
+    monkeypatch.setattr(mod, "locate_row_db_key", _locate)
+
+    async def _fake_build(document_id, db_key):  # noqa: ARG001
         return "succeeded"
 
     monkeypatch.setattr(mod, "build_and_store", _fake_build)
