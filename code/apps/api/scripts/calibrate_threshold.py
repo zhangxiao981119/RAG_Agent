@@ -14,6 +14,12 @@ RELEVANCE_THRESHOLD_VECTOR）。本脚本用 eval_cases 跑**纯检索层**（�
     python scripts/calibrate_threshold.py --mode vector  # 强制按向量口径采集
     python scripts/calibrate_threshold.py --mode rerank  # 强制按重排口径采集
 
+★ 硬闸（fail-closed，退出码 2，**不输出任何建议值**）：
+  `--mode` 与采集到的实际口径不符、采集期间混口径、或根本拿不到口径
+  （dominant 不是 vector/rerank）时，本脚本拒绝给建议值 —— 只会说明原因。
+  理由：建议值会被直接抄进 decisions.py，错口径得到的数字与正确的**长得一样**，
+  没有任何下游信号能发现它错。宁可跑不出结果，不可给出错结果。
+
 ★ 循环论证陷阱（务必保留此处理）：
   采集前必须把阈值置 0。否则不可答问题会先被当前阈值拒答
   （retrieve 返回 refused=True 且无 chunks），采集到 0.0 而非真实分数 ——
@@ -171,6 +177,43 @@ async def main() -> int:
         return 1
 
     mode = dominant if args.mode == "auto" else args.mode
+
+    # ── 硬闸：口径对不上就**不许**输出建议值 ──────────────────────────
+    # ★ 修的是「打印一行警告、照样给出建议值」的 fail-open：
+    #   建议值会被直接抄进 decisions.py，而错口径得到的那份数字
+    #   **看起来和正确的一模一样**（都是 0.00–0.90 的阈值 + 漂亮的 F1），
+    #   唯一能拦住它的就是这里。故不打印任何报告、非零退出。
+    # ★ 三条路径都拦（同一类缺陷，逐条封）：
+    #   1) 显式 --mode 与采集到的实际口径不符 → 阈值会写进错误的常量；
+    #   2) 采集期间混口径 → 样本本身无效，dominant 只是"较多数的那个"；
+    #   3) 采集到 0 条带口径的样本 → dominant="unknown"，任何常量名都是瞎猜。
+    observed = {src for _, _, _, src in rows if src not in ("", "unknown")}
+    if len(observed) > 1:
+        print(
+            f"[×] 采集期间出现混口径样本 {sorted(observed)} —— 样本不可用于标定，"
+            "拒绝输出建议值。请修好重排服务（或临时禁用）后重跑。",
+            file=sys.stderr,
+        )
+        return 2
+    if dominant not in ("vector", "rerank"):
+        print(
+            f"[×] 未能确定采集口径（dominant={dominant!r}）：检索结果没有带上 "
+            "score_source。口径未知时写任何常量都是瞎猜，拒绝输出建议值。"
+            "请确认 get_retrieval_service() 返回的 result.score_source 已填充。",
+            file=sys.stderr,
+        )
+        return 2
+    if args.mode != "auto" and args.mode != dominant:
+        target = f"RELEVANCE_THRESHOLD_{args.mode.upper()}"
+        print(
+            f"[×] --mode {args.mode} 与本次采集的实际口径 {dominant} 不符 —— "
+            f"拿 {dominant} 口径的分数去扫 {args.mode} 口径的阈值，写进 "
+            f"decisions.{target} 只会让阈值失效。拒绝输出建议值。"
+            f"请去掉 --mode（自动跟随 {dominant}），或先用 --mode {dominant} 采集。",
+            file=sys.stderr,
+        )
+        return 2
+
     ans_scores = sorted((s for _, a, s, _ in rows if a), reverse=True)
     unans_scores = sorted((s for _, a, s, _ in rows if not a), reverse=True)
 

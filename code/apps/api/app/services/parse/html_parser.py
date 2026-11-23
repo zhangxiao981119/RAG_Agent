@@ -128,14 +128,50 @@ def _replace_images(root: Tag, soup: BeautifulSoup) -> None:
         img.replace_with(para)  # 独立图片：包成段落，让正文遍历能收走
 
 
+def _decode_html(data: bytes) -> str | bytes:
+    """HTML 字节 → 交给 bs4 的输入（能确定是 UTF-8 就解成 str，否则原样退回 bytes）。
+
+    为什么需要这一步：把原始 bytes 直接交给 BeautifulSoup 会走 UnicodeDammit 的
+    统计猜测，而猜测**依赖内容、且依赖本机装了哪个探测器**（chardet / cchardet /
+    charset_normalizer 三者结果可以不同），同一份 UTF-8 页面的不同片段会解出不同
+    结果。本机实测（bs4 4.15.0 / Python 3.13.14，仅装 charset_normalizer 3.5.1）：
+    `<div><img src="b.png" alt="网络拓扑"></div>` 编码后的 UTF-8 字节被判成
+    `windows-1251`，alt 解成 `зЅ‘з»њж‹“ж‰‘`；而同一批里 `<p>正文</p>` 却被正确
+    判成 utf-8 —— 错的不是"payload 短"，是猜测本身不稳定。
+
+    判据为什么足够强：中文内容的 GBK / GB18030 字节几乎不可能构成合法 UTF-8
+    序列，所以"严格 UTF-8 解码成功"本身已几乎等价于"这份字节就是 UTF-8"。
+    唯一两者同时成立的是纯 ASCII 页面，那种情况按 UTF-8 解也是对的。
+
+    为什么是 utf-8-sig 而不是 utf-8：对无 BOM 的 UTF-8 二者等价，但 utf-8-sig
+    会顺带剥掉 BOM，否则 BOM（U+FEFF）会作为文本节点混进第一个 chunk。
+
+    为什么不会回归「GB18030 + <meta charset>」：这类页面严格 UTF-8 解码必然抛
+    UnicodeDecodeError → 回退原始 bytes → UnicodeDammit 尊重 <meta> → 仍然正确。
+    但**无 meta 的 GB18030 页面仍是原来的乱码结果，本函数不修那种情况。**
+
+    明确未覆盖（不要读成"编码问题已全修"）：
+      1. 无 <meta charset> 且非 UTF-8 的页面：仍靠统计猜测，仍可能乱码；
+      2. HTTP 响应头声明的 charset 在入口就被丢弃 —— `app/services/sync/
+         web_fetcher.py` 的 FetchResult 只保留 content 字节，`resp.encoding` /
+         `Content-Type` 从未使用，下游无从恢复。属另一处待修（方案 3）。
+    """
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        # 非 UTF-8：原样交回 bs4，由 UnicodeDammit 按 <meta charset> 等线索处理
+        return data
+
+
 def parse_html(data: bytes) -> list[ParsedBlock]:
     """HTML 字节 → ParsedBlock 列表（正文与表格按文档顺序交错）。
 
     与 docx_parser 同构：标题栈维护 heading_path，表格块随当前标题栈归属。
     全文无可检索内容 → ParseError（不产空块静默入库）。
+    编码策略见 _decode_html：严格 UTF-8 优先，非法字节才回退 bs4 的统计猜测。
     """
     try:
-        soup = BeautifulSoup(data, "html.parser")
+        soup = BeautifulSoup(_decode_html(data), "html.parser")
     except Exception as exc:
         raise ParseError(f"HTML 解析失败: {exc}") from exc
 

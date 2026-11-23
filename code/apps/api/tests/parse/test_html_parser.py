@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from app.services.parse.base import ParseError
-from app.services.parse.html_parser import parse_html
+from app.services.parse.html_parser import _decode_html, parse_html
 
 
 def test_noise_tags_removed():
@@ -221,3 +221,62 @@ def test_figcaption_becomes_text_block():
     texts = [b.text for b in parse_html(html.encode("utf-8"))]
     assert "[图片] 拓扑" in texts
     assert "图 1 网络拓扑示意" in texts
+
+
+# ── 编码策略回归（_decode_html：严格 UTF-8 优先，失败才回退 bs4 猜测）──────
+
+
+def test_gb18030_with_meta_charset_still_decodes():
+    """GB18030 页面 + <meta charset> 必须仍解对（护栏：防「改成 errors='replace'」的偷懒修法）。
+
+    这类页面严格 UTF-8 解码必然抛 UnicodeDecodeError → 回退原始 bytes →
+    bs4 的 UnicodeDammit 尊重 <meta charset> → 仍然正确。
+    若有人把 _decode_html 改成 `data.decode("utf-8", errors="replace")`，
+    非法字节会被静默替换成 U+FFFD，<meta charset> 再也读不到 —— 本用例立刻变红。
+    """
+    html = (
+        '<html><head><meta charset="gb18030"></head>'
+        "<body><p>中文编码测试内容</p></body></html>"
+    ).encode("gb18030")
+    texts = "\n".join(b.text for b in parse_html(html))
+    assert "中文编码测试内容" in texts
+
+
+def test_utf8_bom_is_stripped():
+    """带 BOM 的 UTF-8：BOM 必须被剥掉，不得作为文本节点混进正文。
+
+    这是选用 utf-8-sig 而非 utf-8 的唯一实际收益（对无 BOM 的 UTF-8 二者等价）。
+
+    为什么要同时断言 helper 层（实测得出，不是推测）：只断言 blocks[0].text，
+    本用例对「换成纯 utf-8」和「回退到修复前」都仍然 PASS —— 因为泄露出来的
+    BOM 是 soup 顶层的一个孤立文本节点，而 parse_html 只遍历 p/li/blockquote/
+    figcaption/pre/table 这些**标签**，孤立文本节点本来就不会被收进任何 block。
+    即块级断言只钉住了"BOM 不进块"这个行为契约，钉不住「必须用 utf-8-sig」。
+    变异实测（4 个变体）：utf-8-sig=PASS；utf-8 / errors='replace' / 返回原始
+    bytes=FAIL —— 只有 helper 层断言能区分它们。
+    """
+    html = "\ufeff<html><body><p>正文</p></body></html>".encode("utf-8")
+
+    # 块级：BOM 不得出现在正文块文本里（行为契约）
+    blocks = parse_html(html)
+    assert blocks[0].text == "正文"
+    assert "\ufeff" not in blocks[0].text
+
+    # helper 级：BOM 必须在解码阶段就被剥掉（区分 utf-8-sig 与 utf-8 的唯一判据）
+    decoded = _decode_html(html)
+    assert isinstance(decoded, str)
+    assert not decoded.startswith("\ufeff")
+    assert "\ufeff" not in decoded
+
+
+def test_alt_chinese_survives_utf8_detection():
+    """最小复现：短 UTF-8 payload 的中文 alt 曾被 bs4 统计猜测害成 windows-1251 乱码。
+
+    与 test_standalone_img_becomes_block 有意重叠：那条是端到端形态，本条把
+    「猜测随内容与探测器漂移」这件事单独钉住，回归时能直接定位到编码层。
+    修复前实测（bs4 4.15.0 / Py3.13.14 / 仅 charset_normalizer）：alt="网络拓扑"
+    被判成 windows-1251，解出 "зЅ‘з»њж‹“ж‰‘"。
+    """
+    html = '<html><body><div><img src="b.png" alt="网络拓扑"></div></body></html>'
+    texts = [b.text for b in parse_html(html.encode("utf-8"))]
+    assert texts == ["[图片] 网络拓扑"]
