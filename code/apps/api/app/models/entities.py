@@ -20,7 +20,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, INET, JSONB, TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, DOUBLE_PRECISION, INET, JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -37,9 +37,22 @@ class Tenant(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
     # §3.2.6 权限缓存版本号；任何权限变更都 +1 使旧缓存 key 失效
     acl_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    # Step 7：库可见性上限。NULL=不限；空数组=全部禁止；数组=白名单。
+    # 关闭 TENANT_GOVERNANCE_ENABLED 时该列不读，行为回到 Step 6。
+    allowed_db_keys: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    __table_args__ = (CheckConstraint("status IN ('active','suspended')", name="ck_tenants_status"),)
+    __table_args__ = (
+        CheckConstraint("status IN ('active','suspended')", name="ck_tenants_status"),
+        CheckConstraint(
+            "allowed_db_keys IS NULL OR array_ndims(allowed_db_keys) = 1",
+            name="ck_tenants_allowed_db_keys_dims",
+        ),
+        CheckConstraint(
+            "allowed_db_keys IS NULL OR array_position(allowed_db_keys, NULL) IS NULL",
+            name="ck_tenants_allowed_db_keys_no_null",
+        ),
+    )
 
 
 class Department(Base):
@@ -557,6 +570,15 @@ class Scenario(Base):
     is_builtin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     # 分库地址（Step 6 起生效，当前写入无效 —— 见类 docstring）
     db_binding: Mapped[str | None] = mapped_column(Text)
+    # Step 7：版本钉定。NULL=跟随 published；非空=钉定版本号（解析时认 published/archived）。
+    pinned_version: Mapped[int | None] = mapped_column(Integer)
+    # Step 7：L1 收紧。NULL=不收紧；关闭 TENANT_GOVERNANCE_ENABLED 时全部忽略。
+    recall_top_k_max: Mapped[int | None] = mapped_column(Integer)
+    threshold_vector_min: Mapped[float | None] = mapped_column(DOUBLE_PRECISION)
+    threshold_rerank_min: Mapped[float | None] = mapped_column(DOUBLE_PRECISION)
+    rerank_allowed: Mapped[bool | None] = mapped_column(Boolean)
+    # Step 7：分级标签。cold ⇔ db_binding 为空；warm/hot ⇒ db_binding 非空（由 CHECK 保证）。
+    tier: Mapped[str] = mapped_column(Text, nullable=False, server_default="cold")
     description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -577,6 +599,30 @@ class Scenario(Base):
             name="ck_scenarios_db_binding_format",
         ),
         UniqueConstraint("tenant_id", "scenario_key", name="uq_scenarios_tenant_key"),
+        # Step 7：治理约束（与迁移 0031 逐条同名）
+        CheckConstraint("tier IN ('hot','warm','cold')", name="ck_scenarios_tier"),
+        CheckConstraint(
+            "(tier = 'cold' AND db_binding IS NULL) "
+            "OR (tier IN ('warm','hot') AND db_binding IS NOT NULL)",
+            name="ck_scenarios_tier_binding",
+        ),
+        CheckConstraint(
+            "pinned_version IS NULL OR pinned_version >= 1",
+            name="ck_scenarios_pinned_version",
+        ),
+        CheckConstraint(
+            "recall_top_k_max IS NULL OR recall_top_k_max > 0",
+            name="ck_scenarios_recall_cap",
+        ),
+        CheckConstraint(
+            "threshold_vector_min IS NULL OR threshold_vector_min BETWEEN 0 AND 1",
+            name="ck_scenarios_threshold_vector_min",
+        ),
+        CheckConstraint(
+            "threshold_rerank_min IS NULL OR threshold_rerank_min BETWEEN 0 AND 1",
+            name="ck_scenarios_threshold_rerank_min",
+        ),
+        Index("idx_scenarios_tenant_tier", "tenant_id", "tier"),
         # 部分唯一索引：CHECK 表达不了「聚合唯一」，只能在索引层表达
         Index(
             "uq_scenarios_one_builtin",

@@ -173,14 +173,20 @@ def test_migration_is_linear_single_head(upgrade_sql):
     assert upgrade_sql.count("-- Running upgrade") == 1
 
 
-def test_alembic_heads_is_0030_only():
-    """`alembic heads` 只有一个头 0030 —— 两个头会让 `upgrade head` 直接报错。
+def test_alembic_heads_is_single_head():
+    """`alembic heads` 只有一个头 —— 两个头会让 `upgrade head` 直接报错。
+
+    ★ 原先钉死 `== ["0030"]`。0031 加入后 0030 不再是头，钉死字面量会让
+      **任何新增迁移**都必然红。这里只保留「恰好一个头」这条真正的不变式；
+      当前头是哪个版本由各迁移自己的用例钉（0031 见
+      `test_0031_migration.py::test_alembic_heads_is_0031_only`）。
 
     ★ 读的是**脚本目录**（不连库），所以这条在任何机器上都能跑。
     """
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == ["0030"], (
-        f"迁移链出现分叉或多个头：{script.get_heads()}（`alembic upgrade head` 会失败）"
+    heads = script.get_heads()
+    assert len(heads) == 1, (
+        f"迁移链出现分叉或多个头：{heads}（`alembic upgrade head` 会失败）"
     )
 
 
