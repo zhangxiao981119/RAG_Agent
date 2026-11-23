@@ -262,6 +262,11 @@ M-B 的具体规则：
 - 场景库控制面表写入触发器：对 `tenants`/`knowledge_bases`/`users`/`scenarios`/`audit_logs` 建 `BEFORE INSERT OR UPDATE OR DELETE ... FOR EACH STATEMENT` 的拒绝触发器。这是把框架 I-8"控制面元数据不随场景分裂"从"文档承诺"变成"数据库强制"，且可测（写入必须报错）。
 - I-8 措辞需修订：原句是"场景库里不得出现 audit_logs / scenario_profile / tenant_quotas"；全链建表会物理存在这些表（空表）。建议改为"场景库的控制面表必须存在但恒为空且禁止写入"。此项须用户批准（见 §9），否则 M-B 字面上违反 I-8。
 
+实现补强（P3 实测发现）：
+- 白名单守卫的列集合必须包含 `tenant_id`：只查 `kb_id`/`document_id`/`chunk_id` 时，只含 `tenant_id` 的新表会逃逸守卫。metadata 现有表全部落在搬迁集或控制面集内，加入后不产生误报。
+- 手术前必须拒绝控制面非空的库：先统计控制面各表行数，任一非空即抛异常并中止，不执行任何 DDL。这是 fail-closed 的前置条件校验，防止 `--dsn` 误指向控制库时删掉控制库外键并装上禁写触发器。
+- 触发器校验必须过滤 `pg_trigger.tgenabled`（仅认 `O`/`A`）：被 `ALTER TABLE ... DISABLE TRIGGER` 禁用的触发器实际不生效，必须视为缺失，否则 verify 会假 PASS。
+
 ### 4.3 迁移顺序（确定顺序，含控制库与场景库）
 
 不假设在线迁移。全程维护窗口。顺序的核心原则：**被写入方的库先就绪，权威方的事实最后改**。
