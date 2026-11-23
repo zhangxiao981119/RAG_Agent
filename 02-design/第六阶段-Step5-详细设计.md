@@ -1046,13 +1046,13 @@ DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 
    → 断言：db_routing_report ⑥ 通过（无缺口、无多余键）
 ③ 搬数据（dump/restore 该场景全部 kb 的文件 + chunks + documents）
 ④ 校验搬完（目标库行数 == 源库该场景行数，逐表比对）
-⑤ 最后一步才改 db_binding = 'kb_x'
+⑤ 最后一步才改 db_binding = 'kb_x'（0031 起同句写 tier='warm'）
    → ★ 此处必须重启 api（或等 > CACHE_TTL_SECONDS=60s），否则进程内缓存的旧行
      会把一部分请求仍路由到默认库（U-5-1 / G-R2）
 ⑥ 观察：该场景检索结果与搬前逐条一致（框架 D3 验收信号①）
 ```
 
-**回滚顺序（与 E.2 一致）**：⑤ 改回 NULL → 等 60s 或重启 → 再关开关。**先关开关再改 NULL 会有一段"全部落默认库"的窗口**。
+**回滚顺序（与 E.2 一致）**：⑤ 同句改回 `tier='cold', db_binding=NULL` → 等 60s 或重启 → 再关开关。**先关开关再改 NULL 会有一段"全部落默认库"的窗口**。
 
 ---
 
@@ -1090,8 +1090,8 @@ DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 
 
 | # | 用例 | 断言 | **破坏方式（必须变红）** |
 |---|---|---|---|
-| **T-5-9** | `'default'` 不可写（**I-5-2**） | 用既有 `expect_violation(conn, exc, "ck_scenarios_db_binding_format", ...)`（`pg_helpers` 的唯一 `raises` 入口）插 `db_binding='default'` → 必须被**该约束名**拒绝 | 把 CHECK 改成 `db_binding ~ '^([a-z]+|kb_[a-z0-9_]+)$'`（"顺手放宽"）→ 不再抛 → 红。**这条用例的存在本身就是 I-5-2 的守卫** |
-| **T-5-10** | 视图行数恒等（**I-5-8 / §B.1.2 细节 1**） | 造 3 个场景：A 有 published（db_binding NULL）、B 有 published（db_binding='kb_x'）、C 无 published → 断言 `count(v_scenario_db_routing) == count(scenarios)`，且 C 行 `published_version IS NULL` 且 `db_key == 'default'` | 把 `LEFT JOIN` 改成 `JOIN` → C 消失 → 行数 2 ≠ 3 → 红。把 `COALESCE(s.db_binding,'default')` 改成 `s.db_binding` → A/C 的 `db_key` 变 NULL（应 `'default'`）→ 红 |
+| **T-5-9** | `'default'` 不可写（**I-5-2**） | 用既有 `expect_violation(conn, exc, "ck_scenarios_db_binding_format", ...)`（`pg_helpers` 的唯一 `raises` 入口）插 `tier='warm', db_binding='default'` → 必须被**该约束名**拒绝 | 把 CHECK 改成 `db_binding ~ '^([a-z]+|kb_[a-z0-9_]+)$'`（"顺手放宽"）→ 不再抛 → 红。**这条用例的存在本身就是 I-5-2 的守卫** |
+| **T-5-10** | 视图行数恒等（**I-5-8 / §B.1.2 细节 1**） | 造 3 个场景：A 有 published（db_binding NULL）、B 有 published（tier='warm', db_binding='kb_x'）、C 无 published → 断言 `count(v_scenario_db_routing) == count(scenarios)`，且 C 行 `published_version IS NULL` 且 `db_key == 'default'` | 把 `LEFT JOIN` 改成 `JOIN` → C 消失 → 行数 2 ≠ 3 → 红。把 `COALESCE(s.db_binding,'default')` 改成 `s.db_binding` → A/C 的 `db_key` 变 NULL（应 `'default'`）→ 红 |
 | **T-5-11** | 冲突检测有牙（**§A.3.1.3**） | 造：同租户 kb₁ 被场景 P（`kb_x`）与场景 Q（`kb_y`）同时绑定 → `fn_kb_db_binding_conflicts()` 返回 **1 行**，`db_keys == ['kb_x','kb_y']`；再让 Q 改成 `kb_x` → 返回 **0 行** | 把 `HAVING count(DISTINCT db_key) > 1` 改成 `> 0` → 第二格变 1 行 → 红。把 `WHERE s.db_binding IS NOT NULL` 删掉 → 造两个 NULL 场景也会冲突 → 红（默认库不该冲突） |
 | **T-5-12** | 视图口径 == resolver 口径（**I-5-8**） | 同一租户下，对每个有 published 版本的场景：`v_scenario_db_routing.published_version` == `(await resolve_scenario(...)).version`；`db_key` == `resolve_db_key(snapshot.db_binding)` | 把视图的 `v.state='published'` 改成 `v.state<>'archived'`（"多算一点"）→ draft 版本进来 → 版本号不等 → 红 |
 | **T-5-13** | 迁移往返 + 对象存在 + 单头 | `upgrade 0029:0030 → downgrade 0030:0029 → upgrade` 无错；三个对象在 `pg_views`/`pg_proc` 里存在；`_render("up","0029:0030")` 含 `-- Running upgrade 0029 -> 0030` | 把 `down_revision` 写成 `"0028"`（复制粘贴）→ 单头断言红 |
@@ -1127,14 +1127,14 @@ DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 
 | **E-1** | 迁移 0030（2 视图 + 1 函数） | `alembic downgrade 0029` | **无损**（无数据、无写入者） | 必须先 revert 脚本（`db_routing_report.py` 会查这两个对象）→ 否则脚本 `UndefinedTable` |
 | **E-2** | `db_router.py` + settings + `config_profile` + `main.py` 两行 | `git revert` 这批文件 | **无损**（关闭态本就零行为） | **必须先确认 `db_binding` 全为 NULL**，再 revert（见下） |
 | **E-3** | 盘点脚本 | `git revert` | 无损 | 独立 |
-| **E-4** | `db_binding` 已被写入（Step 6 之后） | `UPDATE scenarios SET db_binding = NULL` | **无损**（数据仍在新库，只切连接） | ★ **改 NULL 先于关开关**。若先关开关：开关关 → 全部落默认库 → 而数据已搬走 → 「一半文档查不到」 |
+| **E-4** | `db_binding` 已被写入（Step 6 之后） | `UPDATE scenarios SET tier='cold', db_binding = NULL` | **无损**（数据仍在新库，只切连接） | ★ **同句改回 cold 再关开关**（0031 的 CHECK 不允许只清 `db_binding`）。若先关开关：开关关 → 全部落默认库 → 而数据已搬走 → 「一半文档查不到」 |
 | **E-5** | 数据已搬到新库 | 不能"撤"（数据位置的事实） | **不可撤回**，只能再搬回来 | 搬回 = 另一个 D3 流程；期间**必须**保证 `db_binding` 指向数据所在的库 |
 
 【推导】**为什么 E-2 不提供"翻开关"这类运行期回滚**（与 Step 4B §E-4 同款论证，但这里更硬）：
 
 - 开关的关闭态是「路由功能不存在」，它**只能**在「数据还没搬」时安全。一旦数据搬走，关开关就**等于**制造"一半文档查不到"。
 - 一个"在某些状态下安全、在另一些状态下致命"的开关，是最危险的一类开关 —— 因为它**看起来**总是可用。
-- 所以回滚的**正解**是两步且有序：先把事实改回（`db_binding = NULL`），再关功能（revert 代码）。**开关只用于"事故止血 + 数据未搬"这一种情形**，且必须在 SOP 里写清前提。
+- 所以回滚的**正解**是两步且有序：先把事实改回（同句 `tier='cold', db_binding = NULL`），再关功能（revert 代码）。**开关只用于"事故止血 + 数据未搬"这一种情形**，且必须在 SOP 里写清前提。
 
 ---
 
@@ -1147,7 +1147,7 @@ DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 
 | **3** | `db_router.py`（纯函数 + 注册表 + 闸门） | ① `pytest tests/scenario/test_step5_db_router.py -q` 全绿（T-5-1…T-5-8）；② `python -c "...register_from_settings(); print(r.created_engines)"` → `0`；③ `python -c "...engine_for('default') is app.database.engine"` → `True` | E-2 |
 | **4** | `config_profile` 接线（含 `CROSS_ROLE_FIELDS` 两项） | ① `pytest tests/scenario/test_step5_guards.py -q -k T_5_18` 全绿；② 启动日志里 `config_fingerprint` **因本次改动而变**（并在交付报告里记录新旧值）；③ `runtime_config_snapshot()` 里 `scene_db_dsn_redacted` 的每个值**不含** `@` 前的账号密码（正则断言） | E-2 |
 | **5** | 真库用例 T-5-9…T-5-13 | ① `pytest tests/scenario/test_step5_db_router_pg.py -q` 全绿（需 `SCENARIO_TEST_DB_URL`）；② **T-5-11 必须先看到它红**（造冲突前断言 0 行、造冲突后断言 1 行 —— 两步都跑一遍） | E-1 |
-| **6** | 盘点脚本 | ① `python -m scripts.db_routing_report; echo $?` 在干净库上 → `0`；② 手工插一行 `db_binding='kb_x'` → 退出码 `1` 且输出含 `⑥` 缺口项 → 恢复后重新 `0` | E-3 |
+| **6** | 盘点脚本 | ① `python -m scripts.db_routing_report; echo $?` 在干净库上 → `0`；② 手工插一行 `tier='warm', db_binding='kb_x'` → 退出码 `1` 且输出含 `⑥` 缺口项 → 恢复后重新 `0` | E-3 |
 | **7** | 文档与注释收口 | ① 框架稿 §3A.8 D1/D2 的表述按 §附录 A 更新（2 处修正）；② 启动横幅与 §B.4.3 的文字逐字一致 | —— |
 
 【推导】**步序为什么是这个**：1 → 2 是"先有可盘点的对象，再谈路由参数"；3 必须在 2 之后（它读 settings）；**4 必须紧跟 3**（否则开关进了运行期却不在指纹里，正是 4B §E-4 反对的形态）；5/6 是"证明它有牙"（真库 + 退出码）；7 最后。**1 和 3 之间不存在依赖反转**，可以并行 —— 但不要合并提交（回滚点不同）。
@@ -1180,7 +1180,7 @@ DB 路由 : 关闭（全部落默认库）· 桶=1 · 每桶 40 · 总计 40 · 
 | **5** | **成本 / 缓存 / 体感（经济性三视角）** | **成本**：模型成本 **= 0**（本步零 LLM/embedding/rerank 调用 → **模型组合与任务-模型分派表 N/A**）。真实成本是**连接预算**（§A.3.4.1 全表代入）：Step 5 `50/80`，与今天**完全相同**；Step 6 推荐配置：N=1/K=2/每桶 20 → `50/80`（把 40 摊成 2×20）；若 N=2/K=2 须每桶降到 15 → `70/80`。**缓存**：不新增、不失效任何既有缓存；但**必须指出一个新耦合** —— resolver 的**进程内 60s 行缓存**是库位键的事实来源，所以「改 `db_binding` → 生效」有一个 **60s × 副本数** 的不可控窗口（F-12 / R-2 / U-5-1）。**体感**：Step 5 **零影响**（不进请求路径）；Step 6 起每桶容量下降 → 每库在途上限 ~30 → ~20（池 20 的实测崩点），**必须重跑阶梯压测**（框架 §3A.4 注 1：换池必须重测）。 |
 | **6** | **可观测性的"谁看"** | 三处按**读者**分工：① **启动横幅一行** → 部署者（改 `.env` 后必然看第一屏；也是"当时开关是开还是关"的唯一留痕）；② **盘点脚本退出码** → CI/cron（唯一能"自动发现"的通道）；③ **复用 S-7 的既有 WARN** → 运维在启动日志里看到"db_binding 配了不生效"。**没有一处依赖"有人主动盯着"**。**没有新增 metrics 打点**（本步不产生运行期指标；且 4B 已裁决不加 Gauge，避免动 `tests/test_metrics_and_rerank.py:80` 的键集断言）。 |
 | **7** | **迁移 / 锁** | §A.3.6：**不加列** → 无 fast default、无 `SET NOT NULL`、无回填；`CREATE VIEW` 只取基表 `ACCESS SHARE` → **不阻塞基表读写**；`downgrade` 纯 DDL **无数据可丢**。若将来必须加列：fast default 是 **O(1)** 但**仍取 ACCESS EXCLUSIVE**，且本项目的事务边界是"一个 HTTP 请求（含整条 SSE 流）"→ **锁等待可长达整条流的时长**，并触发**锁队列头阻塞**；因此必须 `lock_timeout` + 无流量窗口 + 分三步（§A.3.6.3）。 |
-| **8** | **回滚** | §E：**有序的两步**（先改事实 `db_binding=NULL`，再关功能）。开关**不能**单独当回滚用（数据已搬时关开关 = 制造"一半文档查不到"）。 |
+| **8** | **回滚** | §E：**有序的两步**（先改事实 `tier='cold', db_binding=NULL`，再关功能）。开关**不能**单独当回滚用（数据已搬时关开关 = 制造"一半文档查不到"）。 |
 | **9** | **多 Agent 编排 / 意图识别 / 检索链拓扑** | **N/A**：本步不改变任何编排、不引入任何新阶段、不触碰 `retrieve/`（验收④ `git diff` 为空）。平台侧无自主循环（框架 `:1235`）。 |
 | **10** | **打转检测（同一操作的重复循环）** | **N/A**：本步没有任何"操作循环"。路由是**一次纯函数调用**（`resolve_db_key`），不重试、不回退、不迭代；Step 6 起 `data_session` 也是"取一次连接、用完即还"。唯一的重复是连接池的复用，而 `pool_pre_ping=True`（`database.py:24`）已覆盖"拿到的是死连接"这一类。 |
 | **11** | **记忆治理（长期记忆的写入/淘汰/污染）** | **N/A**：本步不读不写任何记忆结构（`messages` / `conversations` / 会话上下文）。库位键**不是记忆**：它是部署事实，随场景行而非随对话变化。 |

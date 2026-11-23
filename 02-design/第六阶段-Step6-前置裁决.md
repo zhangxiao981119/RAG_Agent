@@ -295,7 +295,7 @@ M-B 的具体规则：
 15. 校验检索等价（见 §3.3 最后一行）。
 
 **Phase 4 切流量与观察**
-16. 最后一步才改事实：`UPDATE scenarios SET db_binding='kb_<scene>' WHERE ...`（单行 update）。
+16. 最后一步才改事实：`UPDATE scenarios SET tier='warm', db_binding='kb_<scene>' WHERE ...`（单行 update）。0031 起 `tier` 与 `db_binding` 受 CHECK 同句约束（cold ⇔ NULL），只改一列会被数据库拒绝。
 17. 重启 api（或等 `>=60s × 副本数` 的路由刷新窗口），观察 `pg_stat_activity` 的 datname 分布与检索延迟。
 18. 恢复 worker，观察解析写入是否落场景库。
 
@@ -319,12 +319,12 @@ M-B 的具体规则：
 |---|---|---|
 | R1 停写 | 停 worker，暂停上传 | `docker compose stop worker`；控制库 `documents` 的 `n_tup_ins` 不再增长 |
 | R2 快照 | 记录现场 | 两库 `alembic current`、逐表 count、`scene_db_split_enabled`、`db_binding` 值、`config_fingerprint` |
-| R3 改事实 | 先清绑定 | `UPDATE scenarios SET db_binding=NULL WHERE id=...` |
+| R3 改事实 | 先清绑定（同句降回 cold） | `UPDATE scenarios SET tier='cold', db_binding=NULL WHERE id=...` |
 | R4 重启并验证落点 | 重启 api | `pg_stat_activity` 只出现控制库 datname；无 500 |
 | R5 校验数据 | 控制库行数 == R2 快照 | 逐表 count 相等；不等说明搬迁窗口有漏写，需补差后再继续 |
 | R6 关开关 | 关 `SCENE_DB_SPLIT_ENABLED` + 重启 | 横幅显示"关闭"；`created_engines=0`；场景库**保留不删**作为证据，用户确认后再 `DROP DATABASE` |
 
-顺序纪律：**必须先 `db_binding=NULL` 再关开关**。反过来会出现"开关已关、绑定仍在"的半状态，报告项会 FAIL 且请求可能落到已关池的键上（虽然 `engine_for` 不读开关，但此时语义已混乱）。
+顺序纪律：**必须在同一句把 `tier='cold', db_binding=NULL` 改回，再关开关**（0031 的 CHECK 不允许只清 `db_binding`）。反过来会出现"开关已关、绑定仍在"的半状态，报告项会 FAIL 且请求可能落到已关池的键上（虽然 `engine_for` 不读开关，但此时语义已混乱）。
 
 ### 4.6 读写两段式（否则分库写不进去）
 
