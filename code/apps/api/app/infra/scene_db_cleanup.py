@@ -172,7 +172,7 @@ async def cleanup_scene_kb(
     """清理场景库中单 kb 的搬迁集行；`apply=False` 时只读统计（用于工单确认）。
 
     - 控制库 kb 不存在且未显式 `allow_missing_kb` → 拒绝（防 --kb-id 写错）；
-    - 删除在单事务内完成，删完立即复核：该 kb 的各表行数必须全部为 0；
+    - 删除在单事务内完成，删完立即复核（复核仍在事务内，残留即整笔回滚）；
     - 不触碰控制库任何行（kb 行由 API 删除，保留审计）。
     """
     control = await asyncpg.connect(control_dsn)
@@ -197,13 +197,15 @@ async def cleanup_scene_kb(
         if apply:
             async with scene.transaction():
                 deleted = await _delete_order_counts(scene, kb_id)
-            after = await scene_kb_counts(scene, kb_id)
-            residual = {name: count for name, count in after.items() if count}
-            if residual:
-                raise CleanupError(
-                    CLEANUP_VERIFY_MISMATCH,
-                    {"kb_id": kb_id, "residual": residual},
-                )
+                # 复核必须留在事务内：发现残留时抛错触发整笔回滚，
+                # 而不是「校验失败但删除已经提交」。
+                after = await scene_kb_counts(scene, kb_id)
+                residual = {name: count for name, count in after.items() if count}
+                if residual:
+                    raise CleanupError(
+                        CLEANUP_VERIFY_MISMATCH,
+                        {"kb_id": kb_id, "residual": residual},
+                    )
         else:
             after = before
 

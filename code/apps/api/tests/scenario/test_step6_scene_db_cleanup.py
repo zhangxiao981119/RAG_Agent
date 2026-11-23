@@ -13,14 +13,18 @@ from __future__ import annotations
 import asyncio
 import sys
 import uuid
+from unittest import mock
 
 import asyncpg
 import pytest
 from alembic import command
 
+from app.infra import scene_db_cleanup as cleanup_mod
 from app.infra.scene_db_cleanup import (
     CLEANUP_KB_MISSING,
+    CLEANUP_TARGET_HAS_CONTROL_ROWS,
     CLEANUP_TARGET_NOT_PREPARED,
+    CLEANUP_VERIFY_MISMATCH,
     DELETE_ORDER,
     KB_ID_TABLES,
     ORPHAN_PREDICATES,
@@ -92,6 +96,32 @@ def test_orphan_predicates_cover_all_tables_and_correct_parents():
     assert KB_ID_TABLES == {
         spec.name for spec in MIGRATION_ORDER if spec.predicate == '"kb_id" = $1'
     }
+
+
+def test_scene_target_rejects_control_plane_rows(monkeypatch):
+    """场景库出现控制面行（DSN 指错或被写入）时，清理必须拒绝而不是照删。"""
+
+    async def ok_distinct(*args, **kwargs):
+        return None
+
+    async def ok_verify(dsn):
+        return {
+            "ok": True,
+            "cross_db_fks": [],
+            "guard_tables": [],
+            "missing_triggers": [],
+        }
+
+    async def occupied(dsn):
+        return [{"table_name": "tenants", "row_count": 1}]
+
+    monkeypatch.setattr(cleanup_mod, "ensure_distinct_targets", ok_distinct)
+    monkeypatch.setattr(cleanup_mod, "verify", ok_verify)
+    monkeypatch.setattr(cleanup_mod, "control_plane_usage", occupied)
+
+    with pytest.raises(CleanupError) as exc:
+        asyncio.run(cleanup_mod._assert_scene_target(None, None, "control", "scene"))
+    assert exc.value.code == CLEANUP_TARGET_HAS_CONTROL_ROWS
 
 
 def _argv(*extra: str) -> None:
@@ -236,6 +266,17 @@ async def _run_roundtrip() -> None:
         assert by_table["documents"]["deleted"] == 1
         assert by_table["chunks"]["deleted"] == 1
         assert all(item["after"] == 0 for item in cleanup["tables"])
+
+        # 清理只动数据面：控制库的 kb 行必须还在（由 API 删并保留审计）
+        control = await asyncpg.connect(control_dsn)
+        try:
+            assert await control.fetchval(
+                'SELECT EXISTS (SELECT 1 FROM "knowledge_bases" WHERE "id" = $1)',
+                ids["kb1"],
+            )
+        finally:
+            await control.close()
+
         assert (await check_orphans(control_dsn, scene_dsn))["ok"] is True
 
         # 7) 场景库出现控制库已不存在的 kb：孤儿检查必须报出来
@@ -299,3 +340,83 @@ async def _run_roundtrip() -> None:
 def test_real_db_cleanup_roundtrip():
     """临时双库：拒绝 → 迁移 → 统计 → 清理 → 孤儿 → 缺 kb 放行 → 控制库副本。"""
     asyncio.run(_run_roundtrip())
+
+
+async def _run_verify_mismatch_rollback() -> None:
+    """复核在事务内：注入残留后必须整笔回滚，不能"报错但已删"。"""
+    base_url = SCENARIO_TEST_DB_URL or ""
+    suffix = uuid.uuid4().hex[:12]
+    control_name = f"cln_rb_ctrl_{suffix}"
+    scene_name = f"cln_rb_scene_{suffix}"
+    control_url = _with_database(base_url, control_name)
+    scene_url = _with_database(base_url, scene_name)
+    control_dsn = _with_database(dsn(base_url), control_name)
+    scene_dsn = _with_database(dsn(base_url), scene_name)
+
+    admin = await asyncpg.connect(_with_database(dsn(base_url), "postgres"))
+    created: list[str] = []
+    try:
+        for name in (control_name, scene_name):
+            try:
+                await admin.execute(f'CREATE DATABASE "{name}" TEMPLATE template0')
+            except asyncpg.exceptions.InsufficientPrivilegeError as exc:
+                pytest.skip(f"当前账号无 CREATE DATABASE 权限（{exc}）")
+            created.append(name)
+
+        for url in (control_url, scene_url):
+            await asyncio.to_thread(command.upgrade, alembic_config(url), "head")
+
+        control = await asyncpg.connect(control_dsn)
+        try:
+            ids = await _seed_control(control)
+        finally:
+            await control.close()
+
+        await apply_surgery(scene_dsn)
+        scene = await asyncpg.connect(scene_dsn)
+        try:
+            await _insert_extra_document(scene, ids, ids["kb1"], "keep.txt")
+        finally:
+            await scene.close()
+
+        # 第 1 次调用是删除前统计；第 2 次（事务内复核）伪造残留。
+        real_counts = cleanup_mod.scene_kb_counts
+        calls = {"n": 0}
+
+        async def fake_counts(connection, kb_id):
+            result = await real_counts(connection, kb_id)
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                result = dict(result)
+                result["documents"] = result["documents"] + 1
+            return result
+
+        with mock.patch.object(cleanup_mod, "scene_kb_counts", fake_counts):
+            with pytest.raises(CleanupError) as exc:
+                await cleanup_scene_kb(
+                    control_dsn, scene_dsn, str(ids["kb1"]), apply=True
+                )
+        assert exc.value.code == CLEANUP_VERIFY_MISMATCH
+
+        # 复核失败触发回滚：删除没有落库，行仍然存在
+        scene = await asyncpg.connect(scene_dsn)
+        try:
+            remaining = await cleanup_mod.scene_kb_counts(scene, str(ids["kb1"]))
+        finally:
+            await scene.close()
+        assert remaining["documents"] == 1
+    finally:
+        for name in created:
+            await admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = $1 AND pid <> pg_backend_pid()",
+                name,
+            )
+            await admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        await admin.close()
+
+
+@requires_db
+def test_real_db_cleanup_rolls_back_on_verify_mismatch():
+    """真实事务里复核失败必须回滚（此前复核在 commit 之后，属于 P1）。"""
+    asyncio.run(_run_verify_mismatch_rollback())
