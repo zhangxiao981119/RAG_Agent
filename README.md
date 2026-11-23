@@ -21,7 +21,7 @@
 |---|---|
 | [一、解决什么问题](#一这个项目解决什么问题) | 通用大模型在企业内的六个硬伤，以及本项目的对应解法 |
 | [二、演示](#二演示) | 流式问答、引用回跳、拒答 |
-| [三、能力全景](#三能力全景) | 检索生成 / 多模态解析 / 治理安全 / 记忆上下文 / 工程 / 图与 LLM Wiki，六组能力与代码入口 |
+| [三、能力全景](#三能力全景) | 检索生成 / 多模态解析 / 治理安全 / 记忆上下文 / 工程 / 图与 LLM Wiki / 场景化配置，七组能力与代码入口 |
 | [四、RAG 全链路](#四rag-全链路) | 端到端流程 + 检索链路四个精修 + 三级记忆 + 上下文治理 |
 | [五、十一个设计取舍](#五十一个设计取舍) | 为什么这么选，以及不这么选会怎样 |
 | [六、多模态解析](#六多模态解析图表与扫描件) | 八类格式、内嵌图转录、图片式表格、质量门禁、水印清理 |
@@ -29,7 +29,7 @@
 | [八、性能实测](#八性能实测与架构约束) | 压测数据、连接池缺陷、视觉链路吞吐天花板 |
 | [九、容器拓扑与技术栈](#九容器拓扑与技术栈) | 11 服务拓扑、技术选型 |
 | [十、快速启动](#十快速启动) | 三条命令跑起来 |
-| [十一、功能清单](#十一功能清单) | F01–F54（含 GraphRAG / LLM Wiki / 企业集成与 MCP 增量） |
+| [十一、功能清单](#十一功能清单) | F01–F60（含 GraphRAG / LLM Wiki / 场景化配置 / 企业集成与 MCP 增量） |
 | [十二、目录结构](#十二目录结构) | 代码地图 |
 | [十三、工程质量](#十三工程质量) | 契约驱动开发、评测门禁、自检发现的缺陷 |
 | [十四、已知边界](#十四已知边界明确说清不做什么) | 明确说清不做什么 |
@@ -147,16 +147,30 @@
 
 > **分步路线状态**：四步代码均已交付（第 4 步三段 commit `ea552c0` / `6717a85` / `86f5fc7`），N1~N6 已裁决；第 1/2/3 步已通过独立验证。**第 4 步真库效果层已实测但未通过「不劣化」**：2026-11-08 完成三轮 217 条 A/B（关态 baseline `20d43188` / 开态·0.85 `069ce6c0` / 开态·0.70 `f7ac0809`），拒答正确率 99.06% / 99.06% / 98.11%，漏答率 0.00% / 0.90% / 1.80%，命中率三轮均 100%；第三轮 `1.80% < 2%` 只是卡进容差，报告同时打印「假绿防线未过 / 本轮评测结论无效」，三行 `passed=True` 都不代表门禁通过。dev 库 19 页 ready / 2 页 failed wiki，开态 `hit_cases` 15 / 17 均未达 `WIKI_NAV_MIN_HIT_CASES=20`（门槛数值按裁决不改），故开态轮结论按 `caliber.validity=invalid_wiki_nav_gate` 记无效而非通过。代码与编排默认 `WIKI_ENABLED=false`，关闭态与未实现第 4 步时逐字节等价；本机 `.env` 仅为标定临时设为 `true`。**唯一安全交付形态仍是两个 selective 开关默认关**。设计见 [02-design/第4步-wiki导航增量设计.md](02-design/第4步-wiki导航增量设计.md) 与 [code/docs/按需路由设计.md](code/docs/按需路由设计.md) §6。
 
+### 场景化配置（第六阶段 Step1~5）
+
+| 能力 | 具体实现 | 代码入口 |
+|------|----------|----------|
+| **场景目录与版本**（Step1~3） | 迁移 `0028` 建 `scenarios` / `scenario_versions`，内置默认场景；解析请求用单条查询取回已发布版本，避免按场景重复查库；发布态带 `checksum` 做乐观并发 | [services/scenario](code/apps/api/app/services/scenario/) · [api/scenarios.py](code/apps/api/app/api/scenarios.py) |
+| **场景策略生效** | 对话与集成问答按场景透传 Policy；检索链接受 `policy` 覆盖，未传时沿用全局 `decisions.py` 口径，默认行为与接入前一致 | [services/retrieve/__init__.py](code/apps/api/app/services/retrieve/__init__.py) · [api/chat.py](code/apps/api/app/api/chat.py) |
+| **场景管理**（Step4A/4B） | 8 个管理端点：列表 / 详情 / 版本详情 / 建场景 / 存草稿 / 校验 / 发布 / 归档；状态机 `draft → validated → published → archived`，发布时自动归档上一版；跨租户访问一律 404 | [api/scenarios.py](code/apps/api/app/api/scenarios.py) |
+| **重嵌入口径**（Step4B） | 迁移 `0029` 建重嵌入判定视图；`GET /api/needs-reindex` 按库位返回需重算的 chunk 口径分布，`reindex_embeddings.py` 与接口共用同一谓词 | [api/needs_reindex.py](code/apps/api/app/api/needs_reindex.py) |
+| **库位目录与连接路由**（Step5） | `scenarios.db_binding` 是唯一库位列（`NULL`=默认库，展示层虚拟键 `default`）；迁移 `0030` 建 `v_scenario_db_routing` 视图、库位冲突函数与视图；`db_router` 启动期登记绑定并做连接预算闸门，**分流关闭时零建引擎**，`engine_for("default")` 直接复用主引擎 | [infra/db_router.py](code/apps/api/app/infra/db_router.py) · [alembic/versions/0030_add_db_routing_views.py](code/apps/api/alembic/versions/0030_add_db_routing_views.py) |
+| **库位盘点** | 只读脚本打印库位分流、覆盖与冲突情况，不写库、不建连接池，用于上线前后核对目录 | [scripts/db_routing_report.py](code/apps/api/scripts/db_routing_report.py) |
+
+> **默认关闭**：`SCENE_DB_SPLIT_ENABLED=false`（默认）时只登记默认绑定、零建连接池；预算闸门只在启动期校验 `(pool_size + max_overflow) × replicas × buckets + worker ≤ max_connections - reserved`，超卖即拒绝启动。
+
 ### 规模
 
 | 维度 | 数字 |
 |---|---|
 | 前端 | React 18 + TypeScript，**5 个业务页面 + 12 个管理面板** |
-| 后端 | FastAPI，**24 个 REST 路由模块 / 88 个接口 / 27 版 Alembic 迁移（0001~0027）** |
+| 后端 | FastAPI，**28 个 REST 路由模块 / 100 个接口 / 30 版 Alembic 迁移（0001~0030）** |
 | 解析 | **8 类格式 / 13 个扩展名**，四类文档支持内嵌图转录 |
-| 测试 | **84 个测试文件**（`tests/` 下 `test_*.py`）；第 3 步独立验证 **520 用例全过**（P0=0 / P1=0 / P2=3），见 [04-test/测试报告-第3步-wiki.md](04-test/测试报告-第3步-wiki.md) |
+| 测试 | **113 个测试文件**（`tests/` 下 `test_*.py`）；第 3 步独立验证 **520 用例全过**（P0=0 / P1=0 / P2=3），见 [04-test/测试报告-第3步-wiki.md](04-test/测试报告-第3步-wiki.md) |
 | 评测 | **217 条** eval 用例（111 可答 + 106 不可答） |
 | 图与 Wiki | 迁移 0024 / 0025（实体图） + 0026（`wiki_pages`）；在线图召回旁路、文档级 LLM Wiki 生成与读接口已交付；第 4 步导航检索代码已交付（默认关闭）；2026-11-08 三轮 217 条 A/B 已跑完并落库，开态存在漏答回退、不得常开 |
+| 场景化配置 | 迁移 0028 / 0029 / 0030；场景目录与版本、重嵌入口径、库位目录与连接路由已交付；库位分流默认关闭，关闭态零建引擎 |
 | 容器 | 开发 11 服务、生产 13 服务（含迁移 / MCP / 网关 / 监控）一键启动 |
 
 ---
@@ -778,6 +792,17 @@ docker compose logs -f api          # 看到 "Uvicorn running on ...:8000" 即�
 | F53 | **MCP 协议适配** | 独立 FastMCP Server 暴露 `knowledge_ask` / `knowledge_search`，只做身份头映射与 HTTP 转发，不持有 RAG 逻辑；仅容器内网可达 |
 | F54 | **SSE 可靠性** | 15 秒注释心跳、断流部分正文落库、`retry_message_id` 幂等重试、终态数据库回放、`generating` 时 409 |
 
+### 场景化配置（第六阶段 Step1~5）
+
+| 编号 | 功能 | 说明 |
+|------|------|------|
+| F55 | **场景目录与版本** | 迁移 `0028` 建 `scenarios` / `scenario_versions`，内置默认场景；单条查询取回已发布版本；发布带 `checksum` 乐观并发 |
+| F56 | **场景策略生效** | 对话与集成问答按场景透传 Policy；检索接受 `policy` 覆盖，未传时沿用全局 `decisions.py`，默认行为不变 |
+| F57 | **场景管理端点** | 8 个端点覆盖建场景、存草稿、校验、发布、归档；发布自动归档上一版；跨租户一律 404 |
+| F58 | **重嵌入口径** | 迁移 `0029` + `GET /api/needs-reindex`；接口与重算脚本共用同一谓词，避免两套口径漂移 |
+| F59 | **库位目录与连接路由** | 迁移 `0030`（两视图一函数）+ `db_router`；`scenarios.db_binding` 单点权威；启动期连接预算闸门拒绝超卖；分流默认关、关闭态零建引擎 |
+| F60 | **库位盘点脚本** | `db_routing_report.py` 只读打印库位分流、覆盖与冲突，不写库、不建连接池 |
+
 **管理面板（admin 可见，共 12 个）**：组织架构 / 用户管理 / 用户组 / 角色管理 / 审计日志 / 系统监控（P50/P95/P99 + 拒答率）/ 评估门禁 / **知识治理（四维评分 + 重跑）** / 配额管理 / 敏感词 / 灰度开关 / 提示词版本。
 
 ---
@@ -789,7 +814,7 @@ code/
 ├── apps/
 │   ├── api/                     # 后端
 │   │   ├── app/
-│   │   │   ├── api/             # REST 路由层（23 个模块 / 83 个接口）
+│   │   │   ├── api/             # REST 路由层（28 个模块 / 100 个接口）
 │   │   │   ├── services/        # 业务层
 │   │   │   │   ├── retrieve/    #   三路召回 + RRF + 章节补全 + 链式拆解
 │   │   │   │   ├── generate/    #   生成 + 拒答判定 + 引用双向校验
@@ -801,12 +826,13 @@ code/
 │   │   │   │   ├── chunk/       #   分块（粒度优先级 + 表格按行组带表头）
 │   │   │   │   ├── graph/       #   实体抽取 / 在线图召回（side channel）
 │   │   │   │   ├── wiki/        #   文档级 LLM Wiki 生成
+│   │   │   │   ├── scenario/    #   场景目录、版本状态机与策略解析
 │   │   │   │   └── acl/         #   四闸门可见性判定
 │   │   │   ├── models/          # SQLAlchemy ORM（PostgreSQL + pgvector）
 │   │   │   ├── schemas/         # Pydantic 请求/响应模型
-│   │   │   ├── infra/           # 指标 / 链路追踪 / Redis 与 arq 连接池
+│   │   │   ├── infra/           # 指标 / 链路追踪 / Redis 与 arq 连接池 / 库位路由（db_router）
 │   │   │   └── config/          # 配置 + 全局口径（decisions.py / index_profile.py / 启动自检）
-│   │   ├── alembic/versions/    # 27 版数据库迁移（0001~0027）
+│   │   ├── alembic/versions/    # 30 版数据库迁移（0001~0030）
 │   │   ├── scripts/             # 评测 / 标定 / 压测 / 重算 / 图数据补建 / wiki 重建脚本
 │   │   └── tests/               # pytest（API / 解析 / 检索 / 权限 / 集成 / MCP）
 │   ├── mcp/                     # MCP 适配服务（FastMCP Streamable HTTP，内网）
