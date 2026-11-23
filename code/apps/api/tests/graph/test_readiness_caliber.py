@@ -82,7 +82,9 @@ class _FakeCheckSession:
 
 
 def _install(monkeypatch, session: _FakeCheckSession) -> None:
-    monkeypatch.setattr(bg, "SessionLocal", lambda: session)
+    # 数据面入口现为 open_job_session(db_key)；假 session 自带 async 上下文方法，
+    # 直接返回即可保持 `async with` 语义不变。
+    monkeypatch.setattr(bg, "open_job_session", lambda _db_key: session)
 
 
 def _row(**overrides) -> SimpleNamespace:
@@ -105,7 +107,7 @@ async def test_check_counts_only_indexed_docs_and_exits_zero(monkeypatch, capsys
     session = _FakeCheckSession(_row(), not_indexed=1, entities=432, relations=182)
     _install(monkeypatch, session)
 
-    assert await bg._check() == 0
+    assert await bg._check("default") == 0
 
     out = capsys.readouterr().out
     assert "已索引文档总数 : 21" in out
@@ -123,7 +125,7 @@ async def test_not_indexed_docs_never_block_readiness(monkeypatch, capsys):
     session = _FakeCheckSession(_row(done=19, skipped=1), not_indexed=5)
     _install(monkeypatch, session)
 
-    assert await bg._check() == 0
+    assert await bg._check("default") == 0
     assert "未索引(不参与) : 5 篇" in capsys.readouterr().out
 
 
@@ -135,7 +137,7 @@ async def test_real_backlog_on_indexed_docs_still_fails(monkeypatch, capsys):
     )
     _install(monkeypatch, session)
 
-    assert await bg._check() == 1
+    assert await bg._check("default") == 1
     assert "未就绪合计     : 3" in capsys.readouterr().out
 
 
@@ -145,7 +147,7 @@ async def test_empty_mention_alarm_has_min_content_length_guard(monkeypatch):
     session = _FakeCheckSession(_row(), not_indexed=0)
     _install(monkeypatch, session)
 
-    await bg._check()
+    await bg._check("default")
 
     guard_sql = next(sql for sql in session.sql if "graph_entity_mentions" in sql)
     assert "char_length" in guard_sql

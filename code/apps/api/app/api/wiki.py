@@ -189,9 +189,19 @@ async def get_wiki_page(
     try:
         db_key = await locate_row_db_key(session, WikiPage, page_id)
     except DbScopeError as exc:
+        # 结构化 detail（与 scenario 等错误映射同口径）：code + 关键上下文，
+        # 便于前端/日志按机器可读字段定位；model/pk 需序列化成 JSON 可写类型。
+        scope = exc.detail or {}
+        model = scope.get("model")
+        pk = scope.get("pk")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"DB_SCOPE_AMBIGUOUS: {exc.detail}",
+            detail={
+                "code": exc.code,
+                "model": getattr(model, "__name__", str(model)),
+                "pk": str(pk) if pk is not None else None,
+                "db_keys": scope.get("db_keys"),
+            },
         ) from exc
     # 404 三合一：不做「页在但你没权」与「页不在」的区分（§9.6 ③）
     if db_key is None:

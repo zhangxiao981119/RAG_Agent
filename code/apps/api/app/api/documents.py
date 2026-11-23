@@ -151,9 +151,19 @@ async def _locate_doc_db_key(session: AsyncSession, doc_id: uuid.UUID) -> str:
     try:
         db_key = await locate_row_db_key(session, Document, doc_id)
     except DbScopeError as exc:
+        # 结构化 detail（与 scenario 等错误映射同口径）：code + 关键上下文，
+        # 便于前端/日志按机器可读字段定位；model/pk 需序列化成 JSON 可写类型。
+        scope = exc.detail or {}
+        model = scope.get("model")
+        pk = scope.get("pk")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"DB_SCOPE_AMBIGUOUS: {exc.detail}",
+            detail={
+                "code": exc.code,
+                "model": getattr(model, "__name__", str(model)),
+                "pk": str(pk) if pk is not None else None,
+                "db_keys": scope.get("db_keys"),
+            },
         ) from exc
     if db_key is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")

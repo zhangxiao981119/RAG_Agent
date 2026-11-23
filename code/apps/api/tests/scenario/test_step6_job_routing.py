@@ -459,12 +459,19 @@ def test_document_by_id_ambiguous_returns_500(endpoint_harness, monkeypatch):
     client, opened, _, doc_id = endpoint_harness
 
     async def _locate(session, model, pk):  # noqa: ANN001
-        raise DbScopeError("DB_SCOPE_AMBIGUOUS", {"db_keys": ["kb_a", "kb_b"]})
+        raise DbScopeError(
+            "DB_SCOPE_AMBIGUOUS",
+            {"model": model, "pk": pk, "db_keys": ["kb_a", "kb_b"]},
+        )
 
     monkeypatch.setattr(documents_api, "locate_row_db_key", _locate)
 
     resp = client.get(f"/api/documents/{doc_id}/parse-preview")
 
     assert resp.status_code == 500
-    assert "DB_SCOPE_AMBIGUOUS" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert detail["code"] == "DB_SCOPE_AMBIGUOUS"
+    assert detail["model"] == "Document"
+    assert detail["pk"] == str(doc_id)
+    assert detail["db_keys"] == ["kb_a", "kb_b"]
     assert opened == []
