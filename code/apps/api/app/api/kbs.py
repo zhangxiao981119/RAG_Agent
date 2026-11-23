@@ -36,6 +36,7 @@ from app.services import kb_member as kb_member_service
 from app.services.acl import compute_doc_acl_tags
 from app.services.acl.subjects import invalidate_tenant_acl
 from app.services.db_scope import (
+    DB_SCOPE_NOT_ALLOWED,
     DbScopeError,
     map_kb_db_keys,
     open_data_session,
@@ -186,6 +187,8 @@ async def delete_kb(
     try:
         db_key = await resolve_kb_db_key(session, user.tenant_id, [kb.id])
     except DbScopeError as exc:
+        if exc.code == DB_SCOPE_NOT_ALLOWED:
+            raise  # 租户库白名单拒绝 → 全局 handler 400
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
@@ -554,6 +557,8 @@ async def upload_document(
     try:
         return await _upload_single(request, kb, file, user, session)
     except DbScopeError as exc:
+        if exc.code == DB_SCOPE_NOT_ALLOWED:
+            raise  # 租户库白名单拒绝 → 全局 handler 400
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(

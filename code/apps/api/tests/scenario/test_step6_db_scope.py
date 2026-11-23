@@ -381,7 +381,7 @@ async def _run_control_copy_same_id() -> None:
             published_at=datetime.now(timezone.utc),
         )
         await control.execute(
-            "UPDATE scenarios SET db_binding = $1 WHERE id = $2",
+            "UPDATE scenarios SET tier = 'warm', db_binding = $1 WHERE id = $2",
             "kb_probe",
             scenario_id,
         )

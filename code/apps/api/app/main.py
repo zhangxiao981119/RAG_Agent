@@ -41,6 +41,11 @@ from app.api.users import router as users_router
 from app.config import decisions
 from app.config.settings import get_settings
 from app.infra import metrics, trace
+from app.services.db_scope import (
+    DB_SCOPE_NOT_ALLOWED,
+    DbScopeError,
+    error_detail,
+)
 from app.infra.arq_pool import close_arq_pool, get_arq_pool
 from app.infra.redis_client import close_redis
 
@@ -396,6 +401,22 @@ async def _value_error_handler(request: Request, exc: ValueError):
     """
     logger.error("ValueError on %s %s: %s\n%s", request.method, request.url.path, exc, traceback.format_exc())
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(DbScopeError)
+async def _db_scope_error_handler(request: Request, exc: DbScopeError):
+    """库位异常的统一出口（Step 7 S7-3）。
+
+    ★ 只有 `DB_SCOPE_NOT_ALLOWED` 在这里映射 400：它是治理拒绝（租户库白名单），
+      不是"同一 kb 命中多个库"的冲突。后者由各调用点显式 409/500 并附业务文案，
+      不会走到这里；走到这里的其它码说明调用点没捕获，维持 500 且不泄露细节。
+    """
+    if exc.code == DB_SCOPE_NOT_ALLOWED:
+        return JSONResponse(status_code=400, content={"detail": error_detail(exc)})
+    logger.error(
+        "Unhandled DbScopeError on %s %s: %s", request.method, request.url.path, exc
+    )
+    return JSONResponse(status_code=500, content={"detail": "INTERNAL_SERVER_ERROR"})
 
 
 @app.exception_handler(Exception)

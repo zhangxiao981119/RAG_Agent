@@ -22,7 +22,11 @@ from app.models import KnowledgeBase, SyncSource
 from app.schemas.sync import SyncSourceCreate, SyncSourceOut, SyncSourceUpdate, SyncResult
 from app.services import audit
 from app.services.crypto import encrypt_credential
-from app.services.db_scope import DbScopeError, resolve_kb_db_key
+from app.services.db_scope import (
+    DB_SCOPE_NOT_ALLOWED,
+    DbScopeError,
+    resolve_kb_db_key,
+)
 
 router = APIRouter(tags=["sync-sources"])
 
@@ -217,6 +221,8 @@ async def trigger_sync(
     try:
         db_key = await resolve_kb_db_key(session, user.tenant_id, [source.kb_id])
     except DbScopeError as exc:
+        if exc.code == DB_SCOPE_NOT_ALLOWED:
+            raise  # 租户库白名单拒绝 → 全局 handler 400
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(

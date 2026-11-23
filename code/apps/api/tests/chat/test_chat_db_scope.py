@@ -20,7 +20,7 @@ import app.api.chat as chat_mod
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.api.rate_limit import check_chat_rate_limit
 from app.main import app
-from app.services.db_scope import DbScopeError
+from app.services.db_scope import DB_SCOPE_NOT_ALLOWED, DbScopeError
 from app.services.generate import StreamDelta
 from app.services.retrieve.base import RetrievalResult, RetrievedChunk
 
@@ -237,6 +237,27 @@ def test_chat_mixed_db_scope_returns_409(harness, monkeypatch):
     assert "default" in detail
     assert "kb_finance" in detail
     # 未进入检索：只查一半的行为必须被 409 挡在门外
+    assert harness.retrieval.seen_session is None
+
+
+def test_chat_db_not_allowed_returns_400(harness, monkeypatch):
+    """Step 7 S7-3：租户库白名单拒绝 → 400（不是 409、不是 500、不是空结果）。"""
+
+    async def _resolve_denied(session, tenant_id, kb_ids):  # noqa: ANN001
+        raise DbScopeError(
+            DB_SCOPE_NOT_ALLOWED,
+            {"tenant_id": tenant_id, "denied": ["default"]},
+        )
+
+    monkeypatch.setattr(chat_mod, "resolve_kb_db_key", _resolve_denied)
+
+    resp = _post(harness)
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["code"] == "DB_SCOPE_NOT_ALLOWED"
+    assert detail["denied"] == ["default"]
+    assert detail["tenant_id"] == str(_TENANT_ID)
+    # 被拒绝的请求绝不能进入检索（否则"拒绝"只是文案，数据已经查过）
     assert harness.retrieval.seen_session is None
 
 

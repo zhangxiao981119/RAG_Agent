@@ -86,7 +86,7 @@
 
 ---
 
-## S7-3 钉定解析 + 库映射 + 白名单
+## [x] S7-3 钉定解析 + 库映射 + 白名单
 
 **文件**
 - 修改 `code/apps/api/app/services/db_scope.py`

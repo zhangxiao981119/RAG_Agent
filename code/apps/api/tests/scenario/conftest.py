@@ -70,6 +70,23 @@ async def conn(schema):
     async with pg_helpers.rolled_back_conn(schema) as connection:
         yield connection
 
+
+@pytest_asyncio.fixture()
+async def db_session(schema):
+    """一条绑定真库的 `AsyncSession`（供直接调用服务层函数的用例使用）。
+
+    ★ 用 `NullPool`：用例只关心语义，不关心连接复用；也避免与 `conn`（asyncpg
+      直连事务）抢同一批连接。
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_async_engine(SCENARIO_TEST_DB_URL, poolclass=NullPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as session:
+        yield session
+    await engine.dispose()
+
 _MIGRATION_PATH = (
     pathlib.Path(__file__).resolve().parents[2] / "alembic" / "versions" / "0028_add_scenarios.py"
 )

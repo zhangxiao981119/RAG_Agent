@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config.settings import get_settings
 from app.services.db_scope import (
+    DB_SCOPE_NOT_ALLOWED,
     DbScopeError,
     error_detail,
     open_data_session,
@@ -190,6 +191,8 @@ async def get_wiki_page(
     try:
         db_key = await resolve_wiki_page_db_key(session, page_id)
     except DbScopeError as exc:
+        if exc.code == DB_SCOPE_NOT_ALLOWED:
+            raise  # 租户库白名单拒绝 → 全局 handler 400
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=error_detail(exc),

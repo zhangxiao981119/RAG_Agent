@@ -50,7 +50,12 @@ from app.services import feature_flag as flag_service
 from app.services import quota as quota_service
 from app.services import sensitive as sensitive_service
 from app.services.caliber import snapshot_for_message
-from app.services.db_scope import DbScopeError, open_data_session, resolve_kb_db_key
+from app.services.db_scope import (
+    DB_SCOPE_NOT_ALLOWED,
+    DbScopeError,
+    open_data_session,
+    resolve_kb_db_key,
+)
 from app.services.generate import build_system_prompt, get_stream_generation_service
 from app.services.guard import injection as injection_guard
 from app.services.keyword_text import hit_snippet
@@ -332,6 +337,8 @@ async def _chat_ask_impl(
             session, user.tenant_id, effective_kb_ids
         )
     except DbScopeError as exc:
+        if exc.code == DB_SCOPE_NOT_ALLOWED:
+            raise  # 租户库白名单拒绝由全局 handler 映射 400，不是跨库冲突
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(

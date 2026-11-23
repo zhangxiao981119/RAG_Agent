@@ -23,6 +23,9 @@ Create Date: 2026-11-23
   不会出现「库搬了、等级没搬」的第二真源。
 
 ★ 回填口径：`db_binding IS NULL → cold`，非 NULL → `warm`。
+  回填包在 `IF EXISTS (SELECT 1 FROM scenarios)` 守卫里：场景库的控制面表
+  装有 FOR EACH STATEMENT 写拦截触发器，命中 0 行的 UPDATE 也会被拒；
+  场景库 `scenarios` 恒为空，因此守卫让同一段迁移在两类库上都能跑。
   现有默认场景都在控制库，基线是 cold；框架写的「回滚到全部温」与本部署事实不符，
   这里按事实回填，并在设计文档里写明。
 """
@@ -62,7 +65,19 @@ _UPGRADE_STATEMENTS = (
     "ALTER TABLE scenarios ADD COLUMN rerank_allowed boolean",
     # 场景级：分级（先可空，回填后再收紧）
     "ALTER TABLE scenarios ADD COLUMN tier text",
-    "UPDATE scenarios SET tier = CASE WHEN db_binding IS NULL THEN 'cold' ELSE 'warm' END",
+    # ★ 回填必须包在「表非空才写」的守卫里：场景库（M-B 手术之后）给控制面表
+    #   装了 FOR EACH STATEMENT 的写拦截触发器，哪怕命中 0 行的 UPDATE 也会被拒。
+    #   场景库的 scenarios 恒为空 ⇒ 跳到 UPDATE，迁移在两类库上都能跑。
+    """
+DO $mig$
+BEGIN
+    IF EXISTS (SELECT 1 FROM scenarios) THEN
+        UPDATE scenarios
+           SET tier = CASE WHEN db_binding IS NULL THEN 'cold' ELSE 'warm' END;
+    END IF;
+END
+$mig$;
+""",
     "ALTER TABLE scenarios ALTER COLUMN tier SET NOT NULL",
     "ALTER TABLE scenarios ALTER COLUMN tier SET DEFAULT 'cold'",
     "ALTER TABLE scenarios ADD CONSTRAINT ck_scenarios_tier "

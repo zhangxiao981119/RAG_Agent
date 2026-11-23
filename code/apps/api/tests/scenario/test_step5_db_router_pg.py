@@ -65,7 +65,7 @@ async def test_t5_9_default_binding_is_not_writable(conn):
         asyncpg.exceptions.CheckViolationError,
         "ck_scenarios_db_binding_format",
         lambda: conn.execute(
-            "UPDATE scenarios SET db_binding = 'default' WHERE id = $1", scenario_id
+            "UPDATE scenarios SET tier = 'warm', db_binding = 'default' WHERE id = $1", scenario_id
         ),
     )
 
@@ -73,7 +73,7 @@ async def test_t5_9_default_binding_is_not_writable(conn):
     # 否则分不清「约束拒绝了 default」与「这条 UPDATE 根本写不进去」。
     async with conn.transaction():
         await conn.execute(
-            "UPDATE scenarios SET db_binding = 'kb_ab' WHERE id = $1", scenario_id
+            "UPDATE scenarios SET tier = 'warm', db_binding = 'kb_ab' WHERE id = $1", scenario_id
         )
         stored = await conn.fetchval(
             "SELECT db_binding FROM scenarios WHERE id = $1", scenario_id
@@ -108,7 +108,7 @@ async def test_t5_10_routing_view_row_count_and_keys(conn):
     )
     # B：已发布 + 绑定库位
     await conn.execute(
-        "UPDATE scenarios SET db_binding = 'kb_ab' WHERE id = $1", scenario_b
+        "UPDATE scenarios SET tier = 'warm', db_binding = 'kb_ab' WHERE id = $1", scenario_b
     )
     await insert_version(
         conn, tenant_id, scenario_b, state="published", published_at=now, kb_ids=[kb_id]
@@ -167,10 +167,10 @@ async def test_t5_11_kb_conflict_detected_then_resolved(conn):
     now = datetime.now(timezone.utc)
 
     await conn.execute(
-        "UPDATE scenarios SET db_binding = 'kb_ab' WHERE id = $1", scenario_p
+        "UPDATE scenarios SET tier = 'warm', db_binding = 'kb_ab' WHERE id = $1", scenario_p
     )
     await conn.execute(
-        "UPDATE scenarios SET db_binding = 'kb_cd' WHERE id = $1", scenario_q
+        "UPDATE scenarios SET tier = 'warm', db_binding = 'kb_cd' WHERE id = $1", scenario_q
     )
     await insert_version(
         conn, tenant_id, scenario_p, state="published", published_at=now,
@@ -192,7 +192,7 @@ async def test_t5_11_kb_conflict_detected_then_resolved(conn):
 
     # 把 Q 改成与 P 相同的库位：判据是「≥2 个不同库位」，不再成立
     await conn.execute(
-        "UPDATE scenarios SET db_binding = 'kb_ab' WHERE id = $1", scenario_q
+        "UPDATE scenarios SET tier = 'warm', db_binding = 'kb_ab' WHERE id = $1", scenario_q
     )
     resolved = await conn.fetch(
         "SELECT tenant_id, kb_id, db_keys FROM fn_kb_db_binding_conflicts() "
@@ -248,10 +248,10 @@ async def test_t5_11c_unbound_scenario_does_not_enter_conflict_group(conn):
     now = datetime.now(timezone.utc)
 
     await conn.execute(
-        "UPDATE scenarios SET db_binding = 'kb_ab' WHERE id = $1", scenario_p
+        "UPDATE scenarios SET tier = 'warm', db_binding = 'kb_ab' WHERE id = $1", scenario_p
     )
     await conn.execute(
-        "UPDATE scenarios SET db_binding = 'kb_cd' WHERE id = $1", scenario_q
+        "UPDATE scenarios SET tier = 'warm', db_binding = 'kb_cd' WHERE id = $1", scenario_q
     )
     for scenario_id in (scenario_p, scenario_q, scenario_unbound):
         await insert_version(
@@ -296,7 +296,7 @@ async def _seed_published_pair() -> uuid.UUID:
 
             bound_scenario = await new_scenario(connection, tenant_id)
             await connection.execute(
-                "UPDATE scenarios SET db_binding = 'kb_ab' WHERE id = $1", bound_scenario
+                "UPDATE scenarios SET tier = 'warm', db_binding = 'kb_ab' WHERE id = $1", bound_scenario
             )
             await insert_version(
                 connection, tenant_id, bound_scenario, state="published",

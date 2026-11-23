@@ -19,7 +19,6 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
-import pytest_asyncio
 from sqlalchemy import text
 
 import app.services.scenario.resolver as resolver_mod
@@ -319,21 +318,6 @@ async def test_validate_db_key(value, expected):
 # ══════════════════════════════════════════════════════════════════════
 # 四、真库：钉定确实改变「解析到哪个版本」
 # ══════════════════════════════════════════════════════════════════════
-
-
-@pytest_asyncio.fixture()
-async def db_session(schema):
-    """一条绑定真库的 AsyncSession（NullPool：用例只关心语义，不关心连接复用）。"""
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-    from sqlalchemy.pool import NullPool
-
-    from tests.scenario.pg_helpers import SCENARIO_TEST_DB_URL
-
-    engine = create_async_engine(SCENARIO_TEST_DB_URL, poolclass=NullPool)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with factory() as session:
-        yield session
-    await engine.dispose()
 
 
 async def test_governed_sql_picks_pinned_archived_version_in_real_db(

@@ -86,11 +86,27 @@ def test_upgrade_adds_all_seven_columns(upgrade_sql):
 
 def test_tier_backfill_runs_before_not_null(upgrade_sql):
     """顺序不能反：先回填，再 SET NOT NULL，否则空库以外的部署会直接迁移失败。"""
-    backfill = upgrade_sql.find("UPDATE scenarios SET tier = CASE")
+    backfill = upgrade_sql.find("SET tier = CASE")
     not_null = upgrade_sql.find("ALTER COLUMN tier SET NOT NULL")
     default = upgrade_sql.find("ALTER COLUMN tier SET DEFAULT 'cold'")
     assert backfill >= 0 and not_null >= 0 and default >= 0
     assert backfill < not_null < default
+
+
+def test_tier_backfill_is_guarded_for_scene_databases(upgrade_sql):
+    """回填必须包在「表非空才写」的守卫里。
+
+    ★ 场景库（M-B 手术之后）对 `scenarios` 装了 FOR EACH STATEMENT 的写拦截触发器：
+      哪怕命中 0 行的 UPDATE 也会被拒。场景库的 `scenarios` 恒为空，
+      守卫能让迁移在控制库（要回填）与场景库（不许写）上同时成立。
+    """
+    guard = upgrade_sql.find("IF EXISTS (SELECT 1 FROM scenarios)")
+    update = upgrade_sql.find("UPDATE scenarios")
+    assert guard >= 0, "回填缺少 `IF EXISTS (SELECT 1 FROM scenarios)` 守卫"
+    assert update >= 0
+    assert guard < update, "守卫必须在 UPDATE 之前"
+    # 不允许出现守卫之外的裸 UPDATE（那会在场景库上直接失败）
+    assert upgrade_sql.count("UPDATE scenarios") == 1
 
 
 def test_tier_binding_check_is_a_real_predicate(upgrade_sql):

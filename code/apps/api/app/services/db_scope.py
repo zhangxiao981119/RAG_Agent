@@ -11,7 +11,10 @@
    （回落会让"绑定了 kb_x 但本进程没配 kb_x"变成"悄悄查错库、返回一半结果"）。
 
 库位判定口径：
-  · 以 `scenario_versions.kb_ids`（**已发布版本**）为准，`jsonb_array_elements_text` 展开；
+  · 以 `scenario_versions.kb_ids` 为准（默认取**已发布版本**；治理开启且场景钉定后
+    改取钉定版本，published/archived 均可），`jsonb_array_elements_text` 展开；
+  · 治理开启时解析结果还要过 `tenants.allowed_db_keys` 白名单（NULL=不限，
+    `{}`=全禁，数组=白名单），越界抛 `DB_SCOPE_NOT_ALLOWED`；
   · `scenarios.db_binding IS NULL` 即默认库 —— **default 也是一个库位**：
     一次请求里「默认库的 kb + 绑定库位的 kb」= 跨库，必须拒绝，否则只会查一半；
   · **不按 `scenarios.status` 过滤**：库位是物理事实，被禁用场景里的数据仍在那个库；
@@ -34,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config.settings import get_settings
 from app.infra.db_router import DEFAULT_DB_KEY, data_session, registered_db_keys
 from app.models import Document, WikiPage
+from app.services.tenant.governance import get_allowed_db_keys
 
 # 一次请求跨多个库位（本期不支持跨库检索/跨库写入）
 DB_SCOPE_MULTI_KEY: Final[str] = "DB_SCOPE_MULTI_KEY"
@@ -41,12 +45,16 @@ DB_SCOPE_MULTI_KEY: Final[str] = "DB_SCOPE_MULTI_KEY"
 DB_SCOPE_AMBIGUOUS: Final[str] = "DB_SCOPE_AMBIGUOUS"
 # worker 收到的队列负载缺少 db_key（D-S6-3-1）
 JOB_DB_KEY_MISSING: Final[str] = "JOB_DB_KEY_MISSING"
+# 租户库白名单拒绝（Step 7 S7-3）：解析出的库位不在 tenants.allowed_db_keys 内
+DB_SCOPE_NOT_ALLOWED: Final[str] = "DB_SCOPE_NOT_ALLOWED"
 
 __all__ = [
     "DB_SCOPE_MULTI_KEY",
     "DB_SCOPE_AMBIGUOUS",
+    "DB_SCOPE_NOT_ALLOWED",
     "JOB_DB_KEY_MISSING",
     "DbScopeError",
+    "ensure_db_keys_allowed",
     "resolve_kb_db_key",
     "map_kb_db_keys",
     "resolve_document_db_key",
@@ -87,6 +95,28 @@ WHERE s.tenant_id = :tenant_id
 GROUP BY kb.value, s.db_binding
 """)
 
+# 治理开启时的映射 SQL：版本选择与 resolver 的 LOOKUP_GOVERNED_SQL **逐字同口径**。
+# ★ 为什么映射必须 pin-aware：kb 集合会随版本变化，若映射仍取 published，
+#   钉定旧版的请求会被引到新版库位 —— 版本与库位来自两个版本 = 读到别人的数据。
+_MAP_SQL_GOVERNED = text("""
+SELECT kb.value AS kb_id, s.db_binding AS db_key
+FROM scenarios s
+JOIN scenario_versions v
+  ON v.scenario_id = s.id
+ AND v.tenant_id   = s.tenant_id
+ AND (
+      (s.pinned_version IS NULL AND v.state = 'published')
+   OR (s.pinned_version IS NOT NULL
+       AND v.version = s.pinned_version
+       AND v.state IN ('published','archived'))
+ )
+CROSS JOIN LATERAL jsonb_array_elements_text(v.kb_ids) AS kb(value)
+WHERE s.tenant_id = :tenant_id
+  AND s.db_binding IS NOT NULL
+  AND kb.value = ANY(:kb_ids)
+GROUP BY kb.value, s.db_binding
+""")
+
 
 async def resolve_kb_db_key(
     control_session: AsyncSession,
@@ -100,20 +130,43 @@ async def resolve_kb_db_key(
       把**未命中的 kb 计为 default** 后去重：0 个 → `"default"`；
       1 个 → 该键；≥2 个 → `DbScopeError(DB_SCOPE_MULTI_KEY)`。
       「默认库 + 绑定库位」的混合请求因此会报 MULTI_KEY，而不是只查绑定库。
+    - 治理开启时再按 `tenants.allowed_db_keys` 校验（**含 default**）：
+      `NULL` 不限；`{}` 全禁；数组为白名单。越界 → `DB_SCOPE_NOT_ALLOWED`
+      （HTTP 400）。先校验再判跨库：白名单拒绝比"挑不出库位"更根本。
 
     ★ 不校验该键是否已注册：注册与否由 `data_session` 在真正开会话时 fail-closed，
       这里若提前回落默认库，就会把配置缺口藏成"查了半个库"。
     """
     mapping = await map_kb_db_keys(control_session, tenant_id, kb_ids)
-    if not mapping:
-        return DEFAULT_DB_KEY
-    keys = sorted(set(mapping.values()))
+    keys = sorted(set(mapping.values())) or [DEFAULT_DB_KEY]
+    await ensure_db_keys_allowed(control_session, tenant_id, keys)
     if len(keys) > 1:
         raise DbScopeError(
             DB_SCOPE_MULTI_KEY,
             {"kb_ids": [str(kb_id) for kb_id in kb_ids], "db_keys": keys},
         )
     return keys[0]
+
+
+async def ensure_db_keys_allowed(
+    control_session: AsyncSession,
+    tenant_id: uuid.UUID,
+    db_keys: Sequence[str],
+) -> None:
+    """租户库白名单校验（Step 7 S7-3）。
+
+    关闭治理开关时 `get_allowed_db_keys` 直接返回 `None` 且不发 SQL，
+    因此这里也不产生任何查询 —— 关闭态与 Step 6 完全一致。
+    """
+    allowed = await get_allowed_db_keys(control_session, tenant_id)
+    if allowed is None:
+        return
+    denied = sorted({str(key) for key in db_keys} - allowed)
+    if denied:
+        raise DbScopeError(
+            DB_SCOPE_NOT_ALLOWED,
+            {"tenant_id": tenant_id, "denied": denied},
+        )
 
 
 async def map_kb_db_keys(
@@ -134,9 +187,11 @@ async def map_kb_db_keys(
     if not get_settings().scene_db_split_enabled:
         return mapping
 
+    # 治理开启 → 映射跟钉定版本走（版本与库位必须同一口径）
+    sql = _MAP_SQL_GOVERNED if get_settings().tenant_governance_enabled else _MAP_SQL
     rows = (
         await control_session.execute(
-            _MAP_SQL,
+            sql,
             {"tenant_id": tenant_id, "kb_ids": [str(kb_id) for kb_id in kb_ids]},
         )
     ).all()

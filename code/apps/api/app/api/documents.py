@@ -26,6 +26,7 @@ from app.schemas.documents import (
 # 预览提取服务（所有上传格式统一转纯文本）
 from app.services import audit
 from app.services.db_scope import (
+    DB_SCOPE_NOT_ALLOWED,
     DbScopeError,
     error_detail,
     open_data_session,
@@ -153,6 +154,8 @@ async def _locate_doc_db_key(session: AsyncSession, doc_id: uuid.UUID) -> str:
     try:
         db_key = await resolve_document_db_key(session, doc_id)
     except DbScopeError as exc:
+        if exc.code == DB_SCOPE_NOT_ALLOWED:
+            raise  # 租户库白名单拒绝 → 全局 handler 400
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=error_detail(exc),
