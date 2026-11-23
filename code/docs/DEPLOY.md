@@ -253,7 +253,7 @@ docker compose -p kagent exec -T worker python -m scripts.backfill_graph --all
 
 | 数据卷 | 内容 | 是否必须备份 |
 |--------|------|--------------|
-| `kagent_postgres_data` | 账号、权限、对话、审计、文档元数据 | 必须 |
+| `kagent_postgres_data` | 控制库（账号/权限/对话/审计/文档元数据）+ 所有场景库的检索数据 | 必须 |
 | `kagent_minio_data` | 上传的原始文档文件 | 必须 |
 | `kagent_redis_data` | 缓存/异步任务队列 | 不需要（可重建） |
 | `kagent_hf_cache` | 模型权重缓存 | 不需要（可重新下载） |
@@ -261,7 +261,7 @@ docker compose -p kagent exec -T worker python -m scripts.backfill_graph --all
 
 ### 5.1 备份（逻辑备份，推荐）
 
-**推荐：一键备份脚本**（PostgreSQL + MinIO 一起打包到 `backups/<时间戳>/`）：
+**推荐：一键备份脚本**（PostgreSQL 全库 + MinIO 一起打包到 `backups/<时间戳>/`）：
 
 ```bash
 cd code
@@ -269,32 +269,41 @@ bash scripts/backup.sh
 # 可用 BACKUP_DIR=/mnt/backup bash scripts/backup.sh 指定输出目录
 ```
 
-`release.sh` 发布前会自动调用该脚本，因此每次发布都留有发布前备份。
+脚本行为：
+
+- 自动枚举实例上所有业务库（`pg_database`，排除模板库、禁止连接的库和维护库 `postgres`），控制库与全部场景库都会备份，新增场景库不需要改脚本。
+- 每库导出一个 `db_<库名>.dump`（`pg_dump -Fc`）；任一库失败则整次备份失败，`release.sh` 不会继续发布。
+- `manifest.txt` 记录备份窗口（开始/结束/总秒数）、每库耗时与体积、RPO 政策值（每日一次全库 dump，政策值非 SLA）。
+- MinIO 打包为 `minio-data.tar.gz`，逻辑不变。
+
+`release.sh` 发布前会自动调用该脚本，因此每次发布都留有发布前备份。日常建议用 crontab 每日执行一次，并将备份文件转存到服务器以外的存储。
 
 如需手工执行：
 
 ```bash
 cd code
 
-# PostgreSQL：导出为带时间戳的 SQL 文件
+# PostgreSQL：逐库导出为 custom 格式
 docker compose -p kagent -f docker-compose.prod.yml exec -T postgres \
-  pg_dump -U kagent -d kagent > "backup-pg-$(date +%Y%m%d-%H%M%S).sql"
+  sh -c 'pg_dump -U "$POSTGRES_USER" -Fc -d "$1"' sh kagent > "backup-pg-kagent-$(date +%Y%m%d-%H%M%S).dump"
 
 # MinIO：打包整个对象数据目录（停服片刻可保证一致性；不停服建议用 mc mirror）
 docker run --rm -v kagent_minio_data:/data -v "$PWD":/backup alpine \
   tar czf "/backup/backup-minio-$(date +%Y%m%d-%H%M%S).tar.gz" -C /data .
 ```
 
-建议加入 crontab 每日执行，并将备份文件转存到服务器以外的存储。
-
 ### 5.2 恢复
 
 ```bash
 cd code
 
-# 1. 恢复 PostgreSQL（目标库需已初始化，即服务至少启动过一次）
-cat backup-pg-XXXXXXXX-XXXXXX.sql | docker compose -p kagent -f docker-compose.prod.yml \
-  exec -T postgres psql -U kagent -d kagent
+# 1. 恢复 PostgreSQL（目标库需已初始化；场景库不存在时先建空库）
+docker compose -p kagent -f docker-compose.prod.yml exec -T postgres \
+  psql -U kagent -d postgres -c 'CREATE DATABASE kagent_finance'
+docker compose -p kagent -f docker-compose.prod.yml exec -T postgres \
+  sh -c 'pg_restore -U "$POSTGRES_USER" -d "$1" --clean --if-exists' sh kagent \
+  < backups/XXXXXXXX-XXXXXX/db_kagent.dump
+# 每个 db_<库名>.dump 按上例恢复到同名库；manifest.txt 里有库清单与每库耗时
 
 # 2. 恢复 MinIO 文件
 docker run --rm -v kagent_minio_data:/data -v "$PWD":/backup alpine \

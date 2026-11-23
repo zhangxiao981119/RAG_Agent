@@ -47,7 +47,7 @@
 - **数据面表带着控制面外键**：`documents.tenant_id → tenants.id`、`documents.kb_id → knowledge_bases.id ON DELETE CASCADE`、`documents.uploaded_by → users.id`。【源 `app/models/entities.py:170-171`、`:185`】
 - kb 硬删除是真 `DELETE`（依赖 CASCADE）。【源 `app/api/kbs.py:139-158`】
 - 检索 SQL 只读 `chunks` + `documents`，不 join 控制面表。【源 `app/services/retrieve/__init__.py:112-124`】
-- 备份脚本只 dump 一个库（`$POSTGRES_DB`），且只在 release 时调用。【源 `code/scripts/backup.sh:16-18`、`scripts/release.sh:11`】
+- 备份脚本只 dump 一个库（`$POSTGRES_DB`），且只在 release 时调用。【源 `code/scripts/backup.sh:16-18`、`scripts/release.sh:11`；S6-7 已扩展为 N 库，见 §4.8】
 
 > 【推导】0.4 是本文最重要的发现：**"温档 = 同实例换个 database"不是改个 DSN 就能跑**。只要往场景库写 `documents`，`kb_id/tenant_id/uploaded_by` 外键就必须在场景库里有对应行；而"把控制面行复制进场景库"会造出第二个可写真相。Step 5 只做了路由件（`data_session` 零调用点），没有触碰这条线，所以 Step 6 的真实工作量远大于"接线"。
 
@@ -349,11 +349,20 @@ Step 6 必须把"路由到场景库"的请求改成两段：
 
 ### 4.8 备份窗口与 RPO/RTO
 
-现状：`scripts/backup.sh` 只 dump `$POSTGRES_DB` 一个库，plain SQL 格式，且只在 `release.sh:11` 调用。【源】
+原状：`scripts/backup.sh` 只 dump `$POSTGRES_DB` 一个库，plain SQL 格式，且只在 `release.sh:11` 调用。【源】
 
 - 【推导】分库后若不改脚本，场景库**完全没有备份**。这是 Step 6 的阻断项，不是优化项。
-- 备份窗口：待标定。测法：`Measure-Command { pg_dump -Fc ... }` 分别测控制库与每个场景库，再测串行/并行两种方式；把实测值回填手册 §6 第 13 项。
-- RPO：待标定。当前是"每次发布前备份"，RPO = 距上次发布的时间，不可作 SLA。建议先定为"每日一次全库 dump"（政策值，非实测），用户确认后写入手册。
+
+**S6-7 落地（2026-11-23）**：`code/scripts/backup.sh` 已扩展为 N 库备份。
+
+- 枚举口径：容器内 `psql -Atc "SELECT datname FROM pg_database WHERE datistemplate = false AND datallowconn = true"`，宿主侧再排除维护库 `postgres`。不读 `SCENE_DB_DSN` 配置清单——温档同实例下，只有"服务器上真实存在的库"能保证不漏库，配置清单会与现场漂移。
+- 格式：每库一个 `db_<name>.dump`，`pg_dump -Fc`（custom，压缩且可 `pg_restore` 选择性恢复）。任一库导出失败即整次备份非零退出，`release.sh` 随之中止（不会带着无备份状态发布）。
+- 记录：`manifest.txt` 写入 `backup_stamp / started_at / finished_at / window_seconds / database_count / rpo_policy`，以及每库的 `seconds / bytes / file`（Tab 分隔行，便于汇总 U13 窗口）。RPO 政策值随清单落盘，不依赖口头约定。
+- 恢复口径同步：`pg_restore` 按库恢复，见 `code/docs/DEPLOY.md` §5。
+
+**RPO 政策初值（用户 2026-11-23 拍板）**：每日一次全库 dump（政策值，非实测，不可当 SLA）。实施方式为 crontab 每日调用 `bash scripts/backup.sh` 并转存异地；`release.sh` 的发布前备份保留，二者不冲突。
+
+- 备份窗口：待标定（U13）。测法：按 `manifest.txt` 的每库 `seconds` 汇总，分别观察串行（当前实现）与并行两种方式的窗口；把实测值回填手册 §6 第 13 项。
 - RTO：待标定。测法：`pg_restore` 到临时库并计时，判据 = 恢复后可完成一次检索且行数校验通过。
 
 ### 4.9 单库演练测不出的三类状态
