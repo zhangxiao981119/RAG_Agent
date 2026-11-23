@@ -7,7 +7,7 @@
     python -m scripts.scene_db_migrate --control-dsn <控制库 DSN> --scene-dsn <场景库 DSN> \\
         --kb-id <UUID> [--probe-term 关键词]
 
-    # 回滚：场景库新增行增量回拷控制库（只增不删、可重跑）
+    # 回滚：场景库新增行增量回拷控制库（只增不删、可重跑；两侧版本必须一致）
     python -m scripts.scene_db_migrate --control-dsn <控制库 DSN> --scene-dsn <场景库 DSN> \\
         --kb-id <UUID> --reverse
 

@@ -391,7 +391,7 @@ Step 6 必须把"路由到场景库"的请求改成两段：
 - 目标清空用 `TRUNCATE <搬迁集>`（**不写 CASCADE**）：搬迁集内部外键已由列表覆盖；将来若冒出外部表引用搬迁集，这里应显式失败而不是连带清空未列出的表。这是对 §4.3 第 12 步原文 `CASCADE` 的有意收窄。
 - 校验：逐表 `count(*)` + `md5(string_agg(id::text, ',' ORDER BY id))`；`chunks` 另加 `sum(length(content))` 与按 `(document_id, chunk_index, id)` 排序的正文摘要。可选 `--probe-term` 在两侧各跑一次 ILIKE 探测并比对命中 id 摘要 —— 这是**关键词谓词等价**，不代表整条检索链路等价；未提供时报告写「未执行」，不得写成 PASS。
 - 写暂停覆盖 COPY 与切绑：脚本在 COPY 前后各取一次源库摘要，不等即回滚并报 `S6_MIGRATE_SOURCE_CHANGED`。停写窗口必须同时覆盖 Phase 3 的 COPY 与 Phase 4 的改绑 —— 改绑完成后写入若仍落控制库，场景库会缺新行；正向校验失败时目标事务整体回滚，重试靠 TRUNCATE 重搬，不手工补行。
-- 回滚前回拷增量：`--reverse` 走「源行 COPY → 目标临时表（LIKE） → `INSERT ... ON CONFLICT (id) DO NOTHING`」，只增不删、可重跑；逐表报告 stage / existing / inserted 作为 R5 差集留痕。同一 id 内容已被改写的行不会被覆盖（脚本不静默改数据），需人工比对后处理。
+- 回滚前回拷增量：`--reverse` 走「源行 COPY → 目标临时表（LIKE） → `INSERT ... ON CONFLICT (id) DO NOTHING`」，只增不删、可重跑；两侧不同库且 `alembic_version` 相同才执行；逐表报告 stage / existing / inserted 作为 R5 差集留痕。同一 id 内容已被改写的行不会被覆盖（脚本不静默改数据），需人工比对后处理。
 - 绑定版本化与 Phase 4 分离：脚本**不修改** `scenarios.db_binding`；改绑是单独一步，R2 快照必须记录改动前的 `db_binding` 原值，回滚按 §4.5 R3「先置 NULL、再关开关」执行。
 
 ---

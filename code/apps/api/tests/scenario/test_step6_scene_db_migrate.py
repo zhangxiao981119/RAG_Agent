@@ -610,12 +610,13 @@ async def _run_roundtrip() -> None:
         injected: list[uuid.UUID] = []
 
         async def _race_write(source, target, spec, kb_id, columns):
-            result = await original_copy(source, target, spec, kb_id, columns)
+            # 先写源库再拷：若检测到写入却未回滚，race.txt 会留在场景库；
+            # 回滚成立时场景库仍是上一次的 1 篇 —— 断言因此能区分回滚与否。
             if spec.name == "documents" and not injected:
                 injected.append(
                     await _insert_extra_document(source, ids, ids["kb1"], "race.txt")
                 )
-            return result
+            return await original_copy(source, target, spec, kb_id, columns)
 
         with mock.patch.object(migrate_mod, "_copy_table", side_effect=_race_write):
             with pytest.raises(MigrateError) as changed:
