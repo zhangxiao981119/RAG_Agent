@@ -223,7 +223,8 @@ async def test_sync_ask_consumes_shared_stream_and_uses_principal(monkeypatch):
     async def _rate_limit(user, application):
         captured["rate_limit"] = (user, application)
 
-    async def _ask_impl(payload, user, session, integration=None, policy=None):
+    async def _ask_impl(payload, user, session, integration=None, policy=None,
+                        policy_caps=None):
         captured["ask"] = (payload, user, session, integration)
 
         async def _events():
@@ -299,7 +300,7 @@ async def test_search_uses_real_acl_and_records_application(monkeypatch):
 
     class _Retrieval:
         async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects,
-                           *, policy=None):
+                           *, policy=None, policy_caps=None):
             captured["retrieve"] = (query, tenant_id, kb_ids, clearance, subjects)
             captured["policy"] = policy
             return RetrievalResult(chunks=[_chunk()])
@@ -377,7 +378,7 @@ async def test_integration_flow_isolates_memory_and_applies_dual_quota_and_audit
     class _Retrieval:
         async def retrieve_chain(
             self, session, query, tenant_id, kb_ids, clearance, subjects,
-            rewrite_score=None, *, policy=None
+            rewrite_score=None, *, policy=None, policy_caps=None
         ):
             return RetrievalResult(chunks=[_chunk()], chain_mode="single")
 

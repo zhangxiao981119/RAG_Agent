@@ -114,7 +114,8 @@ class _FakeRetrieval:
         self.result = RetrievalResult(chunks=[_chunk()], stage_ms={"retrieving": 1})
 
     async def retrieve_chain(self, session, query, tenant_id, kb_ids, clearance, subjects,
-                             rewrite_score=None, *, policy=None):  # noqa: ANN001
+                             rewrite_score=None, *, policy=None,
+                             policy_caps=None):  # noqa: ANN001
         self.seen_session = session
         if self.raise_on_retrieve:
             raise RuntimeError("pgvector 不可用")

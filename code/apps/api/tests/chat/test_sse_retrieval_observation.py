@@ -135,15 +135,17 @@ class _FakeRetrieval:
         )
         self.raise_on_retrieve = False
 
-    async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects, *, policy=None):  # noqa: ANN001
+    async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects, *,
+                       policy=None, policy_caps=None):  # noqa: ANN001
         if self.raise_on_retrieve:
             raise RuntimeError("pgvector 不可用")
         return self.result
 
     async def retrieve_chain(self, session, query, tenant_id, kb_ids, clearance, subjects,
-                             rewrite_score=None, *, policy=None):  # noqa: ANN001
+                             rewrite_score=None, *, policy=None,
+                             policy_caps=None):  # noqa: ANN001
         result = await self.retrieve(session, query, tenant_id, kb_ids, clearance, subjects,
-                                     policy=policy)
+                                     policy=policy, policy_caps=policy_caps)
         result.chain_mode = "single"
         return result
 

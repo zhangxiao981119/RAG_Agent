@@ -372,6 +372,8 @@ async def integration_ask(
         # `_chat_ask_impl → retrieve_chain`，不传这里等于 ask 接口拿不到策略
         # （只有 search 生效）—— 这种「一半生效」是最难发现的接线错误。
         policy=snapshot.policy,
+        # 租户收紧上限与策略同源（都来自 snapshot），漏传 = ask 与 search 口径不一致
+        policy_caps=snapshot.caps,
     )
     # meta 在消费事件流之后附加：不改 `_consume_ask_response`（共用链路的稳定面）
     return (await _consume_ask_response(response)).model_copy(
@@ -404,6 +406,7 @@ async def integration_search(
             # 场景策略：本 handler 手里已有 snapshot（`_resolve_or_reject` 的返回值），
             # 此处传入是**零新增 IO**
             policy=snapshot.policy,
+            policy_caps=snapshot.caps,
         )
     except Exception as exc:
         logger.exception("集成检索失败")

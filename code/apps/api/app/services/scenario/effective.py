@@ -28,6 +28,7 @@ from typing import Final
 from app.config import decisions
 from app.services.scenario import policy_spec
 from app.services.scenario.snapshot import ScenarioPolicy
+from app.services.tenant.governance import EMPTY_CAPS, TenantPolicyCaps
 
 ACTIVE_KEYS: Final[frozenset[str]] = frozenset(
     {
@@ -71,7 +72,18 @@ class EffectiveRetrieval:
     threshold_rerank: float
     final_top_n: int
     clamped: tuple[str, ...] = ()
-    """被平台上限裁掉的字段名（空 = 没裁）。**只返回不打点**，见模块说明。"""
+    """被平台上限裁掉的字段名（空 = 没裁）。**只返回不打点**，见模块说明。
+
+    ★ 只记录「平台收窄」；租户收紧不改这里（否则 `clamped` 的告警文案
+      "超出平台上限" 会对着租户 cap 说谎），租户来源见 `sources`。
+    """
+    sources: tuple[tuple[str, str], ...] = ()
+    """每个键**最终取值的来源**：`(键, platform|scenario|tenant)`。
+
+    顺序固定为 `recall_top_k / rerank_enabled / threshold_vector / threshold_rerank`。
+    ★ 只在租户 cap **真的改变值**时记 `tenant`：记成 tenant 却不改值，
+      会让管理端预览显示"租户在收紧"，而实际参数与场景配置一致。
+    """
 
     def threshold_for(self, *, use_rerank: bool) -> float:
         """按**实际**打分来源取阈值。
@@ -89,35 +101,89 @@ def effective_retrieval(
     policy: ScenarioPolicy | None,
     *,
     platform_rerank_enabled: bool,
+    caps: TenantPolicyCaps | None = None,
 ) -> EffectiveRetrieval:
-    """把（场景覆盖, 平台值）折叠成有效值。`policy is None` 等价于全 `None`。
+    """把（平台值, 场景覆盖, 租户上限）折叠成有效值。
+
+    折叠顺序固定：**L0 平台硬上限 → L2 场景值 → L1 租户 cap**。
+    `policy is None` 等价于全 `None`；`caps is None` 等价于空 caps（不限制）。
+
+    ★ 顺序的理由：平台上限是物理安全线（内存/延迟），租户 cap 是合同约束。
+      先平台后租户 ⇒ 租户看到的值永远不超过平台；若反过来，一个配置过高的
+      租户 cap 就能把平台的物理上限架空。
 
     `platform_rerank_enabled` 由调用方读一次后传入（而不是本函数自己读 settings）：
     这样本函数是**纯的**，且「平台重排开关只读一次」是调用方可以文本断言的事实
     （Z3-4：`get_settings().rerank_enabled` 在 `retrieve/__init__.py` 恰好 1 次）。
     """
     policy = policy or ScenarioPolicy()
+    caps = caps or EMPTY_CAPS
     clamped: list[str] = []
+    sources: list[tuple[str, str]] = []
 
     recall_top_k = policy.effective_recall_top_k()
+    recall_source = "scenario" if policy.recall_top_k is not None else "platform"
     # ★ 上下界都收窄：上界是平台硬上限（`RECALL_TOP_K_MAX` 会随压测**下调**，
     #   届时库里已有的历史行可能越界）；下界防 0（0 会让切片为空 → 全量拒答）。
     #   收窄 MUST 打点（`clamped` 返回给调用方），否则就是静默降级 ——
     #   而「静默降级」正是 Step 1–2 用整章反对的形态。
     if recall_top_k > policy_spec.RECALL_TOP_K_MAX:
         recall_top_k = policy_spec.RECALL_TOP_K_MAX
+        recall_source = "platform"
         clamped.append("recall_top_k")
     elif recall_top_k < 1:
         recall_top_k = 1
+        recall_source = "platform"
         clamped.append("recall_top_k")
+    if caps.recall_top_k_max is not None and recall_top_k > caps.recall_top_k_max:
+        recall_top_k = caps.recall_top_k_max
+        recall_source = "tenant"
+    sources.append(("recall_top_k", recall_source))
+
+    rerank_enabled = policy.effective_rerank_enabled(platform_rerank_enabled)
+    # 来源如实反映「谁决定了最终值」：平台关时场景的声明无法生效，来源是 platform
+    if not platform_rerank_enabled or policy.rerank_enabled is None:
+        rerank_source = "platform"
+    else:
+        rerank_source = "scenario"
+    if caps.rerank_allowed is not None and rerank_enabled and not caps.rerank_allowed:
+        rerank_enabled = False
+        rerank_source = "tenant"
+    sources.append(("rerank_enabled", rerank_source))
+
+    threshold_vector = policy.effective_threshold(use_rerank=False)
+    if policy.relevance_threshold_vector is None:
+        threshold_vector_source = "platform"
+    else:
+        threshold_vector_source = "scenario"
+    if (
+        caps.threshold_vector_min is not None
+        and threshold_vector < caps.threshold_vector_min
+    ):
+        threshold_vector = caps.threshold_vector_min
+        threshold_vector_source = "tenant"
+    sources.append(("threshold_vector", threshold_vector_source))
+
+    threshold_rerank = policy.effective_threshold(use_rerank=True)
+    if policy.relevance_threshold_rerank is None:
+        threshold_rerank_source = "platform"
+    else:
+        threshold_rerank_source = "scenario"
+    if (
+        caps.threshold_rerank_min is not None
+        and threshold_rerank < caps.threshold_rerank_min
+    ):
+        threshold_rerank = caps.threshold_rerank_min
+        threshold_rerank_source = "tenant"
+    sources.append(("threshold_rerank", threshold_rerank_source))
 
     return EffectiveRetrieval(
         recall_top_k=recall_top_k,
         # 单向 AND：平台关时场景开 → 仍为 False（成本由平台承担，见
         # `ScenarioPolicy.effective_rerank_enabled`）
-        rerank_enabled=policy.effective_rerank_enabled(platform_rerank_enabled),
-        threshold_vector=policy.effective_threshold(use_rerank=False),
-        threshold_rerank=policy.effective_threshold(use_rerank=True),
+        rerank_enabled=rerank_enabled,
+        threshold_vector=threshold_vector,
+        threshold_rerank=threshold_rerank,
         # ★ Step 4 的唯一改动点：改为 `policy.final_top_n` 折叠。
         #   现在恒等平台值是**有意的**：`ScenarioPolicy` 尚无 final_top_n 字段
         #   （`snapshot.py` 只有 4 个字段），闭集里它有 `wired_in_step=4`。
@@ -125,4 +191,5 @@ def effective_retrieval(
         #   找「平台上限条数」常量（见设计文档 §A.4 的诚实说明）。
         final_top_n=decisions.TOP_K_RERANK,
         clamped=tuple(clamped),
+        sources=tuple(sources),
     )

@@ -247,7 +247,8 @@ def _service_with_stub(
     svc = RetrievalService()
     seen_policies = policies if policies is not None else []
 
-    async def _stub(sess, query, tenant_id, kb_ids, clearance, subjects, *, policy=None):  # noqa: ANN001
+    async def _stub(sess, query, tenant_id, kb_ids, clearance, subjects, *,
+                    policy=None, policy_caps=None):  # noqa: ANN001
         sessions.append(id(sess))
         queries.append(query)
         seen_policies.append(policy)

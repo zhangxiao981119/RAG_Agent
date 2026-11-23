@@ -413,7 +413,8 @@ async def test_z3_3_unbound_app_policy_is_empty(monkeypatch):
 
     captured: dict = {}
 
-    async def _ask_impl(payload, user, session, integration=None, policy=None):
+    async def _ask_impl(payload, user, session, integration=None, policy=None,
+                        policy_caps=None):
         captured["policy"] = policy
 
         async def _events():
@@ -464,8 +465,10 @@ async def test_integration_ask_forwards_bound_policy(monkeypatch):
 
     captured: dict = {}
 
-    async def _ask_impl(payload, user, session, integration=None, policy=None):
+    async def _ask_impl(payload, user, session, integration=None, policy=None,
+                        policy_caps=None):
         captured["policy"] = policy
+        captured["policy_caps"] = policy_caps
         captured["integration"] = integration
 
         async def _events():
@@ -488,6 +491,9 @@ async def test_integration_ask_forwards_bound_policy(monkeypatch):
     assert policy is not None
     assert policy.declared() == {"recall_top_k": 7}, "绑定场景的覆盖集必须原样透传"
     assert effective_retrieval(policy, platform_rerank_enabled=False).recall_top_k == 7
+    # Step 7：caps 必须与 policy 同一次读取带下来（关闭治理时是空 caps）
+    assert captured["policy_caps"] is not None
+    assert captured["policy_caps"].is_empty()
 
 
 async def test_integration_search_forwards_policy_to_retrieve(monkeypatch):
@@ -510,8 +516,10 @@ async def test_integration_search_forwards_policy_to_retrieve(monkeypatch):
     captured: dict = {}
 
     class _RecordingRetrieval:
-        async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects, *, policy=None):
+        async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects, *,
+                           policy=None, policy_caps=None):
             captured["policy"] = policy
+            captured["policy_caps"] = policy_caps
             captured["kb_ids"] = list(kb_ids)
             from app.services.retrieve.base import RetrievalResult
 
@@ -532,6 +540,9 @@ async def test_integration_search_forwards_policy_to_retrieve(monkeypatch):
     policy = captured["policy"]
     assert policy is not None, "search 不传 policy ⇒ 检索接口静默忽略场景配置"
     assert policy.declared() == {"recall_top_k": 7}
+    # Step 7：caps 与 policy 同源，漏传会让 search 绕过租户收紧
+    assert captured["policy_caps"] is not None
+    assert captured["policy_caps"].is_empty()
     assert captured["kb_ids"] == [KB_A], "接管取范围仍来自请求 ∩ 应用授权，与场景无关"
 
 
@@ -553,7 +564,7 @@ async def test_chain_passes_policy_to_every_round(monkeypatch):
     seen: list = []
     svc = RetrievalService()
 
-    async def _stub(sess, query, tenant_id, kb_ids, clearance, subjects, *, policy=None):  # noqa: ANN001
+    async def _stub(sess, query, tenant_id, kb_ids, clearance, subjects, *, policy=None, policy_caps=None):  # noqa: ANN001
         seen.append(policy)
         from app.services.retrieve.base import RetrievalResult, RetrievedChunk
 
@@ -621,7 +632,7 @@ async def test_chat_ask_impl_forwards_policy_to_retrieve_chain(monkeypatch):
     class _RecordingRetrieval:
         async def retrieve_chain(  # noqa: ANN001
             self, session, query, tenant_id, kb_ids, clearance, subjects,
-            rewrite_score=None, *, policy=None,
+            rewrite_score=None, *, policy=None, policy_caps=None,
         ):
             seen["policy"] = policy
             seen["query"] = query
@@ -706,7 +717,7 @@ async def test_chain_single_path_passes_policy(monkeypatch):
     seen: list = []
     svc = RetrievalService()
 
-    async def _stub(sess, query, tenant_id, kb_ids, clearance, subjects, *, policy=None):  # noqa: ANN001
+    async def _stub(sess, query, tenant_id, kb_ids, clearance, subjects, *, policy=None, policy_caps=None):  # noqa: ANN001
         seen.append(policy)
         from app.services.retrieve.base import RetrievedChunk
 
@@ -756,7 +767,7 @@ async def test_chain_single_path_when_rewrite_score_is_none(monkeypatch):
     svc = RetrievalService()
     from app.services.retrieve.base import RetrievalResult
 
-    async def _stub(sess, query, tenant_id, kb_ids, clearance, subjects, *, policy=None):  # noqa: ANN001
+    async def _stub(sess, query, tenant_id, kb_ids, clearance, subjects, *, policy=None, policy_caps=None):  # noqa: ANN001
         seen.append(policy)
         return RetrievalResult(chunks=[], stage_ms={})
 

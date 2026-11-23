@@ -231,11 +231,13 @@ class _Retrieval:
         # Step 3：桩必须与生产签名一致（`retrieve(..., *, policy=None)`），
         # 否则「策略有没有传到检索层」无法被断言。只记录，不改任何既有断言。
         self.policies: list = []
+        self.caps: list = []
 
     async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects,
-                       *, policy=None):
+                       *, policy=None, policy_caps=None):
         self.calls.append((query, tenant_id, list(kb_ids), clearance, subjects))
         self.policies.append(policy)
+        self.caps.append(policy_caps)
         return RetrievalResult(chunks=[_chunk()])
 
 
@@ -377,7 +379,8 @@ async def test_ask_handler_fills_meta(monkeypatch):
     class _FakeAskResponse(integrations_mod.IntegrationAskResponse):
         pass
 
-    async def _ask_impl(payload, user, session, integration=None, policy=None):
+    async def _ask_impl(payload, user, session, integration=None, policy=None,
+                        policy_caps=None):
         async def _events():
             yield chat_mod._sse("meta", {"conversation_id": None, "message_id": None})
             yield chat_mod._sse("delta", {"text": "500 元"})

@@ -118,7 +118,7 @@
 
 ---
 
-## S7-4 三段折叠 + provenance
+## [x] S7-4 三段折叠 + provenance
 
 **文件**
 - 修改 `code/apps/api/app/services/scenario/effective.py`

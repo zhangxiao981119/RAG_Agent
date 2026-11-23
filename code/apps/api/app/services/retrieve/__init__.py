@@ -55,6 +55,7 @@ from app.services.retrieve.chain import (
 from app.services.rerank import RerankTimeout, get_rerank_service
 from app.services.scenario.effective import effective_retrieval
 from app.services.scenario.snapshot import ScenarioPolicy
+from app.services.tenant.governance import TenantPolicyCaps
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +246,7 @@ class RetrievalService:
         user_subjects: list[str],
         *,
         policy: ScenarioPolicy | None = None,
+        policy_caps: TenantPolicyCaps | None = None,
     ) -> RetrievalResult:
         """混合召回 + RRF + rerank。
 
@@ -279,7 +281,11 @@ class RetrievalService:
         # ★ 平台重排开关在这里读**一次**并显式传给纯函数：这样折叠函数无 IO，
         #   且「平台值只读一次」是可被文本断言的事实（恰好 1 次）。
         platform_rerank_on = get_settings().rerank_enabled
-        eff = effective_retrieval(policy, platform_rerank_enabled=platform_rerank_on)
+        eff = effective_retrieval(
+            policy,
+            platform_rerank_enabled=platform_rerank_on,
+            caps=policy_caps,
+        )
         if eff.clamped:
             # 收窄 MUST 可见：否则「我配了 150、实际跑 100」就是静默降级
             metrics.incr("rag.scenario.policy_clamped", len(eff.clamped))
@@ -288,13 +294,26 @@ class RetrievalService:
                 extra={"fields": list(eff.clamped), "trace_id": trace.get_trace_id()},
             )
         declared = policy.declared() if policy is not None else {}
-        if declared:
+        caps_declared = (
+            policy_caps.declared()
+            if policy_caps is not None and not policy_caps.is_empty()
+            else {}
+        )
+        if declared or caps_declared:
             # 只在真的配了东西时打点/记日志：默认场景的 declared 是 {}，
-            # 零影响路径上一条噪音都不产生。
-            metrics.incr("rag.scenario.policy_active", len(declared))
+            # 零影响路径上一条噪音都不产生（关闭治理时 caps 恒为空）。
+            active_keys = sorted(set(declared) | set(caps_declared))
+            metrics.incr("rag.scenario.policy_active", len(active_keys))
             logger.info(
                 "场景策略生效",
-                extra={"keys": sorted(declared), "trace_id": trace.get_trace_id()},
+                extra={
+                    "keys": active_keys,
+                    # provenance：一行日志回答「这个值最终是谁定的」
+                    "sources": [
+                        {"key": key, "source": source} for key, source in eff.sources
+                    ],
+                    "trace_id": trace.get_trace_id(),
+                },
             )
 
         # ① 向量召回（embedding 调用与向量 SQL 分段计时：两者成本量级不同，
@@ -945,6 +964,7 @@ class RetrievalService:
         rewrite_score: int | None = None,
         *,
         policy: ScenarioPolicy | None = None,
+        policy_caps: TenantPolicyCaps | None = None,
     ) -> RetrievalResult:
         """链式检索：按复杂度信号决定是否拆解 → 多轮检索 → 证据合并。
 
@@ -956,7 +976,7 @@ class RetrievalService:
         参数是 pushdown_params 的直接展开（与 retrieve 同口径），额外接收
         rewrite_score 作为「问题复杂度」信号。
 
-        ★ `policy` MUST 透传到**每一轮**子问题，也必须透传到**单趟**出口
+        ★ `policy` / `policy_caps` MUST 透传到**每一轮**子问题，也必须透传到**单趟**出口
           （`_single()`）。漏掉任一处，场景的召回条数就只对一部分请求生效 ——
           而且完全不报错。两条路径各自有钉子：
             · 多轮：`test_chain_passes_policy_to_every_round`
@@ -972,6 +992,7 @@ class RetrievalService:
             result = await self.retrieve(
                 session, query, tenant_id, authorized_kb_ids, clearance, user_subjects,
                 policy=policy,
+                policy_caps=policy_caps,
             )
             result.chain_mode = chain_mode
             if chain_ms is not None:
@@ -1007,6 +1028,7 @@ class RetrievalService:
             rounds.append(await self.retrieve(
                 session, sq, tenant_id, authorized_kb_ids, clearance, user_subjects,
                 policy=policy,
+                policy_caps=policy_caps,
             ))
 
         merged = merge_rounds(rounds)

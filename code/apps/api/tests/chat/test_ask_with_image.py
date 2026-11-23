@@ -126,7 +126,8 @@ class _FakeRetrieval:
     def __init__(self) -> None:
         self.queries: list[str] = []
 
-    async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects, *, policy=None):  # noqa: ANN001
+    async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects, *,
+                       policy=None, policy_caps=None):  # noqa: ANN001
         self.queries.append(query)
         return RetrievalResult(
             chunks=[_chunk()],
@@ -135,10 +136,11 @@ class _FakeRetrieval:
         )
 
     async def retrieve_chain(self, session, query, tenant_id, kb_ids, clearance, subjects,
-                             rewrite_score=None, *, policy=None):  # noqa: ANN001
+                             rewrite_score=None, *, policy=None,
+                             policy_caps=None):  # noqa: ANN001
         # 单趟语义替身：本 WU 关注模态行为，链式编排由 tests/retrieve/test_chain.py 覆盖
         result = await self.retrieve(session, query, tenant_id, kb_ids, clearance, subjects,
-                                     policy=policy)
+                                     policy=policy, policy_caps=policy_caps)
         result.chain_mode = "single"
         return result
 
