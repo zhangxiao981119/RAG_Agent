@@ -14,10 +14,15 @@
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from urllib.parse import urlsplit, urlunsplit
 
+import asyncpg
 import pytest
+from alembic import command
 
 from app.infra.db_router import registered_db_keys
 from app.services import db_scope
@@ -29,6 +34,14 @@ from app.services.db_scope import (
     resolve_kb_db_key,
 )
 from tests.fake_settings import fake_settings
+from tests.scenario.pg_helpers import (
+    SCENARIO_TEST_DB_URL,
+    alembic_config,
+    dsn,
+    insert_version,
+    new_scenario,
+    requires_db,
+)
 
 _TENANT_ID = uuid.uuid4()
 _KB_A = uuid.uuid4()
@@ -290,15 +303,163 @@ def test_db_scope_error_carries_code_and_detail():
     assert str(err) == "DB_SCOPE_MULTI_KEY: {'db_keys': ['kb_a', 'kb_b']}"
 
 
-def test_ambiguous_code_exists_for_id_probing():
-    """D-S6-3-2 的顺序探测错误码：同一主键命中多个库位时抛出。"""
-    assert db_scope.DB_SCOPE_AMBIGUOUS == "DB_SCOPE_AMBIGUOUS"
-    err = DbScopeError(db_scope.DB_SCOPE_AMBIGUOUS, {"probed": ["default", "kb_a"]})
-    assert err.code == "DB_SCOPE_AMBIGUOUS"
+def test_owner_unresolved_code_is_machine_readable():
+    """D-S6-3-2 修订：wiki 页归属文档副本缺失时的错误码（不再有跨库歧义码）。"""
+    assert db_scope.DB_SCOPE_OWNER_UNRESOLVED == "DB_SCOPE_OWNER_UNRESOLVED"
+    err = DbScopeError(
+        db_scope.DB_SCOPE_OWNER_UNRESOLVED,
+        {"page_id": "p", "document_id": "d"},
+    )
+    assert err.code == "DB_SCOPE_OWNER_UNRESOLVED"
 
 
 def test_registered_db_keys_contains_default_sorted_and_unique():
-    """registered_db_keys 是探测用的公开视图：含 default、去重、排序。"""
+    """registered_db_keys 是已注册库位的公开视图（治理扫描等使用）：含 default、去重、排序。"""
     keys = registered_db_keys()
     assert "default" in keys
     assert keys == tuple(sorted(set(keys)))
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 真库层：控制库 + 场景库同 id 是迁移 COPY 的正常状态（不得判歧义）
+# ══════════════════════════════════════════════════════════════════════
+
+_DOC_INSERT_SQL = (
+    "INSERT INTO documents "
+    "(id, tenant_id, kb_id, doc_group_id, filename, ext, size_bytes, storage_key) "
+    "VALUES ($1, $2, $3, $1, $4, $5, $6, $7)"
+)
+
+
+def _with_database(url: str, database: str) -> str:
+    """替换 DSN 的库名（保留账号、口令、主机与端口）。"""
+    parts = urlsplit(url)
+    return urlunsplit(parts._replace(path=f"/{database}"))
+
+
+async def _run_control_copy_same_id() -> None:
+    base_url = SCENARIO_TEST_DB_URL or ""
+    temp_name = f"scene_probe_{uuid.uuid4().hex[:12]}"
+    admin = await asyncpg.connect(_with_database(dsn(base_url), "postgres"))
+    control = await asyncpg.connect(dsn(base_url))
+    tenant_id, kb_id, doc_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    created = False
+    try:
+        try:
+            await admin.execute(f'CREATE DATABASE "{temp_name}" TEMPLATE template0')
+        except asyncpg.exceptions.InsufficientPrivilegeError as exc:
+            pytest.skip(f"当前账号无 CREATE DATABASE 权限（{exc}）")
+        created = True
+        temp_url = _with_database(base_url, temp_name)
+        await asyncio.to_thread(command.upgrade, alembic_config(temp_url), "head")
+
+        # 控制库：租户 + 库 + 已发布场景（kb → kb_probe）+ 文档副本
+        await control.execute(
+            "INSERT INTO tenants (id, name, code) VALUES ($1, $2, $3)",
+            tenant_id,
+            "控制副本用例租户",
+            f"cc-{tenant_id.hex[:8]}",
+        )
+        await control.execute(
+            "INSERT INTO knowledge_bases (id, tenant_id, name, description) "
+            "VALUES ($1, $2, $3, $4)",
+            kb_id,
+            tenant_id,
+            f"kb-{str(kb_id)[:8]}",
+            "控制副本用例库",
+        )
+        scenario_id = await new_scenario(control, tenant_id)
+        await insert_version(
+            control,
+            tenant_id,
+            scenario_id,
+            version=1,
+            state="published",
+            kb_ids=[str(kb_id)],
+            published_at=datetime.now(timezone.utc),
+        )
+        await control.execute(
+            "UPDATE scenarios SET db_binding = $1 WHERE id = $2",
+            "kb_probe",
+            scenario_id,
+        )
+        await control.execute(
+            _DOC_INSERT_SQL,
+            doc_id,
+            tenant_id,
+            kb_id,
+            "控制副本.pdf",
+            "pdf",
+            10,
+            "control/doc.pdf",
+        )
+
+        # 场景库：同 id 文档行（迁移 COPY 后两个库都有这一行）
+        scene = await asyncpg.connect(_with_database(dsn(base_url), temp_name))
+        try:
+            await scene.execute(
+                "INSERT INTO tenants (id, name, code) VALUES ($1, $2, $3)",
+                tenant_id,
+                "控制副本用例租户",
+                f"cc-{tenant_id.hex[:8]}",
+            )
+            await scene.execute(
+                "INSERT INTO knowledge_bases (id, tenant_id, name, description) "
+                "VALUES ($1, $2, $3, $4)",
+                kb_id,
+                tenant_id,
+                f"kb-{str(kb_id)[:8]}",
+                "控制副本用例库",
+            )
+            await scene.execute(
+                _DOC_INSERT_SQL,
+                doc_id,
+                tenant_id,
+                kb_id,
+                "控制副本.pdf",
+                "pdf",
+                10,
+                "control/doc.pdf",
+            )
+        finally:
+            await scene.close()
+
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        engine = create_async_engine(base_url)
+        try:
+            factory = async_sessionmaker(engine, expire_on_commit=False)
+            async with factory() as session:
+                # 只读控制副本的 kb_id 推导：返回绑定库位，不因场景库同 id 报歧义
+                assert await db_scope.resolve_document_db_key(session, doc_id) == "kb_probe"
+        finally:
+            await engine.dispose()
+    finally:
+        # 清理控制库造的数据（先子表后主表），再丢弃临时场景库
+        await control.execute("DELETE FROM documents WHERE id = $1", doc_id)
+        await control.execute(
+            "DELETE FROM scenario_versions WHERE tenant_id = $1", tenant_id
+        )
+        await control.execute("DELETE FROM scenarios WHERE tenant_id = $1", tenant_id)
+        await control.execute(
+            "DELETE FROM knowledge_bases WHERE tenant_id = $1", tenant_id
+        )
+        await control.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
+        await control.close()
+        if created:
+            await admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = $1 AND pid <> pg_backend_pid()",
+                temp_name,
+            )
+            await admin.execute(f'DROP DATABASE IF EXISTS "{temp_name}"')
+        await admin.close()
+
+
+@requires_db
+def test_real_db_control_copy_same_id_returns_scene_key(schema, monkeypatch):
+    """控制库与场景库同 id：新入口返回控制副本 kb 的绑定库位，而非歧义。"""
+    monkeypatch.setattr(
+        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
+    )
+    asyncio.run(_run_control_copy_same_id())

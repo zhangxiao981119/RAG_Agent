@@ -1,13 +1,14 @@
-"""Step 6 D-S6-3-1 / D-S6-3-2：写路径 db_key 贯通与按 ID 寻址探测。
+"""Step 6 D-S6-3-1 / D-S6-3-2：写路径 db_key 贯通与按 ID 寻址库位推导。
 
 覆盖（不连真库，全部猴补丁）：
   1. `open_job_session`：db_key 原样透传给 `data_session`；缺失/空串/非字符串
      → `JOB_DB_KEY_MISSING`（禁止回落默认库）；
   2. 6 个 worker 入口缺 db_key → `JOB_DB_KEY_MISSING`；
   3. 链式入队负载透传 db_key（parse 段链 / graph / wiki）；
-  4. `locate_row_db_key`：关闭态零 SQL 直接 default；开启态不短路扫描控制库 +
-     全部已注册库位，0/1/2 命中（控制库与场景库同主键判歧义）；
-  5. 按 ID 寻址端点：数据面会话按定位键打开、404、歧义 500。
+  4. 按 ID 寻址的库位推导（D-S6-3-2 修订：控制面副本）：关闭态零 SQL 返回
+     default；开启态控制库无行 → None；文档按副本 kb_id 解析；wiki 页归属
+     文档缺失 → `DB_SCOPE_OWNER_UNRESOLVED`；控制库与场景库同 id 不判歧义；
+  5. 按 ID 寻址端点：数据面会话按推导键打开、404、结构化 500。
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from fastapi.testclient import TestClient
 from app.api import documents as documents_api
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config import decisions
-from app.models import Document
+from app.models import Document, WikiPage
 from app.services import db_scope
 from app.services import governance as governance_worker
 from app.services.db_scope import DbScopeError
@@ -213,131 +214,162 @@ async def test_graph_and_wiki_enqueue_carry_db_key(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 4. locate_row_db_key
+# 4. 按 ID 寻址的库位推导（控制面副本，D-S6-3-2 修订）
 # ══════════════════════════════════════════════════════════════════════
 
 
-class _ProbeSession:
-    def __init__(self, hit: bool) -> None:
-        self.hit = hit
-        self.gets = 0
+class _Rows:
+    def __init__(self, rows: list) -> None:
+        self._rows = rows
+
+    def all(self) -> list:
+        return list(self._rows)
+
+
+class _ControlSession:
+    """控制面会话替身：get 按 (model, pk) 返对象；execute 按脚本出栈。"""
+
+    def __init__(self, objects: dict, rows: list | None = None) -> None:
+        self._objects = dict(objects)
+        self._rows = list(rows or [])
+        self.calls: list[tuple] = []
 
     async def get(self, model, pk):  # noqa: ANN001
-        self.gets += 1
-        return object() if self.hit else None
+        self.calls.append(("get", model, pk))
+        return self._objects.get((model, pk))
+
+    async def execute(self, stmt, params=None):  # noqa: ANN001
+        self.calls.append(("execute", str(stmt), dict(params or {})))
+        return _Rows(self._rows.pop(0))
+
+
+class _NoSqlSession:
+    """关闭态一旦发 SQL 即失败。"""
+
+    async def get(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("关闭态不得执行任何 SQL")
+
+    async def execute(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("关闭态不得执行任何 SQL")
+
+
+def _document_model(kb_id: uuid.UUID) -> Document:
+    return Document(
+        id=uuid.uuid4(),
+        tenant_id=_TENANT_ID,
+        kb_id=kb_id,
+        filename="制度.pdf",
+        ext="pdf",
+        size_bytes=10,
+        status="indexed",
+        version=1,
+        level_rank=20,
+        is_latest=True,
+    )
+
+
+def _wiki_page(document_id: uuid.UUID) -> WikiPage:
+    return WikiPage(id=uuid.uuid4(), document_id=document_id)
 
 
 @pytest.mark.asyncio
-async def test_locate_closed_state_returns_default_without_sql(monkeypatch):
+async def test_resolve_document_closed_state_returns_default_without_sql(monkeypatch):
     monkeypatch.setattr(
         db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=False)
     )
-
-    class _Exploding:
-        async def get(self, *args, **kwargs):  # noqa: ANN002, ANN003
-            raise AssertionError("关闭态不得执行任何 SQL")
-
-    assert await db_scope.locate_row_db_key(_Exploding(), Document, "pk") == "default"
+    assert await db_scope.resolve_document_db_key(_NoSqlSession(), uuid.uuid4()) == "default"
 
 
 @pytest.mark.asyncio
-async def test_locate_enabled_control_hit_probes_all_keys_and_returns_default(monkeypatch):
-    """控制库命中也不短路：仍要探完所有已注册库位（否则双库同主键无法判歧义）。"""
-    probes: list[str] = []
-
-    @asynccontextmanager
-    async def _fake_data_session(db_key: str):
-        probes.append(db_key)
-        yield _ProbeSession(hit=False)
-
+async def test_resolve_wiki_page_closed_state_returns_default_without_sql(monkeypatch):
     monkeypatch.setattr(
-        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
+        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=False)
     )
-    monkeypatch.setattr(db_scope, "registered_db_keys", lambda: ("default", "kb_a"))
-    monkeypatch.setattr(db_scope, "data_session", _fake_data_session)
-
-    assert await db_scope.locate_row_db_key(_ProbeSession(hit=True), Document, "pk") == "default"
-    assert probes == ["kb_a"]
+    assert await db_scope.resolve_wiki_page_db_key(_NoSqlSession(), uuid.uuid4()) == "default"
 
 
 @pytest.mark.asyncio
-async def test_locate_enabled_control_and_scene_same_pk_is_ambiguous(monkeypatch):
-    """控制库与场景库同主键 → 歧义（不得因为控制库先命中就静默返回 default）。"""
-
-    @asynccontextmanager
-    async def _fake_data_session(db_key: str):
-        yield _ProbeSession(hit=True)
-
+async def test_resolve_document_enabled_control_miss_returns_none(monkeypatch):
+    """控制库没有该行 → None（调用方 404），且不查任何绑定。"""
     monkeypatch.setattr(
         db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
     )
-    monkeypatch.setattr(db_scope, "registered_db_keys", lambda: ("default", "kb_a"))
-    monkeypatch.setattr(db_scope, "data_session", _fake_data_session)
+    session = _ControlSession({})
+    doc_id = uuid.uuid4()
+
+    assert await db_scope.resolve_document_db_key(session, doc_id) is None
+    assert session.calls == [("get", Document, doc_id)]
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_enabled_bound_kb_returns_scene_key(monkeypatch):
+    """控制库 + 场景库同 id 属迁移 COPY 的正常状态：只按控制副本 kb 推导，不判歧义。"""
+    monkeypatch.setattr(
+        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
+    )
+    kb_id = uuid.uuid4()
+    doc = _document_model(kb_id)
+    session = _ControlSession(
+        {(Document, doc.id): doc}, [[(str(kb_id), "kb_probe")]]
+    )
+
+    assert await db_scope.resolve_document_db_key(session, doc.id) == "kb_probe"
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_enabled_unbound_kb_returns_default(monkeypatch):
+    monkeypatch.setattr(
+        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
+    )
+    doc = _document_model(uuid.uuid4())
+    session = _ControlSession({(Document, doc.id): doc}, [[]])
+
+    assert await db_scope.resolve_document_db_key(session, doc.id) == "default"
+
+
+@pytest.mark.asyncio
+async def test_resolve_wiki_page_enabled_missing_page_returns_none(monkeypatch):
+    monkeypatch.setattr(
+        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
+    )
+    session = _ControlSession({})
+
+    assert await db_scope.resolve_wiki_page_db_key(session, uuid.uuid4()) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_wiki_page_owner_document_missing_raises(monkeypatch):
+    """页存在但归属文档副本缺失：无处取 kb_id，显式报错而不是猜库位。"""
+    monkeypatch.setattr(
+        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
+    )
+    page = _wiki_page(uuid.uuid4())
+    session = _ControlSession({(WikiPage, page.id): page})
 
     with pytest.raises(DbScopeError) as excinfo:
-        await db_scope.locate_row_db_key(_ProbeSession(hit=True), Document, "pk")
+        await db_scope.resolve_wiki_page_db_key(session, page.id)
 
-    assert excinfo.value.code == "DB_SCOPE_AMBIGUOUS"
-    assert excinfo.value.detail["db_keys"] == ["default", "kb_a"]
-
-
-@pytest.mark.asyncio
-async def test_locate_enabled_zero_hit_returns_none(monkeypatch):
-    probes: list[str] = []
-
-    @asynccontextmanager
-    async def _fake_data_session(db_key: str):
-        probes.append(db_key)
-        yield _ProbeSession(hit=False)
-
-    monkeypatch.setattr(
-        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
-    )
-    monkeypatch.setattr(
-        db_scope, "registered_db_keys", lambda: ("default", "kb_a", "kb_b")
-    )
-    monkeypatch.setattr(db_scope, "data_session", _fake_data_session)
-
-    assert await db_scope.locate_row_db_key(_ProbeSession(hit=False), Document, "pk") is None
-    assert probes == ["kb_a", "kb_b"]
+    assert excinfo.value.code == "DB_SCOPE_OWNER_UNRESOLVED"
+    assert excinfo.value.detail == {
+        "page_id": str(page.id),
+        "document_id": str(page.document_id),
+    }
 
 
 @pytest.mark.asyncio
-async def test_locate_enabled_single_hit_returns_key(monkeypatch):
-    @asynccontextmanager
-    async def _fake_data_session(db_key: str):
-        yield _ProbeSession(hit=(db_key == "kb_b"))
-
+async def test_resolve_wiki_page_enabled_bound_kb_returns_scene_key(monkeypatch):
     monkeypatch.setattr(
         db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
     )
-    monkeypatch.setattr(
-        db_scope, "registered_db_keys", lambda: ("default", "kb_a", "kb_b")
+    kb_id = uuid.uuid4()
+    doc = _document_model(kb_id)
+    page = _wiki_page(doc.id)
+    session = _ControlSession(
+        {(WikiPage, page.id): page, (Document, doc.id): doc},
+        [[(str(kb_id), "kb_probe")]],
     )
-    monkeypatch.setattr(db_scope, "data_session", _fake_data_session)
 
-    assert await db_scope.locate_row_db_key(_ProbeSession(hit=False), Document, "pk") == "kb_b"
-
-
-@pytest.mark.asyncio
-async def test_locate_enabled_two_hits_raise_ambiguous(monkeypatch):
-    @asynccontextmanager
-    async def _fake_data_session(db_key: str):
-        yield _ProbeSession(hit=True)
-
-    monkeypatch.setattr(
-        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
-    )
-    monkeypatch.setattr(
-        db_scope, "registered_db_keys", lambda: ("default", "kb_a", "kb_b")
-    )
-    monkeypatch.setattr(db_scope, "data_session", _fake_data_session)
-
-    with pytest.raises(DbScopeError) as excinfo:
-        await db_scope.locate_row_db_key(_ProbeSession(hit=False), Document, "pk")
-
-    assert excinfo.value.code == "DB_SCOPE_AMBIGUOUS"
-    assert excinfo.value.detail["db_keys"] == ["kb_a", "kb_b"]
+    assert await db_scope.resolve_wiki_page_db_key(session, page.id) == "kb_probe"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -426,13 +458,13 @@ def endpoint_harness(monkeypatch):
     return _client(doc_session), opened, doc_session, doc_id
 
 
-def test_document_by_id_uses_located_data_session(endpoint_harness, monkeypatch):
+def test_document_by_id_uses_control_copy_db_key(endpoint_harness, monkeypatch):
     client, opened, doc_session, doc_id = endpoint_harness
 
-    async def _locate(session, model, pk):  # noqa: ANN001
+    async def _resolve(session, pk):  # noqa: ANN001
         return "kb_finance"
 
-    monkeypatch.setattr(documents_api, "locate_row_db_key", _locate)
+    monkeypatch.setattr(documents_api, "resolve_document_db_key", _resolve)
 
     resp = client.get(f"/api/documents/{doc_id}/parse-preview")
 
@@ -444,10 +476,10 @@ def test_document_by_id_uses_located_data_session(endpoint_harness, monkeypatch)
 def test_document_by_id_not_found(endpoint_harness, monkeypatch):
     client, opened, _, doc_id = endpoint_harness
 
-    async def _locate(session, model, pk):  # noqa: ANN001
+    async def _resolve(session, pk):  # noqa: ANN001
         return None
 
-    monkeypatch.setattr(documents_api, "locate_row_db_key", _locate)
+    monkeypatch.setattr(documents_api, "resolve_document_db_key", _resolve)
 
     resp = client.get(f"/api/documents/{doc_id}/parse-preview")
 
@@ -455,23 +487,22 @@ def test_document_by_id_not_found(endpoint_harness, monkeypatch):
     assert opened == []
 
 
-def test_document_by_id_ambiguous_returns_500(endpoint_harness, monkeypatch):
+def test_document_by_id_scope_error_returns_structured_500(endpoint_harness, monkeypatch):
     client, opened, _, doc_id = endpoint_harness
 
-    async def _locate(session, model, pk):  # noqa: ANN001
+    async def _resolve(session, pk):  # noqa: ANN001
         raise DbScopeError(
-            "DB_SCOPE_AMBIGUOUS",
-            {"model": model, "pk": pk, "db_keys": ["kb_a", "kb_b"]},
+            "DB_SCOPE_MULTI_KEY",
+            {"kb_ids": [str(uuid.uuid4())], "db_keys": ["default", "kb_finance"]},
         )
 
-    monkeypatch.setattr(documents_api, "locate_row_db_key", _locate)
+    monkeypatch.setattr(documents_api, "resolve_document_db_key", _resolve)
 
     resp = client.get(f"/api/documents/{doc_id}/parse-preview")
 
     assert resp.status_code == 500
     detail = resp.json()["detail"]
-    assert detail["code"] == "DB_SCOPE_AMBIGUOUS"
-    assert detail["model"] == "Document"
-    assert detail["pk"] == str(doc_id)
-    assert detail["db_keys"] == ["kb_a", "kb_b"]
+    assert detail["code"] == "DB_SCOPE_MULTI_KEY"
+    assert detail["db_keys"] == ["default", "kb_finance"]
+    assert "kb_ids" in detail
     assert opened == []

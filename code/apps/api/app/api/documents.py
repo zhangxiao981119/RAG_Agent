@@ -27,8 +27,9 @@ from app.schemas.documents import (
 from app.services import audit
 from app.services.db_scope import (
     DbScopeError,
-    locate_row_db_key,
+    error_detail,
     open_data_session,
+    resolve_document_db_key,
 )
 from app.services.parse.image_parser import IMAGE_EXTS
 from app.services.preview import PreviewError, extract_preview_text
@@ -144,26 +145,17 @@ async def _doc_provenance(
 
 
 async def _locate_doc_db_key(session: AsyncSession, doc_id: uuid.UUID) -> str:
-    """按 ID 定位文档库位：0 命中 → 404；≥2 命中 → 500（DB_SCOPE_AMBIGUOUS）。
+    """按控制面文档副本的 kb_id 推导数据面库位：0 命中 → 404；解析冲突 → 500。
 
-    关闭态下 `locate_row_db_key` 直接返回 "default"（零 SQL），行为与接线前等价。
+    关闭态下 `resolve_document_db_key` 直接返回 "default"（零 SQL），行为与接线前等价。
+    控制副本只用于取 kb_id/归属，不返回给客户端，内容仍从库位会话读。
     """
     try:
-        db_key = await locate_row_db_key(session, Document, doc_id)
+        db_key = await resolve_document_db_key(session, doc_id)
     except DbScopeError as exc:
-        # 结构化 detail（与 scenario 等错误映射同口径）：code + 关键上下文，
-        # 便于前端/日志按机器可读字段定位；model/pk 需序列化成 JSON 可写类型。
-        scope = exc.detail or {}
-        model = scope.get("model")
-        pk = scope.get("pk")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "code": exc.code,
-                "model": getattr(model, "__name__", str(model)),
-                "pk": str(pk) if pk is not None else None,
-                "db_keys": scope.get("db_keys"),
-            },
+            detail=error_detail(exc),
         ) from exc
     if db_key is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")

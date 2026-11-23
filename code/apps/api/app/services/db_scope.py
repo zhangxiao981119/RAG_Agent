@@ -17,6 +17,9 @@
   · **不按 `scenarios.status` 过滤**：库位是物理事实，被禁用场景里的数据仍在那个库；
   · 同一 kb 被两个不同库位的已发布场景命中 = 数据冲突（与迁移 0030 的
     `fn_kb_db_binding_conflicts` 同口径），显式报错，不替调用方挑一个。
+  · 按 ID 寻址（文档 / wiki 页）只读**控制面副本**的 `kb_id` 推导库位，不做跨库
+    主键扫描：迁移 §4.3 第 12 步是 COPY，控制库与场景库同 id 属正常状态
+    （D-S6-3-2 修订，R5/R6 回滚依赖控制副本）。
 """
 from __future__ import annotations
 
@@ -29,26 +32,29 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import get_settings
-from app.infra.db_router import DEFAULT_DB_KEY, data_session, registered_db_keys
+from app.infra.db_router import DEFAULT_DB_KEY, data_session
+from app.models import Document, WikiPage
 
 # 一次请求跨多个库位（本期不支持跨库检索/跨库写入）
 DB_SCOPE_MULTI_KEY: Final[str] = "DB_SCOPE_MULTI_KEY"
-# 按 ID 顺序探测时同一主键命中多个库位（D-S6-3-2）
-DB_SCOPE_AMBIGUOUS: Final[str] = "DB_SCOPE_AMBIGUOUS"
+# wiki 页存在但归属文档行缺失，无法推导库位（D-S6-3-2 修订）
+DB_SCOPE_OWNER_UNRESOLVED: Final[str] = "DB_SCOPE_OWNER_UNRESOLVED"
 # worker 收到的队列负载缺少 db_key（D-S6-3-1）
 JOB_DB_KEY_MISSING: Final[str] = "JOB_DB_KEY_MISSING"
 
 __all__ = [
     "DB_SCOPE_MULTI_KEY",
-    "DB_SCOPE_AMBIGUOUS",
+    "DB_SCOPE_OWNER_UNRESOLVED",
     "JOB_DB_KEY_MISSING",
     "DbScopeError",
     "resolve_kb_db_key",
     "map_kb_db_keys",
+    "resolve_document_db_key",
+    "resolve_wiki_page_db_key",
+    "error_detail",
     "open_data_session",
     "open_job_session",
     "require_job_db_key",
-    "locate_row_db_key",
 ]
 
 
@@ -196,39 +202,69 @@ async def open_job_session(db_key: str) -> AsyncIterator[AsyncSession]:
         yield session
 
 
-async def locate_row_db_key(
+async def resolve_document_db_key(
     control_session: AsyncSession,
-    model: type,
-    pk: object,
+    doc_id: uuid.UUID,
 ) -> str | None:
-    """按主键定位一行在哪个库位（D-S6-3-2 顺序探测）。
+    """按**控制面文档副本**的 `kb_id` 推导数据面库位（D-S6-3-2 修订）。
 
-    - 关闭态：直接返回 `"default"`，零 SQL（分库关闭时所有行都在默认库）；
-    - 开启态：扫描控制库（默认库）与 `registered_db_keys()` 中每个非 default
-      库位，**全部命中都要收集，不在控制库命中时短路** —— 短路会让「控制库与
-      场景库同主键」被静默判成 default，永远触发不了歧义保护。
-      0 命中 → None（调用方 404）；1 命中 → 该键；≥2 命中 →
-      `DbScopeError(DB_SCOPE_AMBIGUOUS)`（同一主键出现在多个库，无法判定，
-      不替调用方挑一个）。
+    设计 §4.3 第 12 步迁移是 COPY：控制库保留数据面行副本，R5/R6 回滚依赖它，
+    因此「控制库 + 场景库同 id」是正常状态 —— 不能按主键跨库扫描判歧义。
+    库位只由控制副本的 `kb_id` 经 `resolve_kb_db_key` 推出（未绑定 → default）。
+
+    - 关闭态：直接返回 `"default"`，零 SQL；
+    - 开启态：`control_session.get(Document, doc_id)`：None → None（调用方 404）；
+      命中 → 用其 kb_id 解析库位（不做「找不到就探测别库」的兜底）。
     """
     if not get_settings().scene_db_split_enabled:
         return DEFAULT_DB_KEY
-
-    hits: list[str] = []
-    if await control_session.get(model, pk) is not None:
-        hits.append(DEFAULT_DB_KEY)
-    for db_key in registered_db_keys():
-        if db_key == DEFAULT_DB_KEY:
-            continue
-        async with open_job_session(db_key) as session:
-            if await session.get(model, pk) is not None:
-                hits.append(db_key)
-
-    if not hits:
+    document = await control_session.get(Document, doc_id)
+    if document is None:
         return None
-    if len(hits) > 1:
+    return await resolve_kb_db_key(
+        control_session, document.tenant_id, [document.kb_id]
+    )
+
+
+async def resolve_wiki_page_db_key(
+    control_session: AsyncSession,
+    page_id: uuid.UUID,
+) -> str | None:
+    """按**控制面 wiki 页副本**的归属文档推导数据面库位（D-S6-3-2 修订）。
+
+    - 关闭态：直接返回 `"default"`，零 SQL；
+    - 开启态：页不存在 → None（调用方 404）；页存在但归属文档副本缺失 →
+      `DbScopeError(DB_SCOPE_OWNER_UNRESOLVED)`（无处取 kb_id，显式报错，
+      不猜库位）；归属文档存在 → 按其 kb_id 解析库位。
+    """
+    if not get_settings().scene_db_split_enabled:
+        return DEFAULT_DB_KEY
+    page = await control_session.get(WikiPage, page_id)
+    if page is None:
+        return None
+    document = await control_session.get(Document, page.document_id)
+    if document is None:
         raise DbScopeError(
-            DB_SCOPE_AMBIGUOUS,
-            {"model": model.__name__, "pk": str(pk), "db_keys": hits},
+            DB_SCOPE_OWNER_UNRESOLVED,
+            {"page_id": str(page_id), "document_id": str(page.document_id)},
         )
-    return hits[0]
+    return await resolve_kb_db_key(
+        control_session, document.tenant_id, [document.kb_id]
+    )
+
+
+def error_detail(exc: DbScopeError) -> dict[str, object]:
+    """把 `DbScopeError` 规整成可直接放 `HTTPException.detail` 的结构（JSON 可写）。
+
+    值为模型类时取 `__name__`，UUID 转字符串 —— 其余（字符串/列表/字典）原样保留。
+    """
+    scope = exc.detail or {}
+    detail: dict[str, object] = {"code": exc.code}
+    for key, value in scope.items():
+        if key == "model":
+            detail[key] = getattr(value, "__name__", str(value))
+        elif isinstance(value, uuid.UUID):
+            detail[key] = str(value)
+        else:
+            detail[key] = value
+    return detail

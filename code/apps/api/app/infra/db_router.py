@@ -240,7 +240,7 @@ def registered_db_keys() -> tuple[str, ...]:
 
     ★ 纯读注册表：不读开关、不建引擎、不查库。
       Step 5 的关闭态只有 default 一个键，因此返回值恒为 `("default",)`；
-      顺序探测（D-S6-3-2）未来只需遍历本函数，不必反推配置。
+      治理定时扫描（D-S6-3-1）遍历本函数覆盖全部已注册库位。
     """
     return tuple(sorted({DEFAULT_DB_KEY, *_REGISTRY}))
 

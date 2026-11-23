@@ -20,12 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config.settings import get_settings
-from app.models import WikiPage
 from app.services.db_scope import (
     DbScopeError,
-    locate_row_db_key,
+    error_detail,
     open_data_session,
     resolve_kb_db_key,
+    resolve_wiki_page_db_key,
 )
 
 router = APIRouter(tags=["wiki"])
@@ -184,24 +184,15 @@ async def get_wiki_page(
     else:
         kb_ids = list(user.authorized_kb_ids)
 
-    # 两段式（S6-3 / D-S6-3-2）：先按 page_id 顺序探测库位（关闭态零 SQL），
-    # 再在数据面会话执行 wiki_pages / chunks 的可见性查询；控制面表留在控制会话。
+    # 两段式（S6-3 / D-S6-3-2 修订）：按控制面 wiki 页副本的归属文档推导库位
+    # （关闭态零 SQL），再在数据面会话执行 wiki_pages / chunks 的可见性查询；
+    # 控制面表留在控制会话，控制副本不返回给客户端。
     try:
-        db_key = await locate_row_db_key(session, WikiPage, page_id)
+        db_key = await resolve_wiki_page_db_key(session, page_id)
     except DbScopeError as exc:
-        # 结构化 detail（与 scenario 等错误映射同口径）：code + 关键上下文，
-        # 便于前端/日志按机器可读字段定位；model/pk 需序列化成 JSON 可写类型。
-        scope = exc.detail or {}
-        model = scope.get("model")
-        pk = scope.get("pk")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "code": exc.code,
-                "model": getattr(model, "__name__", str(model)),
-                "pk": str(pk) if pk is not None else None,
-                "db_keys": scope.get("db_keys"),
-            },
+            detail=error_detail(exc),
         ) from exc
     # 404 三合一：不做「页在但你没权」与「页不在」的区分（§9.6 ③）
     if db_key is None:
