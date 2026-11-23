@@ -381,6 +381,18 @@ Step 6 必须把"路由到场景库"的请求改成两段：
 - 库位只由已认证上下文推出（I-7），不接受调用方指定。
 - `default` 也计为一个库位：一次请求里同时出现默认库 kb 与绑定库 kb，即判为跨库 → 409，不得只查场景库而丢掉默认库那一半结果。
 
+### 4.11 S6-5 实施口径（2026-11-23，落地为脚本）
+
+落点：`code/apps/api/app/infra/scene_db_migrate.py`（表集、过滤键、校验 SQL 的唯一来源）＋ `code/apps/api/scripts/scene_db_migrate.py`（CLI）。实现已按 §4.3 Phase 3 完成并经真库双库测试。
+
+- 搬迁方式：逐表 `COPY (SELECT <列清单> FROM <表> WHERE <kb 过滤>) TO STDOUT` → 临时文件 → 目标库 `COPY <表>(<列清单>) FROM STDIN`；列清单从 `information_schema.columns` 发现并排除生成列（`chunks.fts_vec`、`graph_entities.name_vec` 显式写入会直接失败）。**不使用 pg_dump 行过滤**（其无 `--where`）。
+- 过滤键逐表显式声明：7 张 `kb_id` 直连；`parse_jobs` / `governance_jobs` 经 `documents`；`parse_segments` 经 `parse_jobs → documents`。COPY 查询只用 `$1` 绑定 kb，不拼字符串。
+- 目标前置（缺一即拒绝，不降级）：M-B 手术三项 PASS；控制面表全空；目标库现有 `documents` 只属于本次 kb；`host + dbname` 与控制库相同直接拒绝。源库该 kb 无文档也拒绝（通常是 `--kb-id` 写错）。
+- 校验：逐表 `count(*)` + `md5(string_agg(id::text, ',' ORDER BY id))`；`chunks` 另加 `sum(length(content))` 与按 `(document_id, chunk_index, id)` 排序的正文摘要。可选 `--probe-term` 在两侧各跑一次 ILIKE 探测并比对命中 id 摘要；未提供时报告写「未执行」，不得写成 PASS。
+- 写暂停覆盖 COPY 与切绑：脚本在 COPY 前后各取一次源库摘要，不等即回滚并报 `S6_MIGRATE_SOURCE_CHANGED`。停写窗口必须同时覆盖 Phase 3 的 COPY 与 Phase 4 的改绑 —— 改绑完成后写入若仍落控制库，场景库会缺新行；正向校验失败时目标事务整体回滚，重试靠 TRUNCATE 重搬，不手工补行。
+- 回滚前回拷增量：`--reverse` 走「源行 COPY → 目标临时表（LIKE） → `INSERT ... ON CONFLICT (id) DO NOTHING`」，只增不删、可重跑；逐表报告 stage / existing / inserted 作为 R5 差集留痕。同一 id 内容已被改写的行不会被覆盖（脚本不静默改数据），需人工比对后处理。
+- 绑定版本化与 Phase 4 分离：脚本**不修改** `scenarios.db_binding`；改绑是单独一步，R2 快照必须记录改动前的 `db_binding` 原值，回滚按 §4.5 R3「先置 NULL、再关开关」执行。
+
 ---
 
 ## 5. 本机容器演练方案与验收标准

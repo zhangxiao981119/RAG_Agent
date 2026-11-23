@@ -289,6 +289,19 @@ async def apply_surgery(dsn: str) -> dict[str, Any]:
         await connection.close()
 
 
+async def control_plane_usage(dsn: str) -> list[dict[str, Any]]:
+    """目标库里非空的控制面表（S6-5 搬迁前的身份校验复用同一口径）。
+
+    返回空列表才说明「这是空的场景库」；非空即应中止搬迁（`tenants` 有行
+    意味着 DSN 指到了控制库或别的场景库）。
+    """
+    connection = await asyncpg.connect(dsn)
+    try:
+        return await _fetch_non_empty_control_plane(connection)
+    finally:
+        await connection.close()
+
+
 async def verify(dsn: str) -> dict[str, Any]:
     """三项检查：跨库外键行数、白名单守卫行数、5 个触发器是否齐全。
 
