@@ -10,11 +10,13 @@
    不接受调用方指定库位；解析失败显式抛 `DbScopeError`，**禁止回落默认库**
    （回落会让"绑定了 kb_x 但本进程没配 kb_x"变成"悄悄查错库、返回一半结果"）。
 
-库位判定口径与迁移 0030 的 `fn_kb_db_binding_conflicts` 一致：
+库位判定口径：
   · 以 `scenario_versions.kb_ids`（**已发布版本**）为准，`jsonb_array_elements_text` 展开；
-  · 只统计 `scenarios.db_binding IS NOT NULL` 的不同库位 —— `db_binding IS NULL` 即默认库，
-    默认库与任何库都不冲突，故不参与判定；
-  · **不按 `scenarios.status` 过滤**：库位是物理事实，被禁用场景里的数据仍在那个库。
+  · `scenarios.db_binding IS NULL` 即默认库 —— **default 也是一个库位**：
+    一次请求里「默认库的 kb + 绑定库位的 kb」= 跨库，必须拒绝，否则只会查一半；
+  · **不按 `scenarios.status` 过滤**：库位是物理事实，被禁用场景里的数据仍在那个库；
+  · 同一 kb 被两个不同库位的已发布场景命中 = 数据冲突（与迁移 0030 的
+    `fn_kb_db_binding_conflicts` 同口径），显式报错，不替调用方挑一个。
 """
 from __future__ import annotations
 
@@ -53,29 +55,12 @@ class DbScopeError(Exception):
         super().__init__(f"{code}: {detail}")
 
 
-# 解析用的库位集合：一次请求内的全部 kb 落在几个库位上？
-# 细节全部对齐迁移 0030：
-#  · LEFT/INNER 都无影响 —— `db_binding IS NOT NULL` 已在 WHERE 里排除默认库；
-#  · `v.state = 'published'` + `v.tenant_id = s.tenant_id`：与 resolver.LOOKUP_SQL 同口径；
-#  · `ORDER BY 1`：让"命中 1 个"时取到的键是确定的，不依赖 PG 的返回顺序。
-_RESOLVE_SQL = text("""
-SELECT DISTINCT s.db_binding
-FROM scenarios s
-JOIN scenario_versions v
-  ON v.scenario_id = s.id
- AND v.tenant_id   = s.tenant_id
- AND v.state       = 'published'
-CROSS JOIN LATERAL jsonb_array_elements_text(v.kb_ids) AS kb(value)
-WHERE s.tenant_id = :tenant_id
-  AND s.db_binding IS NOT NULL
-  AND kb.value = ANY(:kb_ids)
-ORDER BY 1
-""")
-
-# 分桶用的 kb → 库位映射：一次查询取回全部命中的 (kb_id, db_key)。
-# GROUP BY 是为了让同一个 kb 在同一库位下只出一行；若同一 kb 出现在两个不同库位的
-# 已发布场景里，会返回两行 —— 这是数据冲突（0030 的冲突函数正好报这种状态），
-# 由 map_kb_db_keys 显式报错，不替调用方挑一个。
+# kb → 库位映射：一次查询取回全部命中的 (kb_id, db_key)，是库位判定的唯一事实来源。
+# · 只返回 `db_binding IS NOT NULL` 的行（非默认库位）；未命中的 kb 由调用方补 default。
+# · `v.state = 'published'` + `v.tenant_id = s.tenant_id`：与 resolver 的 LOOKUP_SQL 同口径。
+# · GROUP BY 让同一个 kb 在同一库位下只出一行；若同一 kb 出现在两个不同库位的
+#   已发布场景里，会返回两行 —— 这是数据冲突（0030 的冲突函数正好报这种状态），
+#   由 map_kb_db_keys 显式报错，不替调用方挑一个。
 _MAP_SQL = text("""
 SELECT kb.value AS kb_id, s.db_binding AS db_key
 FROM scenarios s
@@ -99,30 +84,22 @@ async def resolve_kb_db_key(
     """把本次请求涉及的 kb 集合解析成**唯一**库位键。
 
     - 关闭态：直接返回 `"default"`，零 SQL（与未接线前等价）。
-    - 开启态：查控制库（已发布版本的 kb_ids），按不同库位数量判定：
-      0 个 → `"default"`；1 个 → 该键；≥2 个 → `DbScopeError(DB_SCOPE_MULTI_KEY)`。
+    - 开启态：复用 `map_kb_db_keys`（单一事实来源）拿到每个 kb 的库位，
+      把**未命中的 kb 计为 default** 后去重：0 个 → `"default"`；
+      1 个 → 该键；≥2 个 → `DbScopeError(DB_SCOPE_MULTI_KEY)`。
+      「默认库 + 绑定库位」的混合请求因此会报 MULTI_KEY，而不是只查绑定库。
 
     ★ 不校验该键是否已注册：注册与否由 `data_session` 在真正开会话时 fail-closed，
       这里若提前回落默认库，就会把配置缺口藏成"查了半个库"。
     """
-    if not kb_ids:
+    mapping = await map_kb_db_keys(control_session, tenant_id, kb_ids)
+    if not mapping:
         return DEFAULT_DB_KEY
-    if not get_settings().scene_db_split_enabled:
-        return DEFAULT_DB_KEY
-
-    rows = (
-        await control_session.execute(
-            _RESOLVE_SQL,
-            {"tenant_id": tenant_id, "kb_ids": [str(kb_id) for kb_id in kb_ids]},
-        )
-    ).all()
-    keys = [row[0] for row in rows]
-    if not keys:
-        return DEFAULT_DB_KEY
+    keys = sorted(set(mapping.values()))
     if len(keys) > 1:
         raise DbScopeError(
             DB_SCOPE_MULTI_KEY,
-            {"kb_ids": [str(kb_id) for kb_id in kb_ids], "db_keys": sorted(keys)},
+            {"kb_ids": [str(kb_id) for kb_id in kb_ids], "db_keys": keys},
         )
     return keys[0]
 
@@ -134,6 +111,7 @@ async def map_kb_db_keys(
 ) -> dict[uuid.UUID, str]:
     """把一组 kb 分桶到库位键（一次查询；未命中的 kb 映射为 `"default"`）。
 
+    `"default"` 本身就是一个库位：调用方按 mapping 的不同取值数判断是否跨库。
     关闭态：零 SQL，全部 `"default"`。
     开启态：同一 kb 若命中 ≥2 个不同库位（0030 定义的冲突态），
     抛 `DbScopeError(DB_SCOPE_MULTI_KEY)` —— 不替调用方挑一个库。

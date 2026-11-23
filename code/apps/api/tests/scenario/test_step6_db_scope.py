@@ -2,10 +2,11 @@
 
 钉住四件事（全部不连库）：
   1. 关闭态零 SQL：resolve / map 直接返回 default，假会话一旦被 execute 就失败；
-  2. 开启态判定：0 个非默认库位 → default；1 个 → 该键；≥2 个 → DbScopeError；
-     map 按 kb 分桶，未命中的 kb 映射为 default；
-  3. 默认场景（db_binding IS NULL）不参与冲突判定 —— 落实为 SQL 契约断言
-     （WHERE 必须带 `db_binding IS NOT NULL`，且不得按 scenarios.status 过滤）；
+  2. 开启态判定（default 计为一个库位）：全 default → default；全同绑定 → 该键；
+     默认+绑定混合 / 多绑定 → DbScopeError；map 按 kb 分桶，未命中的 kb 映射为 default；
+  3. 默认场景（db_binding IS NULL）不产生绑定行，但会以 default 身份参与跨库判定 ——
+     落实为 SQL 契约断言（WHERE 必须带 `db_binding IS NOT NULL`，且不得按
+     scenarios.status 过滤）+ 「混合 default+bound 报错」的行为断言；
   4. open_data_session：default 原样交出控制会话且不 commit；非 default 先 commit
      再开会话（用记录调用顺序的替身断言顺序）。
 
@@ -129,13 +130,35 @@ async def test_enabled_no_non_default_binding_returns_default(enabled):
 
 @pytest.mark.asyncio
 async def test_enabled_single_binding_returns_that_key(enabled):
-    session = _ScriptedSession([[("kb_finance",)]])
+    """全部 kb 落在同一个绑定库位 → 该键（default 未被任何 kb 命中）。"""
+    session = _ScriptedSession(
+        [[(str(_KB_A), "kb_finance"), (str(_KB_B), "kb_finance")]]
+    )
     assert await resolve_kb_db_key(session, _TENANT_ID, [_KB_A, _KB_B]) == "kb_finance"
 
 
 @pytest.mark.asyncio
+async def test_enabled_mixed_default_and_bound_raises_multi_key(enabled):
+    """D1：默认库 kb + 绑定库 kb = 跨库，必须报 MULTI_KEY 而不是只返回绑定键。
+
+    查询只返回非默认库位的行（kb_b → kb_finance），kb_a 未命中即 default；
+    若实现只看"非默认库位数量"，这里会错误地返回 kb_finance。
+    """
+    session = _ScriptedSession([[(str(_KB_B), "kb_finance")]])
+    with pytest.raises(DbScopeError) as excinfo:
+        await resolve_kb_db_key(session, _TENANT_ID, [_KB_A, _KB_B])
+
+    exc = excinfo.value
+    assert exc.code == DB_SCOPE_MULTI_KEY
+    assert exc.detail["db_keys"] == ["default", "kb_finance"]
+    assert exc.detail["kb_ids"] == [str(_KB_A), str(_KB_B)]
+
+
+@pytest.mark.asyncio
 async def test_enabled_multi_binding_raises_multi_key(enabled):
-    session = _ScriptedSession([[("kb_finance",), ("kb_hr",)]])
+    session = _ScriptedSession(
+        [[(str(_KB_A), "kb_finance"), (str(_KB_B), "kb_hr")]]
+    )
     with pytest.raises(DbScopeError) as excinfo:
         await resolve_kb_db_key(session, _TENANT_ID, [_KB_A, _KB_B])
 
@@ -155,7 +178,7 @@ async def test_enabled_resolve_passes_tenant_and_string_kb_ids(enabled):
     sql, params = session.calls[0]
     assert params["tenant_id"] == _TENANT_ID
     assert params["kb_ids"] == [str(_KB_A)]
-    # SQL 契约：只统计非默认库位的已发布版本，且不按场景状态过滤
+    # SQL 契约：以已发布版本的 kb_ids 为准，只返回非默认库位行，且不按场景状态过滤
     assert "scenario_versions" in sql
     assert "jsonb_array_elements_text" in sql
     assert "published" in sql

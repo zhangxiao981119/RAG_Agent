@@ -35,7 +35,12 @@ from app.services import audit
 from app.services import kb_member as kb_member_service
 from app.services.acl import compute_doc_acl_tags
 from app.services.acl.subjects import invalidate_tenant_acl
-from app.services.db_scope import map_kb_db_keys, open_data_session, resolve_kb_db_key
+from app.services.db_scope import (
+    DbScopeError,
+    map_kb_db_keys,
+    open_data_session,
+    resolve_kb_db_key,
+)
 from app.services.parse.image_parser import IMAGE_EXTS
 from app.services.storage import get_storage
 
@@ -176,7 +181,18 @@ async def delete_kb(
     if user.clearance < 40 and kb.owner_id != user.user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
 
-    db_key = await resolve_kb_db_key(session, user.tenant_id, [kb.id])
+    # 库位解析失败（同一 kb 命中多个库）时无法判定是否已搬入场景库：
+    # 显式 409 并保留机器可读原因，绝不带着未知库位去删控制库行。
+    try:
+        db_key = await resolve_kb_db_key(session, user.tenant_id, [kb.id])
+    except DbScopeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"KB_SCOPE_CONFLICT: 库位解析冲突（{exc.code}: {exc.detail}），"
+                "无法判定该库是否已搬入场景库，拒绝删除"
+            ),
+        ) from exc
     if db_key != DEFAULT_DB_KEY:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -573,7 +589,7 @@ async def upload_documents_batch(
     failed: list[BatchUploadFailure] = []
     for file in files:
         try:
-            succeeded.append(await _upload_single(request, kb, file, user, session))
+            out = await _upload_single(request, kb, file, user, session)
         except HTTPException as exc:
             # 单文件失败不影响其他文件（各自已独立 commit / 入队）
             failed.append(
@@ -582,5 +598,16 @@ async def upload_documents_batch(
                     detail=str(exc.detail),
                 )
             )
+        except DbScopeError as exc:
+            # 库位解析冲突同样是"该文件失败"，不是整批 500：
+            # 保留 code，便于按文件定位（此时尚未写对象存储/DB）
+            failed.append(
+                BatchUploadFailure(
+                    filename=file.filename or "unnamed",
+                    detail=f"{exc.code}: 库位解析冲突，拒绝写入（{exc.detail}）",
+                )
+            )
+        else:
+            succeeded.append(out)
 
     return BatchUploadResponse(succeeded=succeeded, failed=failed)

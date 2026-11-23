@@ -701,6 +701,7 @@ async def _chat_ask_impl(
             # 会话只包住检索，退出后段的控制面写（持久化/审计）不与数据面重叠。
             async with open_data_session(session, retrieve_db_key) as retrieve_session:
                 retrieval = get_retrieval_service()
+                retrieval_failed = False
                 try:
                     result = await retrieval.retrieve_chain(
                         retrieve_session,
@@ -717,16 +718,22 @@ async def _chat_ask_impl(
                     )
                 except Exception:
                     logger.exception("检索失败")
-                    yield _sse("refused", {
-                        "reason": "VECTOR_STORE_DOWN",
-                        "message": "知识库暂时不可用，请稍后重试",
-                    })
-                    await _persist_assistant(
-                        conversation_id, user, message_id,
-                        text="", refused=True, citations=[],
-                        meta={"refused": True, "reason": "VECTOR_STORE_DOWN"},
-                    )
-                    return
+                    retrieval_failed = True
+
+            # ★ 异常分支的持久化/审计必须在数据面会话关闭之后：
+            #   _persist_assistant 会自开控制面会话，若在 async with 块内调用，
+            #   绑定库位时会出现数据面 + 控制面两条连接并存（违反两段式纪律）。
+            if retrieval_failed:
+                yield _sse("refused", {
+                    "reason": "VECTOR_STORE_DOWN",
+                    "message": "知识库暂时不可用，请稍后重试",
+                })
+                await _persist_assistant(
+                    conversation_id, user, message_id,
+                    text="", refused=True, citations=[],
+                    meta={"refused": True, "reason": "VECTOR_STORE_DOWN"},
+                )
+                return
 
             # 检索完成后即使生成阶段断连，也能把本轮观测随部分答案一起落库。
             partial_observation = _retrieval_observation(result)
