@@ -52,6 +52,7 @@ __all__ = [
     "MigrateError",
     "column_list",
     "server_identity",
+    "ensure_distinct_targets",
     "table_metrics",
     "probe_digest",
     "migrate_forward",
@@ -303,7 +304,7 @@ async def probe_digest(
     return dict(row)
 
 
-async def _ensure_distinct_targets(
+async def ensure_distinct_targets(
     control: asyncpg.Connection,
     scene: asyncpg.Connection,
     control_dsn: str,
@@ -362,7 +363,7 @@ async def migrate_forward(
     try:
         # 同库判定必须最先做：DSN 填反时若先跑 verify/清库检查，
         # 「把控制库当场景库」只会报 NOT_PREPARED 之类的次生错误。
-        await _ensure_distinct_targets(control, scene, control_dsn, scene_dsn)
+        await ensure_distinct_targets(control, scene, control_dsn, scene_dsn)
 
         prepared = await verify(scene_dsn)
         if not prepared["ok"]:
@@ -508,7 +509,7 @@ async def migrate_reverse(
     scene = await asyncpg.connect(scene_dsn)
     control = await asyncpg.connect(control_dsn)
     try:
-        await _ensure_distinct_targets(control, scene, control_dsn, scene_dsn)
+        await ensure_distinct_targets(control, scene, control_dsn, scene_dsn)
 
         tables: list[dict[str, Any]] = []
         for spec in MIGRATION_ORDER:

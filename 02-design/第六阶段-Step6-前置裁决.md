@@ -394,6 +394,17 @@ Step 6 必须把"路由到场景库"的请求改成两段：
 - 回滚前回拷增量：`--reverse` 走「源行 COPY → 目标临时表（LIKE） → `INSERT ... ON CONFLICT (id) DO NOTHING`」，只增不删、可重跑；两侧不同库且 `alembic_version` 相同才执行；逐表报告 stage / existing / inserted 作为 R5 差集留痕。同一 id 内容已被改写的行不会被覆盖（脚本不静默改数据），需人工比对后处理。
 - 绑定版本化与 Phase 4 分离：脚本**不修改** `scenarios.db_binding`；改绑是单独一步，R2 快照必须记录改动前的 `db_binding` 原值，回滚按 §4.5 R3「先置 NULL、再关开关」执行。
 
+### 4.12 S6-6 实施口径（2026-11-23，落地为脚本）
+
+落点：`code/apps/api/app/infra/scene_db_cleanup.py`（清理与孤儿判定的唯一来源）＋ `code/apps/api/scripts/scene_db_cleanup.py`（CLI）。API 侧 409 门禁（`KB_IN_BOUND_SCENE` / `KB_SCOPE_CONFLICT`）在 S6-3 已实现，本节只补运维侧。
+
+- 清理：`--kb-id` + `--apply` 时，按 `MIGRATION_ORDER` 的**严格逆序**在单事务内删除该 kb 的搬迁集行（先子表后父表），删完立即复核各表行数必须全为 0，否则报 `S6_CLEANUP_VERIFY_MISMATCH`。不带 `--apply` 只做只读统计，用于工单确认。
+- 身份校验复用搬迁侧：先判非同一库（服务端视角）、再判手术 PASS、控制面表全空；控制库不存在的 kb 默认拒绝（`S6_CLEANUP_KB_MISSING`），孤儿清理必须显式 `--allow-missing-kb`。
+- 控制库不删：脚本不触碰控制库任何行；kb 行仍由 API 删除以保留审计（`kb.delete`），其数据面残留靠原有 FK CASCADE 清掉。
+- 孤儿检查（§4.7 规则 3）两个方向，任一非零即退出码 1：
+  · 场景库：7 张 `kb_id` 直连表按 kb 分组，凡 kb 不在控制库 `knowledge_bases` 即孤儿；`parse_jobs`/`governance_jobs` 经 `documents`、`parse_segments` 经 `parse_jobs → documents`，父实体缺失的行记为 `<missing_parent>` 同样算孤儿；
+  · 控制库：数据面行若父实体（kb / document / job）已不存在，记为陈旧副本（正常恒为 0，非零说明 FK 被破坏）。
+
 ---
 
 ## 5. 本机容器演练方案与验收标准
