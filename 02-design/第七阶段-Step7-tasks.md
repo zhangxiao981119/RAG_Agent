@@ -224,7 +224,7 @@
 
 ---
 
-## S7-7 配额与审计回归
+## [x] S7-7 配额与审计回归
 
 **文件**
 - 无生产代码；若 `test_step7_audit.py` 发现 `scenario.version.archive` 缺审计，在 `app/services/scenario/write_service.py` 补齐，并单独 commit。
