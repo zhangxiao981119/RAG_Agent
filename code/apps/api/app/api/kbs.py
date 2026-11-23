@@ -549,7 +549,18 @@ async def upload_document(
     session: AsyncSession = Depends(get_db),
 ) -> DocumentOut:
     kb = await _load_kb_for_upload(kb_id, user, session)
-    return await _upload_single(request, kb, file, user, session)
+    # 库位解析失败（同一 kb 命中多个库）：无法确定写入哪个库，显式 409 并保留原因码。
+    # 解析发生在落对象存储之前，因此失败时没有任何副作用。
+    try:
+        return await _upload_single(request, kb, file, user, session)
+    except DbScopeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"KB_SCOPE_CONFLICT: 库位解析冲突（{exc.code}: {exc.detail}），"
+                "无法确定该文件的写入库位，拒绝上传"
+            ),
+        ) from exc
 
 
 def _file_ext(filename: str | None) -> str:

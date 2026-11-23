@@ -92,10 +92,12 @@ class _FakeArqPool:
 
 @pytest.fixture
 def client(monkeypatch):
+    storage = _FakeStorage()
+
     async def _async_of(value):
         return value
 
-    monkeypatch.setattr("app.api.kbs.get_storage", lambda: _async_of(_FakeStorage()))
+    monkeypatch.setattr("app.api.kbs.get_storage", lambda: _async_of(storage))
 
     async def _fake_audit(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
         return None
@@ -105,6 +107,7 @@ def client(monkeypatch):
     test_app = FastAPI()
     test_app.include_router(router, prefix="/api")
     test_app.state.arq_pool = _FakeArqPool()
+    test_app.state.test_storage = storage
     test_app.dependency_overrides[get_current_user] = lambda: _user()
 
     async def _override_get_db():
@@ -160,3 +163,26 @@ def test_batch_upload_scope_conflict_reports_per_file(client, monkeypatch):
     assert len(body["failed"]) == 1
     assert body["failed"][0]["filename"] == "制度.pdf"
     assert "DB_SCOPE_MULTI_KEY" in body["failed"][0]["detail"]
+
+
+def test_single_upload_scope_conflict_returns_409_with_code(client, monkeypatch):
+    """单文件上传：库位解析冲突 → 409 KB_SCOPE_CONFLICT 且保留原因码，不落存储。"""
+    storage = client.app.state.test_storage
+
+    async def _resolve_conflict(session, tenant_id, kb_ids):  # noqa: ANN001
+        raise DbScopeError(
+            "DB_SCOPE_MULTI_KEY",
+            {"conflicts": {str(_KB_ID): ["kb_finance", "kb_hr"]}},
+        )
+
+    monkeypatch.setattr("app.api.kbs.resolve_kb_db_key", _resolve_conflict)
+
+    resp = client.post(
+        f"/api/kbs/{_KB_ID}/documents",
+        files={"file": ("制度.pdf", b"%PDF-1.4", "application/pdf")},
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert "KB_SCOPE_CONFLICT" in detail
+    assert "DB_SCOPE_MULTI_KEY" in detail
+    assert storage.put_keys == []
