@@ -37,6 +37,7 @@ from app.api.roles import router as roles_router
 from app.api.scenarios import router as scenarios_router
 from app.api.sensitive_words import router as sensitive_words_router
 from app.api.sync import router as sync_router
+from app.api.tenant_governance import router as tenant_governance_router
 from app.api.users import router as users_router
 from app.config import decisions
 from app.config.settings import get_settings
@@ -482,3 +483,5 @@ app.include_router(scenarios_router, prefix="/api")
 # ★ 与 `/api/admin/metrics` 同前缀不同模块：那边是进程内计数，这边是**查库**的
 #   实时口径分布。合进 metrics.py 会让"一个模块两种数据源"，回滚时一起回滚。
 app.include_router(needs_reindex_router, prefix="/api")
+# ── Step 7 S7-5：租户治理面（库白名单 / 场景分级 / 钉定 / 上限）──
+app.include_router(tenant_governance_router, prefix="/api")

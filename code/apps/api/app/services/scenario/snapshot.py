@@ -199,45 +199,8 @@ class ScenarioRow:
         return tuple(result)
 
     def to_policy(self) -> ScenarioPolicy:
-        """把稀疏覆盖集折叠成值对象。
-
-        未知键或类型不符在这里**不该出现**（写入时已由 policy_spec 校验 + DB CHECK
-        兜底），但既然它来自库，仍按「只取认识的键、类型不符即损坏」处理：
-        合法的覆盖集缺失某个键是正常，出现类型错的值是不可解析。
-
-        ★ 类型判定与写入校验**共用** `policy_spec.type_ok`：
-          两边各写一份的话，写入严、读取松（或反之）就会出现「能落库但解析 500」
-          或「落库就该拒但被放行」—— 而这两种错都不会在任何日志里留下痕迹。
-          读取侧比写入侧更严没有意义，更松则是漏。
-        """
-        raw = self.policy or {}
-        if not isinstance(raw, Mapping):
-            raise ScenarioError(
-                ScenarioCode.UNRESOLVABLE,
-                diagnostic={
-                    "reason": "policy_not_object",
-                    "scenario_id": str(self.scenario_id),
-                },
-            )
-        values: dict[str, object] = {}
-        for name in SCENARIO_POLICY_KEYS:
-            if name not in raw:
-                continue
-            value = raw[name]
-            expected = _POLICY_TYPE_BY_NAME[name]
-            if not type_ok(value, expected):
-                raise ScenarioError(
-                    ScenarioCode.UNRESOLVABLE,
-                    diagnostic={
-                        "reason": f"policy_type_mismatch:{name}",
-                        "scenario_id": str(self.scenario_id),
-                        # 记类型而不是值：值可能很长，且类型已足够定位
-                        "actual_type": type(value).__name__,
-                        "expected_type": expected,
-                    },
-                )
-            values[name] = value
-        return ScenarioPolicy(**values)  # type: ignore[arg-type]
+        """把稀疏覆盖集折叠成值对象（实现见模块级 `parse_policy`）。"""
+        return parse_policy(self.policy, scenario_id=self.scenario_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +266,60 @@ class ScenarioSnapshot:
 # ══════════════════════════════════════════════════════════════════════
 # 二、纯函数
 # ══════════════════════════════════════════════════════════════════════
+
+
+def parse_policy(
+    raw: object, *, scenario_id: uuid.UUID | None = None
+) -> ScenarioPolicy:
+    """把稀疏覆盖集折叠成值对象（`ScenarioRow.to_policy` 的模块级实现）。
+
+    未知键或类型不符在这里**不该出现**（写入时已由 policy_spec 校验 + DB CHECK
+    兜底），但既然它来自库，仍按「只取认识的键、类型不符即损坏」处理：
+    合法的覆盖集缺失某个键是正常，出现类型错的值是不可解析。
+
+    ★ 类型判定与写入校验**共用** `policy_spec.type_ok`：
+      两边各写一份的话，写入严、读取松（或反之）就会出现「能落库但解析 500」
+      或「落库就该拒但被放行」—— 而这两种错都不会在任何日志里留下痕迹。
+      读取侧比写入侧更严没有意义，更松则是漏。
+
+    ★ 抽成模块级纯函数（S7-5）的理由：管理端预览（`tenant.governance`）读的是
+      `scenario_versions.policy` 原始值，不是 `ScenarioRow`。若预览自己手抄一份
+      解析规则，就会出现「检索按 A 规则解析、预览按 B 规则展示」的两份真源 ——
+      而这类分叉不会报错，只会让运维看到与实际不符的上限。
+
+    `scenario_id` 只用于诊断；调用方没有场景上下文时可为 `None`。
+    """
+    diagnostics_scenario_id = (
+        None if scenario_id is None else str(scenario_id)
+    )
+    raw = raw or {}
+    if not isinstance(raw, Mapping):
+        raise ScenarioError(
+            ScenarioCode.UNRESOLVABLE,
+            diagnostic={
+                "reason": "policy_not_object",
+                "scenario_id": diagnostics_scenario_id,
+            },
+        )
+    values: dict[str, object] = {}
+    for name in SCENARIO_POLICY_KEYS:
+        if name not in raw:
+            continue
+        value = raw[name]
+        expected = _POLICY_TYPE_BY_NAME[name]
+        if not type_ok(value, expected):
+            raise ScenarioError(
+                ScenarioCode.UNRESOLVABLE,
+                diagnostic={
+                    "reason": f"policy_type_mismatch:{name}",
+                    "scenario_id": diagnostics_scenario_id,
+                    # 记类型而不是值：值可能很长，且类型已足够定位
+                    "actual_type": type(value).__name__,
+                    "expected_type": expected,
+                },
+            )
+        values[name] = value
+    return ScenarioPolicy(**values)  # type: ignore[arg-type]
 
 
 def _canonical_json(payload: object) -> str:

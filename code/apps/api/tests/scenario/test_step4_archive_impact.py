@@ -175,6 +175,7 @@ async def integration(api, monkeypatch):
             rewrite_score=None,
             *,
             policy=None,
+            policy_caps=None,
         ):
             captured["policy"] = policy
             captured["kb_ids"] = list(kb_ids)
@@ -190,6 +191,7 @@ async def integration(api, monkeypatch):
             subjects,
             *,
             policy=None,
+            policy_caps=None,
         ):
             captured["policy"] = policy
             return RetrievalResult(chunks=[_chunk()], stage_ms={})

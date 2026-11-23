@@ -151,7 +151,7 @@
 
 ---
 
-## S7-5 治理面 API + 审计
+## [x] S7-5 治理面 API + 审计
 
 **文件**
 - 新增 `code/apps/api/app/api/tenant_governance.py`

@@ -50,7 +50,16 @@ def test_scenarios_router_is_mounted():
     from app.main import app
 
     paths = app.openapi()["paths"]
-    actual = {path: set(methods) for path, methods in paths.items() if "scenario" in path}
+    # ★ 只取「场景写接口」这一族：`/api/scenarios*` 与集成侧的绑定接口。
+    #   早先用「路径含 scenario」过滤，会把 S7-5 的管理端治理面
+    #   （`/api/admin/scenario-governance`）也吸进来 —— 那是另一套契约，
+    #   它的挂载由 `test_step7_api.py::test_governance_router_is_mounted` 单独守。
+    actual = {
+        path: set(methods)
+        for path, methods in paths.items()
+        if path.startswith("/api/scenarios")
+        or path == "/api/integrations/applications/{application_id}/scenario"
+    }
     assert actual == _EXPECTED_ROUTES, (
         "场景接口的对外契约与设计不一致：\n"
         f"  缺少：{sorted(set(_EXPECTED_ROUTES) - set(actual))}\n"
