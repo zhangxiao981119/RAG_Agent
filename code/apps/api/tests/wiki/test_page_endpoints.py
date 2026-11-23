@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 import app.api.wiki as wiki_mod
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.main import app
+from app.services import db_scope as db_scope_mod
 from tests.fake_settings import fake_settings
 
 KB_ID = uuid.uuid4()
@@ -116,10 +117,17 @@ class _Harness:
             self._orig = wiki_mod.get_settings
             wiki_mod.get_settings = lambda: fake_settings(wiki_enabled=False)
 
+        # ★ S6-3：wiki.py 的列表查询改走 db_scope.open_data_session。
+        #   分库开关必须由用例钉死为关闭：否则 .env 一旦开启，resolve 会先发一条
+        #   控制库查询，消费掉 `_FakeSession` 的按序结果，断言就崩在与开关无关的位置。
+        self._orig_db_scope_settings = db_scope_mod.get_settings
+        db_scope_mod.get_settings = lambda: fake_settings(scene_db_split_enabled=False)
+
     def close(self):
         app.dependency_overrides.clear()
         if self._orig is not None:
             wiki_mod.get_settings = self._orig
+        db_scope_mod.get_settings = self._orig_db_scope_settings
 
 
 def _client() -> TestClient:

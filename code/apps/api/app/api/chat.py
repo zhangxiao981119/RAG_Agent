@@ -50,6 +50,7 @@ from app.services import feature_flag as flag_service
 from app.services import quota as quota_service
 from app.services import sensitive as sensitive_service
 from app.services.caliber import snapshot_for_message
+from app.services.db_scope import DbScopeError, open_data_session, resolve_kb_db_key
 from app.services.generate import build_system_prompt, get_stream_generation_service
 from app.services.guard import injection as injection_guard
 from app.services.keyword_text import hit_snippet
@@ -322,6 +323,22 @@ async def _chat_ask_impl(
     ).scalars().all()
     if len(kb_rows) != len(effective_kb_ids):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="部分知识库不存在")
+
+    # 两段式（S6-3）：kb 归属校验在控制面完成后解析库位。
+    # ★ 本期不支持跨库检索：本次请求的 kb 落在 ≥2 个库位 → 409，显式拒绝而不是
+    #   只查一半（把"缺结果"伪装成"没命中"）。
+    try:
+        retrieve_db_key = await resolve_kb_db_key(
+            session, user.tenant_id, effective_kb_ids
+        )
+    except DbScopeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"CROSS_DB_RETRIEVAL_UNSUPPORTED: 本次请求的知识库分布在多个库位"
+                f"（{exc.detail}），本期不支持跨库检索，请缩小到同一场景的知识库"
+            ),
+        ) from exc
 
     # 集成会话只能在原应用、原用户下继续使用，普通 Web 会话也不能跨入口复用。
     if payload.conversation_id is not None:
@@ -680,7 +697,9 @@ async def _chat_ask_impl(
             # ★ 走链式检索入口：按 rewrite_score 复杂度信号决定是否拆解为多轮检索，
             #   拆解不可用时内部降级单趟 —— 对下游是同一个 RetrievalResult 契约
             _t_retrieve = _time.monotonic()
-            async with SessionLocal() as retrieve_session:
+            # 数据面会话（关闭态即控制面会话本身，零新增连接）；
+            # 会话只包住检索，退出后段的控制面写（持久化/审计）不与数据面重叠。
+            async with open_data_session(session, retrieve_db_key) as retrieve_session:
                 retrieval = get_retrieval_service()
                 try:
                     result = await retrieval.retrieve_chain(

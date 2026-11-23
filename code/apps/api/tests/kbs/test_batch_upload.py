@@ -20,6 +20,7 @@ from app.api.kbs import router
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config.settings import get_settings
 from app.models import KnowledgeBase
+from tests.fake_settings import fake_settings
 
 _TENANT_ID = uuid.uuid4()
 _KB_ID = uuid.uuid4()
@@ -100,6 +101,12 @@ def client(monkeypatch: pytest.MonkeyPatch):
         "app.api.kbs.get_storage", lambda: _async_of(_FakeStorage())
     )
     monkeypatch.setattr("app.api.kbs.audit.record", _fake_audit)
+    # ★ S6-3：上传主链改走 db_scope.open_data_session。开关钉死为关闭，
+    #   否则 .env 一旦开启分库，resolve 会先查控制库 —— 假 session 不支持 execute。
+    monkeypatch.setattr(
+        "app.services.db_scope.get_settings",
+        lambda: fake_settings(scene_db_split_enabled=False),
+    )
     fake_arq = _FakeArqPool()
 
     def _mount(kb: KnowledgeBase | None, user: CurrentUser) -> TestClient:

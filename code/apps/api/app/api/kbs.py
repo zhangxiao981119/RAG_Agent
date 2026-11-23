@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config.settings import get_settings
 from app.infra import trace
+from app.infra.db_router import DEFAULT_DB_KEY
 from app.infra.redis_client import get_redis
 from app.models import Document, KnowledgeBase, KnowledgeBaseMember, ParseJob, User
 from app.schemas.documents import BatchUploadFailure, BatchUploadResponse, DocumentOut
@@ -34,6 +35,7 @@ from app.services import audit
 from app.services import kb_member as kb_member_service
 from app.services.acl import compute_doc_acl_tags
 from app.services.acl.subjects import invalidate_tenant_acl
+from app.services.db_scope import map_kb_db_keys, open_data_session, resolve_kb_db_key
 from app.services.parse.image_parser import IMAGE_EXTS
 from app.services.storage import get_storage
 
@@ -59,20 +61,39 @@ async def list_kbs(
             KnowledgeBase.id.in_(auth_ids),
         )
     rows = (await session.execute(stmt)).scalars().all()
+
+    # ── 两段式：控制面取库列表 → 按库位分桶 → 数据面统计文档数 ──────────
+    # 先一次性解析全部 kb 的库位（关闭态零 SQL、全 default），再按库位顺序
+    # 逐个打数据面会话。逐库一条 count 会变成"每个 kb 一次连接获取"，
+    # 这里按桶聚合成一条 IN 查询；**不做跨库 join**（不同库位的表不能互相引）。
+    keys_by_kb = await map_kb_db_keys(session, user.tenant_id, [kb.id for kb in rows])
+    buckets: dict[str, list[uuid.UUID]] = {}
+    for kb_id, db_key in keys_by_kb.items():
+        buckets.setdefault(db_key, []).append(kb_id)
+
+    doc_counts: dict[uuid.UUID, int] = {}
+    for db_key in sorted(buckets):
+        async with open_data_session(session, db_key) as data_plane:
+            count_stmt = (
+                select(Document.kb_id, func.count(Document.id))
+                .where(
+                    Document.kb_id.in_(buckets[db_key]),
+                    Document.deleted_at.is_(None),
+                )
+                .group_by(Document.kb_id)
+            )
+            for kb_id, count in (await data_plane.execute(count_stmt)).all():
+                doc_counts[kb_id] = count
+
     result: list[KnowledgeBaseOut] = []
     for kb in rows:
-        count_stmt = (
-            select(func.count(Document.id))
-            .where(Document.kb_id == kb.id, Document.deleted_at.is_(None))
-        )
-        doc_count = (await session.execute(count_stmt)).scalar_one()
         result.append(
             KnowledgeBaseOut(
                 id=kb.id,
                 name=kb.name,
                 description=kb.description,
                 is_public=kb.is_public,
-                doc_count=doc_count,
+                doc_count=doc_counts.get(kb.id, 0),
                 # P-d：库管理权标志（admin 或 owner），前端按此渲染上传区
                 can_upload=user.clearance >= 40 or kb.owner_id == user.user_id,
             )
@@ -145,12 +166,25 @@ async def delete_kb(
     """删除知识库（级联删文档/chunks/members/sync_sources）。
 
     权限：仅 admin（clearance >= 40）或库 owner 可删。
+    ★ 已绑定到非默认库位的 kb 直接 409：跨 database 的 CASCADE 永不触发
+      （设计 §4.7），删控制库行会在场景库留下孤儿 documents —— 必须先走
+      清理脚本删数据面，再回来删 kb。
     """
     kb = await session.get(KnowledgeBase, kb_id)
     if kb is None or kb.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
     if user.clearance < 40 and kb.owner_id != user.user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
+
+    db_key = await resolve_kb_db_key(session, user.tenant_id, [kb.id])
+    if db_key != DEFAULT_DB_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"KB_IN_BOUND_SCENE: 该知识库属于场景库位 {db_key}，"
+                "跨库 CASCADE 不生效，请先按清理脚本删除场景库数据后再删 kb"
+            ),
+        )
 
     redis = await get_redis()
     try:
@@ -179,11 +213,14 @@ async def get_kb(
     kb = await session.get(KnowledgeBase, kb_id)
     if kb is None or kb.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+    # 两段式：kb 校验走控制面；文档数在数据面（关闭态复用控制面会话）
+    db_key = await resolve_kb_db_key(session, user.tenant_id, [kb.id])
     count_stmt = (
         select(func.count(Document.id))
         .where(Document.kb_id == kb.id, Document.deleted_at.is_(None))
     )
-    doc_count = (await session.execute(count_stmt)).scalar_one()
+    async with open_data_session(session, db_key) as data_plane:
+        doc_count = (await data_plane.execute(count_stmt)).scalar_one()
     return KnowledgeBaseDetail(
         id=kb.id,
         name=kb.name,
@@ -264,6 +301,14 @@ async def list_documents(
     # admin 豁免 G2 库级授权校验
     if user.clearance < 40 and kb_id not in user.authorized_kb_ids:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
+    # P-c/P-d：库管理权（同 KB 一次判定，控制面）
+    kb = await session.get(KnowledgeBase, kb_id)
+    can_upload = kb is not None and (
+        user.clearance >= 40 or kb.owner_id == user.user_id
+    )
+
+    # 两段式：控制面 kb 校验 → 数据面查 documents → 关闭后再回控制面查展示名
+    db_key = await resolve_kb_db_key(session, user.tenant_id, [kb_id])
     stmt = (
         select(Document)
         .where(
@@ -274,13 +319,10 @@ async def list_documents(
         )
         .order_by(Document.created_at.desc())
     )
-    rows = (await session.execute(stmt)).scalars().all()
+    async with open_data_session(session, db_key) as data_plane:
+        rows = (await data_plane.execute(stmt)).scalars().all()
 
-    # P-c/P-d：库管理权（同 KB 一次判定）+ 上传人姓名批量查询（P-e）
-    kb = await session.get(KnowledgeBase, kb_id)
-    can_upload = kb is not None and (
-        user.clearance >= 40 or kb.owner_id == user.user_id
-    )
+    # P-e：上传人姓名批量查询（users 在控制库，数据面会话已关闭）
     uploader_ids = {d.uploaded_by for d in rows if d.uploaded_by is not None}
     uploader_names: dict[uuid.UUID, str] = {}
     if uploader_ids:
@@ -337,6 +379,8 @@ async def _upload_single(
       "文件 → 对象存储 → Document → ParseJob → 审计 → 入队" 主链；
     ★ 每个文件独立 commit + 入队：batch 部分成功时不被后续失败拖累，
       失败文件返回逐文件原因（INV-M-18 验收口径）。
+    ★ 两段式（S6-3）：KB 校验由端点层在控制面完成；本函数解析库位后，
+      在数据面会话里写 documents/parse_jobs，会话关闭后再审计（自开会话）与入队。
     """
     settings = get_settings()
 
@@ -372,6 +416,10 @@ async def _upload_single(
             ),
         )
 
+    # 两段式：KB 校验已在端点层完成（控制面）；这里解析库位，失败即中止，
+    # 不产生对象存储副作用。关闭态零 SQL，返回 default。
+    db_key = await resolve_kb_db_key(session, user.tenant_id, [kb.id])
+
     # 落对象存储
     doc_group_id = uuid.uuid4()
     storage_key = f"{user.tenant_id}/{kb.id}/{doc_group_id}/v1/{filename}"
@@ -385,40 +433,43 @@ async def _upload_single(
     # acl_tags 由 compute_doc_acl_tags 唯一生成（§4.2.8 H1：dept 仅自身路径）
     acl_tags = sorted(compute_doc_acl_tags(dept_path=owner_dept_path))
 
-    # 建 document
-    document = Document(
-        tenant_id=user.tenant_id,
-        kb_id=kb.id,
-        doc_group_id=doc_group_id,
-        version=1,
-        is_latest=True,
-        filename=filename,
-        ext=ext,
-        size_bytes=size_bytes,
-        storage_key=storage_key,
-        status="pending",
-        level=1,
-        level_rank=20,
-        owner_dept_path=owner_dept_path,
-        acl_tags=acl_tags,
-        deny_subjects=[],
-        uploaded_by=user.user_id,
-    )
-    session.add(document)
-    await session.flush()
+    # 数据面写 documents/parse_jobs（关闭态复用控制面会话；绑定库位时先收控制面事务）
+    async with open_data_session(session, db_key) as data_plane:
+        # 建 document
+        document = Document(
+            tenant_id=user.tenant_id,
+            kb_id=kb.id,
+            doc_group_id=doc_group_id,
+            version=1,
+            is_latest=True,
+            filename=filename,
+            ext=ext,
+            size_bytes=size_bytes,
+            storage_key=storage_key,
+            status="pending",
+            level=1,
+            level_rank=20,
+            owner_dept_path=owner_dept_path,
+            acl_tags=acl_tags,
+            deny_subjects=[],
+            uploaded_by=user.user_id,
+        )
+        data_plane.add(document)
+        await data_plane.flush()
 
-    # 建 parse_job
-    parse_job = ParseJob(
-        tenant_id=user.tenant_id,
-        document_id=document.id,
-        status="queued",
-        max_attempts=settings.arq_max_attempts,
-    )
-    session.add(parse_job)
-    await session.commit()
-    await session.refresh(document)
-    await session.refresh(parse_job)
+        # 建 parse_job
+        parse_job = ParseJob(
+            tenant_id=user.tenant_id,
+            document_id=document.id,
+            status="queued",
+            max_attempts=settings.arq_max_attempts,
+        )
+        data_plane.add(parse_job)
+        await data_plane.commit()
+        await data_plane.refresh(document)
+        await data_plane.refresh(parse_job)
 
+    # 数据面会话已关闭：audit 自开控制面会话
     # 审计：上传文档（含目标库/文件名/大小/密级）
     await audit.record(
         user.tenant_id, user.user_id, "doc.upload",

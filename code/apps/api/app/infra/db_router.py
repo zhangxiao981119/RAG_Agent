@@ -7,10 +7,10 @@
    `engine_for("default")` 返回的仍是 `app.database.engine` 这个**同一个对象**
    （`is` 恒等），因此关闭态与未引入路由层之前完全等价。
 
-2. **不进请求路径**：本模块只提供接线件，`data_session()` 在 app/ 内零调用点
-   （由 tests/scenario/test_step5_db_router.py 的 AST 守卫断言）。
-   Step 5 只建路由层，Step 6 才接线 —— 先让"库位键的解析、预算、留痕"可被单测，
-   再把调用点接上去，避免"一次改动同时引入路由与业务行为变化"。
+2. **不进请求路径（除唯一收口处）**：本模块只提供接线件，`data_session()` 在 app/ 内
+   只有一个调用点 —— `app/services/db_scope.py`（请求层数据面入口）。
+   由 tests/scenario/test_step5_db_router.py 的 T-5-7 断言"调用点白名单 + 只定义一次"，
+   防止第二个模块绕过 db_scope 直接开会话。
 
 3. **解析与可用性分离**：`resolve_db_key()` 不校验注册表、不读 settings，
    它只负责把 `db_binding` 归一成库位键；键是否存在、DSN 是否可用由
@@ -60,6 +60,7 @@ __all__ = [
     "RouterReport",
     "resolve_db_key",
     "register_from_settings",
+    "registered_db_keys",
     "engine_for",
     "data_session",
     "check_connection_budget",
@@ -232,6 +233,16 @@ def _report(keys: tuple[str, ...]) -> RouterReport:
         created_engines=_CREATED_ENGINES,
         notes=tuple(notes),
     )
+
+
+def registered_db_keys() -> tuple[str, ...]:
+    """当前进程已注册的库位键（含 default，排序）。
+
+    ★ 纯读注册表：不读开关、不建引擎、不查库。
+      Step 5 的关闭态只有 default 一个键，因此返回值恒为 `("default",)`；
+      顺序探测（D-S6-3-2）未来只需遍历本函数，不必反推配置。
+    """
+    return tuple(sorted({DEFAULT_DB_KEY, *_REGISTRY}))
 
 
 def engine_for(db_key: str) -> AsyncEngine:

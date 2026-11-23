@@ -7,7 +7,7 @@
     T-5-4 预算算术（唯一算术来源 _arithmetic）
     T-5-5 超预算必须 raise + 边界 needed == budget 允许
     T-5-6 未注册键 fail-closed
-    T-5-7 AST：data_session 零调用点、定义只在 db_router.py 一次
+    T-5-7 AST：data_session 调用点白名单（仅 app/services/db_scope.py）、定义只在 db_router.py 一次
     T-5-8 AST：engine_for / data_session 不读 scene_db_split_enabled
 
 ★ 期望值一律字面量：不复用被测模块的常量，避免"实现错了断言跟着错"。
@@ -25,6 +25,8 @@ from app.infra import db_router
 _API_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _APP_ROOT = _API_ROOT / "app"
 _DB_ROUTER_PATH = _APP_ROOT / "infra" / "db_router.py"
+# S6-4 接线后 data_session 的唯一允许调用点（请求层数据面入口）
+_DB_SCOPE_PATH = _APP_ROOT / "services" / "db_scope.py"
 
 # 合法 DSN（settings 的 field_validator 只要求 postgresql+asyncpg:// 前缀）
 _DSN = "postgresql+asyncpg://u:p@h:5432/demo"
@@ -249,14 +251,22 @@ def _callee_name(func: ast.expr) -> str | None:
     return None
 
 
-def test_t5_7_data_session_has_zero_call_sites_and_single_definition():
-    call_sites: list[tuple[str, int]] = []
+def test_t5_7_data_session_has_single_call_site_in_db_scope_and_single_definition():
+    """S6-4 重写：data_session 的调用点白名单 = 只有 app/services/db_scope.py 一处。
+
+    Step 5 的形态是"零调用点"；Step 6 接线后唯一允许的调用点是请求层数据面入口
+    `db_scope.open_data_session`。破坏方式（必须变红）：
+      · 在 api/kbs.py 或别处再 `async with data_session(...)` → 调用点变 2 → 红；
+      · 把 db_scope 的调用搬去别的模块 → 白名单路径不匹配 → 红；
+      · 复制一份 `def data_session` → 定义文件数变 2 → 红。
+    """
+    call_sites: list[pathlib.Path] = []
     definition_files: list[pathlib.Path] = []
 
     for path, tree in _iter_app_trees():
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and _callee_name(node.func) == "data_session":
-                call_sites.append((str(path), node.lineno))
+                call_sites.append(path)
             # async def 节点是 AsyncFunctionDef，与 FunctionDef 一并计入"定义"
             if (
                 isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -264,7 +274,12 @@ def test_t5_7_data_session_has_zero_call_sites_and_single_definition():
             ):
                 definition_files.append(path)
 
-    assert call_sites == [], f"data_session 在 app/ 内必须零调用点，实际：{call_sites}"
+    assert len(call_sites) == 1, (
+        f"data_session 在 app/ 内必须只有 1 个调用点（db_scope.py），实际：{call_sites}"
+    )
+    assert call_sites[0].resolve() == _DB_SCOPE_PATH.resolve(), (
+        f"data_session 的唯一调用点必须是 {_DB_SCOPE_PATH}，实际：{call_sites[0]}"
+    )
     assert len(definition_files) == 1, f"data_session 必须只定义一次，实际：{definition_files}"
     assert definition_files[0].resolve() == _DB_ROUTER_PATH.resolve()
 

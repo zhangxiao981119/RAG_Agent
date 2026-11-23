@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.config.settings import get_settings
+from app.services.db_scope import open_data_session, resolve_kb_db_key
 
 router = APIRouter(tags=["wiki"])
 
@@ -114,6 +115,10 @@ async def list_wiki_pages(
         if user.clearance >= 40
         else list(user.authorized_kb_ids)
     )
+
+    # 两段式（S6-3）：kb 校验与租户库集合（_tenant_kb_ids）都在控制面先完成；
+    # wiki_pages/chunks 是数据面表，按解析出的库位开会话查询。
+    db_key = await resolve_kb_db_key(session, user.tenant_id, [kb_id])
     sql = f"""
     SELECT p.id, p.document_id, p.title, p.generated_at
     FROM wiki_pages p
@@ -127,18 +132,19 @@ async def list_wiki_pages(
       )
     ORDER BY p.generated_at DESC
     """
-    rows = (
-        await session.execute(
-            text(sql),
-            {
-                "kb_id": kb_id,
-                "tenant_id": user.tenant_id,
-                "clearance": user.clearance,
-                "authorized_kb_ids": kb_ids,
-                "user_subjects": user.subjects,
-            },
-        )
-    ).all()
+    async with open_data_session(session, db_key) as data_plane:
+        rows = (
+            await data_plane.execute(
+                text(sql),
+                {
+                    "kb_id": kb_id,
+                    "tenant_id": user.tenant_id,
+                    "clearance": user.clearance,
+                    "authorized_kb_ids": kb_ids,
+                    "user_subjects": user.subjects,
+                },
+            )
+        ).all()
     return WikiPageListResponse(
         items=[
             WikiPageListItem(
