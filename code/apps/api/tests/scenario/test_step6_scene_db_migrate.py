@@ -18,27 +18,35 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
+from unittest import mock
 from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 import pytest
 from alembic import command
 
+from app.infra import scene_db_migrate as migrate_mod
 from app.infra.scene_db_migrate import (
     COLUMN_SQL,
+    MIGRATE_SCHEMA_DRIFT,
     MIGRATE_SOURCE_EMPTY,
     MIGRATE_TARGET_HAS_FOREIGN_KB,
     MIGRATE_TARGET_NOT_PREPARED,
+    MIGRATE_VERIFY_MISMATCH,
+    MIGRATE_VERSION_MISMATCH,
     MIGRATION_ORDER,
     PROBE_SQL,
     MigrateError,
-    _database_of,
+    _describe,
     _metrics_sql,
     migrate_forward,
     migrate_reverse,
+    server_identity,
 )
 from app.infra.scene_db_schema import MIGRATION_TABLES, apply_surgery
+from scripts import scene_db_migrate as cli
 from tests.scenario.pg_helpers import (
     SCENARIO_TEST_DB_URL,
     alembic_config,
@@ -138,15 +146,82 @@ def test_probe_sql_has_two_parameters():
     assert "ilike" in sql
 
 
-def test_same_database_detection_uses_host_and_dbname():
-    """同一个 host+dbname 必须被判为同库（防止把控制库当场景库 TRUNCATE）。"""
-    assert _database_of("postgresql://u:p@h:5432/kagent") == ("h", "kagent")
-    assert _database_of("postgresql://u:p@h:5432/kagent") == _database_of(
-        "postgresql://x:y@h:5432/kagent"
+def test_dsn_description_masks_credentials():
+    """报告里只出现 host:port/dbname，账号口令一律不出现。"""
+    described = _describe("postgresql://alice:s3cret@db.internal:6543/kagent_finance")
+
+    assert described == "db.internal:6543/kagent_finance"
+    assert "alice" not in described
+    assert "s3cret" not in described
+
+
+def test_cli_returns_one_and_prints_code_on_migrate_error(monkeypatch, capsys):
+    """CLI 遇 MigrateError：退出码 1、打印错误码、不回显 DSN 口令。"""
+
+    async def boom(*args, **kwargs):
+        raise MigrateError("S6_TEST_CODE", {"hint": "测试"})
+
+    monkeypatch.setattr(cli, "migrate_forward", boom)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "scene_db_migrate",
+            "--control-dsn",
+            "postgresql://alice:s3cret@h:1/kagent",
+            "--scene-dsn",
+            "postgresql://alice:s3cret@h:1/kagent_finance",
+            "--kb-id",
+            str(uuid.uuid4()),
+        ],
     )
-    assert _database_of("postgresql://u:p@h:5432/kagent") != _database_of(
-        "postgresql://u:p@h:5432/kagent_finance"
+    assert cli.main() == 1
+    captured = capsys.readouterr()
+    assert "S6_TEST_CODE" in captured.err
+    assert "s3cret" not in captured.err
+    assert "s3cret" not in captured.out
+
+
+def test_cli_returns_zero_and_prints_table_rows(monkeypatch, capsys):
+    """CLI 成功路径：退出码 0，逐表打印 PASS。"""
+
+    async def ok(*args, **kwargs):
+        return {
+            "direction": "forward",
+            "control": "h:1/kagent",
+            "scene": "h:1/kagent_finance",
+            "kb_id": "kb",
+            "tables": [
+                {
+                    "table": "documents",
+                    "source": {"row_count": 1, "id_md5": "a" * 32},
+                    "target": {"row_count": 1, "id_md5": "a" * 32},
+                    "ok": True,
+                }
+            ],
+            "equivalence": None,
+            "ok": True,
+        }
+
+    monkeypatch.setattr(cli, "migrate_forward", ok)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "scene_db_migrate",
+            "--control-dsn",
+            "postgresql://u:p@h:1/kagent",
+            "--scene-dsn",
+            "postgresql://u:p@h:1/kagent_finance",
+            "--kb-id",
+            "kb",
+        ],
     )
+    assert cli.main() == 0
+    captured = capsys.readouterr()
+    assert "documents" in captured.out
+    assert "PASS" in captured.out
+    assert "未执行" in captured.out
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -232,8 +307,9 @@ async def _seed_control(connection: asyncpg.Connection) -> dict[str, uuid.UUID]:
             "INSERT INTO chunks"
             " (id, tenant_id, kb_id, document_id, chunk_index, content, fts_text,"
             "  token_count, heading_path, level_rank, acl_tags, deny_subjects,"
-            "  embedding_model, embedding_text_version, chunker_version)"
-            " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+            "  embedding_model, embedding_text_version, chunker_version, embedding)"
+            " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,"
+            "         $15, ('[' || repeat('0.5,', 1023) || '0.5]')::vector)",
             ids[chunk_key],
             ids["tenant"],
             ids[kb_key],
@@ -391,6 +467,17 @@ async def _run_roundtrip() -> None:
         for url in (control_url, scene_url):
             await asyncio.to_thread(command.upgrade, alembic_config(url), "head")
 
+        # 两个临时库必须被判为不同库（同库会让正向 TRUNCATE 清掉控制库）
+        control_probe = await asyncpg.connect(control_dsn)
+        scene_probe = await asyncpg.connect(scene_dsn)
+        try:
+            assert await server_identity(control_probe) != await server_identity(
+                scene_probe
+            )
+        finally:
+            await control_probe.close()
+            await scene_probe.close()
+
         control = await asyncpg.connect(control_dsn)
         try:
             ids = await _seed_control(control)
@@ -434,6 +521,19 @@ async def _run_roundtrip() -> None:
             assert await scene.fetchval(
                 "SELECT fts_vec IS NOT NULL FROM chunks"
             ) is True
+            # pgvector 非空值必须逐字节等价（文本 COPY 不能把向量写坏）
+            scene_embedding = await scene.fetchval(
+                "SELECT embedding::text FROM chunks"
+            )
+            control = await asyncpg.connect(control_dsn)
+            try:
+                control_embedding = await control.fetchval(
+                    "SELECT embedding::text FROM chunks WHERE id = $1", ids["chunk1"]
+                )
+            finally:
+                await control.close()
+            assert scene_embedding is not None
+            assert scene_embedding == control_embedding
             assert await scene.fetchval(
                 "SELECT count(*) FROM parse_segments"
             ) == 1
@@ -447,7 +547,43 @@ async def _run_roundtrip() -> None:
             item["table"]: item["target"] for item in rerun["tables"]
         } == {item["table"]: item["source"] for item in rerun["tables"]}
 
-        # 5) 目标库已存在别家 kb 的数据：必须拒绝（不许静默 TRUNCATE 掉）
+        # 5) 两侧列清单不一致：必须拒绝并在裁缝处报 SCHEMA_DRIFT
+        scene = await asyncpg.connect(scene_dsn)
+        try:
+            await scene.execute('ALTER TABLE "kb_terms" ADD COLUMN s6_extra int')
+        finally:
+            await scene.close()
+        with pytest.raises(MigrateError) as drift:
+            await migrate_forward(control_dsn, scene_dsn, str(ids["kb1"]))
+        assert drift.value.code == MIGRATE_SCHEMA_DRIFT
+        scene = await asyncpg.connect(scene_dsn)
+        try:
+            await scene.execute('ALTER TABLE "kb_terms" DROP COLUMN s6_extra')
+        finally:
+            await scene.close()
+
+        # 6) 拷贝缺表：逐表摘要不等必须回滚（场景库保持上一次完整状态）
+        original_copy = migrate_mod._copy_table
+
+        async def _skip_kb_terms(source, target, spec, kb_id, columns):
+            # 跳过叶子表：既触发摘要不等，又不会破坏搬迁集内部外键
+            if spec.name == "kb_terms":
+                return 0
+            return await original_copy(source, target, spec, kb_id, columns)
+
+        with mock.patch.object(
+            migrate_mod, "_copy_table", side_effect=_skip_kb_terms
+        ):
+            with pytest.raises(MigrateError) as mismatch:
+                await migrate_forward(control_dsn, scene_dsn, str(ids["kb1"]))
+        assert mismatch.value.code == MIGRATE_VERIFY_MISMATCH
+        scene = await asyncpg.connect(scene_dsn)
+        try:
+            assert await scene.fetchval("SELECT count(*) FROM chunks") == 1
+        finally:
+            await scene.close()
+
+        # 7) 目标库已存在别家 kb 的数据：必须拒绝（不许静默 TRUNCATE 掉）
         scene = await asyncpg.connect(scene_dsn)
         try:
             foreign_doc = await _insert_extra_document(
@@ -464,7 +600,7 @@ async def _run_roundtrip() -> None:
         finally:
             await scene.close()
 
-        # 6) 回滚回拷：场景库新增行增量回控制库，只增不删、可重跑
+        # 8) 回滚回拷：场景库新增行增量回控制库，只增不删、可重跑
         scene = await asyncpg.connect(scene_dsn)
         try:
             new_doc = await _insert_extra_document(scene, ids, ids["kb1"], "new.txt")
@@ -508,6 +644,31 @@ async def _run_roundtrip() -> None:
 
         repeat = await migrate_reverse(scene_dsn, control_dsn, str(ids["kb1"]))
         assert all(item["inserted"] == 0 for item in repeat["tables"])
+
+        # 9) 回滚不覆盖既有行：场景库改了同 id 内容，控制库保持原值（不静默改数据）
+        scene = await asyncpg.connect(scene_dsn)
+        try:
+            await scene.execute(
+                "UPDATE chunks SET content = '场景库改写' WHERE id = $1",
+                ids["chunk1"],
+            )
+        finally:
+            await scene.close()
+        await migrate_reverse(scene_dsn, control_dsn, str(ids["kb1"]))
+        control = await asyncpg.connect(control_dsn)
+        try:
+            assert await control.fetchval(
+                "SELECT content FROM chunks WHERE id = $1", ids["chunk1"]
+            ) == "alpha 关键词命中的正文"
+        finally:
+            await control.close()
+
+        # 10) 两侧 alembic 版本不一致：必须拒绝（列口径不可信）
+        await asyncio.to_thread(command.downgrade, alembic_config(scene_url), "-1")
+        with pytest.raises(MigrateError) as version:
+            await migrate_forward(control_dsn, scene_dsn, str(ids["kb1"]))
+        assert version.value.code == MIGRATE_VERSION_MISMATCH
+        await asyncio.to_thread(command.upgrade, alembic_config(scene_url), "head")
     finally:
         for name in created:
             await admin.execute(

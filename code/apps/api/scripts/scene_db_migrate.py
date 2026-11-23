@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """存量搬迁（S6-5）：控制库单场景 kb 的数据面表 → 场景库，及回滚增量回拷。
 
-用法（后端根 code/apps/api）：
+用法（后端根 code/apps/api，用 -m 让 app / scripts 都可导入）：
     # 正向：控制库 → 场景库（场景库须先 alembic upgrade head + 已做 M-B 手术）
-    python scripts/scene_db_migrate.py --control-dsn <控制库 DSN> --scene-dsn <场景库 DSN> \\
+    python -m scripts.scene_db_migrate --control-dsn <控制库 DSN> --scene-dsn <场景库 DSN> \\
         --kb-id <UUID> [--probe-term 关键词]
 
     # 回滚：场景库新增行增量回拷控制库（只增不删、可重跑）
-    python scripts/scene_db_migrate.py --control-dsn <控制库 DSN> --scene-dsn <场景库 DSN> \\
+    python -m scripts.scene_db_migrate --control-dsn <控制库 DSN> --scene-dsn <场景库 DSN> \\
         --kb-id <UUID> --reverse
 
 前置与纪律见 `02-design/第六阶段-Step6-前置裁决.md` §4.3 Phase 3 / §4.5：
@@ -16,7 +16,8 @@
     · 本脚本**不修改** `scenarios.db_binding`（Phase 4 才切流量，单独一步）；
     · 正向先 TRUNCATE 搬迁集再整表 COPY，可重复执行（幂等）；
     · 逐表校验行数 + id 摘要，chunks 另加正文长度与正文摘要；
-    · 可选 `--probe-term` 在两侧各跑一次关键词探测，比对命中 id 摘要。
+    · 可选 `--probe-term` 在两侧各跑一次关键词 ILIKE 探测，比对命中 id 摘要
+      （是关键词谓词等价，不代表整条检索链路等价）。
 
 退出码：0 = 全部校验通过；1 = 任一项失败或执行出错。
 ★ 永不打印口令：报告只出现 `host:port/dbname`。
@@ -51,11 +52,11 @@ def _print_forward(report: dict[str, Any]) -> None:
         print(line)
     equivalence = report.get("equivalence")
     if equivalence is None:
-        print("检索等价：未执行（未提供 --probe-term）")
+        print("关键词探测等价：未执行（未提供 --probe-term）")
     else:
         state = "PASS" if equivalence["ok"] else "FAIL"
         print(
-            f"检索等价：{state}  term={equivalence['term']!r}  "
+            f"关键词探测等价：{state}  term={equivalence['term']!r}  "
             f"control_hits={equivalence['control']['row_count']}  "
             f"scene_hits={equivalence['scene']['row_count']}"
         )

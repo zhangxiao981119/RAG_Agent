@@ -35,6 +35,7 @@ MIGRATE_SOURCE_EMPTY: Final[str] = "S6_MIGRATE_SOURCE_EMPTY"
 MIGRATE_SOURCE_CHANGED: Final[str] = "S6_MIGRATE_SOURCE_CHANGED"
 MIGRATE_VERIFY_MISMATCH: Final[str] = "S6_MIGRATE_VERIFY_MISMATCH"
 MIGRATE_SCHEMA_DRIFT: Final[str] = "S6_MIGRATE_SCHEMA_DRIFT"
+MIGRATE_VERSION_MISMATCH: Final[str] = "S6_MIGRATE_VERSION_MISMATCH"
 
 __all__ = [
     "MIGRATE_TARGET_NOT_PREPARED",
@@ -45,10 +46,12 @@ __all__ = [
     "MIGRATE_SOURCE_CHANGED",
     "MIGRATE_VERIFY_MISMATCH",
     "MIGRATE_SCHEMA_DRIFT",
+    "MIGRATE_VERSION_MISMATCH",
     "MIGRATION_ORDER",
     "TableSpec",
     "MigrateError",
     "column_list",
+    "server_identity",
     "table_metrics",
     "probe_digest",
     "migrate_forward",
@@ -132,7 +135,8 @@ FROM "chunks"
 WHERE "kb_id" = $1
   AND ("content" ILIKE '%' || $2 || '%' OR "heading_path" ILIKE '%' || $2 || '%')
 """
-"""关键词探测：与检索关键词路同口径的 ILIKE 子串匹配，按 id 固定顺序取摘要。"""
+"""关键词探测：与检索**关键词路**同款 ILIKE 子串谓词（不是整条检索链路等价），
+按 id 固定顺序取摘要。"""
 
 
 def _describe(dsn: str) -> str:
@@ -144,9 +148,22 @@ def _describe(dsn: str) -> str:
     return f"{host}:{port}/{database}"
 
 
-def _database_of(dsn: str) -> tuple[str, str]:
-    parts = urlsplit(dsn)
-    return (parts.hostname or "", (parts.path or "").lstrip("/"))
+async def server_identity(
+    connection: asyncpg.Connection,
+) -> tuple[str, str, int]:
+    """连接实际落到的 (库名, 服务端地址, 端口)。
+
+    ★ 用服务端视角判定「是否同一个库」而不是比较 DSN 字符串：
+      `localhost` / `127.0.0.1` / 容器名指向同一实例时必须判为同库，
+      否则 `--scene-dsn` 误填控制库时 TRUNCATE 会清掉控制库数据面。
+    """
+    row = await connection.fetchrow(
+        "SELECT current_database() AS db,"
+        "       COALESCE(inet_server_addr()::text, '') AS addr,"
+        "       COALESCE(inet_server_port(), 0) AS port"
+    )
+    return (row["db"], row["addr"], int(row["port"]))
+
 
 
 async def column_list(connection: asyncpg.Connection, table: str) -> tuple[str, ...]:
@@ -286,11 +303,32 @@ async def probe_digest(
     return dict(row)
 
 
-async def _ensure_not_same_database(control_dsn: str, scene_dsn: str) -> None:
-    if _database_of(control_dsn) == _database_of(scene_dsn):
+async def _ensure_distinct_targets(
+    control: asyncpg.Connection,
+    scene: asyncpg.Connection,
+    control_dsn: str,
+    scene_dsn: str,
+) -> None:
+    """两个连接必须落在不同库、且迁移版本一致（否则列/表口径不可信）。
+
+    ★ 同库判定用服务端视角（库名 + 服务端地址 + 端口），不比较 DSN 字符串，
+      避免 `localhost` 与 `127.0.0.1` 这类别名绕过保护。
+    """
+    if await server_identity(control) == await server_identity(scene):
         raise MigrateError(
             MIGRATE_SAME_DATABASE,
             {"control": _describe(control_dsn), "scene": _describe(scene_dsn)},
+        )
+    control_version = await control.fetchval("SELECT version_num FROM alembic_version")
+    scene_version = await scene.fetchval("SELECT version_num FROM alembic_version")
+    if control_version != scene_version:
+        raise MigrateError(
+            MIGRATE_VERSION_MISMATCH,
+            {
+                "control": control_version,
+                "scene": scene_version,
+                "hint": "两侧先各跑 alembic upgrade head（场景库升级后重做 M-B 手术）",
+            },
         )
 
 
@@ -311,8 +349,6 @@ async def migrate_forward(
     搬迁窗口写检测：COPY 前后各取一次源库摘要，不等即回滚并报
     `MIGRATE_SOURCE_CHANGED`（说明停写没做到，本次结果不可信）。
     """
-    await _ensure_not_same_database(control_dsn, scene_dsn)
-
     prepared = await verify(scene_dsn)
     if not prepared["ok"]:
         raise MigrateError(
@@ -335,6 +371,8 @@ async def migrate_forward(
     control = await asyncpg.connect(control_dsn)
     scene = await asyncpg.connect(scene_dsn)
     try:
+        await _ensure_distinct_targets(control, scene, control_dsn, scene_dsn)
+
         foreign = await scene.fetch(
             'SELECT DISTINCT "kb_id"::text AS kb_id FROM "documents"'
         )
@@ -372,6 +410,8 @@ async def migrate_forward(
 
         tables: list[dict[str, Any]] = []
         async with scene.transaction():
+            # ★ 不写 CASCADE：搬迁集内部外键已在列表里，若将来冒出「外部表引用搬迁集」，
+            #   这里必须显式失败，而不是连带清空未列出的表（§4.3 原文的 CASCADE 在此有意收窄）。
             await scene.execute(
                 "TRUNCATE "
                 + ", ".join(f'"{spec.name}"' for spec in MIGRATION_ORDER)
@@ -454,11 +494,11 @@ async def migrate_reverse(
     - 每张表在目标事务里合并，失败即回滚该表；
     - 逐表报告「临时表行数 / 已存在 / 新增」，供 R5 差集留痕。
     """
-    await _ensure_not_same_database(control_dsn, scene_dsn)
-
     scene = await asyncpg.connect(scene_dsn)
     control = await asyncpg.connect(control_dsn)
     try:
+        await _ensure_distinct_targets(control, scene, control_dsn, scene_dsn)
+
         tables: list[dict[str, Any]] = []
         for spec in MIGRATION_ORDER:
             source_columns = await column_list(scene, spec.name)
