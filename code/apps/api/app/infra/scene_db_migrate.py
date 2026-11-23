@@ -319,8 +319,16 @@ async def _ensure_distinct_targets(
             MIGRATE_SAME_DATABASE,
             {"control": _describe(control_dsn), "scene": _describe(scene_dsn)},
         )
-    control_version = await control.fetchval("SELECT version_num FROM alembic_version")
-    scene_version = await scene.fetchval("SELECT version_num FROM alembic_version")
+    try:
+        control_version = await control.fetchval(
+            "SELECT version_num FROM alembic_version"
+        )
+        scene_version = await scene.fetchval("SELECT version_num FROM alembic_version")
+    except asyncpg.UndefinedTableError as exc:
+        raise MigrateError(
+            MIGRATE_VERSION_MISMATCH,
+            {"hint": "某一侧没有 alembic_version（未执行 alembic upgrade head）"},
+        ) from exc
     if control_version != scene_version:
         raise MigrateError(
             MIGRATE_VERSION_MISMATCH,
@@ -349,29 +357,31 @@ async def migrate_forward(
     搬迁窗口写检测：COPY 前后各取一次源库摘要，不等即回滚并报
     `MIGRATE_SOURCE_CHANGED`（说明停写没做到，本次结果不可信）。
     """
-    prepared = await verify(scene_dsn)
-    if not prepared["ok"]:
-        raise MigrateError(
-            MIGRATE_TARGET_NOT_PREPARED,
-            {
-                "target": _describe(scene_dsn),
-                "cross_db_fks": len(prepared["cross_db_fks"]),
-                "guard_tables": len(prepared["guard_tables"]),
-                "missing_triggers": prepared["missing_triggers"],
-            },
-        )
-
-    occupied = await control_plane_usage(scene_dsn)
-    if occupied:
-        raise MigrateError(
-            MIGRATE_TARGET_HAS_CONTROL_ROWS,
-            {"target": _describe(scene_dsn), "tables": occupied},
-        )
-
     control = await asyncpg.connect(control_dsn)
     scene = await asyncpg.connect(scene_dsn)
     try:
+        # 同库判定必须最先做：DSN 填反时若先跑 verify/清库检查，
+        # 「把控制库当场景库」只会报 NOT_PREPARED 之类的次生错误。
         await _ensure_distinct_targets(control, scene, control_dsn, scene_dsn)
+
+        prepared = await verify(scene_dsn)
+        if not prepared["ok"]:
+            raise MigrateError(
+                MIGRATE_TARGET_NOT_PREPARED,
+                {
+                    "target": _describe(scene_dsn),
+                    "cross_db_fks": len(prepared["cross_db_fks"]),
+                    "guard_tables": len(prepared["guard_tables"]),
+                    "missing_triggers": prepared["missing_triggers"],
+                },
+            )
+
+        occupied = await control_plane_usage(scene_dsn)
+        if occupied:
+            raise MigrateError(
+                MIGRATE_TARGET_HAS_CONTROL_ROWS,
+                {"target": _describe(scene_dsn), "tables": occupied},
+            )
 
         foreign = await scene.fetch(
             'SELECT DISTINCT "kb_id"::text AS kb_id FROM "documents"'
@@ -491,6 +501,7 @@ async def migrate_reverse(
     """回滚方向：把场景库中控制库缺失的行增量回拷（§4.5 R5「补差」）。
 
     - 只 INSERT 缺失 id，不 DELETE / 不 UPDATE，控制库既有行一字不改；
+    - 两侧必须不同库且 `alembic_version` 相同（列清单一致才允许合并）；
     - 每张表在目标事务里合并，失败即回滚该表；
     - 逐表报告「临时表行数 / 已存在 / 新增」，供 R5 差集留痕。
     """

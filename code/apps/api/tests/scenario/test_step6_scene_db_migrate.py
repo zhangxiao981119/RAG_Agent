@@ -30,8 +30,11 @@ from alembic import command
 from app.infra import scene_db_migrate as migrate_mod
 from app.infra.scene_db_migrate import (
     COLUMN_SQL,
+    MIGRATE_SAME_DATABASE,
     MIGRATE_SCHEMA_DRIFT,
+    MIGRATE_SOURCE_CHANGED,
     MIGRATE_SOURCE_EMPTY,
+    MIGRATE_TARGET_HAS_CONTROL_ROWS,
     MIGRATE_TARGET_HAS_FOREIGN_KB,
     MIGRATE_TARGET_NOT_PREPARED,
     MIGRATE_VERIFY_MISMATCH,
@@ -484,19 +487,36 @@ async def _run_roundtrip() -> None:
         finally:
             await control.close()
 
-        # 1) 场景库未做手术：必须拒绝（跨库外键会让 COPY 失败）
+        # 1) 控制库 / 场景库填成同一个库：必须最先拒绝（同库判定先于手术校验）
+        with pytest.raises(MigrateError) as same:
+            await migrate_forward(control_dsn, control_dsn, str(ids["kb1"]))
+        assert same.value.code == MIGRATE_SAME_DATABASE
+        with pytest.raises(MigrateError) as same_reverse:
+            await migrate_reverse(control_dsn, control_dsn, str(ids["kb1"]))
+        assert same_reverse.value.code == MIGRATE_SAME_DATABASE
+
+        # 2) 场景库未做手术：必须拒绝（跨库外键会让 COPY 失败）
         with pytest.raises(MigrateError) as unprepared:
             await migrate_forward(control_dsn, scene_dsn, str(ids["kb1"]))
         assert unprepared.value.code == MIGRATE_TARGET_NOT_PREPARED
 
         await apply_surgery(scene_dsn)
 
-        # 2) 源库该 kb 没有文档：必须拒绝（常见于 --kb-id 写错）
+        # 3) 场景库控制面非空：必须拒绝（这不是空的场景库）
+        async def _fake_usage(_dsn):
+            return [{"table": "tenants", "rows": 1}]
+
+        with mock.patch.object(migrate_mod, "control_plane_usage", _fake_usage):
+            with pytest.raises(MigrateError) as occupied:
+                await migrate_forward(control_dsn, scene_dsn, str(ids["kb1"]))
+        assert occupied.value.code == MIGRATE_TARGET_HAS_CONTROL_ROWS
+
+        # 4) 源库该 kb 没有文档：必须拒绝（常见于 --kb-id 写错）
         with pytest.raises(MigrateError) as empty:
             await migrate_forward(control_dsn, scene_dsn, str(uuid.uuid4()))
         assert empty.value.code == MIGRATE_SOURCE_EMPTY
 
-        # 3) 正向搬迁 + 检索等价比对
+        # 5) 正向搬迁 + 关键词探测比对
         report = await migrate_forward(
             control_dsn, scene_dsn, str(ids["kb1"]), probe_term="alpha"
         )
@@ -540,14 +560,14 @@ async def _run_roundtrip() -> None:
         finally:
             await scene.close()
 
-        # 4) 幂等：同一 kb 重跑，行数与摘要不变
+        # 6) 幂等：同一 kb 重跑，行数与摘要不变
         rerun = await migrate_forward(control_dsn, scene_dsn, str(ids["kb1"]))
         assert rerun["ok"] is True
         assert {
             item["table"]: item["target"] for item in rerun["tables"]
         } == {item["table"]: item["source"] for item in rerun["tables"]}
 
-        # 5) 两侧列清单不一致：必须拒绝并在裁缝处报 SCHEMA_DRIFT
+        # 7) 两侧列清单不一致：必须拒绝（SCHEMA_DRIFT）
         scene = await asyncpg.connect(scene_dsn)
         try:
             await scene.execute('ALTER TABLE "kb_terms" ADD COLUMN s6_extra int')
@@ -562,7 +582,7 @@ async def _run_roundtrip() -> None:
         finally:
             await scene.close()
 
-        # 6) 拷贝缺表：逐表摘要不等必须回滚（场景库保持上一次完整状态）
+        # 8) 拷贝缺表：逐表摘要不等必须回滚（场景库保持上一次完整状态）
         original_copy = migrate_mod._copy_table
 
         async def _skip_kb_terms(source, target, spec, kb_id, columns):
@@ -579,11 +599,44 @@ async def _run_roundtrip() -> None:
         assert mismatch.value.code == MIGRATE_VERIFY_MISMATCH
         scene = await asyncpg.connect(scene_dsn)
         try:
-            assert await scene.fetchval("SELECT count(*) FROM chunks") == 1
+            # 跳过的是 kb_terms：回滚成立时它仍是上一次完整搬迁的 1 行；
+            # 若事务未回滚，TRUNCATE 后未拷贝会让这里变成 0（用 chunks 无法区分）。
+            assert await scene.fetchval("SELECT count(*) FROM kb_terms") == 1
+            assert await scene.fetchval("SELECT count(*) FROM documents") == 1
         finally:
             await scene.close()
 
-        # 7) 目标库已存在别家 kb 的数据：必须拒绝（不许静默 TRUNCATE 掉）
+        # 9) 搬迁窗口内源库有写入：必须回滚并报 SOURCE_CHANGED
+        injected: list[uuid.UUID] = []
+
+        async def _race_write(source, target, spec, kb_id, columns):
+            result = await original_copy(source, target, spec, kb_id, columns)
+            if spec.name == "documents" and not injected:
+                injected.append(
+                    await _insert_extra_document(source, ids, ids["kb1"], "race.txt")
+                )
+            return result
+
+        with mock.patch.object(migrate_mod, "_copy_table", side_effect=_race_write):
+            with pytest.raises(MigrateError) as changed:
+                await migrate_forward(control_dsn, scene_dsn, str(ids["kb1"]))
+        assert changed.value.code == MIGRATE_SOURCE_CHANGED
+        scene = await asyncpg.connect(scene_dsn)
+        try:
+            # 目标事务必须回滚：仍是上一次完整搬迁的 1 篇，而不是 2 篇
+            assert await scene.fetchval("SELECT count(*) FROM documents") == 1
+            assert await scene.fetchval(
+                "SELECT count(*) FROM documents WHERE filename = 'race.txt'"
+            ) == 0
+        finally:
+            await scene.close()
+        control = await asyncpg.connect(control_dsn)
+        try:
+            await control.execute("DELETE FROM documents WHERE id = ANY($1::uuid[])", injected)
+        finally:
+            await control.close()
+
+        # 10) 目标库已存在别家 kb 的数据：必须拒绝（不许静默 TRUNCATE 掉）
         scene = await asyncpg.connect(scene_dsn)
         try:
             foreign_doc = await _insert_extra_document(
@@ -600,7 +653,7 @@ async def _run_roundtrip() -> None:
         finally:
             await scene.close()
 
-        # 8) 回滚回拷：场景库新增行增量回控制库，只增不删、可重跑
+        # 11) 回滚回拷：场景库新增行增量回控制库，只增不删、可重跑
         scene = await asyncpg.connect(scene_dsn)
         try:
             new_doc = await _insert_extra_document(scene, ids, ids["kb1"], "new.txt")
@@ -645,7 +698,7 @@ async def _run_roundtrip() -> None:
         repeat = await migrate_reverse(scene_dsn, control_dsn, str(ids["kb1"]))
         assert all(item["inserted"] == 0 for item in repeat["tables"])
 
-        # 9) 回滚不覆盖既有行：场景库改了同 id 内容，控制库保持原值（不静默改数据）
+        # 12) 回滚不覆盖既有行：场景库改了同 id 内容，控制库保持原值（不静默改数据）
         scene = await asyncpg.connect(scene_dsn)
         try:
             await scene.execute(
@@ -663,7 +716,7 @@ async def _run_roundtrip() -> None:
         finally:
             await control.close()
 
-        # 10) 两侧 alembic 版本不一致：必须拒绝（列口径不可信）
+        # 13) 两侧 alembic 版本不一致：必须拒绝（列口径不可信）
         await asyncio.to_thread(command.downgrade, alembic_config(scene_url), "-1")
         with pytest.raises(MigrateError) as version:
             await migrate_forward(control_dsn, scene_dsn, str(ids["kb1"]))

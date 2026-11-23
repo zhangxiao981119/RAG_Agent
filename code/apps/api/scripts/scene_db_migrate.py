@@ -86,7 +86,7 @@ def main() -> int:
     parser.add_argument(
         "--probe-term",
         default=None,
-        help="可选：关键词探测词，用于两侧检索等价比对",
+        help="可选：关键词探测词，用于两侧关键词命中摘要比对（非整条检索链路等价）",
     )
     parser.add_argument(
         "--reverse",

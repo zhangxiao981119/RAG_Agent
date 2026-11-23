@@ -387,7 +387,7 @@ Step 6 必须把"路由到场景库"的请求改成两段：
 
 - 搬迁方式：逐表 `COPY (SELECT <列清单> FROM <表> WHERE <kb 过滤>) TO STDOUT` → 临时文件 → 目标库 `COPY <表>(<列清单>) FROM STDIN`；列清单从 `information_schema.columns` 发现并排除生成列（`chunks.fts_vec`、`graph_entities.name_vec` 显式写入会直接失败）。**不使用 pg_dump 行过滤**（其无 `--where`）。
 - 过滤键逐表显式声明：7 张 `kb_id` 直连；`parse_jobs` / `governance_jobs` 经 `documents`；`parse_segments` 经 `parse_jobs → documents`。COPY 查询只用 `$1` 绑定 kb，不拼字符串。
-- 目标前置（缺一即拒绝，不降级）：M-B 手术三项 PASS；控制面表全空；目标库现有 `documents` 只属于本次 kb；源库该 kb 无文档也拒绝（通常是 `--kb-id` 写错）；两侧 `alembic_version` 必须相同。同库判定用**服务端视角**（`current_database()` + `inet_server_addr()` + `inet_server_port()`），不比较 DSN 字符串 —— `localhost` 与 `127.0.0.1` 指向同一实例时必须判为同库。
+- 目标前置（缺一即拒绝，不降级）：先判「是否同一个库」，再判 M-B 手术三项 PASS、控制面表全空、目标库现有 `documents` 只属于本次 kb、源库该 kb 有文档（0 篇通常是 `--kb-id` 写错）、两侧 `alembic_version` 相同。同库判定用**服务端视角**（`current_database()` + `inet_server_addr()` + `inet_server_port()`），不比较 DSN 字符串 —— `localhost` 与 `127.0.0.1` 指向同一实例时必须判为同库。
 - 目标清空用 `TRUNCATE <搬迁集>`（**不写 CASCADE**）：搬迁集内部外键已由列表覆盖；将来若冒出外部表引用搬迁集，这里应显式失败而不是连带清空未列出的表。这是对 §4.3 第 12 步原文 `CASCADE` 的有意收窄。
 - 校验：逐表 `count(*)` + `md5(string_agg(id::text, ',' ORDER BY id))`；`chunks` 另加 `sum(length(content))` 与按 `(document_id, chunk_index, id)` 排序的正文摘要。可选 `--probe-term` 在两侧各跑一次 ILIKE 探测并比对命中 id 摘要 —— 这是**关键词谓词等价**，不代表整条检索链路等价；未提供时报告写「未执行」，不得写成 PASS。
 - 写暂停覆盖 COPY 与切绑：脚本在 COPY 前后各取一次源库摘要，不等即回滚并报 `S6_MIGRATE_SOURCE_CHANGED`。停写窗口必须同时覆盖 Phase 3 的 COPY 与 Phase 4 的改绑 —— 改绑完成后写入若仍落控制库，场景库会缺新行；正向校验失败时目标事务整体回滚，重试靠 TRUNCATE 重搬，不手工补行。
