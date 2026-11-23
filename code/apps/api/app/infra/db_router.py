@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -61,6 +62,7 @@ __all__ = [
     "resolve_db_key",
     "register_from_settings",
     "registered_db_keys",
+    "database_name_for",
     "engine_for",
     "data_session",
     "check_connection_budget",
@@ -243,6 +245,42 @@ def registered_db_keys() -> tuple[str, ...]:
       治理定时扫描（D-S6-3-1）遍历本函数覆盖全部已注册库位。
     """
     return tuple(sorted({DEFAULT_DB_KEY, *_REGISTRY}))
+
+
+def database_name_for(db_key: str) -> str:
+    """取某库位 DSN 里的**数据库名**（容量看板按库名查 `pg_stat_database`）。
+
+    - `default` → `get_settings().database_url`；
+    - 其它键 → `get_settings().scene_db_dsn[db_key]`，未配置即 fail-closed
+      （`DB_ROUTE_KEY_UNKNOWN`），不回落默认库的库名；
+    - 用 `make_url(dsn).database` 取库名，为空 → `DB_ROUTE_DSN_INVALID`。
+
+    ★ 只返回库名：**绝不返回或记录完整 DSN**（DSN 值含凭据）。
+    """
+    s = get_settings()
+    if db_key == DEFAULT_DB_KEY:
+        dsn = s.database_url
+    else:
+        dsn = s.scene_db_dsn.get(db_key)
+        if dsn is None:
+            raise DbRouteError(
+                DB_ROUTE_KEY_UNKNOWN,
+                {"db_key": db_key, "registered": list(registered_db_keys())},
+            )
+    try:
+        database = make_url(dsn).database
+    except Exception as exc:
+        # detail 只放异常类型，避免把 DSN 明文带进错误信息
+        raise DbRouteError(
+            DB_ROUTE_DSN_INVALID,
+            {"db_key": db_key, "error": type(exc).__name__},
+        ) from exc
+    if not database:
+        raise DbRouteError(
+            DB_ROUTE_DSN_INVALID,
+            {"db_key": db_key, "error": "DSN 缺少数据库名"},
+        )
+    return database
 
 
 def engine_for(db_key: str) -> AsyncEngine:

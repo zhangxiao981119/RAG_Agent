@@ -98,6 +98,33 @@ PLACEHOLDERS: Final[tuple[Placeholder, ...]] = (
         owner="db_router",
         note="待部署标定 · 应用不知道自己有几个副本，闸门偏松是刻意的（宁可偏松也不要拒绝启动）",
     ),
+    # ── 容量看板（Step 7 S7-6）──────────────────────────────────────
+    # ★ 三个值全部是**声明值 / 示例假设**，没有一个来自实测。容量看板会把它们
+    #   连同 calibrated=false 一起吐给页面；登记在这里是为了让启动横幅同样可见。
+    Placeholder(
+        name="CAPACITY_M_SHARED_DECLARED_MB",
+        value=8192,
+        owner="capacity",
+        note=(
+            "待实测标定 · prod 编排里 embedding + reranker 两个模型服务 mem_limit 声明值之和"
+            "（4g+4g；dev 编排的 4g 设在 reranker/ocr，总量同）；未必等于实测驻留"
+        ),
+    ),
+    Placeholder(
+        name="CAPACITY_M_CONTROL_PG_LOWER_MB",
+        value=128,
+        owner="capacity",
+        note=(
+            "待标定 · 控制库 shared_buffers 的下界（PG 默认 128MB）；"
+            "运行时以 current_setting('shared_buffers') 的实测值覆盖"
+        ),
+    ),
+    Placeholder(
+        name="CAPACITY_M_SCENE_PG_MB",
+        value=300,
+        owner="capacity",
+        note="待实测标定 · 框架示例里假设每个热库占 300MB，当前无任何实测依据",
+    ),
 )
 
 

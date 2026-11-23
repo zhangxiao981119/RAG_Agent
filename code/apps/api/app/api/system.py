@@ -20,6 +20,7 @@ from app.config.capabilities import (
 )
 from app.config.config_profile import config_fingerprint
 from app.config.settings import get_settings
+from app.services.capacity import capacity_snapshot
 
 router = APIRouter(prefix="/system", tags=["system"])
 
@@ -46,3 +47,20 @@ async def system_capabilities(
         wiki_stats = await collect_wiki_data_stats(session)
 
     return capability_snapshot(fingerprint, stats, wiki_stats)
+
+
+@router.get("/capacity")
+async def system_capacity(
+    user: Any = Depends(require_admin),
+    session: AsyncSession = Depends(get_db),
+) -> dict:
+    """容量看板（admin）。非 admin 403（require_admin）。
+
+    ★ 只读：全部是 SELECT（scenarios 计数 / current_setting / pg_stat_database），
+      不建表、不写状态、不触发补建。
+    ★ 所有常量都带 `calibrated` 状态：本期的三个常量与四条阈值一律 false，
+      表示「值是从编排声明或框架示例来的，尚未实测标定」。
+    ★ hot 声明与实际分离：`inputs.n_hot_declared` 是库里 hot 档的场景数，
+      `inputs.n_hot_effective` 固定 0（hot 档本期未实现），并给出 `hot_unsupported=True`。
+    """
+    return await capacity_snapshot(session)

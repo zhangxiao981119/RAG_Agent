@@ -193,7 +193,7 @@
 
 ---
 
-## S7-6 容量看板
+## [x] S7-6 容量看板
 
 **文件**
 - 新增 `code/apps/api/app/services/capacity.py`
