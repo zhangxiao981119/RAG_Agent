@@ -35,6 +35,8 @@ class ChatAskRequest(BaseModel):
     # 带图提问（M7 WU-M-07）：默认空 = 纯文本形态
     # 数量 / 单图大小校验在端点层做（规范要求超限返 400，pydantic 校验失败是 422）
     images: list[ImageRef] = []
+    # 可选场景（L3）：None = 沿用平台口径，行为与改动前一致
+    scenario_id: uuid.UUID | None = None
 
 
 class Citation(BaseModel):

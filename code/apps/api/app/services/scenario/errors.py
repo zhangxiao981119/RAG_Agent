@@ -27,6 +27,7 @@ class ScenarioCode(str, Enum):
     NOT_ALLOWED = "SCENARIO_NOT_ALLOWED"
     MISMATCH = "SCENARIO_MISMATCH"
     UNRESOLVABLE = "SCENARIO_UNRESOLVABLE"
+    NOT_FOUND = "SCENARIO_NOT_FOUND"
 
 
 # 码 → (HTTP 状态, 固定文案)。文案 MUST NOT 含场景 key / status / 真实 kb_ids。
@@ -37,6 +38,11 @@ _MESSAGES: Final[dict[ScenarioCode, tuple[int, str]]] = {
     ScenarioCode.MISMATCH: (400, "请求的知识库不在场景范围内"),
     # R1：引用的场景解析不出已发布版本（数据一致性破坏，不静默退回默认）
     ScenarioCode.UNRESOLVABLE: (500, "场景配置不可解析"),
+    # Web 入口：请求体里的 scenario_id 查不到（客户端给了不存在的场景）。
+    # ★ 与 UNRESOLVABLE 不可合并：Web 入口的场景 ID 来自请求体，查不到是**客户端错误**
+    #   （404）；集成入口的「应用绑定场景解析不出」是**数据损坏**（500）。
+    #   跨租户与不存在共用同一个 404，避免状态码差异变成存在性探针。
+    ScenarioCode.NOT_FOUND: (404, "场景不存在"),
 }
 
 

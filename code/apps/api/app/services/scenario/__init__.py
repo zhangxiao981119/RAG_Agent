@@ -1,8 +1,9 @@
 """场景化配置的解析层（Step 2）。
 
-对外只暴露四样东西，其余都是实现细节：
+对外只暴露以下入口，其余都是实现细节：
 
-    resolve_scenario   唯一 impure 入口（一次 DB 读），失败 raise ScenarioError
+    resolve_scenario        集成入口（按应用绑定）的唯一 impure 入口（一次 DB 读），失败 raise ScenarioError
+    resolve_scenario_by_id  Web 入口（按请求体场景 ID）的解析入口，查不到行报 404
     ScenarioSnapshot   一次请求解析出的不可变口径快照
     ScenarioError      场景解析失败（fail-closed 的唯一载体）
     COMPONENT          日志 / metrics 的组件名
@@ -13,7 +14,7 @@
 from __future__ import annotations
 
 from app.services.scenario.errors import COMPONENT, ScenarioCode, ScenarioError
-from app.services.scenario.resolver import resolve_scenario
+from app.services.scenario.resolver import resolve_scenario, resolve_scenario_by_id
 from app.services.scenario.snapshot import (
     ScenarioPolicy,
     ScenarioRow,
@@ -34,4 +35,5 @@ __all__ = [
     "compute_checksum",
     "current_dna",
     "resolve_scenario",
+    "resolve_scenario_by_id",
 ]

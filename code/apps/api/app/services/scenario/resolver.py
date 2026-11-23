@@ -29,7 +29,7 @@ from app.config import placeholders
 from app.config.settings import get_settings
 from app.infra import metrics
 from app.models import IntegrationApplication
-from app.services.scenario.errors import COMPONENT
+from app.services.scenario.errors import COMPONENT, ScenarioCode, ScenarioError
 from app.services.scenario.snapshot import (
     ScenarioRow,
     ScenarioSnapshot,
@@ -276,3 +276,52 @@ async def resolve_scenario(
             extra={"tenant_id": str(tenant_id)},
         )
     return snapshot
+
+
+async def resolve_scenario_by_id(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    scenario_id: uuid.UUID,
+    requested_kb_ids: Sequence[uuid.UUID],
+) -> ScenarioSnapshot:
+    """Web `/chat/ask` 的 L3 可选场景入口（框架 §3.1）：按请求体里的场景 ID 解析口径快照。
+
+    与 `resolve_scenario` 的唯一差别是**入口身份**与**查不到行**的语义：
+      · 本函数由客户端直接给出 `scenario_id`（Web 请求体），不经应用绑定；
+      · 查不到行 / 行属于其他租户 → `SCENARIO_NOT_FOUND`（404，客户端错误），
+        而集成入口同种情形按数据损坏报 `SCENARIO_UNRESOLVABLE`（500）。
+        两者不可合并：一个要调用方改请求，一个要运维修数据。
+      · 其余解析（active 判定、explicit 范围、caps、真值表）全部委托
+        `build_snapshot`，**不复制第二份真值表**。
+
+    缓存与 `resolve_scenario` 共用同一键空间 `(tenant_id, scenario_id)`；只缓存命中行，
+    不做负缓存（补种/修复后必须立刻可见，而不是等 TTL）。
+    """
+    key = (tenant_id, scenario_id)
+
+    row = _cache_get(key)
+    if row is None:
+        row = await _load_published(session, tenant_id=tenant_id, scenario_id=scenario_id)
+        # 只有通过租户一致性校验的行才进缓存：否则一旦 SQL 的租户条件被改坏，
+        # 别人的行会按本租户的键在 TTL 内反复命中。
+        if row is not None and row.tenant_id == tenant_id:
+            _cache_put(key, row)
+
+    # 跨租户与不存在返回同一个 404：状态码差异本身就是存在性探针。
+    if row is None or row.tenant_id != tenant_id:
+        raise ScenarioError(
+            ScenarioCode.NOT_FOUND,
+            diagnostic={
+                "reason": "scenario_not_found",
+                "tenant_id": str(tenant_id),
+                "scenario_id": str(scenario_id),
+            },
+        )
+
+    return build_snapshot(
+        row=row,
+        tenant_id=tenant_id,
+        scenario_id=scenario_id,
+        requested_kb_ids=requested_kb_ids,
+    )

@@ -26,8 +26,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 if TYPE_CHECKING:
-    # 只为类型标注导入：`chat` → `services.scenario` 的运行时导入没有必要
-    # （本模块不在 import 期需要那个类），且能避免将来出现 import 环。
+    # 这两类只在类型标注里出现；场景解析函数与异常已在运行时导入（见上方
+    # `app.services.scenario.*`），本块不再承担「避免 import 环」的职责。
     from app.services.scenario.snapshot import ScenarioPolicy
     from app.services.tenant.governance import TenantPolicyCaps
 
@@ -76,6 +76,8 @@ from app.services.query_rewrite import rewrite_query
 from app.services.retrieve import get_retrieval_service
 from app.services.retrieve.base import RetrievalResult, assemble_context_chunks
 from app.services.router.modality import Modality, detect
+from app.services.scenario.errors import ScenarioError
+from app.services.scenario.resolver import resolve_scenario_by_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
@@ -274,7 +276,7 @@ async def chat_ask(
     session: AsyncSession = Depends(get_db),
     _: None = Depends(check_chat_rate_limit),
 ) -> StreamingResponse:
-    return await _chat_ask_impl(payload, user, session)
+    return await _chat_ask_impl(payload, user, session, scenario_id=payload.scenario_id)
 
 
 async def _chat_ask_impl(
@@ -284,6 +286,7 @@ async def _chat_ask_impl(
     integration: IntegrationApplication | None = None,
     policy: "ScenarioPolicy | None" = None,
     policy_caps: "TenantPolicyCaps | None" = None,
+    scenario_id: uuid.UUID | None = None,
 ) -> StreamingResponse:
     """Web 与集成问答共用主链路，集成模式额外约束会话、权限和配额。
 
@@ -295,6 +298,9 @@ async def _chat_ask_impl(
       已经有 `snapshot`（`_resolve_or_reject` 的返回值），零新增 IO。
     ★ 只收 `ScenarioPolicy` 不收 `ScenarioSnapshot`：快照带着已过门禁的 `kb_ids`，
       传进来就等于给主链路开了第二条「取授权范围」的路径（设计文档 §A.2）。
+    ★ `scenario_id` 只属于 Web 入口：集成入口由凭证解析出场景后，以
+      `policy` / `policy_caps` 两项传入；Web 入口没有应用身份，用请求体里的场景 ID
+      按 `(tenant_id, scenario_id)` 解析快照。不传时行为与改动前逐字节一致。
     """
     async def audit_record(tenant_id, user_id, action, **kwargs) -> None:
         detail = dict(kwargs.pop("detail", None) or {})
@@ -331,6 +337,27 @@ async def _chat_ask_impl(
     ).scalars().all()
     if len(kb_rows) != len(effective_kb_ids):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="部分知识库不存在")
+
+    # Web 入口的可选场景（L3）：按 (tenant_id, scenario_id) 解析口径快照。
+    # ★ requested_kb_ids 传已过授权交集的 effective_kb_ids：用未授权的 kb 探测场景
+    #   边界会在 MISMATCH 与 NOT_ALLOWED 的差异里泄露场景声明集合。
+    # ★ 解析失败一律转成 4xx/5xx，绝不回退默认场景（fail-closed）。
+    if scenario_id is not None:
+        try:
+            scenario_snapshot = await resolve_scenario_by_id(
+                session,
+                tenant_id=user.tenant_id,
+                scenario_id=scenario_id,
+                requested_kb_ids=effective_kb_ids,
+            )
+        except ScenarioError as exc:
+            logger.warning(
+                "Web 场景解析失败 code=%s trace_id=%s detail=%s",
+                exc.code.value, trace.get_trace_id(), exc.diagnostic,
+            )
+            raise HTTPException(exc.http_status, exc.message) from exc
+        policy = scenario_snapshot.policy
+        policy_caps = scenario_snapshot.caps
 
     # 两段式（S6-3）：kb 归属校验在控制面完成后解析库位。
     # ★ 本期不支持跨库检索：本次请求的 kb 落在 ≥2 个库位 → 409，显式拒绝而不是
