@@ -5,9 +5,10 @@
      → `JOB_DB_KEY_MISSING`（禁止回落默认库）；
   2. 6 个 worker 入口缺 db_key → `JOB_DB_KEY_MISSING`；
   3. 链式入队负载透传 db_key（parse 段链 / graph / wiki）；
-  4. 按 ID 寻址的库位推导（D-S6-3-2 修订：控制面副本）：关闭态零 SQL 返回
-     default；开启态控制库无行 → None；文档按副本 kb_id 解析；wiki 页归属
-     文档缺失 → `DB_SCOPE_OWNER_UNRESOLVED`；控制库与场景库同 id 不判歧义；
+  4. 按 ID 寻址的库位推导（控制面副本优先，缺失时探测场景库）：关闭态零 SQL；
+     控制库有副本 → 按 kb 推导且不探测；控制库无副本 → 0/1/≥2 命中
+     （≥2 → `DB_SCOPE_AMBIGUOUS`）；wiki 页覆盖「页只在场景库」与
+     「页在控制库、归属文档缺失」两条探测路径；
   5. 按 ID 寻址端点：数据面会话按推导键打开、404、结构化 500。
 """
 from __future__ import annotations
@@ -288,79 +289,149 @@ async def test_resolve_wiki_page_closed_state_returns_default_without_sql(monkey
     assert await db_scope.resolve_wiki_page_db_key(_NoSqlSession(), uuid.uuid4()) == "default"
 
 
-@pytest.mark.asyncio
-async def test_resolve_document_enabled_control_miss_returns_none(monkeypatch):
-    """控制库没有该行 → None（调用方 404），且不查任何绑定。"""
+class _ProbeSession:
+    """场景库会话替身：命中与否由安装器按库位键指定。"""
+
+    def __init__(self, hit: bool) -> None:
+        self.hit = hit
+
+    async def get(self, model, pk):  # noqa: ANN001
+        return object() if self.hit else None
+
+
+def _install_scene_probe(
+    monkeypatch, hits: dict[str, bool]
+) -> list[str]:
+    """安装场景库探测替身（registered_db_keys + data_session），返回探测顺序。"""
+    probed: list[str] = []
+
+    @asynccontextmanager
+    async def _fake_data_session(db_key: str):
+        probed.append(db_key)
+        yield _ProbeSession(hit=hits.get(db_key, False))
+
+    monkeypatch.setattr(
+        db_scope, "registered_db_keys", lambda: ("default", *tuple(hits))
+    )
+    monkeypatch.setattr(db_scope, "data_session", _fake_data_session)
+    return probed
+
+
+def _enable(monkeypatch) -> None:
     monkeypatch.setattr(
         db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
     )
-    session = _ControlSession({})
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_control_miss_probes_scene_and_returns_key(monkeypatch):
+    """控制库无副本、场景库唯一命中 → 返回该场景键（新文档场景）。"""
+    _enable(monkeypatch)
     doc_id = uuid.uuid4()
+    session = _ControlSession({})
+    probed = _install_scene_probe(monkeypatch, {"kb_a": False, "kb_b": True})
 
-    assert await db_scope.resolve_document_db_key(session, doc_id) is None
+    assert await db_scope.resolve_document_db_key(session, doc_id) == "kb_b"
     assert session.calls == [("get", Document, doc_id)]
+    assert probed == ["kb_a", "kb_b"]
 
 
 @pytest.mark.asyncio
-async def test_resolve_document_enabled_bound_kb_returns_scene_key(monkeypatch):
-    """控制库 + 场景库同 id 属迁移 COPY 的正常状态：只按控制副本 kb 推导，不判歧义。"""
-    monkeypatch.setattr(
-        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
-    )
+async def test_resolve_document_control_miss_zero_hit_returns_none(monkeypatch):
+    """控制库无副本、探测场景库也 0 命中 → None（调用方 404）。"""
+    _enable(monkeypatch)
+    session = _ControlSession({})
+    probed = _install_scene_probe(monkeypatch, {"kb_a": False, "kb_b": False})
+
+    assert await db_scope.resolve_document_db_key(session, uuid.uuid4()) is None
+    assert probed == ["kb_a", "kb_b"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_control_miss_two_scene_hits_is_ambiguous(monkeypatch):
+    """两个场景库同 id → 歧义，不替调用方挑一个。"""
+    _enable(monkeypatch)
+    doc_id = uuid.uuid4()
+    session = _ControlSession({})
+    _install_scene_probe(monkeypatch, {"kb_a": True, "kb_b": True})
+
+    with pytest.raises(DbScopeError) as excinfo:
+        await db_scope.resolve_document_db_key(session, doc_id)
+
+    assert excinfo.value.code == "DB_SCOPE_AMBIGUOUS"
+    assert excinfo.value.detail == {
+        "model": "Document",
+        "pk": str(doc_id),
+        "db_keys": ["kb_a", "kb_b"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_control_copy_wins_without_probing(monkeypatch):
+    """控制库有副本（场景库同 id 也有）→ 走控制派生，返回 kb 的库位且不探测。"""
+    _enable(monkeypatch)
     kb_id = uuid.uuid4()
     doc = _document_model(kb_id)
     session = _ControlSession(
         {(Document, doc.id): doc}, [[(str(kb_id), "kb_probe")]]
     )
+    probed = _install_scene_probe(monkeypatch, {"kb_probe": True})
 
     assert await db_scope.resolve_document_db_key(session, doc.id) == "kb_probe"
+    assert probed == []
 
 
 @pytest.mark.asyncio
-async def test_resolve_document_enabled_unbound_kb_returns_default(monkeypatch):
-    monkeypatch.setattr(
-        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
-    )
+async def test_resolve_document_control_unbound_kb_returns_default(monkeypatch):
+    _enable(monkeypatch)
     doc = _document_model(uuid.uuid4())
     session = _ControlSession({(Document, doc.id): doc}, [[]])
+    probed = _install_scene_probe(monkeypatch, {"kb_a": True})
 
     assert await db_scope.resolve_document_db_key(session, doc.id) == "default"
+    assert probed == []
 
 
 @pytest.mark.asyncio
-async def test_resolve_wiki_page_enabled_missing_page_returns_none(monkeypatch):
-    monkeypatch.setattr(
-        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
-    )
+async def test_resolve_wiki_page_control_miss_probes_scene(monkeypatch):
+    """页只在场景库 → 按 page_id 探测场景库，返回该键。"""
+    _enable(monkeypatch)
+    page_id = uuid.uuid4()
     session = _ControlSession({})
-
-    assert await db_scope.resolve_wiki_page_db_key(session, uuid.uuid4()) is None
+    probed = _install_scene_probe(monkeypatch, {"kb_a": True})
+    assert await db_scope.resolve_wiki_page_db_key(session, page_id) == "kb_a"
+    assert session.calls == [("get", WikiPage, page_id)]
+    assert probed == ["kb_a"]
 
 
 @pytest.mark.asyncio
-async def test_resolve_wiki_page_owner_document_missing_raises(monkeypatch):
-    """页存在但归属文档副本缺失：无处取 kb_id，显式报错而不是猜库位。"""
-    monkeypatch.setattr(
-        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
-    )
-    page = _wiki_page(uuid.uuid4())
-    session = _ControlSession({(WikiPage, page.id): page})
+async def test_resolve_wiki_page_control_miss_zero_hit_returns_none(monkeypatch):
+    _enable(monkeypatch)
+    session = _ControlSession({})
+    probed = _install_scene_probe(monkeypatch, {"kb_a": False})
+    assert await db_scope.resolve_wiki_page_db_key(session, uuid.uuid4()) is None
+    assert probed == ["kb_a"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_wiki_page_control_miss_two_hits_is_ambiguous(monkeypatch):
+    _enable(monkeypatch)
+    page_id = uuid.uuid4()
+    session = _ControlSession({})
+    _install_scene_probe(monkeypatch, {"kb_a": True, "kb_b": True})
 
     with pytest.raises(DbScopeError) as excinfo:
-        await db_scope.resolve_wiki_page_db_key(session, page.id)
+        await db_scope.resolve_wiki_page_db_key(session, page_id)
 
-    assert excinfo.value.code == "DB_SCOPE_OWNER_UNRESOLVED"
-    assert excinfo.value.detail == {
-        "page_id": str(page.id),
-        "document_id": str(page.document_id),
-    }
+    assert excinfo.value.code == "DB_SCOPE_AMBIGUOUS"
+    assert excinfo.value.detail["model"] == "WikiPage"
+    assert excinfo.value.detail["pk"] == str(page_id)
 
 
 @pytest.mark.asyncio
-async def test_resolve_wiki_page_enabled_bound_kb_returns_scene_key(monkeypatch):
-    monkeypatch.setattr(
-        db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
-    )
+async def test_resolve_wiki_page_control_copy_derives_from_owner_document(monkeypatch):
+    """控制库有页副本与归属文档 → 按文档 kb 解析，不探测。"""
+    _enable(monkeypatch)
     kb_id = uuid.uuid4()
     doc = _document_model(kb_id)
     page = _wiki_page(doc.id)
@@ -368,8 +439,26 @@ async def test_resolve_wiki_page_enabled_bound_kb_returns_scene_key(monkeypatch)
         {(WikiPage, page.id): page, (Document, doc.id): doc},
         [[(str(kb_id), "kb_probe")]],
     )
+    probed = _install_scene_probe(monkeypatch, {"kb_probe": True})
 
     assert await db_scope.resolve_wiki_page_db_key(session, page.id) == "kb_probe"
+    assert probed == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_wiki_page_owner_missing_probes_scene_by_document(monkeypatch):
+    """页副本在控制库但归属文档副本缺失 → 按 document_id 探测场景库。"""
+    _enable(monkeypatch)
+    page = _wiki_page(uuid.uuid4())
+    session = _ControlSession({(WikiPage, page.id): page})
+    probed = _install_scene_probe(monkeypatch, {"kb_a": True})
+
+    assert await db_scope.resolve_wiki_page_db_key(session, page.id) == "kb_a"
+    assert session.calls == [
+        ("get", WikiPage, page.id),
+        ("get", Document, page.document_id),
+    ]
+    assert probed == ["kb_a"]
 
 
 # ══════════════════════════════════════════════════════════════════════

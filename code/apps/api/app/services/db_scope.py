@@ -17,9 +17,9 @@
   · **不按 `scenarios.status` 过滤**：库位是物理事实，被禁用场景里的数据仍在那个库；
   · 同一 kb 被两个不同库位的已发布场景命中 = 数据冲突（与迁移 0030 的
     `fn_kb_db_binding_conflicts` 同口径），显式报错，不替调用方挑一个。
-  · 按 ID 寻址（文档 / wiki 页）只读**控制面副本**的 `kb_id` 推导库位，不做跨库
-    主键扫描：迁移 §4.3 第 12 步是 COPY，控制库与场景库同 id 属正常状态
-    （D-S6-3-2 修订，R5/R6 回滚依赖控制副本）。
+  · 按 ID 寻址（文档 / wiki 页）**控制面副本优先**：控制副本命中即按其 `kb_id`
+    推导库位，不再探测（迁移 §4.3 第 12 步是 COPY，控制库与场景库同 id 属正常
+    状态）；只有控制副本缺失时才按主键探测已注册场景库（0→404、≥2→歧义）。
 """
 from __future__ import annotations
 
@@ -32,19 +32,19 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import get_settings
-from app.infra.db_router import DEFAULT_DB_KEY, data_session
+from app.infra.db_router import DEFAULT_DB_KEY, data_session, registered_db_keys
 from app.models import Document, WikiPage
 
 # 一次请求跨多个库位（本期不支持跨库检索/跨库写入）
 DB_SCOPE_MULTI_KEY: Final[str] = "DB_SCOPE_MULTI_KEY"
-# wiki 页存在但归属文档行缺失，无法推导库位（D-S6-3-2 修订）
-DB_SCOPE_OWNER_UNRESOLVED: Final[str] = "DB_SCOPE_OWNER_UNRESOLVED"
+# 控制库无副本时按主键探测场景库，同一主键命中多个库位（D-S6-3-2）
+DB_SCOPE_AMBIGUOUS: Final[str] = "DB_SCOPE_AMBIGUOUS"
 # worker 收到的队列负载缺少 db_key（D-S6-3-1）
 JOB_DB_KEY_MISSING: Final[str] = "JOB_DB_KEY_MISSING"
 
 __all__ = [
     "DB_SCOPE_MULTI_KEY",
-    "DB_SCOPE_OWNER_UNRESOLVED",
+    "DB_SCOPE_AMBIGUOUS",
     "JOB_DB_KEY_MISSING",
     "DbScopeError",
     "resolve_kb_db_key",
@@ -202,55 +202,75 @@ async def open_job_session(db_key: str) -> AsyncIterator[AsyncSession]:
         yield session
 
 
+async def _probe_scene_db_key(model: type, pk: uuid.UUID) -> str | None:
+    """控制库无副本时，按主键探测**已注册场景库**（default 由控制会话覆盖，跳过）。
+
+    只在控制库查不到副本时调用；控制库命中一律不探测（见两个 resolve 入口）。
+    0 → None（调用方 404）；1 → 该键；≥2 → `DB_SCOPE_AMBIGUOUS`（同一主键
+    出现在多个场景库，不替调用方挑一个）。
+    """
+    hits: list[str] = []
+    for db_key in registered_db_keys():
+        if db_key == DEFAULT_DB_KEY:
+            continue
+        async with data_session(db_key) as session:
+            if await session.get(model, pk) is not None:
+                hits.append(db_key)
+
+    if not hits:
+        return None
+    if len(hits) > 1:
+        raise DbScopeError(
+            DB_SCOPE_AMBIGUOUS,
+            {"model": model.__name__, "pk": str(pk), "db_keys": hits},
+        )
+    return hits[0]
+
+
 async def resolve_document_db_key(
     control_session: AsyncSession,
     doc_id: uuid.UUID,
 ) -> str | None:
-    """按**控制面文档副本**的 `kb_id` 推导数据面库位（D-S6-3-2 修订）。
-
-    设计 §4.3 第 12 步迁移是 COPY：控制库保留数据面行副本，R5/R6 回滚依赖它，
-    因此「控制库 + 场景库同 id」是正常状态 —— 不能按主键跨库扫描判歧义。
-    库位只由控制副本的 `kb_id` 经 `resolve_kb_db_key` 推出（未绑定 → default）。
+    """按 ID 推导文档库位：控制面副本优先，缺失时探测已注册场景库。
 
     - 关闭态：直接返回 `"default"`，零 SQL；
-    - 开启态：`control_session.get(Document, doc_id)`：None → None（调用方 404）；
-      命中 → 用其 kb_id 解析库位（不做「找不到就探测别库」的兜底）。
+    - 开启态：`control_session.get(Document, doc_id)` 命中 → 用其 kb_id 经
+      `resolve_kb_db_key` 推导（**不探测**：控制库+场景库同 id 是迁移 COPY 的
+      正常状态）；未命中 → 按主键探测场景库（0→None、1→该键、≥2→歧义）。
     """
     if not get_settings().scene_db_split_enabled:
         return DEFAULT_DB_KEY
     document = await control_session.get(Document, doc_id)
-    if document is None:
-        return None
-    return await resolve_kb_db_key(
-        control_session, document.tenant_id, [document.kb_id]
-    )
+    if document is not None:
+        return await resolve_kb_db_key(
+            control_session, document.tenant_id, [document.kb_id]
+        )
+    return await _probe_scene_db_key(Document, doc_id)
 
 
 async def resolve_wiki_page_db_key(
     control_session: AsyncSession,
     page_id: uuid.UUID,
 ) -> str | None:
-    """按**控制面 wiki 页副本**的归属文档推导数据面库位（D-S6-3-2 修订）。
+    """按 ID 推导 wiki 页库位：控制面副本优先，缺失时探测已注册场景库。
 
     - 关闭态：直接返回 `"default"`，零 SQL；
-    - 开启态：页不存在 → None（调用方 404）；页存在但归属文档副本缺失 →
-      `DbScopeError(DB_SCOPE_OWNER_UNRESOLVED)`（无处取 kb_id，显式报错，
-      不猜库位）；归属文档存在 → 按其 kb_id 解析库位。
+    - 开启态：控制库有页副本 → 取其 document_id；控制库有该文档 → 按 kb 解析；
+      文档副本缺失 → 按 document_id 探测场景库；页副本缺失 → 按 page_id
+      探测场景库（0→None、1→该键、≥2→歧义）。任何路径都不回落 default。
     """
     if not get_settings().scene_db_split_enabled:
         return DEFAULT_DB_KEY
     page = await control_session.get(WikiPage, page_id)
     if page is None:
-        return None
+        return await _probe_scene_db_key(WikiPage, page_id)
+
     document = await control_session.get(Document, page.document_id)
-    if document is None:
-        raise DbScopeError(
-            DB_SCOPE_OWNER_UNRESOLVED,
-            {"page_id": str(page_id), "document_id": str(page.document_id)},
+    if document is not None:
+        return await resolve_kb_db_key(
+            control_session, document.tenant_id, [document.kb_id]
         )
-    return await resolve_kb_db_key(
-        control_session, document.tenant_id, [document.kb_id]
-    )
+    return await _probe_scene_db_key(Document, page.document_id)
 
 
 def error_detail(exc: DbScopeError) -> dict[str, object]:

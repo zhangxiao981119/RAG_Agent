@@ -24,6 +24,8 @@ import asyncpg
 import pytest
 from alembic import command
 
+from app.config.settings import get_settings
+from app.infra import db_router
 from app.infra.db_router import registered_db_keys
 from app.services import db_scope
 from app.services.db_scope import (
@@ -303,14 +305,14 @@ def test_db_scope_error_carries_code_and_detail():
     assert str(err) == "DB_SCOPE_MULTI_KEY: {'db_keys': ['kb_a', 'kb_b']}"
 
 
-def test_owner_unresolved_code_is_machine_readable():
-    """D-S6-3-2 修订：wiki 页归属文档副本缺失时的错误码（不再有跨库歧义码）。"""
-    assert db_scope.DB_SCOPE_OWNER_UNRESOLVED == "DB_SCOPE_OWNER_UNRESOLVED"
+def test_ambiguous_code_is_machine_readable():
+    """D-S6-3-2：控制库无副本时，同一主键命中多个场景库的错误码。"""
+    assert db_scope.DB_SCOPE_AMBIGUOUS == "DB_SCOPE_AMBIGUOUS"
     err = DbScopeError(
-        db_scope.DB_SCOPE_OWNER_UNRESOLVED,
-        {"page_id": "p", "document_id": "d"},
+        db_scope.DB_SCOPE_AMBIGUOUS,
+        {"model": "Document", "pk": "p", "db_keys": ["kb_a", "kb_b"]},
     )
-    assert err.code == "DB_SCOPE_OWNER_UNRESOLVED"
+    assert err.code == "DB_SCOPE_AMBIGUOUS"
 
 
 def test_registered_db_keys_contains_default_sorted_and_unique():
@@ -463,3 +465,144 @@ def test_real_db_control_copy_same_id_returns_scene_key(schema, monkeypatch):
         db_scope, "get_settings", lambda: fake_settings(scene_db_split_enabled=True)
     )
     asyncio.run(_run_control_copy_same_id())
+
+
+_WIKI_INSERT_SQL = (
+    "INSERT INTO wiki_pages "
+    "(id, tenant_id, kb_id, document_id, title, summary, "
+    " generator_model, prompt_version, content_hash) "
+    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+)
+
+
+async def _seed_scene_db(
+    url: str,
+    tenant_id: uuid.UUID,
+    kb_id: uuid.UUID,
+    doc_ids: list[uuid.UUID],
+    page_id: uuid.UUID | None = None,
+) -> None:
+    """在临时场景库造最小归属链（租户/库/文档/可选 wiki 页）。"""
+    conn = await asyncpg.connect(dsn(url))
+    try:
+        await conn.execute(
+            "INSERT INTO tenants (id, name, code) VALUES ($1, $2, $3)",
+            tenant_id,
+            "场景探测用例租户",
+            f"sp-{tenant_id.hex[:8]}",
+        )
+        await conn.execute(
+            "INSERT INTO knowledge_bases (id, tenant_id, name, description) "
+            "VALUES ($1, $2, $3, $4)",
+            kb_id,
+            tenant_id,
+            f"kb-{str(kb_id)[:8]}",
+            "场景探测用例库",
+        )
+        for doc_id in doc_ids:
+            await conn.execute(
+                _DOC_INSERT_SQL,
+                doc_id,
+                tenant_id,
+                kb_id,
+                "场景文档.pdf",
+                "pdf",
+                10,
+                "scene/doc.pdf",
+            )
+        if page_id is not None:
+            await conn.execute(
+                _WIKI_INSERT_SQL,
+                page_id,
+                tenant_id,
+                kb_id,
+                doc_ids[0],
+                "场景导航页",
+                "场景导航摘要",
+                "stub",
+                "v1",
+                "hash00000001",
+            )
+    finally:
+        await conn.close()
+
+
+async def _run_scene_probe_cases() -> None:
+    """控制库无副本：唯一命中返回场景键；两个场景同 id → 歧义。"""
+    base_url = SCENARIO_TEST_DB_URL or ""
+    names = [f"scene_probe_{uuid.uuid4().hex[:12]}" for _ in range(2)]
+    admin = await asyncpg.connect(_with_database(dsn(base_url), "postgres"))
+    settings = get_settings()
+    old_enabled, old_dsn = settings.scene_db_split_enabled, dict(settings.scene_db_dsn)
+    created: list[str] = []
+    tenant_id, kb_a, kb_b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    doc_unique, page_unique, doc_shared = (
+        uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    )
+    try:
+        for name in names:
+            try:
+                await admin.execute(f'CREATE DATABASE "{name}" TEMPLATE template0')
+            except asyncpg.exceptions.InsufficientPrivilegeError as exc:
+                pytest.skip(f"当前账号无 CREATE DATABASE 权限（{exc}）")
+            created.append(name)
+            await asyncio.to_thread(
+                command.upgrade,
+                alembic_config(_with_database(base_url, name)),
+                "head",
+            )
+
+        url_a = _with_database(base_url, names[0])
+        url_b = _with_database(base_url, names[1])
+        await _seed_scene_db(
+            url_a, tenant_id, kb_a, [doc_unique, doc_shared], page_unique
+        )
+        await _seed_scene_db(url_b, tenant_id, kb_b, [doc_shared])
+
+        settings.scene_db_split_enabled = True
+        settings.scene_db_dsn = {"kb_scene_a": url_a, "kb_scene_b": url_b}
+        db_router.register_from_settings()
+
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        engine = create_async_engine(base_url)
+        try:
+            factory = async_sessionmaker(engine, expire_on_commit=False)
+            async with factory() as session:
+                # 文档/页只在场景库：按主键探测返回该场景键
+                assert (
+                    await db_scope.resolve_document_db_key(session, doc_unique)
+                    == "kb_scene_a"
+                )
+                assert (
+                    await db_scope.resolve_wiki_page_db_key(session, page_unique)
+                    == "kb_scene_a"
+                )
+                # 两个场景库同 id：歧义，不替调用方挑一个
+                with pytest.raises(DbScopeError) as excinfo:
+                    await db_scope.resolve_document_db_key(session, doc_shared)
+                assert excinfo.value.code == "DB_SCOPE_AMBIGUOUS"
+                assert excinfo.value.detail["db_keys"] == [
+                    "kb_scene_a",
+                    "kb_scene_b",
+                ]
+        finally:
+            await engine.dispose()
+    finally:
+        settings.scene_db_split_enabled = old_enabled
+        settings.scene_db_dsn = old_dsn
+        db_router.register_from_settings()
+        for name in created:
+            await admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = $1 AND pid <> pg_backend_pid()",
+                name,
+            )
+            await admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        await admin.close()
+
+
+@requires_db
+def test_real_db_scene_only_probe_and_ambiguous(schema):
+    """控制库无副本：场景库唯一命中返回该键；两个场景同 id 报歧义。"""
+    asyncio.run(_run_scene_probe_cases())
