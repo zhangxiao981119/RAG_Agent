@@ -28,6 +28,7 @@ from app.config.wiki_profile import WikiProfile
 from app.services import retrieve as retrieve_mod
 from app.services.keyword_text import build_ilike_pattern, build_ilike_terms
 from app.services.retrieve import RetrievalService
+from tests.retrieve.conftest import fake_settings
 
 TENANT = uuid.UUID(int=9)
 KB = uuid.UUID(int=1)
@@ -125,10 +126,16 @@ def _common_stubs(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
 
 
 def _settings(monkeypatch: pytest.MonkeyPatch, *, wiki_enabled: bool) -> None:
+    # ★ 假配置由 `fake_settings()` 造（以 Settings 的**类默认值**为底，只覆盖本文件
+    #   关心的五个字段）。原先这里是 `SimpleNamespace(...)` 只列 5 个字段，于是
+    #   Step 3 一加 `wiki_nav_selective` 读取，本文件 6 条用例就以 `AttributeError`
+    #   变红 —— 报错位置（`_wiki_should_nav`）与本文件要证明的东西毫无关系。
+    #   覆盖字段的值原样保留：rerank / graph 关、图超时 800ms、wiki 由参数决定、
+    #   nav 超时 50ms。
     monkeypatch.setattr(
         retrieve_mod,
         "get_settings",
-        lambda: SimpleNamespace(
+        lambda: fake_settings(
             rerank_enabled=False,
             graph_enabled=False,
             graph_retrieve_timeout_ms=800,

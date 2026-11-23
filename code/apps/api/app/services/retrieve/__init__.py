@@ -8,6 +8,21 @@ M4 任务 5：权限下推过滤（H7）。向量 / 关键词 SQL 都接进四�
 
 删除 M2 "先取后过滤"临时逻辑。PUSHDOWN_WHERE_SQL 从 acl/visibility 导入
 （手册 §3.3.2 唯一真源），pushdown_params 构造参数。
+
+★ Step 3（场景化配置）：本模块的**全部**检索参数都来自
+  `EffectiveRetrieval`（见 `app/services/scenario/effective.py` 的"唯一折叠点"）。
+  四条纪律，由 `tests/scenario/test_effective.py` 的文本守卫强制执行：
+
+    1. 平台召回条数常量、平台取用条数常量、平台阈值选择函数在本文件里被
+       **直接引用 0 次** —— 它们必须经由 `eff` 取，否则「场景覆盖」会在某个读点上
+       被静默绕过（8 个读点里任何一处漏改，表现是「策略只对 search 生效、
+       对 ask 不生效」，且**没有任何报错**）。
+    2. 平台重排开关在本文件里**恰好读 1 次**（构造 `eff` 时），读两次就是两条真源。
+    3. 注释里 MUST NOT 写出那几个常量的完整属性访问形式 —— 守卫是**文本计数**，
+       会连注释一起数进去。要解释时写「平台召回条数常量」而不是原文。
+    4. `recall_top_k`（候选池大小）与 `final_top_n`（进上下文的条数）是两个不同的
+       参数：前者绝不能传给重排服务的条数参数（重排在线分支不做二次截断，
+       误传会让整池都进上下文）。`test_recall_top_k_never_passed_as_rerank_top_n` 钉住。
 """
 from __future__ import annotations
 
@@ -38,6 +53,8 @@ from app.services.retrieve.chain import (
     merge_rounds,
 )
 from app.services.rerank import RerankTimeout, get_rerank_service
+from app.services.scenario.effective import effective_retrieval
+from app.services.scenario.snapshot import ScenarioPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +101,13 @@ _WHERE_BASE = """WHERE c.tenant_id = :tenant_id
 #   与写入侧 parse_job 记录的口径对齐。改模型/改向量文本公式后，旧 chunk 向量
 #   被判为不同构而**排除**——宁可在重算前查不到，也不能把不同构向量混进来算相似度
 #   （那是"静默劣化"：不报错，只是答不准）。
-#   ★ 该过滤**只加在向量路径**：关键词路（ILIKE / tsquery）与向量空间无关，加会误伤。
+#   ★ 该过滤**只加在向量路径**（Step 4B-1 §A.3.4 的修正表述）：
+#     ① 三条硬 DNA 列只改变**向量**、不改变 `chunk.content`；
+#     ② 关键词路判的是**正文**，命中它给出的是正确内容，加过滤只有召回损失；
+#     ③ `chunker_version` 虽改变分块边界，但属**软 DNA**
+#        （`DNA与Policy口径对照表-v1.md:32`），按定义不得据此排除。
+#     （旧话写的是"关键词路与向量空间无关，加会误伤"—— 结论对，理由不成立：
+#      关键词路并不比较向量，"无关"回避了真正的问题：它判的对象是正文。）
 # 治理权重（M7 WU-M-17）：COALESCE 按 0 —— INV-M-12 治理失败/未审查不参与过滤
 _VECTOR_SQL_TEMPLATE = f"""
 SELECT c.id, c.document_id, c.kb_id, c.content, c.heading_path, c.page_no,
@@ -220,11 +243,21 @@ class RetrievalService:
         authorized_kb_ids: list[uuid.UUID],
         clearance: int,
         user_subjects: list[str],
+        *,
+        policy: ScenarioPolicy | None = None,
     ) -> RetrievalResult:
         """混合召回 + RRF + rerank。
 
         参数是 pushdown_params 的直接展开（由 API 层从 CurrentUser 取，
         MUST NOT 信任前端传参）。若 authorized_kb_ids 为空直接拒答。
+
+        `policy` 是场景策略的**稀疏覆盖集**（`None` = 全跟随平台）。
+        ★ keyword-only：本方法今天有多个调用点按 6 个**位置参数**传（`chat.py`
+          的链式入口、`integrations.py` 的 search、`eval_service`、标定脚本），
+          改成位置参数会静默改变实参含义。
+        ★ 只收 `ScenarioPolicy`、**不收 `ScenarioSnapshot`**：快照里带着已过场景
+          门禁的 `kb_ids`，把它传进来就多出第二条「取授权范围」的路径，而
+          `effective_kb_ids` 的三重交集是唯一授权计算点（设计文档 §A.2）。
         """
         stages: dict[str, int] = {}
 
@@ -238,6 +271,31 @@ class RetrievalService:
             "authorized_kb_ids": authorized_kb_ids,
             "user_subjects": user_subjects,
         }
+
+        # ── 0. 场景策略折叠（唯一取值入口；Step 3）────────────────────────
+        # ★ 位置 MUST 在 `if not authorized_kb_ids` 之后：
+        #   空范围请求不产生「这台机器按什么参数跑」的读取，与改动前逐字节一致
+        #   （零影响承诺 Z3-2 的形式之一）。
+        # ★ 平台重排开关在这里读**一次**并显式传给纯函数：这样折叠函数无 IO，
+        #   且「平台值只读一次」是可被文本断言的事实（恰好 1 次）。
+        platform_rerank_on = get_settings().rerank_enabled
+        eff = effective_retrieval(policy, platform_rerank_enabled=platform_rerank_on)
+        if eff.clamped:
+            # 收窄 MUST 可见：否则「我配了 150、实际跑 100」就是静默降级
+            metrics.incr("rag.scenario.policy_clamped", len(eff.clamped))
+            logger.warning(
+                "场景策略超出平台上限，已收窄到平台值",
+                extra={"fields": list(eff.clamped), "trace_id": trace.get_trace_id()},
+            )
+        declared = policy.declared() if policy is not None else {}
+        if declared:
+            # 只在真的配了东西时打点/记日志：默认场景的 declared 是 {}，
+            # 零影响路径上一条噪音都不产生。
+            metrics.incr("rag.scenario.policy_active", len(declared))
+            logger.info(
+                "场景策略生效",
+                extra={"keys": sorted(declared), "trace_id": trace.get_trace_id()},
+            )
 
         # ① 向量召回（embedding 调用与向量 SQL 分段计时：两者成本量级不同，
         #    合并成一个 retrieving 无法判断瓶颈究竟是模型往返还是 HNSW 查询）
@@ -255,7 +313,8 @@ class RetrievalService:
             vector_sql,
             {
                 **pushdown,
-                "limit": decisions.TOP_K_RECALL,
+                # 读点 #1：每路召回条数上限 = 场景策略折叠后的有效值
+                "limit": eff.recall_top_k,
                 "embedding_model": profile.embedding_model,
                 "embedding_text_version": profile.embedding_text_version,
             },
@@ -365,7 +424,8 @@ class RetrievalService:
                     # ★ :needle 不变：仍是最长的**原 query 词元**。换成 wiki 词元会
                     #   改变 ORDER BY 的 strpos 定序 → RRF 顺序漂移 → 217 条基线风险。
                     "needle": ilike_terms[0].lower(),
-                    "limit": decisions.TOP_K_RECALL,
+                    # 读点 #2：ILIKE 路召回条数
+                    "limit": eff.recall_top_k,
                 },
             )
             keyword_rows = list(keyword_result.fetchall())
@@ -392,7 +452,8 @@ class RetrievalService:
             try:
                 fts_result = await session.execute(
                     _KEYWORD_FTS_SQL,
-                    {**pushdown, "tsquery": tsquery, "limit": decisions.TOP_K_RECALL},
+                    # 读点 #3：tsquery 路召回条数
+                    {**pushdown, "tsquery": tsquery, "limit": eff.recall_top_k},
                 )
                 fts_rows = list(fts_result.fetchall())
             except Exception:
@@ -424,14 +485,29 @@ class RetrievalService:
                 all_chunks[row.id] = dict(row._mapping)
             keyword_ranks.append(row.id)
 
+        # ── 降级可观测（Step 4B-1 / DQ4B-8）──────────────────────────
+        # 向量路回 0 行 = 主检索退化为仅关键词。这条降级是
+        # `DNA与Policy口径对照表-v1.md:14` 明确写为**预期行为**的路径（换模型 /
+        # 改向量文本公式后，旧向量不同构 → 向量路空集），但在此之前它**完全不可见**：
+        # 本函数 30 余处打点无一条与"某路回 0 行"有关（F-18）。
+        # ★ 为什么它比"再加一个百分比闸门"有用（R10 的正解）：百分比闸门的处置是
+        #   "等它变绿"，而它永远不会绿 → 运维学会无视；这一条的处置是"看它是不是
+        #   只在某段时间陡增"，有明确的陡增/回落形状，不是一个只会亮不会灭的灯。
+        # ★ 这一行不碰任何 SQL 文本（I-4B-4）：T-4B-9 的 golden 哈希仍绿。
+        if not vector_rows:
+            metrics.incr(
+                "rag.caliber.vector_empty",
+                keyword_hit="yes" if (fts_rows or keyword_rows) else "no",
+            )
+
         if not all_chunks:
             return RetrievalResult(refused=True, refuse_reason="NO_RELEVANT_CONTENT", stage_ms=stages)
 
         # ③ RRF 融合（三路召回：向量 / tsquery / ILIKE 全部计入）
         rrf_scores = _build_rrf_scores(vector_ranks, fts_ranks, keyword_ranks)
-        # 按 RRF 降序取 top 50（去重后的候选）
+        # 按 RRF 降序取候选池（读点 #4：池上限 = 每路召回条数的同一个值，与现状一致）
         sorted_ids = sorted(all_chunks.keys(), key=lambda cid: rrf_scores[cid], reverse=True)
-        candidate_ids = sorted_ids[: decisions.TOP_K_RECALL]
+        candidate_ids = sorted_ids[: eff.recall_top_k]
 
         # 取 filename
         doc_ids = list({all_chunks[cid]["document_id"] for cid in candidate_ids})
@@ -444,19 +520,26 @@ class RetrievalService:
         reranked_ids: list[uuid.UUID] = []
         rerank_scores: dict[uuid.UUID, float] = {}
         use_rerank = True
-        rerank_off = not get_settings().rerank_enabled
+        # 读点 #5：是否发起重排（平台开关与场景覆盖的单向 AND 已在 eff 里折叠）
+        rerank_off = not eff.rerank_enabled
         if rerank_off:
-            # ★ 重排显式关闭（RERANK_ENABLED=false）：不发起调用，直接走 vector 口径。
-            #   关闭 ≠ 降级 —— 故不计 rag.rerank.degraded、不刷降级告警，消除误导性日志。
+            # ★ 重排显式关闭：不发起调用，直接走 vector 口径。
+            #   关闭 ≠ 降级 —— 故不计降级指标、不刷降级告警，消除误导性日志。
             #   依据：本机 CPU 实测 bge-reranker-v2-m3 单次 8 条 10.5s、50 条 66s，
             #   远超 rerank_timeout_seconds(3s)，开启也必然逐次降级（白等 3s 后才降级，
             #   链式多轮时按轮数放大到 9s 级）。换到 GPU / 更强算力后置 true 即可启用。
+            if platform_rerank_on:
+                # 平台开着、场景把它关掉 —— 这是**新出现**的一种 off。
+                # `mode="off"` 这个既有 label 分不清「平台关」与「场景关」，
+                # 故单独计一个 counter（label 取值保持三态不变：改它会让既有看板出断点，
+                # 断点比不精确更难排查）。
+                metrics.incr("rag.rerank.disabled_by_scenario")
             use_rerank = False
         else:
             try:
                 rerank_service = get_rerank_service()
                 documents = [all_chunks[cid]["content"] for cid in candidate_ids]
-                results = await rerank_service.rerank(query, documents, decisions.TOP_K_RERANK)
+                results = await rerank_service.rerank(query, documents, eff.final_top_n)
                 # results 按相关性绝对分降序，直接采用（relevance_score 已是 0~1 的 sigmoid 分）
                 for idx, score in results:
                     # 防御越界：异常 rerank 服务返回的 idx 可能超出 candidate_ids 范围
@@ -529,12 +612,15 @@ class RetrievalService:
         else:
             retrieved = [_build_chunk(cid) for cid in candidate_ids]
             retrieved.sort(key=lambda c: c.final_score, reverse=True)
-            retrieved = retrieved[: decisions.TOP_K_RERANK]
+            # 读点 #7：降级/关闭路径的截断（重排在线路径**不截断**，见上）
+            retrieved = retrieved[: eff.final_top_n]
 
         # L1 阈值闸门
         # ★ 必须按当前打分口径取阈值：重排在线比 rerank 分，降级比向量余弦分。
         #   两者分布不同，用同一个阈值会在重排抖动时产生不可预测的拒答行为。
-        threshold = decisions.active_threshold(use_rerank)
+        #   读点 #8：阈值只从 `eff` 取（内部按 use_rerank 分流），
+        #   本文件 MUST NOT 出现第二处阈值选择（Z3-4 文本守卫）。
+        threshold = eff.threshold_for(use_rerank=use_rerank)
         if not retrieved or retrieved[0].final_score < threshold:
             metrics.incr(
                 "rag.gate.refused",
@@ -565,7 +651,7 @@ class RetrievalService:
         #    · 在表格/章节回捞**之前** —— 图召回片先占 final_id_set，回捞据此排除重复
         #      （顺序反了会让同一片进上下文两次，编号重复、白占 token）。
         #    · 产物**不 append 进 retrieved**：分数恒 0 的片进 retrieved 会同时污染排序
-        #      与 retrieved[0] 的阈值语义，而且 TOP_K_RERANK 截断后根本进不了上下文。
+        #      与 retrieved[0] 的阈值语义，而且按平台取用条数截断后根本进不了上下文。
         #    · 关闭图能力时整块跳过：不发一条 SQL、不 import 图服务（见下方延迟导入）。
         graph_chunks: list[RetrievedChunk] = []
         graph_candidates: list[RetrievedChunk] = []
@@ -857,6 +943,8 @@ class RetrievalService:
         clearance: int,
         user_subjects: list[str],
         rewrite_score: int | None = None,
+        *,
+        policy: ScenarioPolicy | None = None,
     ) -> RetrievalResult:
         """链式检索：按复杂度信号决定是否拆解 → 多轮检索 → 证据合并。
 
@@ -867,6 +955,15 @@ class RetrievalService:
 
         参数是 pushdown_params 的直接展开（与 retrieve 同口径），额外接收
         rewrite_score 作为「问题复杂度」信号。
+
+        ★ `policy` MUST 透传到**每一轮**子问题，也必须透传到**单趟**出口
+          （`_single()`）。漏掉任一处，场景的召回条数就只对一部分请求生效 ——
+          而且完全不报错。两条路径各自有钉子：
+            · 多轮：`test_chain_passes_policy_to_every_round`
+            · 单趟：`test_chain_single_path_passes_policy`
+                    `test_chain_single_path_when_rewrite_score_is_none`
+          单趟不是边角：`rewrite_score` 为 None（跳过改写）或不低于复杂度阈值
+          （自包含的简单问题）时都走单趟，那是线上主要流量。
         """
         t0 = time.perf_counter()
 
@@ -874,6 +971,7 @@ class RetrievalService:
             # 单趟路径统一出口：复用既有 retrieve()，只补 chain_mode 与拆解耗时
             result = await self.retrieve(
                 session, query, tenant_id, authorized_kb_ids, clearance, user_subjects,
+                policy=policy,
             )
             result.chain_mode = chain_mode
             if chain_ms is not None:
@@ -908,6 +1006,7 @@ class RetrievalService:
         for sq in subquestions:
             rounds.append(await self.retrieve(
                 session, sq, tenant_id, authorized_kb_ids, clearance, user_subjects,
+                policy=policy,
             ))
 
         merged = merge_rounds(rounds)

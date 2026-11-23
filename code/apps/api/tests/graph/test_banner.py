@@ -49,6 +49,7 @@ def test_enabled_banner_shows_caliber_and_readiness(env):
     env.setenv("GRAPH_ENABLED", "true")
     env.setenv("WIKI_ENABLED", "true")
     env.setenv("GRAPH_EXTRACTOR_MODEL", "")
+    env.setenv("WIKI_GENERATOR_MODEL", "")  # 同理：空 = 跟随 llm_model（settings.py:188-189）
     env.setenv("LLM_MODEL", "deepseek-v4-flash")
     env.setenv("WIKI_SCOPE", "doc")
     get_settings.cache_clear()

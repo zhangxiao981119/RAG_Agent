@@ -20,6 +20,7 @@ from app.config import decisions
 from app.services import retrieve as retrieve_mod
 from app.services.retrieve import RetrievalService
 from app.services.rerank import RerankTimeout
+from tests.fake_settings import fake_settings
 
 TENANT = uuid.uuid4()
 KB = uuid.UUID(int=1)
@@ -131,7 +132,7 @@ def svc(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(
             retrieve_mod,
             "get_settings",
-            lambda: SimpleNamespace(
+            lambda: fake_settings(
                 rerank_enabled=True, graph_enabled=False, wiki_enabled=False
             ),
         )

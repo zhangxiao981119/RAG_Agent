@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
@@ -8,6 +9,9 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 ROOT_DIR = Path(__file__).resolve().parents[4]
+
+# 库位键口径：与场景绑定校验（ck_scenarios_db_binding_format）保持一致
+_KB_KEY_RE = re.compile(r"^kb_[a-z0-9_]{2,40}$")
 
 
 class Settings(BaseSettings):
@@ -60,6 +64,26 @@ class Settings(BaseSettings):
     # 过载时 MUST 快速失败：pool_timeout 30s 会让请求挂着不动 30 秒再 500
     # （实测 c=20 的 P50 总耗时 60s = 两次 30s 等池），5s 直接 503 更有用。
     db_pool_timeout_s: float = 5.0
+    # ── 数据层路由（Step 5 建目录与路由层，Step 6 才接线）────────────
+    # ★ 默认 false：关闭态下 db_router 不创建任何引擎、不被任何生产模块调用。
+    # ★ 关闭态 != 迁移回滚：若数据已经搬到别的库，关开关会让查询全部落回默认库
+    #   → 「一半文档查不到」。安全顺序见设计文档 §E.2。
+    scene_db_split_enabled: bool = False
+    # 库位键 → DSN。例（JSON）：
+    #   {"kb_finance": "postgresql+asyncpg://user:pw@postgres:5432/kagent_finance"}
+    # ★ 键必须匹配 ^kb_[a-z0-9_]{2,40}$（与 ck_scenarios_db_binding_format 同口径），
+    #   启动期校验；'default' 是保留虚拟键，不得作为键出现（它指现有库）。
+    # ★ 值含凭据 → MUST 逐值脱敏后才进快照，永不进日志明文/响应体。
+    scene_db_dsn: dict[str, str] = {}
+    # ── 连接预算闸门（数值全部来自框架 §3A.4 的算式）──
+    # ★ 100 是 PG 默认值，本项目未覆盖该参数；启动期会 SHOW max_connections 比对，取较小者。
+    db_max_connections_for_budget: int = 100
+    # ★ 预留 10 是**设定值不是实测**（已登记为站位值）。
+    db_conn_reserved: int = 10
+    # ★ worker 侧 10 条（compose DB_POOL_SIZE=5 + DB_MAX_OVERFLOW=5）。
+    db_worker_conn_total: int = 10
+    # ★ 副本数应用自己不知道（无共享状态）→ 只能由部署声明；默认 1 是保守值（闸门偏松）。
+    db_replicas_expected: int = 1
     redis_url: str = "redis://redis:6379/0"
     redis_max_connections: int = 20  # 单进程连接池上限；× 副本数应 ≤ Redis maxclients 的余量
     redis_socket_timeout_s: float = 3.0  # 建连/读写超时（秒）—— 避免 Redis 抖动时请求无限等待
@@ -214,6 +238,32 @@ class Settings(BaseSettings):
     def parse_allowed_ext(cls, value: object) -> object:
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("scene_db_dsn", mode="after")
+    @classmethod
+    def validate_scene_db_dsn(cls, value: dict[str, str]) -> dict[str, str]:
+        """库位键与 DSN 的启动期校验：任一不合规即抛错，拒绝启动。
+
+        空 dict（默认态）直接通过。
+        """
+        for key, dsn in value.items():
+            # 'default' 是保留虚拟键（指向现有库），不允许作为库位键出现
+            if key == "default":
+                raise ValueError(
+                    "scene_db_dsn 的键 'default' 是保留虚拟键（指向现有库），"
+                    "不得作为库位键出现；请改用形如 kb_<业务名> 的键"
+                )
+            if not _KB_KEY_RE.match(key):
+                raise ValueError(
+                    f"scene_db_dsn 的键 {key!r} 不合规：必须匹配 ^kb_[a-z0-9_]{{2,40}}$"
+                    "（小写字母/数字/下划线，前缀 kb_，与场景绑定口径一致）"
+                )
+            if not dsn.startswith("postgresql+asyncpg://"):
+                raise ValueError(
+                    f"scene_db_dsn 中键 {key!r} 的值 {dsn!r} 不合规："
+                    "必须以 postgresql+asyncpg:// 开头（本平台只支持 asyncpg 驱动）"
+                )
         return value
 
     def model_post_init(self, __context) -> None:

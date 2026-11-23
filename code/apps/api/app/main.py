@@ -29,10 +29,12 @@ from app.api.kbs import router as kbs_router
 from app.api.me import router as me_router
 from app.api.messages import router as messages_router
 from app.api.metrics import router as metrics_router
+from app.api.needs_reindex import router as needs_reindex_router
 from app.api.prompts import router as prompts_router
 from app.api.quota import router as quota_router
 from app.api.rate_limit import check_chat_rate_limit  # noqa: F401 — 限流依赖
 from app.api.roles import router as roles_router
+from app.api.scenarios import router as scenarios_router
 from app.api.sensitive_words import router as sensitive_words_router
 from app.api.sync import router as sync_router
 from app.api.users import router as users_router
@@ -43,6 +45,27 @@ from app.infra.arq_pool import close_arq_pool, get_arq_pool
 from app.infra.redis_client import close_redis
 
 logger = logging.getLogger(__name__)
+
+def _iso_with_millis(formatter: logging.Formatter, record: logging.LogRecord) -> str:
+    """把 `created` 格式化为 `YYYY-MM-DDTHH:MM:SS.mmm`。
+
+    ★ 为什么不能写 `formatter.formatTime(record, "%Y-%m-%dT%H:%M:%S.%03d")`：
+      `%03d` 是 C `strftime` 的**宽度修饰**，Python 的 `time.strftime` 不支持，
+      在 3.12+ 上直接抛 `ValueError: Invalid format string`。
+      日志格式化器抛异常 = 整条日志链路（含场景解析的 diagnostic、
+      trace_id、审计字段）全部丢掉 —— 排障通道被自己的格式化器掐断，
+      而且**每条日志都会炸**，不是偶发。
+
+    ★ 为什么用 `formatter.converter` 而不是 `time.localtime`：
+      `converter` 是 Formatter 的既有配置（默认 `time.localtime`，
+      可被改造成 UTC/本地时区），沿用它才不丢时区语义。
+
+    ★ 毫秒取 `record.msecs` 而不是 `created % 1`：前者是 logging 在构造
+      LogRecord 时算好的（与 `created` 同源），避免两次浮点运算出现进位差。
+    """
+    converted = formatter.converter(record.created)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", converted) + f".{int(record.msecs):03d}"
+
 
 # ── M6 可观测：结构化 JSON 日志 ──────────────────────────
 # 每条日志输出为单行 JSON，方便 ELK/Loki 等日志聚合系统采集
@@ -56,11 +79,15 @@ class JsonFormatter(logging.Formatter):
         "filename", "module", "exc_info", "exc_text", "stack_info",
         "lineno", "funcName", "created", "msecs", "relativeCreated",
         "thread", "threadName", "processName", "process",
+        # Python 3.12 给 LogRecord 新增了 taskName（asyncio 任务名）。
+        # 它是 logging 自身的字段而不是业务 extra —— 不排除的话每条日志都会
+        # 多出一个 "taskName": null。此前不可见是因为格式化器本身在抛异常。
+        "taskName",
     }
 
     def format(self, record: logging.LogRecord) -> str:
         entry = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S.%03d"),
+            "ts": _iso_with_millis(self, record),
             "level": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),
@@ -92,6 +119,39 @@ trace.install_log_filter()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     decisions.self_check()
+
+    # ── 场景化配置自检（Step 3）────────────────────────────────────────
+    # 分两类，动作刻意不同（设计文档 §C.3「代码错了就别启动，数据错了就喊出来」）：
+    #   T1 常量类（无 DB）→ 违反 raise，拒绝启动；
+    #   T2 数据类（有 DB）→ 只 WARN + metric，**永不 raise**。
+    # ★ 为什么 T2 不放进 check_capabilities()：那个函数在「图与 wiki 都关」时**提前
+    #   return**（self_check_ext.py:322-325），而本机默认两者全关 —— 放进去等于
+    #   「自检写了一行、永远是绿的」。
+    # ★ 为什么 T2 只在 api 侧：worker 不检索，跑全场景扫描是纯加成本与 DB 压力。
+    from app.database import SessionLocal
+    from app.services.scenario.effective import WIRED_RETRIEVAL_STEP
+    from app.services.scenario.self_check import (
+        check_scenario_constants,
+        check_scenario_data,
+    )
+
+    check_scenario_constants()  # T1：违反即拒绝启动
+
+    # ── 数据层连接预算闸门（Step 5）──
+    # T1：纯算术、无 IO，超预算直接拒绝启动；关闭态不创建任何引擎。
+    from app.infra.db_router import (
+        check_connection_budget,
+        log_db_router_banner,
+        register_from_settings,
+    )
+
+    check_connection_budget()
+    register_from_settings()
+
+    async with SessionLocal() as _scenario_check_session:
+        # T2：返回各判据的命中计数（已由 self_check 内部打点/记日志），此处只兜底
+        await check_scenario_data(_scenario_check_session, max_step=WIRED_RETRIEVAL_STEP)
+
     # LLM 预算校验：窗口上限 / 输出预留 / 模型窗口三者必须对齐。
     # 模型名来自配置（.env），只有这里拿得到，故不放进 decisions.self_check() 内部。
     decisions.check_llm_budget(
@@ -122,6 +182,19 @@ async def lifespan(_: FastAPI):
 
     await check_capabilities()
     await log_capability_banner(role="api")
+
+    # ── chunk 口径分布横幅（Step 4B-1）──────────────────────────────
+    # ★ 异步 + 超时降级（默认 5s，站位值已登记到 placeholders）：
+    #   这条统计是 `chunks` 上的一次全表扫（口径三列无索引，U-4B-7）。既然把它放进了
+    #   启动路径，就必须给启动路径一个**上界** —— 否则「离线动作、不必加索引」这个
+    #   论证不成立（设计 §B.5.2 与 U-4B-7 原本互相矛盾，本实现按"启动期有界成本 +
+    #   超时护栏"解决）。超时/异常都只打提示，**绝不阻塞启动、绝不抛**。
+    from app.services.scenario.needs_reindex import log_needs_reindex_banner
+
+    await log_needs_reindex_banner()
+
+    # ── DB 路由横幅（关闭态必打：这是「开关当时是开还是关」的唯一留痕）──
+    await log_db_router_banner(SessionLocal)
 
     # ── crypto 私钥预热 ────────────────────────────────────
     # 见 app/services/crypto.py::warm_up —— 该模块用同步 Redis 客户端，
@@ -379,3 +452,12 @@ app.include_router(sensitive_words_router, prefix="/api")
 app.include_router(feature_flags_router, prefix="/api")
 app.include_router(metrics_router, prefix="/api")
 app.include_router(prompts_router, prefix="/api")
+# ── Step 4A：场景管理写接口 ─────────────────────────────
+# ★ 漏这一行 = 全部 9 个场景接口不可达，而且**不会报任何错**（import 正确、
+#   应用能起、测试里直接测 service 也全绿）—— 只有对着文档调接口才会发现 404。
+#   守护用例：`tests/scenario/test_step4_routes.py::test_scenarios_router_is_mounted`。
+app.include_router(scenarios_router, prefix="/api")
+# ── Step 4B-1：chunk 口径分布（admin 只读）────────────────────
+# ★ 与 `/api/admin/metrics` 同前缀不同模块：那边是进程内计数，这边是**查库**的
+#   实时口径分布。合进 metrics.py 会让"一个模块两种数据源"，回滚时一起回滚。
+app.include_router(needs_reindex_router, prefix="/api")

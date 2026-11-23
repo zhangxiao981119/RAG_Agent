@@ -20,6 +20,7 @@ from app.config import decisions
 from app.services import retrieve as retrieve_mod
 from app.services.retrieve import RetrievalService
 from app.services.rerank import RerankTimeout
+from tests.fake_settings import fake_settings
 
 TENANT = uuid.uuid4()
 KB = uuid.UUID(int=1)
@@ -134,7 +135,7 @@ def svc(monkeypatch: pytest.MonkeyPatch):
             retrieve_mod,
             "get_settings",
             # graph_enabled=False：本文件测章节补全时序，开图会多一条图 SQL
-            lambda: SimpleNamespace(
+            lambda: fake_settings(
                 rerank_enabled=True, graph_enabled=False, wiki_enabled=False
             ),
         )

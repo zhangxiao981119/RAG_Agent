@@ -26,6 +26,7 @@ from app.services.graph.base import GraphNeighbor
 from app.services.graph.recall import GraphRecallOutcome
 from app.services.retrieve import RetrievalService
 from app.services.retrieve.base import RetrievedChunk
+from tests.retrieve.conftest import fake_settings
 
 TENANT = uuid.uuid4()
 KB = uuid.UUID(int=1)
@@ -130,10 +131,15 @@ def svc(monkeypatch: pytest.MonkeyPatch):
     def _make(h: Harness, *, graph_enabled: bool):
         monkeypatch.setattr(retrieve_mod, "get_embedding_service", lambda: FakeEmbedding())
         monkeypatch.setattr(retrieve_mod, "get_rerank_service", lambda: FakeRerank())
+        # ★ 假配置由 `fake_settings()` 造（以 Settings 的**类默认值**为底，只覆盖
+        #   本文件关心的四个字段）。原先这里是 `SimpleNamespace(...)` 只列 4 个字段，
+        #   于是 Step 3 一加 `graph_recall_selective` 读取，本文件 7 条用例就以
+        #   `AttributeError` 变红 —— 而那个报错与本文件要证明的东西毫无关系。
+        #   覆盖字段值的语义原样保留：rerank 关、graph 由参数决定、超时 800ms、wiki 关。
         monkeypatch.setattr(
             retrieve_mod,
             "get_settings",
-            lambda: SimpleNamespace(
+            lambda: fake_settings(
                 rerank_enabled=False,
                 graph_enabled=graph_enabled,
                 graph_retrieve_timeout_ms=800,

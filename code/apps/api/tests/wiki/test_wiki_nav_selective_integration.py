@@ -37,6 +37,7 @@ from app.config.wiki_profile import WikiProfile
 from app.services import retrieve as retrieve_mod
 from app.services.retrieve import RetrievalService
 from app.services.wiki.navigate import WikiNavPage, load_wiki_nav_page, select_nav_terms
+from tests.fake_settings import fake_settings
 
 # ── 真库 env 开关（仅 DB 用例使用；缺省 → fixture 内 skip，不做连接）─────────
 WIKI_NAV_ACL_DB_URL = os.environ.get("WIKI_NAV_ACL_DB_URL")
@@ -400,7 +401,7 @@ def _settings(monkeypatch: pytest.MonkeyPatch, *,
     monkeypatch.setattr(
         retrieve_mod,
         "get_settings",
-        lambda: SimpleNamespace(
+        lambda: fake_settings(
             rerank_enabled=False,
             graph_enabled=False,
             graph_retrieve_timeout_ms=800,

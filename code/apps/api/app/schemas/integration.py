@@ -27,6 +27,9 @@ class IntegrationApplicationOut(BaseModel):
     daily_message_limit: int
     created_at: datetime
     disabled_at: datetime | None = None
+    # 场景绑定（Step 4）：null = 跟随租户内置场景（= 平台默认）。
+    # 没有这个字段，W7 的结果在响应里不可观测（绑定成功与没绑定看起来一样）。
+    scenario_id: uuid.UUID | None = None
 
 
 class IntegrationApplicationCreated(IntegrationApplicationOut):
@@ -59,6 +62,9 @@ class IntegrationAskResponse(BaseModel):
     message: str | None = None
     usage: dict
     suggestions: list[str]
+    # 本次请求的口径快照（**纯增量，只增不改**，旧客户端忽略未知键即可）。
+    # Step 2 只有 4 个键，见 app/api/integrations.py::_scenario_meta。
+    meta: dict | None = None
 
 
 class IntegrationSearchItem(BaseModel):
@@ -74,3 +80,5 @@ class IntegrationSearchItem(BaseModel):
 
 class IntegrationSearchResponse(BaseModel):
     items: list[IntegrationSearchItem]
+    # 同 IntegrationAskResponse.meta
+    meta: dict | None = None

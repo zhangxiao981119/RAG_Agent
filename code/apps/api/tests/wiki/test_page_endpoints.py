@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 import app.api.wiki as wiki_mod
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.main import app
+from tests.fake_settings import fake_settings
 
 KB_ID = uuid.uuid4()
 PAGE_ID = uuid.uuid4()
@@ -77,12 +78,14 @@ class _FakeSession:
     def __init__(self, results: list) -> None:
         self._results = list(results)
         self.sql: list[str] = []
+        self.gets: list = []
 
     async def execute(self, stmt, params=None):
         self.sql.append(str(stmt))
         return _FakeResult(self._results.pop(0))
 
     async def get(self, model, pk):
+        self.gets.append((model, pk))
         return self._results.pop(0)
 
     def last_sql(self) -> str:
@@ -103,9 +106,15 @@ class _Harness:
         if wiki_enabled:
             # wiki.py 在请求期读 get_settings().wiki_enabled —— 按请求打桩
             self._orig = wiki_mod.get_settings
-            wiki_mod.get_settings = lambda: SimpleNamespace(wiki_enabled=True)
+            wiki_mod.get_settings = lambda: fake_settings(wiki_enabled=True)
         else:
-            self._orig = None
+            # ★ 关闭分支必须**同样**打桩，不能只置 `self._orig = None`：
+            #   真配置读的是 `.env`，本机/CI 一旦把 WIKI_ENABLED 设成 true，
+            #   关闭态用例里的端点就不再走 404 早退，而是真去查库 —— `_FakeSession`
+            #   按序出栈，空列表 `pop(0)` 抛 IndexError，报错落在与开关毫无关系的地方。
+            #   「关闭态要用什么配置」必须由用例自己声明，不能由 `.env` 决定。
+            self._orig = wiki_mod.get_settings
+            wiki_mod.get_settings = lambda: fake_settings(wiki_enabled=False)
 
     def close(self):
         app.dependency_overrides.clear()
@@ -125,19 +134,27 @@ def _client() -> TestClient:
 
 
 def test_disabled_wiki_returns_404_on_both_endpoints():
-    """WIKI_ENABLED=false（默认）：两端点 404，且 MUST NOT 触碰数据库。"""
-    session = _FakeSession(results=[])
-    app.dependency_overrides[get_current_user] = lambda: _user()
-    app.dependency_overrides[get_db] = lambda: session
+    """WIKI_ENABLED=false（默认）：两端点 404，且 MUST NOT 触碰数据库。
+
+    ★ 走 `_Harness(wiki_enabled=False)` 而不是手搭 `_FakeSession`：开关必须由用例
+      自己钉死。曾经这里没打桩，读到 `.env` 的 `WIKI_ENABLED=true` 后端点跳过 404
+      早退去查库 —— 404 断言变成 500 只是表象，真正的信号是「关闭态发了 SQL」。
+    ★ 怎么证明是「走 404 早退」而不是「碰巧没崩」：`_FakeSession` 的 `results=[]`
+      意味着任何一次 `execute`/`get` 都会 `IndexError`（→ 500 而不是 404），
+      所以 `sql == []` 与 `gets == []` 两条断言同时成立 + 状态码 404 三者一起，
+      才锁住「一行 DB 操作都没发生」。
+    """
+    h = _Harness(_user(), results=[], wiki_enabled=False)
     try:
         client = _client()
         r1 = client.get(f"/api/kbs/{KB_ID}/wiki/pages")
         r2 = client.get(f"/api/wiki/pages/{PAGE_ID}")
     finally:
-        app.dependency_overrides.clear()
+        h.close()
     assert r1.status_code == 404
     assert r2.status_code == 404
-    assert session.sql == [], "关闭态 MUST NOT 发出任何 SQL"
+    assert h.session.sql == [], "关闭态 MUST NOT 发出任何 SQL"
+    assert h.session.gets == [], "关闭态 MUST NOT 用 session.get 取任何行"
 
 
 # ── 列表端点 ────────────────────────────────────────────────────

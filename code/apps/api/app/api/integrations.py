@@ -19,8 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.chat import _chat_ask_impl, _integration_kb_ids
 from app.api.deps import CurrentUser, get_current_user, get_db, require_admin
 from app.api.rate_limit import check_integration_rate_limit
+from app.api.scenarios import to_http_exception
+from app.config import decisions
+from app.infra import trace
 from app.models import IntegrationApplication, KnowledgeBase
 from app.schemas.chat import ChatAskRequest
+from app.schemas.scenario import ScenarioBindingUpdate
 from app.schemas.integration import (
     IntegrationApplicationCreate,
     IntegrationApplicationCreated,
@@ -33,6 +37,9 @@ from app.schemas.integration import (
 )
 from app.services import audit
 from app.services.retrieve import get_retrieval_service
+from app.services.scenario import ScenarioError, ScenarioSnapshot, resolve_scenario
+from app.services.scenario import write_service as scenario_write_service
+from app.services.scenario.write_errors import WriteError
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/integrations", tags=["integrations"])
@@ -61,6 +68,9 @@ def _application_out(application: IntegrationApplication) -> IntegrationApplicat
         daily_message_limit=application.daily_message_limit,
         created_at=application.created_at,
         disabled_at=application.disabled_at,
+        # ★ 必须回显：W7 只有 200 + 空 body 的话，「绑定成功」与「绑定请求丢了」
+        #   在客户端完全一样。这也是前端刷新列表后能显示当前绑定的唯一来源。
+        scenario_id=application.scenario_id,
     )
 
 
@@ -193,6 +203,83 @@ async def disable_application(
     return _application_out(application)
 
 
+@router.put(
+    "/applications/{application_id}/scenario",
+    response_model=IntegrationApplicationOut,
+)
+async def bind_application_scenario(
+    application_id: uuid.UUID,
+    payload: ScenarioBindingUpdate,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(get_db),
+) -> IntegrationApplicationOut:
+    """W7：把应用绑定到某个场景（`scenario_id=null` = 解绑回内置/平台默认）。
+
+    ★ 为什么用 `PUT` 而不是 `POST /bind`：这个子资源**只有一个字段**且是幂等赋值，
+      `PUT` 的语义（"把该子资源整体设为这个值"）与实现一一对应；`POST /bind`
+      还需要再有一个 `/unbind` 才能表达解绑，于是「解绑」变成另一个需要单独
+      鉴权/审计/测试的入口 —— 两条路径迟早会有一条漏掉前置校验。
+
+    ★ 前置校验在 service 里（`write_service.bind_application`），路由层只做两件事：
+      鉴权 + 错误映射。把「目标场景必须有 published 版本」这类判定写在路由里，
+      将来任何第二个调用方（脚本、迁移、批量导入）都会绕过它。
+    """
+    try:
+        application = await scenario_write_service.bind_application(
+            session,
+            tenant_id=user.tenant_id,
+            user_id=user.user_id,
+            application_id=application_id,
+            scenario_id=payload.scenario_id,
+        )
+    except WriteError as error:
+        raise to_http_exception(error) from error
+    return _application_out(application)
+
+
+async def _resolve_or_reject(
+    session: AsyncSession,
+    principal: "IntegrationPrincipal",
+    requested_kb_ids: list[uuid.UUID],
+) -> ScenarioSnapshot:
+    """解析场景口径；失败转成 HTTP 错误（**fail-closed，绝不退回默认场景**）。
+
+    `diagnostic`（含 scenario_id / tenant_id / status）只进日志，
+    响应体只有 `ScenarioError.message` 的固定文案 —— 集成侧是外部系统，
+    不需要知道租户内部 ID 与场景的真实范围。
+    """
+    try:
+        return await resolve_scenario(
+            session,
+            tenant_id=principal.user.tenant_id,
+            application=principal.application,
+            requested_kb_ids=requested_kb_ids,
+        )
+    except ScenarioError as exc:
+        logger.warning(
+            "场景解析失败 code=%s trace_id=%s detail=%s",
+            exc.code.value,
+            trace.get_trace_id(),
+            exc.diagnostic,
+        )
+        raise HTTPException(exc.http_status, exc.message) from exc
+
+
+def _scenario_meta(snapshot: ScenarioSnapshot) -> dict:
+    """响应的 `meta`：Step 2 只填 4 个**当下就能保证为真**的字段。
+
+    ★ 为什么不填其余字段（dna_fingerprint / score_source / use_rerank /
+      policy_applied）：那些值属 Step 4 接线后才有意义，此刻填 None 等于在契约里
+      承诺一个假值。`meta.required` 因此恰为这 4 个键（设计文档 §D.5 B-4）。
+    """
+    return {
+        "scenario_key": snapshot.scenario_key,
+        "scenario_version": snapshot.version,
+        "scenario_fingerprint": snapshot.fingerprint,
+        "contract_version": decisions.CONTRACT_VERSION,
+    }
+
+
 async def _consume_ask_response(response) -> IntegrationAskResponse:
     """消费共用问答事件流并转换为同步 JSON，不复制 RAG 主链路。"""
     conversation_id: uuid.UUID | None = None
@@ -267,6 +354,11 @@ async def integration_ask(
     session: AsyncSession = Depends(get_db),
 ) -> IntegrationAskResponse:
     await check_integration_rate_limit(principal.user, principal.application)
+    # 场景解析在**进入共用问答链路之前**：失败必须是 400/500，而不是流里的半截错误。
+    # `snapshot.kb_ids` 与 `payload.kb_ids` 逐元素相同（场景不额外限制请求集合），
+    # 因此下方 `_chat_ask_impl` 内部的 `_integration_kb_ids` 结果与改动前完全一致 ——
+    # 不动共用链路是零影响承诺 Z-3 的实现方式。
+    snapshot = await _resolve_or_reject(session, principal, payload.kb_ids)
     response = await _chat_ask_impl(
         ChatAskRequest(
             question=payload.question,
@@ -276,8 +368,15 @@ async def integration_ask(
         principal.user,
         session,
         integration=principal.application,
+        # 场景策略透传给共用问答链路：`/integrations/ask` 走的是
+        # `_chat_ask_impl → retrieve_chain`，不传这里等于 ask 接口拿不到策略
+        # （只有 search 生效）—— 这种「一半生效」是最难发现的接线错误。
+        policy=snapshot.policy,
     )
-    return await _consume_ask_response(response)
+    # meta 在消费事件流之后附加：不改 `_consume_ask_response`（共用链路的稳定面）
+    return (await _consume_ask_response(response)).model_copy(
+        update={"meta": _scenario_meta(snapshot)}
+    )
 
 
 @router.post("/search", response_model=IntegrationSearchResponse)
@@ -289,7 +388,8 @@ async def integration_search(
     user = principal.user
     application = principal.application
     await check_integration_rate_limit(user, application)
-    effective_kb_ids = _integration_kb_ids(payload.kb_ids, user, application)
+    snapshot = await _resolve_or_reject(session, principal, payload.kb_ids)
+    effective_kb_ids = _integration_kb_ids(list(snapshot.kb_ids), user, application)
     if not effective_kb_ids:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "FORBIDDEN")
 
@@ -301,6 +401,9 @@ async def integration_search(
             effective_kb_ids,
             user.clearance,
             user.subjects,
+            # 场景策略：本 handler 手里已有 snapshot（`_resolve_or_reject` 的返回值），
+            # 此处传入是**零新增 IO**
+            policy=snapshot.policy,
         )
     except Exception as exc:
         logger.exception("集成检索失败")
@@ -335,4 +438,4 @@ async def integration_search(
             "result_count": len(items),
         },
     )
-    return IntegrationSearchResponse(items=items)
+    return IntegrationSearchResponse(items=items, meta=_scenario_meta(snapshot))

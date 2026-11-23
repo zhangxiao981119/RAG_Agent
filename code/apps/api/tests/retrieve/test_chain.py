@@ -236,13 +236,21 @@ def test_merge_accumulates_stage_ms_and_path_stats():
 # ── retrieve_chain 编排 ────────────────────────────────────────────
 
 
-def _service_with_stub(queries: list[str], sessions: list[int]) -> RetrievalService:
-    """返回一个 retrieve() 被替换成替身的 RetrievalService。"""
-    svc = RetrievalService()
+def _service_with_stub(
+    queries: list[str], sessions: list[int], policies: list | None = None
+) -> RetrievalService:
+    """返回一个 retrieve() 被替换成替身的 RetrievalService。
 
-    async def _stub(sess, query, tenant_id, kb_ids, clearance, subjects):  # noqa: ANN001
+    `policies`（可选）：记录每轮收到的 `policy`，供「链式透传」断言用。
+    本参数默认 None ⇒ 既有 6 个用例的调用形态与断言一字未改。
+    """
+    svc = RetrievalService()
+    seen_policies = policies if policies is not None else []
+
+    async def _stub(sess, query, tenant_id, kb_ids, clearance, subjects, *, policy=None):  # noqa: ANN001
         sessions.append(id(sess))
         queries.append(query)
+        seen_policies.append(policy)
         return _round([_chunk(uuid.uuid4(), 0.9)])
 
     svc.retrieve = _stub

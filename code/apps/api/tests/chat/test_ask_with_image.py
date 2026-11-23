@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -26,6 +25,7 @@ from app.services.generate import StreamDelta
 from app.services.multimodal import VisionError, VisionNoContentError
 from app.services.parse import ParsedBlock
 from app.services.retrieve.base import RetrievalResult, RetrievedChunk
+from tests.fake_settings import fake_settings
 
 _TENANT_ID = uuid.uuid4()
 _USER_ID = uuid.uuid4()
@@ -126,7 +126,7 @@ class _FakeRetrieval:
     def __init__(self) -> None:
         self.queries: list[str] = []
 
-    async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects):  # noqa: ANN001
+    async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects, *, policy=None):  # noqa: ANN001
         self.queries.append(query)
         return RetrievalResult(
             chunks=[_chunk()],
@@ -135,9 +135,10 @@ class _FakeRetrieval:
         )
 
     async def retrieve_chain(self, session, query, tenant_id, kb_ids, clearance, subjects,
-                             rewrite_score=None):  # noqa: ANN001
+                             rewrite_score=None, *, policy=None):  # noqa: ANN001
         # 单趟语义替身：本 WU 关注模态行为，链式编排由 tests/retrieve/test_chain.py 覆盖
-        result = await self.retrieve(session, query, tenant_id, kb_ids, clearance, subjects)
+        result = await self.retrieve(session, query, tenant_id, kb_ids, clearance, subjects,
+                                     policy=policy)
         result.chain_mode = "single"
         return result
 
@@ -351,7 +352,7 @@ def test_ask_oversized_data_url_400(harness, monkeypatch):
     # 把单图上限压到 1MB，构造解码后 >1MB 的 base64 载荷
     monkeypatch.setattr(
         chat_mod, "get_settings",
-        lambda: SimpleNamespace(max_upload_mb=1),
+        lambda: fake_settings(max_upload_mb=1),
     )
     big_payload = "A" * (1024 * 1024 * 2)  # base64 解码后约 1.5MB
     resp = harness.client.post(

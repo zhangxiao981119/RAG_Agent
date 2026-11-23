@@ -26,6 +26,7 @@ from app.services.wiki.build import (
     compute_content_hash,
     generate_page_content,
 )
+from tests.fake_settings import fake_settings
 
 TENANT = uuid.uuid4()
 KB = uuid.uuid4()
@@ -111,7 +112,7 @@ def _stub_profile(monkeypatch):
     )
     monkeypatch.setattr(
         build_module, "get_settings",
-        lambda: SimpleNamespace(wiki_input_max_chars=10**9),
+        lambda: fake_settings(wiki_input_max_chars=10**9),
     )
 
 

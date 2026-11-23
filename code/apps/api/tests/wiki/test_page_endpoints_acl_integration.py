@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 import uuid
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -35,6 +34,7 @@ from sqlalchemy.pool import NullPool
 import app.api.wiki as wiki_mod
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.main import app
+from tests.fake_settings import fake_settings
 
 _DB_URL = os.getenv("WIKI_ACL_DB_URL", "").strip()
 
@@ -228,7 +228,7 @@ async def test_wiki_acl_is_enforced_by_real_postgres():
         }
         app.dependency_overrides[get_db] = _override_get_db
         app.dependency_overrides[get_current_user] = lambda: holder["user"]
-        wiki_mod.get_settings = lambda: SimpleNamespace(wiki_enabled=True)
+        wiki_mod.get_settings = lambda: fake_settings(wiki_enabled=True)
 
         transport = httpx.ASGITransport(app=app)  # 不发送 lifespan scope
         async with httpx.AsyncClient(transport=transport, base_url="http://acl-probe") as client:

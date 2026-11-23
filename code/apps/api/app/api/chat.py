@@ -18,12 +18,17 @@ import json
 import logging
 import re
 import uuid
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+if TYPE_CHECKING:
+    # 只为类型标注导入：`chat` → `services.scenario` 的运行时导入没有必要
+    # （本模块不在 import 期需要那个类），且能避免将来出现 import 环。
+    from app.services.scenario.snapshot import ScenarioPolicy
 
 from app.api.deps import CurrentUser, get_current_user, get_db
 from app.api.rate_limit import check_chat_rate_limit
@@ -270,8 +275,18 @@ async def _chat_ask_impl(
     user: CurrentUser,
     session: AsyncSession,
     integration: IntegrationApplication | None = None,
+    policy: "ScenarioPolicy | None" = None,
 ) -> StreamingResponse:
-    """Web 与集成问答共用主链路，集成模式额外约束会话、权限和配额。"""
+    """Web 与集成问答共用主链路，集成模式额外约束会话、权限和配额。
+
+    `policy` 是场景策略覆盖集（稀疏；`None` = 全跟随平台）。
+    ★ 为什么由调用方传进来而不是本函数自己解析：解析需要
+      `resolve_scenario` + session + 应用身份，而 `/chat/ask`（Web 端）根本没有
+      应用身份 —— 它走默认 `None`，行为与改动前逐字节一致。集成侧的 handler 手里
+      已经有 `snapshot`（`_resolve_or_reject` 的返回值），零新增 IO。
+    ★ 只收 `ScenarioPolicy` 不收 `ScenarioSnapshot`：快照带着已过门禁的 `kb_ids`，
+      传进来就等于给主链路开了第二条「取授权范围」的路径（设计文档 §A.2）。
+    """
     async def audit_record(tenant_id, user_id, action, **kwargs) -> None:
         detail = dict(kwargs.pop("detail", None) or {})
         if integration is not None:
@@ -679,6 +694,7 @@ async def _chat_ask_impl(
                         user.clearance,
                         user.subjects,
                         rewrite_score=rewrite_score,  # 复杂度信号（复用改写分）
+                        policy=policy,                # 场景策略（None = 全跟随平台）
                     )
                 except Exception:
                     logger.exception("检索失败")

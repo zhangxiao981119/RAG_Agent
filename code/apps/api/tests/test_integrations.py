@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -28,6 +27,7 @@ from app.services import quota as quota_service
 from app.services.generate import StreamDelta
 from app.services.quota import DegradationPlan
 from app.services.retrieve.base import RetrievalResult, RetrievedChunk
+from tests.fake_settings import fake_settings
 
 _TENANT_ID = uuid.uuid4()
 _USER_ID = uuid.uuid4()
@@ -223,7 +223,7 @@ async def test_sync_ask_consumes_shared_stream_and_uses_principal(monkeypatch):
     async def _rate_limit(user, application):
         captured["rate_limit"] = (user, application)
 
-    async def _ask_impl(payload, user, session, integration=None):
+    async def _ask_impl(payload, user, session, integration=None, policy=None):
         captured["ask"] = (payload, user, session, integration)
 
         async def _events():
@@ -298,8 +298,10 @@ async def test_search_uses_real_acl_and_records_application(monkeypatch):
     audited = []
 
     class _Retrieval:
-        async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects):
+        async def retrieve(self, session, query, tenant_id, kb_ids, clearance, subjects,
+                           *, policy=None):
             captured["retrieve"] = (query, tenant_id, kb_ids, clearance, subjects)
+            captured["policy"] = policy
             return RetrievalResult(chunks=[_chunk()])
 
     async def _rate_limit(user, application):
@@ -374,7 +376,8 @@ async def test_integration_flow_isolates_memory_and_applies_dual_quota_and_audit
 
     class _Retrieval:
         async def retrieve_chain(
-            self, session, query, tenant_id, kb_ids, clearance, subjects, rewrite_score=None
+            self, session, query, tenant_id, kb_ids, clearance, subjects,
+            rewrite_score=None, *, policy=None
         ):
             return RetrievalResult(chunks=[_chunk()], chain_mode="single")
 
@@ -533,7 +536,7 @@ class _RateRedis:
 @pytest.mark.asyncio
 async def test_integration_rate_limit_checks_application_and_user(monkeypatch):
     monkeypatch.setattr(
-        rate_limit_mod, "get_settings", lambda: SimpleNamespace(chat_rate_limit_per_minute=1)
+        rate_limit_mod, "get_settings", lambda: fake_settings(chat_rate_limit_per_minute=1)
     )
     redis = _RateRedis(counts=[2, 1])
 

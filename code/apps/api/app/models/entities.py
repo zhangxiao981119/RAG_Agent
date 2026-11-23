@@ -474,6 +474,13 @@ class IntegrationApplication(Base):
     # 高熵随机密钥只保存 SHA-256 哈希，明文仅在创建响应中出现一次。
     key_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     kb_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    # 场景绑定（迁移 0028）。NULL **不是「没有场景」而是「内置默认场景」**：
+    # 0027 之前的存量应用全是 NULL，回填不改变任何行为且不可逆，故不回填
+    # （设计文档 §A.4）。ON DELETE RESTRICT 是有意的：删场景不该让一批应用
+    # 悄悄退回默认口径，必须先在应用层摘掉引用。
+    scenario_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("scenarios.id", ondelete="RESTRICT")
+    )
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
     rate_limit_per_minute: Mapped[int] = mapped_column(Integer, nullable=False)
     daily_token_limit: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -489,6 +496,7 @@ class IntegrationApplication(Base):
         CheckConstraint("daily_message_limit > 0", name="ck_integration_app_message_positive"),
         UniqueConstraint("tenant_id", "name", name="uq_integration_app_tenant_name"),
         Index("idx_integration_app_tenant", "tenant_id", "status"),
+        Index("idx_integration_app_scenario", "tenant_id", "scenario_id"),
     )
 
 
@@ -519,6 +527,188 @@ class IntegrationConversation(Base):
             "user_id",
             "created_at",
         ),
+    )
+
+
+# ── 场景化配置（迁移 0028，Step 1）────────────────────────────────────
+# 结构决策 D-A1：scenarios 只存**身份**，内容（policy / kb_ids / dna）全在
+# scenario_versions。单表内联会出现「场景的内容」与「已发布版本的内容」两份
+# 真源，改一处漏一处；归一化让漂移不可能发生（缓存吸收多一次 join 的成本）。
+
+
+class Scenario(Base):
+    """场景身份行（一组「检索策略 + 知识集合」的命名绑定）。
+
+    ★ 每租户恰好 ≤1 行 is_builtin=true（部分唯一索引 uq_scenarios_one_builtin）：
+      内置场景由迁移创建、内容不可编辑，其已发布版本 policy MUST 为空覆盖集 ——
+      于是「解析内置场景」与「解析平台默认」在定义上逐字段相等。
+    ★ db_binding 本期只建列不读列（Step 6 起生效）：写入非 NULL 时由启动自检
+      WARN，避免「配了不生效」的静默失败（设计文档 §A.2 决策 D-A4）。
+    """
+
+    __tablename__ = "scenarios"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    # 对外稳定标识：凭证与运维文书写 key 而不写物理 ID（配置里不出现 UUID）
+    scenario_key: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    is_builtin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    # 分库地址（Step 6 起生效，当前写入无效 —— 见类 docstring）
+    db_binding: Mapped[str | None] = mapped_column(Text)
+    description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # 缓存失效依据（ScenarioRow 进程内缓存的 TTL 兜底，设计文档 §C.7）
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active','disabled')", name="ck_scenarios_status"),
+        CheckConstraint(
+            "scenario_key ~ '^[a-z][a-z0-9_]{1,63}$'", name="ck_scenarios_key_format"
+        ),
+        CheckConstraint("length(name) BETWEEN 1 AND 128", name="ck_scenarios_name_len"),
+        CheckConstraint(
+            "db_binding IS NULL OR db_binding ~ '^kb_[a-z0-9_]{2,40}$'",
+            name="ck_scenarios_db_binding_format",
+        ),
+        UniqueConstraint("tenant_id", "scenario_key", name="uq_scenarios_tenant_key"),
+        # 部分唯一索引：CHECK 表达不了「聚合唯一」，只能在索引层表达
+        Index(
+            "uq_scenarios_one_builtin",
+            "tenant_id",
+            unique=True,
+            postgresql_where=text("is_builtin"),
+        ),
+    )
+
+
+class ScenarioVersion(Base):
+    """场景内容 + 版本（生命周期 draft → validated → published → archived）。
+
+    ★ 同一场景同一时刻至多一行 published —— 由部分唯一索引
+      uq_scenario_versions_one_published 保证，是**数据库事实**而非应用纪律。
+    ★ policy 是**稀疏覆盖集**（只存显式改过的键）：缺键 = 跟随平台。
+      键闭集由 ck_scenario_versions_policy_keyset 兜底；未接线的键写进来就是
+      静默 no-op，因此必须在写入时被拒绝（主校验在 app 层 policy_spec）。
+    ★ dna_declared 是**声明镜像**：仅用于审计与漂移检测，
+      resolver **绝不读它** —— DNA 只从三个 current_*_profile() 读（fail-closed）。
+    ★ checksum = sha256(规范序列化)[:16]，与迁移内的 compute_checksum 同源，
+      由 tests/scenario 的 checksum 用例锁死。
+    """
+
+    __tablename__ = "scenario_versions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # 冗余但必要：所有查询都带租户条件，不靠 join 施加隔离（障碍 6）
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    scenario_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("scenarios.id", ondelete="CASCADE"), nullable=False
+    )
+    # 单调递增整数而非时间戳：可读、可 diff、可 pin
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default="draft")
+    policy: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    kb_ids: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    # fail-closed 的关键列：unrestricted 只允许内置场景，explicit 必须非空
+    binding_mode: Mapped[str] = mapped_column(Text, nullable=False, server_default="explicit")
+    dna_declared: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    change_note: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('draft','validated','published','archived')",
+            name="ck_scenario_versions_state",
+        ),
+        CheckConstraint("version >= 1", name="ck_scenario_versions_version_positive"),
+        CheckConstraint(
+            "binding_mode IN ('explicit','unrestricted')",
+            name="ck_scenario_versions_binding_mode",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(policy) = 'object'", name="ck_scenario_versions_policy_object"
+        ),
+        CheckConstraint(
+            "policy - ARRAY['recall_top_k','rerank_enabled',"
+            "'relevance_threshold_vector','relevance_threshold_rerank']::text[] = '{}'::jsonb",
+            name="ck_scenario_versions_policy_keyset",
+        ),
+        CheckConstraint(
+            "(policy->>'recall_top_k')::int BETWEEN 1 AND 1000",
+            name="ck_scenario_versions_policy_recall_top_k",
+        ),
+        CheckConstraint(
+            "(policy->>'relevance_threshold_vector')::float8 BETWEEN 0.0 AND 1.0",
+            name="ck_scenario_versions_policy_threshold_vector",
+        ),
+        CheckConstraint(
+            "(policy->>'relevance_threshold_rerank')::float8 BETWEEN 0.0 AND 1.0",
+            name="ck_scenario_versions_policy_threshold_rerank",
+        ),
+        CheckConstraint(
+            "policy->'rerank_enabled' IS NULL "
+            "OR jsonb_typeof(policy->'rerank_enabled') = 'boolean'",
+            name="ck_scenario_versions_policy_rerank_bool",
+        ),
+        # 防 fail-open：空 kb_ids 若表示「不限制」，则「忘配」与「故意放开」无法区分
+        CheckConstraint(
+            "(binding_mode = 'explicit' AND jsonb_array_length(kb_ids) > 0) "
+            "OR (binding_mode = 'unrestricted' AND kb_ids = '[]'::jsonb)",
+            name="ck_scenario_versions_binding_consistent",
+        ),
+        CheckConstraint(
+            "NOT jsonb_path_exists(kb_ids, '$[*] ? (@.type() != \"string\")')",
+            name="ck_scenario_versions_kb_ids_strings",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(dna_declared) = 'object'",
+            name="ck_scenario_versions_dna_object",
+        ),
+        CheckConstraint(
+            "dna_declared ? 'embedding_text_version' AND dna_declared ? 'chunker_version' "
+            "AND dna_declared ? 'graph_prompt_version' AND dna_declared ? 'wiki_prompt_version' "
+            "AND dna_declared ? 'env_bound'",
+            name="ck_scenario_versions_dna_required_keys",
+        ),
+        CheckConstraint(
+            "dna_declared - ARRAY['embedding_text_version','chunker_version',"
+            "'graph_prompt_version','wiki_prompt_version','env_bound']::text[] = '{}'::jsonb",
+            name="ck_scenario_versions_dna_keyset",
+        ),
+        CheckConstraint(
+            "checksum ~ '^[0-9a-f]{16}$'", name="ck_scenario_versions_checksum_format"
+        ),
+        CheckConstraint(
+            "(state <> 'published' OR published_at IS NOT NULL) "
+            "AND (state <> 'validated' OR validated_at IS NOT NULL) "
+            "AND (state <> 'archived' OR archived_at IS NOT NULL)",
+            name="ck_scenario_versions_state_timestamps",
+        ),
+        UniqueConstraint(
+            "tenant_id", "scenario_id", "version", name="uq_scenario_versions_scenario_version"
+        ),
+        Index(
+            "uq_scenario_versions_one_published",
+            "scenario_id",
+            unique=True,
+            postgresql_where=text("state = 'published'"),
+        ),
+        Index("idx_scenario_versions_lookup", "tenant_id", "scenario_id", "state", "version"),
     )
 
 

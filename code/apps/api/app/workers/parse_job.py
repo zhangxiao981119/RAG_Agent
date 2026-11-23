@@ -630,7 +630,14 @@ class WorkerSettings:
         """
         from app.config.capabilities import log_capability_banner
         from app.config.self_check_ext import check_capabilities
+        from app.services.scenario.self_check import check_scenario_constants
 
         decisions.self_check()
+        # 场景化配置的**常量类**自检（Step 3）：纯内存、无 DB，api 与 worker 两侧都跑。
+        # ★ 只跑常量类（T1），不跑数据类（T2）：worker 不检索、不读任何策略，
+        #   跑全场景扫描是纯加启动成本与 DB 压力，且它没有一条路径能从那结论受益。
+        # ★ 两侧都跑 T1 的理由：T1 查的是「规格表是否自洽」。两侧结论不同是最难查的
+        #   一类问题（同一份代码两台机器行为不一致），而它的成本近零。
+        check_scenario_constants()
         await check_capabilities()
         await log_capability_banner(role="worker")

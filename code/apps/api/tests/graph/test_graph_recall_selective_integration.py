@@ -43,6 +43,7 @@ from app.services.graph.postgres_store import PostgresGraphStore, get_graph_stor
 from app.services.graph.recall import GraphRecallOutcome, recall_by_graph
 from app.services.retrieve import RetrievalService
 from app.services.retrieve.base import RetrievedChunk
+from tests.fake_settings import fake_settings
 
 TENANT = uuid.UUID(int=9)
 KB = uuid.UUID(int=1)
@@ -323,7 +324,7 @@ def _make_svc(monkeypatch, *, graph_enabled: bool, graph_recall_selective: bool)
     monkeypatch.setattr(
         retrieve_mod,
         "get_settings",
-        lambda: SimpleNamespace(
+        lambda: fake_settings(
             rerank_enabled=False,
             graph_enabled=graph_enabled,
             graph_recall_selective=graph_recall_selective,

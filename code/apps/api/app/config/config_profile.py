@@ -75,6 +75,12 @@ CROSS_ROLE_FIELDS: Final[tuple[str, ...]] = (
     # 第 4 步 wiki 导航在线超时：api 侧消费（worker 不跑检索，但两侧取不同值
     # 会让「同一套配置」的指纹比对失真 —— 与 graph_retrieve_timeout_ms 同款判据）。
     "wiki_nav_timeout_ms",
+    # 数据层路由（Step 5）：api 开 / worker 关 → api 检索查场景库、worker 解析写控制库，
+    # 新文档永远检不到；键集不同 → 同一份 .env 派生两个「库位宇宙」，一侧 500。
+    # ★ 只放键集，不放 DSN 值：DSN 含凭据，进指纹就等于把「凭据变更」的强度
+    #   绑到 12 位 sha1 上 —— 没必要；键集已足够回答「两侧是不是同一个库位宇宙」。
+    "scene_db_split_enabled",
+    "scene_db_keys",
 )
 """跨角色必须一致的字段白名单 —— `config_fingerprint` **只**对这份子集求指纹。
 
@@ -141,6 +147,17 @@ def runtime_config_snapshot() -> dict:
         "wiki_generate_timeout_seconds": s.wiki_generate_timeout_seconds,
         "wiki_input_max_chars": s.wiki_input_max_chars,
         "wiki_nav_timeout_ms": s.wiki_nav_timeout_ms,
+        # ── 数据层路由（Step 5）──
+        # ★ 只放键名与**逐值脱敏**后的 DSN：DSN 含账号密码，MUST NOT 明文进日志/落库
+        #   （见模块 docstring 的脱敏纪律）。脱敏后仍保留 host:port，
+        #   足以判断「两次运行是不是同一个实例」。
+        "scene_db_split_enabled": s.scene_db_split_enabled,
+        "scene_db_keys": sorted(s.scene_db_dsn),
+        "scene_db_dsn_redacted": {k: _redact_url(v) for k, v in s.scene_db_dsn.items()},
+        "db_max_connections_for_budget": s.db_max_connections_for_budget,
+        "db_conn_reserved": s.db_conn_reserved,
+        "db_worker_conn_total": s.db_worker_conn_total,
+        "db_replicas_expected": s.db_replicas_expected,
     }
 
 

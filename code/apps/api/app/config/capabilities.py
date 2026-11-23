@@ -28,7 +28,7 @@ from typing import Final
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import decisions
+from app.config import decisions, placeholders
 from app.config.config_profile import config_fingerprint, runtime_config_snapshot
 from app.config.graph_profile import current_graph_profile
 from app.config.settings import get_settings
@@ -352,6 +352,15 @@ def _render_text(
             f" 图规模                : 实体 {stats['entities']}"
             f" · 关系 {stats['relations']}"
         )
+
+    # ── 站位值（未标定的常量）──
+    # ★ 无论图/wiki 开关如何，**无条件**打印：站位值的危害不是「不准」，而是
+    #   「没人知道它不准」。项目里已有若干站位值只写在 docstring 里，没人会在启动时
+    #   看到；横幅是唯一会被每个运维看见的位置（S-6 的可执行形态）。
+    # ★ 文案取 `placeholders.render_line`，与登记表同源，不在这里手抄常量名。
+    _placeholder_line = placeholders.render_line("scenario")
+    if _placeholder_line:
+        lines.append(f" {_placeholder_line}")
 
     lines.append(_SUB)
     if graph_enabled or wiki_enabled:

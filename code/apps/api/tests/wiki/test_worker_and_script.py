@@ -26,6 +26,7 @@ import pytest
 
 import app.workers.graph_job as graph_job
 from app.services.wiki import build as build_module
+from tests.fake_settings import fake_settings
 
 API_ROOT = Path(__file__).resolve().parents[2]
 
@@ -47,7 +48,7 @@ def test_run_wiki_build_disabled_executes_nothing(monkeypatch):
     """WIKI_ENABLED=false → 返回 "disabled"；document_id 连 UUID 都不是也不许抛
     （抛 ValueError = 代码走到了门卫之后，违反"一行不执行"契约）。"""
     monkeypatch.setattr(
-        graph_job, "get_settings", lambda: SimpleNamespace(wiki_enabled=False)
+        graph_job, "get_settings", lambda: fake_settings(wiki_enabled=False)
     )
 
     import asyncio
@@ -145,11 +146,11 @@ def _stub_wiki_env(monkeypatch):
     )
     monkeypatch.setattr(
         build_module, "get_settings",
-        lambda: SimpleNamespace(wiki_input_max_chars=10**9),
+        lambda: fake_settings(wiki_input_max_chars=10**9),
     )
     monkeypatch.setattr(
         graph_job, "get_settings",
-        lambda: SimpleNamespace(wiki_enabled=True, arq_max_attempts=3),
+        lambda: fake_settings(wiki_enabled=True, arq_max_attempts=3),
     )
     return _session_factory
 

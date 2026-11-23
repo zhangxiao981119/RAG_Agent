@@ -23,6 +23,7 @@ from app.config import decisions
 from app.services import retrieve as retrieve_mod
 from app.services.retrieve import RetrievalService
 from app.services.rerank import RerankTimeout
+from tests.fake_settings import fake_settings
 
 TENANT = uuid.uuid4()
 KB = uuid.uuid4()
@@ -115,7 +116,7 @@ def svc(monkeypatch: pytest.MonkeyPatch):
             retrieve_mod,
             "get_settings",
             # graph_enabled=False：本文件测治理加权的阈值口径，图召回与此无关
-            lambda: SimpleNamespace(
+            lambda: fake_settings(
                 rerank_enabled=True, graph_enabled=False, wiki_enabled=False
             ),
         )
@@ -232,3 +233,49 @@ async def test_negative_weight_pulls_under_gate(svc) -> None:
 
     assert result.refused  # (threshold+0.005) - 0.05 = threshold-0.045
     assert result.refuse_reason == "NO_RELEVANT_CONTENT"
+
+
+# ── DQ4B-8：降级可观测（Step 4B-1）──────────────────────────────────────
+#
+# ★ 为什么这条放在本文件：这里有全仓唯一一套「三路召回的 session 替身」
+#   （`FakeSession` 按 SQL 特征分发）。自己再写一套等于第二份口径，
+#   而第二份口径分叉时不会有任何信号（`pg_helpers` 模块 docstring 的同一理由）。
+
+
+@pytest.mark.asyncio
+async def test_vector_empty_metric_is_observable_and_label_stable(svc) -> None:
+    """向量路回 0 行时打 `rag.caliber.vector_empty{keyword_hit="no"}`（降级不再隐形）。
+
+    破坏方式（必须变红）：删掉 `retrieve/__init__.py` 里 `if not vector_rows:` 那段
+    `metrics.incr(...)` → 计数为 0、序列键不存在 → 两条断言都红。
+
+    ★ 为什么这条重要（F-18 / DQ4B-8）：换模型或改向量文本公式后，旧向量被判为
+      不同构 → 向量路空集 → 主检索退化为仅关键词。这是
+      `DNA与Policy口径对照表-v1.md:14` 明确写为**预期行为**的降级路径，
+      但在此之前它**完全不可见**：本模块 30 余处打点没有一条与"某路回 0 行"有关。
+      没有它，运维只能从"答案变差了"倒推。
+
+    ★ 为什么这里断言**标签集**而不只是数值：`metrics._counter()` 只按 name 缓存，
+      首次调用时的标签集就固定下来。若第一处调用不带 `keyword_hit`、后来某处带上，
+      prometheus 客户端会直接 ValueError（进程内异常，且只在特定请求序列下出现）。
+      所以"永远带同一个标签"这件事必须被钉住。
+    """
+    from app.infra import metrics as metrics_mod
+
+    metrics_mod.reset()
+    result = await _retrieve(svc(Harness([])))
+    assert result.refused, "三路全空必须拒绝，而不是编一个答案"
+
+    assert metrics_mod.get("rag.caliber.vector_empty", keyword_hit="no") == 1, (
+        "向量路回 0 行没有打点 —— 降级不可观测（F-18）"
+    )
+    keys = [
+        key for key in metrics_mod.snapshot()["counters"] if "vector_empty" in key
+    ]
+    # 序列键形如 `rag_caliber_vector_empty|keyword_hit=no`（`metrics._series_key`
+    # 用 `|k=v` 而不是 prometheus 的 `{k="v"}`；名字里的 `.` 已被 `_normalize` 换成 `_`）。
+    # 只钉两件事，都是这条打点的**契约**：恰好一条序列 + 标签恰好是 `keyword_hit`。
+    assert len(keys) == 1, f"打点缺失或出现了多条序列：{keys}"
+    assert keys[0].endswith("|keyword_hit=no"), (
+        f"标签集不稳定或不符预期：{keys}"
+    )

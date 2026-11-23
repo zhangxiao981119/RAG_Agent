@@ -12,6 +12,12 @@
     python scripts/reindex_embeddings.py             # 重算所有过期 chunk
     python scripts/reindex_embeddings.py --check     # 只统计过期数（过期>0 退出码为 1）
     python scripts/reindex_embeddings.py --dry-run   # 只打印前几条输入，不写入
+
+★ 「过期」的判定谓词**不本文件里**：唯一实现是迁移 0029 的
+  `fn_chunk_reindex_candidates(...)`，本脚本与 `GET /api/admin/needs-reindex`、
+  发布快照、巡检视图都调它。理由写在那个迁移的 docstring 里（I-4B-2）：
+  两处各写一遍 predicate，第一次分叉就会产生「视图说 0 条、脚本说 300 条」，
+  而这类分叉没有任何单一行为用例能同时覆盖两边。
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ import asyncio
 import sys
 import traceback
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import text, update
 
 from app.config.index_profile import current_index_profile
 from app.database import SessionLocal
@@ -31,24 +37,32 @@ from app.services.embedding import get_embedding_service
 
 
 async def _load_stale() -> list:
-    """取出所有口径与当前不一致的 is_latest chunk。"""
+    """取出所有硬口径与当前不一致的 is_latest chunk。
+
+    ★ 谓词来自 `fn_chunk_reindex_candidates`（迁移 0029），**不在这里重写**：
+      视图 / 端点 / 发布快照与 `--check` 门禁必须同源，否则「视图说 0 条、
+      脚本说 300 条」这类分叉无从发现（I-4B-2）。守卫：`T-4B-10`。
+    ★ 本函数只投影重算所需的五列：**判定的形状归函数，取数的列归调用方**。
+    ★ 加了 `ORDER BY` 不是顺手：原实现无排序，行序由堆表决定 → 分批重算时
+      "哪 8 条先进一批"不可复现；一批失败后重跑，批次划分与上次不同 →
+      "上次是哪几条失败"无法还原。确定性排序是零成本的。
+    """
     profile = current_index_profile()
     async with SessionLocal() as session:
         rows = (
             await session.execute(
-                select(
-                    Chunk.id,
-                    Chunk.content,
-                    Chunk.heading_path,
-                    Chunk.token_count,
-                    Chunk.page_no,
-                ).where(
-                    Chunk.is_latest.is_(True),
-                    or_(
-                        Chunk.embedding_model != profile.embedding_model,
-                        Chunk.embedding_text_version != profile.embedding_text_version,
-                    ),
-                )
+                text(
+                    "SELECT c.id, c.content, c.heading_path, c.token_count, c.page_no "
+                    "FROM chunks c "
+                    "JOIN fn_chunk_reindex_candidates(:m, :tv, :cv) f ON f.chunk_id = c.id "
+                    "WHERE f.stale_hard "
+                    "ORDER BY f.chunk_created_at, f.chunk_id"
+                ),
+                {
+                    "m": profile.embedding_model,
+                    "tv": profile.embedding_text_version,
+                    "cv": profile.chunker_version,
+                },
             )
         ).all()
     return list(rows)
@@ -110,11 +124,17 @@ async def main(batch_size: int, dry_run: bool, check: bool) -> int:
                 await session.execute(
                     update(Chunk)
                     .where(Chunk.id == row[0])
+                    # ★ 这里**只**写三列 —— 全部是"本次真的重算过"的事实。
+                    #   `chunker_version` **不写**：本脚本只重算向量、**没有重切**，
+                    #   `row` 里的 `content` / `token_count` 仍是旧分块边界下的产物。
+                    #   写新值等于把它标成"按新参数切的"，而那是个假事实 ——
+                    #   它会让「建议重切」这个唯一用途在跑一次重算后永久消失
+                    #   （`index_profile.py:19-21`），4B 的 `chunker_only` 也就
+                    #   成了永远不会说话的观测项。守卫：`T-4B-6`。
                     .values(
                         embedding=vec,
                         embedding_model=profile.embedding_model,
                         embedding_text_version=profile.embedding_text_version,
-                        chunker_version=profile.chunker_version,
                     )
                 )
             await session.commit()

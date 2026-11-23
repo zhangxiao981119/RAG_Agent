@@ -92,18 +92,20 @@ class FakeRetrieval:
         self.chain_calls: list[dict] = []
 
     async def retrieve(self, session, query, tenant_id, authorized_kb_ids,
-                       clearance, user_subjects):  # noqa: ANN001
+                       clearance, user_subjects, *, policy=None):  # noqa: ANN001
         self.retrieve_calls.append(
             (query, tenant_id, tuple(authorized_kb_ids), clearance, tuple(user_subjects))
         )
         return self.result
 
     async def retrieve_chain(self, session, query, tenant_id, authorized_kb_ids,
-                             clearance, user_subjects, rewrite_score=None):  # noqa: ANN001
+                             clearance, user_subjects, rewrite_score=None,
+                             *, policy=None):  # noqa: ANN001
         self.chain_calls.append({
             "positional": (query, tenant_id, tuple(authorized_kb_ids), clearance,
                            tuple(user_subjects)),
             "rewrite_score": rewrite_score,
+            "policy": policy,
         })
         return self.result
 
