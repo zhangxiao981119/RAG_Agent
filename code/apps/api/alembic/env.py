@@ -27,7 +27,11 @@ config = context.config
 # ★ CLI 直跑（`python -m alembic upgrade head`）不设 attributes ⇒ 回落到
 #   `get_settings().database_url`，与改动前行为逐字一致（生产路径不受影响）。
 _injected_url = config.attributes.get("sqlalchemy_url")
-config.set_main_option("sqlalchemy.url", _injected_url or get_settings().database_url)
+# ★ ConfigParser 把 `%` 当插值语法：口令含 `%40` 这类 percent-encoding 时，
+#   直接把 DSN 交给 set_main_option 会抛 `ValueError: invalid interpolation syntax`。
+#   转义成 `%%` 后，get_main_option / get_section 读回时仍是原值。
+_url = _injected_url or get_settings().database_url
+config.set_main_option("sqlalchemy.url", _url.replace("%", "%%"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

@@ -284,7 +284,9 @@ def test_env_py_honors_injected_url_before_app_settings():
       ③ `X` 必须来自 `config.attributes.get("sqlalchemy_url")`（alembic 官方通道，
          不是自造的环境变量协议）；
       ④ 兜底里仍有 `get_settings().database_url` —— 否则 CLI 直跑（不传 attributes）
-         会因为 url 为空而失败，生产路径被测试需求破坏。
+         会因为 url 为空而失败，生产路径被测试需求破坏；
+      ⑤ 值外层必须先 `.replace("%", "%%")` —— ConfigParser 把 `%` 当插值语法，
+         含 `%40` 的口令不转义会在 `set_main_option` 直接抛 ValueError。
     """
     source = (_ALEMBIC_DIR / "env.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -307,11 +309,16 @@ def test_env_py_honors_injected_url_before_app_settings():
     assert len(call.args) >= 2, "set_main_option 缺少值参数"
 
     value = call.args[1]
-    assert isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or), (
-        "必须是 `注入值 or 兜底值` 的形式；直接写 get_settings().database_url 就是无条件覆盖"
+    # ★ ConfigParser 插值守卫：口令含 `%40` 时未转义会在 set_main_option 直接抛错。
+    #   允许且要求外层是 `.replace("%", "%%")`，再检查里面的 `注入值 or 兜底值`。
+    assert isinstance(value, ast.Call) and getattr(value.func, "attr", None) == "replace", (
+        "set_main_option 的值必须先把 `%` 转义为 `%%`，否则含 percent-encoding 的口令会直接失败"
+    )
+    assert [ast.literal_eval(arg) for arg in value.args] == ["%", "%%"], (
+        "转义必须精确为 `.replace(\"%\", \"%%\")`"
     )
 
-    # `_injected_url or ...` 里的 `_injected_url` 本身要能追到 attributes.get
+    # 先建 Name → 赋值表达式的索引：`_url = 注入值 or 兜底值` 允许一层中转。
     assigned: dict[str, ast.expr] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
@@ -325,13 +332,20 @@ def test_env_py_honors_injected_url_before_app_settings():
             return _resolve(assigned[node.id], depth + 1)
         return ast.unparse(node)
 
-    injected = _resolve(value.values[0])
+    inner = value.func.value
+    if isinstance(inner, ast.Name) and inner.id in assigned:
+        inner = assigned[inner.id]
+    assert isinstance(inner, ast.BoolOp) and isinstance(inner.op, ast.Or), (
+        "必须是 `注入值 or 兜底值` 的形式；直接写 get_settings().database_url 就是无条件覆盖"
+    )
+
+    injected = _resolve(inner.values[0])
     assert "config.attributes.get(" in injected, (
         f"显式注入必须走 alembic 官方通道 config.attributes，实际是 {injected!r}"
     )
     assert "sqlalchemy_url" in injected, f"attributes 的键名必须是 sqlalchemy_url，实际 {injected!r}"
 
-    fallback = _resolve(value.values[-1])
+    fallback = _resolve(inner.values[-1])
     assert "get_settings().database_url" in fallback, (
         f"兜底值必须是应用配置（否则 CLI 直跑没有 url 可用），实际 {fallback!r}"
     )

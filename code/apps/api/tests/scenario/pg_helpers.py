@@ -80,7 +80,8 @@ def alembic_config(url: str | None = None) -> Config:
     config.set_main_option("script_location", os.path.join(_API_ROOT, "alembic"))
     target = url or SCENARIO_TEST_DB_URL or ""
     config.attributes["sqlalchemy_url"] = target
-    config.set_main_option("sqlalchemy.url", target)
+    # ConfigParser 插值：口令含 `%` 时必须转义，否则 set_main_option 直接抛 ValueError。
+    config.set_main_option("sqlalchemy.url", target.replace("%", "%%"))
     return config
 
 

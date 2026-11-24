@@ -279,7 +279,9 @@ M-B 的具体规则：
 
 **Phase 1 建库与迁移（场景库先到 head，控制库不动）**
 5. `CREATE DATABASE kagent_<scene>`（`CREATE DATABASE` 不能在事务块内，用 `psql -c`）。
-6. 场景库执行 `alembic upgrade head`（全链 0030）。
+6. 场景库执行 `alembic upgrade head`（全链 0030）；多库批量推进用
+   `python -m scripts.alembic_all_dbs --all-scenes`（逐库隔离失败、非零退出码汇总；
+   必须显式声明 `--db-key` 或 `--all-scenes`，不会隐式只迁默认库）。
 7. 断言：场景库 `version_num='0030'`；控制库 `version_num` 仍为 `0030`（未被动过）；场景库控制面表行数为 0。
 8. 执行 M-B 手术脚本；再跑白名单守卫，必须 0 行；安装控制面写入触发器。
 
