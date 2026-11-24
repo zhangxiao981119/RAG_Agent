@@ -38,6 +38,7 @@ from app.services.acl.subjects import invalidate_tenant_acl
 from app.services.db_scope import (
     DB_SCOPE_NOT_ALLOWED,
     DbScopeError,
+    ensure_db_keys_allowed,
     map_kb_db_keys,
     open_data_session,
     resolve_kb_db_key,
@@ -76,6 +77,10 @@ async def list_kbs(
     buckets: dict[str, list[uuid.UUID]] = {}
     for kb_id, db_key in keys_by_kb.items():
         buckets.setdefault(db_key, []).append(kb_id)
+
+    # 白名单必须先于数据面：被拒库位一律不打开，避免列表统计绕过 allowed_db_keys。
+    # 治理关闭时该函数零 SQL；拒绝交给全局 DbScopeError 处理器映射为 400。
+    await ensure_db_keys_allowed(session, user.tenant_id, sorted(buckets))
 
     doc_counts: dict[uuid.UUID, int] = {}
     for db_key in sorted(buckets):
