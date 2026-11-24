@@ -151,11 +151,18 @@ def test_locked_parameters_never_enter_keyset():
 
 
 def test_undefined_parameters_do_not_invent_defaults():
-    """#15/#16 源码里没有开关常量 ⇒ 规格表写「待定义」而不是编造默认值。"""
+    """#15/#16 已有平台开关常量（默认常开），且仍未进写入闭集。"""
     spec = {f.name: f for f in POLICY_FIELDS}
-    for name in ("table_recall_enabled", "section_recall_enabled"):
-        assert spec[name].default_semantics.startswith("待定义")
-        assert "源码无此开关" in spec[name].default_semantics
+    for name, const in (
+        ("table_recall_enabled", "TABLE_RECALL_ENABLED"),
+        ("section_recall_enabled", "SECTION_RECALL_ENABLED"),
+    ):
+        semantics = spec[name].default_semantics
+        assert semantics.startswith("常开")
+        assert f"decisions.{const}=" in semantics
+        # 闭集未扩：不能写成可配置（否则会让人以为能按场景写）
+        assert "不可按场景覆盖" in semantics
+        assert spec[name].wired_in_step > POLICY_CLOSURE_STEP
 
 
 # ── 写入校验（应用层主校验，DB CHECK 只兜底）─────────────────────────
@@ -188,6 +195,18 @@ def test_validate_policy_rejects_unknown_key():
     with pytest.raises(PolicyValidationError) as exc_info:
         validate_policy({"no_such_knob": 1})
     assert "未知参数" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "name", ["table_recall_enabled", "section_recall_enabled"]
+)
+def test_validate_policy_rejects_recall_switches(name):
+    """G-9：两键已有平台常量（常开），但仍在写入闭集外 → 场景写入必须被拒。"""
+    with pytest.raises(PolicyValidationError) as exc_info:
+        validate_policy({name: True})
+    assert exc_info.value.field == name
+    assert "尚未接线" in str(exc_info.value)
+    assert "Step 4" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

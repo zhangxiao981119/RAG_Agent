@@ -457,15 +457,24 @@ class RetrievalService:
         fts_ms = 0.0
         # ⑤ wiki 索引词元走独立 FTS 预算（WIKI_NAV_MAX_FTS_TOKENS=6），
         #   不重截原 24 词元窗口；降级时 extra_index_tokens=[] → 原分支逐字节相同。
-        tsquery = (
-            build_fts_query(
-                query,
-                alias_index_tokens(alias_map),
-                extra_index_tokens=wiki_fts_tokens,
+        tsquery = None
+        if decisions.KEYWORD_TSQUERY_ENABLED:
+            # 别名词元只在本路生效：alias_map 为空时不调用展开函数（零无谓开销）。
+            alias_tokens = alias_index_tokens(alias_map) if alias_map else []
+            # C4 §3.1「把静默改成可见」：统计被独立预算
+            # （LEXICON_FTS_ALIAS_MAX_TERMS）裁掉的去重别名词元个数；未超预算不计数
+            # （保持零噪音）。★ 打点放在调用侧而不是纯函数 keyword_text.py ——
+            # 那里必须是无 IO 的纯函数，才能让 Golden 快照逐字节复现、也能单独单测。
+            dropped = max(
+                0,
+                len(dict.fromkeys(alias_tokens))
+                - decisions.LEXICON_FTS_ALIAS_MAX_TERMS,
             )
-            if decisions.KEYWORD_TSQUERY_ENABLED
-            else None
-        )
+            if dropped:
+                metrics.incr("rag.lexicon.fts_alias_dropped", dropped)
+            tsquery = build_fts_query(
+                query, alias_tokens, extra_index_tokens=wiki_fts_tokens
+            )
         if tsquery:
             t_fts = time.perf_counter()
             try:
@@ -749,7 +758,7 @@ class RetrievalService:
             )
             if g
         }
-        if hit_group_ids:
+        if decisions.TABLE_RECALL_ENABLED and hit_group_ids:
             t_recall = time.perf_counter()
             for gid in hit_group_ids:
                 recall_result = await session.execute(
@@ -822,7 +831,7 @@ class RetrievalService:
             seen_sections.add(key)
             hit_sections.append(key)
 
-        if hit_sections:
+        if decisions.SECTION_RECALL_ENABLED and hit_sections:
             t_section = time.perf_counter()
             recall_params: dict = {
                 **pushdown,

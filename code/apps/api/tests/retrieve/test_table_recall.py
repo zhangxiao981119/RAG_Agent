@@ -27,14 +27,16 @@ KB = uuid.UUID(int=1)
 DOC = uuid.UUID(int=2)
 
 
-def _row(cid: uuid.UUID, group_id: str | None, vector_score: float) -> SimpleNamespace:
+def _row(
+    cid: uuid.UUID, group_id: str | None, vector_score: float, *, heading: str = "表"
+) -> SimpleNamespace:
     """主召回行替身（三路 SQL 的输出形态）。"""
     mapping = {
         "id": cid,
         "document_id": DOC,
         "kb_id": KB,
         "content": f"分片 {cid}",
-        "heading_path": "表",
+        "heading_path": heading,
         "page_no": 1,
         "level_rank": 20,
         "acl_tags": [],
@@ -75,6 +77,8 @@ class FakeSession:
     def __init__(self, h: "Harness") -> None:
         self._h = h
         self.recall_calls: list[dict] = []
+        # 章节补全 SQL 的调用记录：G-9 门控用例要证明「表关不影响段」
+        self.section_calls: list[dict] = []
 
     async def execute(self, stmt, params=None):  # noqa: ANN001
         sql = stmt.text if hasattr(stmt, "text") else str(stmt)
@@ -89,6 +93,7 @@ class FakeSession:
         if "FROM kb_terms" in sql:
             return FakeResult([])
         if "v(document_id, heading_path)" in sql:
+            self.section_calls.append(dict(params or {}))
             return FakeResult([])
         if "table_group_id = :group_id" in sql:
             self.recall_calls.append(dict(params or {}))
@@ -254,3 +259,68 @@ async def test_degraded_rerank_still_recalls(svc) -> None:
 
     assert not result.refused
     assert [c.chunk_id for c in result.table_recall_chunks] == [uuid.UUID(int=101)]
+
+
+# ── G-9 平台开关（默认常开；仅平台级故障隔离，不开放场景覆盖）──────────
+
+
+def test_recall_switch_constants_default_on() -> None:
+    """两个平台开关默认 True（防被误改成默认关，静默改变既有行为）。"""
+    assert decisions.TABLE_RECALL_ENABLED is True
+    assert decisions.SECTION_RECALL_ENABLED is True
+
+
+@pytest.mark.asyncio
+async def test_table_recall_switch_off_skips_sql(svc, monkeypatch: pytest.MonkeyPatch) -> None:
+    """TABLE_RECALL_ENABLED=False → 不发回捞 SQL、table_recall_chunks 为空，主召回不变。"""
+    monkeypatch.setattr(decisions, "TABLE_RECALL_ENABLED", False)
+    gid = uuid.uuid4().hex
+    hit_id = uuid.UUID(int=100)
+    h = Harness([_row(hit_id, gid, 0.80)])
+    h.rerank_result = [(0, 0.80)]
+    h.recall_rows[gid] = [_recall_row(uuid.UUID(int=101), 50)]
+    result, session = await _retrieve(svc(h))
+
+    assert not result.refused
+    assert result.table_recall_chunks == []
+    assert session.recall_calls == []
+    assert [c.chunk_id for c in result.chunks] == [hit_id]
+
+
+@pytest.mark.asyncio
+async def test_section_recall_unaffected_when_table_off(svc, monkeypatch: pytest.MonkeyPatch) -> None:
+    """关表回捞不影响章节补全：非表格命中片仍触发补全 SQL。"""
+    monkeypatch.setattr(decisions, "TABLE_RECALL_ENABLED", False)
+    gid = uuid.uuid4().hex
+    h = Harness([
+        _row(uuid.UUID(int=100), gid, 0.90),                 # 表格分片：开关关 → 不回捞
+        _row(uuid.UUID(int=101), None, 0.80, heading="第三章 报销标准"),  # 普通分片：仍走章节补全
+    ])
+    h.rerank_result = [(0, 0.70), (1, 0.80)]
+    result, session = await _retrieve(svc(h))
+
+    assert not result.refused
+    assert result.table_recall_chunks == []
+    assert session.recall_calls == []
+    assert session.section_calls, "章节补全不应受表回捞开关影响"
+
+
+@pytest.mark.asyncio
+async def test_both_recall_switches_off(svc, monkeypatch: pytest.MonkeyPatch) -> None:
+    """两个开关同关 → 两处皆空、两路 SQL 均不发，主召回不变。"""
+    monkeypatch.setattr(decisions, "TABLE_RECALL_ENABLED", False)
+    monkeypatch.setattr(decisions, "SECTION_RECALL_ENABLED", False)
+    gid = uuid.uuid4().hex
+    h = Harness([
+        _row(uuid.UUID(int=100), gid, 0.90),
+        _row(uuid.UUID(int=101), None, 0.80, heading="第三章 报销标准"),
+    ])
+    h.rerank_result = [(0, 0.70), (1, 0.80)]
+    result, session = await _retrieve(svc(h))
+
+    assert not result.refused
+    assert result.table_recall_chunks == []
+    assert result.section_recall_chunks == []
+    assert session.recall_calls == []
+    assert session.section_calls == []
+    assert [c.chunk_id for c in result.chunks] == [uuid.UUID(int=100), uuid.UUID(int=101)]

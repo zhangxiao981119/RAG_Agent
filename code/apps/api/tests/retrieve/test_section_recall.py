@@ -68,6 +68,20 @@ def _section_row(cid: uuid.UUID, tokens: int) -> SimpleNamespace:
     )
 
 
+def _table_row(cid: uuid.UUID, tokens: int) -> SimpleNamespace:
+    """表格回捞行替身（_TABLE_RECALL_SQL 的输出形态，属性访问）。"""
+    return SimpleNamespace(
+        id=cid,
+        document_id=DOC,
+        kb_id=KB,
+        content=f"回捞 {cid}",
+        heading_path="表",
+        page_no=1,
+        level_rank=20,
+        token_count=tokens,
+    )
+
+
 class FakeResult:
     def __init__(self, rows: list) -> None:
         self._rows = rows
@@ -82,6 +96,8 @@ class FakeSession:
     def __init__(self, h: "Harness") -> None:
         self._h = h
         self.section_calls: list[dict] = []
+        # 表格回捞 SQL 的调用记录：G-9 门控用例要证明「段关不影响表」
+        self.recall_calls: list[dict] = []
 
     async def execute(self, stmt, params=None):  # noqa: ANN001
         sql = stmt.text if hasattr(stmt, "text") else str(stmt)
@@ -99,7 +115,8 @@ class FakeSession:
             self.section_calls.append(dict(params or {}))
             return FakeResult(self._h.section_rows)
         if "table_group_id = :group_id" in sql:
-            return FakeResult([])
+            self.recall_calls.append(dict(params or {}))
+            return FakeResult(self._h.table_rows)
         raise AssertionError(f"未识别的 SQL: {sql[:80]}")
 
 
@@ -124,6 +141,7 @@ class Harness:
         self.vector_rows = rows
         self.rerank_result: list | Exception = []
         self.section_rows: list = []
+        self.table_rows: list = []
 
 
 @pytest.fixture
@@ -277,3 +295,40 @@ async def test_degraded_rerank_still_recalls(svc) -> None:
 
     assert not result.refused
     assert [c.chunk_id for c in result.section_recall_chunks] == [uuid.UUID(int=101)]
+
+
+# ── G-9 平台开关（默认常开；仅平台级故障隔离，不开放场景覆盖）──────────
+
+
+@pytest.mark.asyncio
+async def test_section_recall_switch_off_skips_sql(svc, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SECTION_RECALL_ENABLED=False → 不发补全 SQL、section_recall_chunks 为空。"""
+    monkeypatch.setattr(decisions, "SECTION_RECALL_ENABLED", False)
+    hit_id = uuid.UUID(int=100)
+    h = Harness([_row(hit_id, HEADING, 0.80)])
+    h.rerank_result = [(0, 0.80)]
+    h.section_rows = [_section_row(uuid.UUID(int=101), 200)]
+    result, session = await _retrieve(svc(h))
+
+    assert not result.refused
+    assert result.section_recall_chunks == []
+    assert session.section_calls == []
+    assert [c.chunk_id for c in result.chunks] == [hit_id]
+
+
+@pytest.mark.asyncio
+async def test_table_recall_unaffected_when_section_off(svc, monkeypatch: pytest.MonkeyPatch) -> None:
+    """关章节补全不影响表回捞：表格分片仍触发组回捞 SQL 并回捞到片。"""
+    monkeypatch.setattr(decisions, "SECTION_RECALL_ENABLED", False)
+    gid = "g1"
+    hit_id = uuid.UUID(int=100)
+    recalled_id = uuid.UUID(int=101)
+    h = Harness([_row(hit_id, HEADING, 0.80, group_id=gid)])
+    h.rerank_result = [(0, 0.80)]
+    h.table_rows = [_table_row(recalled_id, 50)]
+    result, session = await _retrieve(svc(h))
+
+    assert not result.refused
+    assert [c.chunk_id for c in result.table_recall_chunks] == [recalled_id]
+    assert session.recall_calls, "表回捞不应受章节补全开关影响"
+    assert session.section_calls == []

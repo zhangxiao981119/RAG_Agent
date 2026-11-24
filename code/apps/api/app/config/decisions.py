@@ -808,6 +808,10 @@ GOVERNANCE_PROMPT_MAX_CHARS: Final[int] = 12_000
 审查看整体形态，头部内容足够代表；不截断则超长文档会打出 LLM 超时重试风暴。"""
 
 # ── 大表分片回捞（表格决策 A1' 限流版）──────────────────────
+TABLE_RECALL_ENABLED: Final[bool] = True
+"""表格分片回捞平台总开关。默认 True 保持既有行为；当前不开放为场景策略键（闭集=3），
+关闭仅作为平台级故障隔离手段。"""
+
 TABLE_RECALL_MAX_CHUNKS: Final[int] = 3
 """单个表格组最多回捞的分片数（不含命中片本身）。
 无上限的回捞会把整张大表塞进上下文，挤占 32K 窗口、挤掉其他正常命中片段。"""
@@ -818,6 +822,9 @@ TABLE_RECALL_TOKEN_BUDGET: Final[int] = 2_048
 
 
 # ── 章节上下文补全（长文档 RAG：召回后补全所属语义单元）──────────
+SECTION_RECALL_ENABLED: Final[bool] = True
+"""长文档章节补全平台总开关。默认 True；口径同 TABLE_RECALL_ENABLED。"""
+
 SECTION_RECALL_MAX_CHUNKS: Final[int] = 3
 """单个小节最多补入的分片数（不含命中片本身）。
 小节通常 1~3 片；上限只为拦住超长章节，避免整节挤占上下文。"""

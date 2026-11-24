@@ -1159,10 +1159,10 @@ meta = {
 | 12 | `graph_retrieve_top_k` | int | `10`（`decisions.py:912`） | `1..50` | L2 | 收紧 | `<= GRAPH_RETRIEVE_TOP_K` | 5 | 无 |
 | 13 | `wiki_enabled` | bool | `False`（`settings.py:179`） | 单向 AND | L2 | 只能收紧 | 同 #2 | 5 | 关→开后需生成 `wiki_pages`（Step 4/5） |
 | 14 | `wiki_nav_selective` | bool | `False`（`settings.py:183`） | 单向 AND | L2 | 只能收紧 | 阈值 `WIKI_NAV_SELECTIVE_MIN_TERMS=3` 是站位值（`decisions.py:131`） | 5 | 无 |
-| 15 | `table_recall_enabled` | bool | **源码无此开关**（只有 `TABLE_RECALL_MAX_CHUNKS=3` / `TABLE_RECALL_TOKEN_BUDGET=2048`，`decisions.py:811/815`） | 待定义 | L2 | 收紧 | 若要加开关，须先回答「关掉表召回对表格题答准率的影响」—— 目前无数据 | 4+ | 无 |
-| 16 | `section_recall_enabled` | bool | **源码无此开关**（只有 `SECTION_RECALL_MAX_CHUNKS=3` / `SECTION_RECALL_TOKEN_BUDGET=1200` / `SECTION_RECALL_MIN_HEADING_CHARS=2`，`decisions.py:821/825/830`） | 待定义 | L2 | 收紧 | 同上 | 4+ | 无 |
+| 15 | `table_recall_enabled` | bool | **2026-11-24 起源码有平台常量** `decisions.TABLE_RECALL_ENABLED=True`（默认常开，不开放场景覆盖）；限流常量仍为 `TABLE_RECALL_MAX_CHUNKS=3` / `TABLE_RECALL_TOKEN_BUDGET=2048`（`decisions.py:811/815`）；此前事实为「源码无此开关」 | 原待定义 → 现默认常开（平台常量），场景不可覆盖；写入闭集仍为 3 | L2 | 收紧 | 若要加开关，须先回答「关掉表召回对表格题答准率的影响」—— 目前无数据 | 4+ | 无 |
+| 16 | `section_recall_enabled` | bool | **2026-11-24 起源码有平台常量** `decisions.SECTION_RECALL_ENABLED=True`（默认常开，不开放场景覆盖）；限流常量仍为 `SECTION_RECALL_MAX_CHUNKS=3` / `SECTION_RECALL_TOKEN_BUDGET=1200` / `SECTION_RECALL_MIN_HEADING_CHARS=2`（`decisions.py:821/825/830`）；此前事实为「源码无此开关」 | 原待定义 → 现默认常开（平台常量），场景不可覆盖；写入闭集仍为 3 | L2 | 收紧 | 同上 | 4+ | 无 |
 
-> **#15/#16 写「待定义」而不编造默认值**：源码里只有上限/预算常量，**没有开关常量**。凭空写「默认 true」就是把推断当成现状 —— 这正是本文件开头承诺不做的事。是否要引入这两个开关，属 Step 4 的设计输入，不在本阶段决定。
+> **#15/#16 写「待定义」而不编造默认值**：产出当时源码里只有上限/预算常量，**没有开关常量**。凭空写「默认 true」就是把推断当成现状 —— 这正是本文件开头承诺不做的事。是否要引入这两个开关，属 Step 4 的设计输入，不在本阶段决定。（2026-11-24 更新：两键已有平台常量 `decisions.TABLE_RECALL_ENABLED` / `SECTION_RECALL_ENABLED`，默认常开但**不开放场景覆盖**，写入闭集仍为 3；「是否开放为场景键」仍属 Step 4 设计输入。）
 
 ### E.3 `self_check` 不变量清单（启动时执行，逐条可测）
 
@@ -1262,8 +1262,8 @@ meta = {
 | **G-5** | `checksum` 只能由 Python 重算，DB 无法校验 | 若有人绕过应用直写 SQL，`checksum` 可能不匹配内容 | 靠巡检 SQL（Step 1 只写 SQL 不落脚本） |
 | **G-6** | `RECALL_TOP_K_MAX = 200` 是**站位值**，无压测依据 | S-2 的 `self_check` 上限是猜的 | 需压测（与 `M_scene_pg` 一起做） |
 | **G-7** | 场景缓存的 TTL 60s 是站位值 | 生效时延预期未与用户确认 | Step 4 开工前确认 |
-| **G-8** | 别名扩展的静默截断（`C4-别名静默截断影响面量化.md`）未修 | 场景化它会放大问题（每个场景一套别名口径） | Step 4 前置 |
-| **G-9** | 表/段召回**没有开关常量**（源码事实），#15/#16 的默认值待定义 | E 表两项「待定义」，不编造 | Step 4 |
+| **G-8** | 别名扩展的静默截断（`C4-别名静默截断影响面量化.md`）未修 | 场景化它会放大问题（每个场景一套别名口径） | Step 4 前置。→ 2026-11-24 已关闭：`keyword_text.build_fts_query` 别名走独立预算（`LEXICON_FTS_ALIAS_MAX_TERMS=6`），并补 `rag.lexicon.fts_alias_dropped` 打点 |
+| **G-9** | 表/段召回**没有开关常量**（源码事实），#15/#16 的默认值待定义 | E 表两项「待定义」，不编造 | Step 4。→ 2026-11-24 已关闭：新增 `decisions.TABLE_RECALL_ENABLED` / `SECTION_RECALL_ENABLED`（默认 True）并接入门控，写入闭集仍为 3 |
 | **G-10** | `RELEVANCE_THRESHOLD_RERANK` 仍未标定（`decisions.py:37-41` 自述） | 场景设这个键 = 用一个未标定的值；S-5 只能 WARN | 需 GPU + `calibrate_threshold.py --mode rerank` |
 | **G-11** | **本设计最大的单一风险**：若用户真实诉求只是「部门看不同库」，则 A/C 两章整体过度设计（§C.8 反例 5） | 可在 Step 2 完工后用一个问题证伪：「除库范围外，你还需要按场景改检索参数吗？」答否 → 砍掉 policy 相关全部设计 | 需用户确认 |
 | **G-12** | `recall_top_k` 与 `TOP_K_RERANK` 的 `>=` 约束（S-2）在 Step 3 接线时才被真正使用；Step 2 只做校验不做接线 | 若 S-2 过严会误伤合法配置（如故意把 recall 设 5 做实验）→ 应以「WARN」而非「RuntimeError」处理 | Step 3 |

@@ -266,10 +266,10 @@ POLICY_FIELDS: Final[tuple[PolicyField, ...]] = (
     PolicyField(
         name="table_recall_enabled",
         type="bool",
-        # 不编造默认值：源码只有上限/预算常量，**没有开关常量**（E 表 #15 / §G-9）
         default_semantics=(
-            "待定义：源码无此开关，只有 decisions.TABLE_RECALL_MAX_CHUNKS="
-            f"{decisions.TABLE_RECALL_MAX_CHUNKS}（是否引入属 Step 4 设计输入）"
+            "常开：decisions.TABLE_RECALL_ENABLED="
+            f"{decisions.TABLE_RECALL_ENABLED}；当前写入闭集为 "
+            f"{POLICY_CLOSURE_STEP}，不可按场景覆盖（wired_in_step=4）"
         ),
         min_value=None,
         max_value=None,
@@ -280,8 +280,9 @@ POLICY_FIELDS: Final[tuple[PolicyField, ...]] = (
         name="section_recall_enabled",
         type="bool",
         default_semantics=(
-            "待定义：源码无此开关，只有 decisions.SECTION_RECALL_MAX_CHUNKS="
-            f"{decisions.SECTION_RECALL_MAX_CHUNKS}（是否引入属 Step 4 设计输入）"
+            "常开：decisions.SECTION_RECALL_ENABLED="
+            f"{decisions.SECTION_RECALL_ENABLED}；当前写入闭集为 "
+            f"{POLICY_CLOSURE_STEP}，不可按场景覆盖（wired_in_step=4）"
         ),
         min_value=None,
         max_value=None,
