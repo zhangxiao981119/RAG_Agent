@@ -91,6 +91,28 @@ class Settings(BaseSettings):
     db_worker_conn_total: int = 10
     # ★ 副本数应用自己不知道（无共享状态）→ 只能由部署声明；默认 1 是保守值（闸门偏松）。
     db_replicas_expected: int = 1
+    # ── 容量看板（Step 7 S7-6）：常量可配置 + 标定记录 ──────────
+    # ★ 这些值只影响只读看板的「知道什么/不知道什么」，不改变检索或存储行为。
+    # ★ 口径：`0` 表示**未提供**（不是「实测为 0」）—— 未提供的项看板一律
+    #   evaluable=false / over=None，绝不用 0 冒充可评估的实测值。
+    # ★ 默认值仍是历史声明值（embedding+reranker 4g+4g / 每热库 300MB），
+    #   只有在目标机实测后才应覆盖，并同步填写 capacity_calibration_ref。
+    # 两个模型服务（embedding + reranker）的驻留内存之和（MB）；默认 8192。
+    capacity_m_shared_mb: int = Field(default=8192, ge=1)
+    # 每个生效热库在 PG 侧预留的内存（MB）；默认 300。
+    capacity_m_scene_pg_mb: int = Field(default=300, ge=1)
+    # PG 容器内存上限或实例可用内存（MB）；0 = 未提供，库大小占比阈值不可评估。
+    capacity_instance_memory_mb: int = Field(default=0, ge=0)
+    # 检索链路 P95 基线（毫秒，rag.retrieve.total）；0 = 未提供，无法比较。
+    capacity_retrieval_p95_baseline_ms: float = Field(default=0.0, ge=0)
+    # 标定记录引用，格式约定 `YYYY-MM-DD/<机器>/<报告路径>`；空 = 未标定。
+    capacity_calibration_ref: str = Field(default="", max_length=200)
+    # 库缓存命中率下限（ratio）；低于它记 over=true。
+    capacity_db_hit_rate_min: float = Field(default=0.95, gt=0, le=1)
+    # 单库大小 / 实例内存上限（ratio）；超过它记 over=true。
+    capacity_db_size_ratio_max: float = Field(default=0.30, gt=0, le=1)
+    # 检索 P95 / 基线 上限（倍数）；超过它记 over=true。
+    capacity_retrieval_p95_ratio_max: float = Field(default=1.5, gt=0)
     redis_url: str = "redis://redis:6379/0"
     redis_max_connections: int = 20  # 单进程连接池上限；× 副本数应 ≤ Redis maxclients 的余量
     redis_socket_timeout_s: float = 3.0  # 建连/读写超时（秒）—— 避免 Redis 抖动时请求无限等待

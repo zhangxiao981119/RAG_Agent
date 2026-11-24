@@ -232,14 +232,14 @@ Step 7 不是“再加一张租户表”，而是把已有三件资产收紧成�
 - 公式：`M_A(N) = M_shared + M_control_pg + N_hot_effective × M_scene_pg`。
 - 常量与标定状态必须一起返回，禁止只给一个数字：
   - `M_shared_declared = 8192 MiB`：只等于 `embedding` 与 `reranker` 的 `mem_limit: 4g`；另有 8 个常驻服务未设上限，逐个列名返回，避免把“已声明上限”说成“总内存”。【源】`code/docker-compose.yml:86,117`、框架 F11。
-  - `M_control_pg_lower = 128 MiB`：`shared_buffers` 默认值；运行时用 `current_setting('shared_buffers')` 覆盖，并标注“仅 shared_buffers 下界，不含连接/扩展开销”。【待标定】
-  - `M_scene_pg = 300 MiB`：框架示例假设，`calibrated=false`。【待标定】
-- 返回 `result.postgres_side_lower_mb` 与 `calibrated=false`；字段名带 `lower_bound`，禁止被当成承诺值。
-- 实时观测：一次 `pg_stat_database` 查询返回已注册库名的 `size / blks_hit / blks_read / 命中率`；P95 从进程指标取，明确标注 `scope=process-wide`，不假装是按库延迟。
-- 阈值四条逐条给 `evaluable` 与 `reason`：
-  - 命中率 < 95%：有读写样本即可评估（阈值本身标 `待标定`）。
-  - 库体积 > 实例内存 30%：实例内存未知 → `evaluable=false`。
-  - P95 > 1.5 倍基线：无基线存储 → `evaluable=false`。
+  - `M_control_pg_lower = 128 MiB`：`shared_buffers` 默认值；运行时用 `current_setting('shared_buffers')` 覆盖并恒标 `calibrated=true`（值来自运行时实测），并标注“仅 shared_buffers 下界，不含连接/扩展开销”。【运行时实测】
+  - `M_scene_pg = 300 MiB`：框架示例假设的**默认声明值**；运行时可由 `CAPACITY_M_SCENE_PG_MB` 覆盖，只有填写 `CAPACITY_CALIBRATION_REF` 后 `calibrated` 才为 true。【默认待标定】
+- 返回 `result.postgres_side_lower_mb` 与 `result.calibrated`（仅有标定记录时为 true）；字段名带 `lower_bound`，禁止被当成承诺值。
+- 实时观测：一次 `pg_stat_database` 查询返回已注册库名的 `size / blks_hit / blks_read / 命中率`；P95 从进程指标取，HTTP P95 明确标注 `scope=process-wide`，检索 P95 取 `rag.retrieve.total`（检索链路总耗时，不含 LLM 生成），不假装是按库延迟。
+- 阈值四条逐条给 `evaluable` 与 `reason`，阈值本身可由 `CAPACITY_*` 配置：
+  - 命中率 < `CAPACITY_DB_HIT_RATE_MIN`（默认 95%）：有读写样本即可评估。
+  - 单库体积 / 实例内存 > `CAPACITY_DB_SIZE_RATIO_MAX`（默认 30%）：实例内存未配置（`CAPACITY_INSTANCE_MEMORY_MB=0`）→ `evaluable=false`。
+  - 检索 P95 > `CAPACITY_RETRIEVAL_P95_RATIO_MAX`（默认 1.5）倍基线：基线未配置或无 `rag.retrieve.total` 样本 → `evaluable=false`。
   - 独立限流：未实现 → `evaluable=false`。
 - 热档未实现：返回 `n_hot_declared`（DB 计数）与 `n_hot_effective`（本期恒 0），公式用后者，`hot_unsupported=true`。不把 hot 标签偷偷算成温档，也不把它隐藏。
 - 不自动告警、不自动升降级：没有实测阈值前，自动动作等于用一个占位值改生产。
@@ -351,7 +351,7 @@ kb_ids → db_scope.resolve_kb_db_key
 | provenance 能回答参数来源 | `GET /api/admin/scenario-governance/{id}` 的 `effective.<key>.source`；检索日志 `sources`；审计 detail `policy_sources` |
 | checksum 并发保存被拦 | 既有 `If-Match` 428/409 用例纳入回归；不新增实现 |
 | 旧钉定客户端行为不变 | 钉 v1 → 发布 v2 → 客户端仍得 v1 的 checksum/kb 集合；unpin 后得 v2 |
-| 容量看板按 M_A(N) 算内存 | `GET /api/system/capacity` 返回公式、输入、`postgres_side_lower_mb`、`calibrated=false`；单测用固定输入复算 |
+| 容量看板按 M_A(N) 算内存 | `GET /api/system/capacity` 返回公式、输入、`postgres_side_lower_mb`、`calibrated`（仅有标定记录时为 true）；单测用固定输入复算 |
 | 关闭态零行为变化 | 同一场景在开关关/开但无治理配置时，`version/checksum/kb_ids/effective 值` 逐字段相等；关闭态不读 `tenants` |
 | 回滚 | 开关置 false 行为回 Step 6；治理列全部可 NULL；tier 回到 CASE 推导；迁移 `0031 downgrade` 可执行 |
 

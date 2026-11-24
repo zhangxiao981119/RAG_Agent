@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
@@ -349,3 +350,63 @@ async def test_chain_multi_reuses_same_session_serially(monkeypatch):
     assert sessions == [id(session)] * 3
     assert "chain_decompose" in result.stage_ms
     assert metrics.get("rag.chain.rounds") == 3
+
+
+# ── 检索链路总耗时埋点 ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_retrieve_chain_observes_rag_total_once_in_ms(monkeypatch):
+    """多轮检索每请求只观测一次，且单位是毫秒（不是秒）。"""
+    calls: list[tuple[str, float]] = []
+
+    def _capture(name, ms, **tags):  # noqa: ANN001
+        calls.append((name, ms))
+
+    monkeypatch.setattr(metrics, "observe_ms", _capture)
+
+    queries: list[str] = []
+    svc = _service_with_stub(queries, [])
+
+    async def _slow_stub(sess, query, tenant_id, kb_ids, clearance, subjects, *,
+                         policy=None, policy_caps=None):  # noqa: ANN001
+        await asyncio.sleep(0.02)
+        return _round([_chunk(uuid.uuid4(), 0.9)])
+
+    svc.retrieve = _slow_stub
+
+    async def _three(question, tenant_id=None):  # noqa: ANN001
+        return ["问题", "子问题二", "子问题三"]
+
+    monkeypatch.setattr(retrieve_mod, "decompose_question", _three)
+    await svc.retrieve_chain(
+        object(), "问题", uuid.uuid4(), [uuid.uuid4()], 1, [], rewrite_score=50
+    )
+
+    totals = [ms for name, ms in calls if name == "rag.retrieve.total"]
+    assert len(totals) == 1
+    # 3 轮 × 20ms：若单位错成秒，这里会远小于 10。
+    assert totals[0] >= 10
+
+
+@pytest.mark.asyncio
+async def test_retrieve_chain_observes_rag_total_on_exception(monkeypatch):
+    """异常路径同样观测一次（耗时是真实成本，不能只统计成功请求）。"""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        metrics, "observe_ms", lambda name, ms, **tags: calls.append(name)
+    )
+
+    svc = RetrievalService()
+
+    async def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("检索失败")
+
+    svc.retrieve = _boom
+
+    with pytest.raises(RuntimeError, match="检索失败"):
+        await svc.retrieve_chain(
+            object(), "问题", uuid.uuid4(), [uuid.uuid4()], 1, [], rewrite_score=95
+        )
+
+    assert calls.count("rag.retrieve.total") == 1

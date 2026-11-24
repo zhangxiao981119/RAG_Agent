@@ -985,6 +985,42 @@ class RetrievalService:
           单趟不是边角：`rewrite_score` 为 None（跳过改写）或不低于复杂度阈值
           （自包含的简单问题）时都走单趟，那是线上主要流量。
         """
+        # ★ 检索链路总耗时只在这里埋点一次：`retrieve_chain` 是每请求执行一次的
+        #   最外层入口，内部多轮 `retrieve()` 是子步骤 —— 若在子步骤再埋一次，
+        #   一条请求会被观测成 N 条样本，P95 失真。
+        # ★ 只测检索链路（拆解 + 各轮召回/重排/回捞），不含 LLM 生成。
+        # ★ 用 try/finally：异常路径的耗时同样是真实成本，不能只统计成功请求。
+        t_total = time.perf_counter()
+        try:
+            return await self._retrieve_chain_impl(
+                session,
+                query,
+                tenant_id,
+                authorized_kb_ids,
+                clearance,
+                user_subjects,
+                rewrite_score,
+                policy=policy,
+                policy_caps=policy_caps,
+            )
+        finally:
+            metrics.observe_ms(
+                "rag.retrieve.total", (time.perf_counter() - t_total) * 1000
+            )
+
+    async def _retrieve_chain_impl(
+        self,
+        session: AsyncSession,
+        query: str,
+        tenant_id: uuid.UUID,
+        authorized_kb_ids: list[uuid.UUID],
+        clearance: int,
+        user_subjects: list[str],
+        rewrite_score: int | None,
+        *,
+        policy: ScenarioPolicy | None,
+        policy_caps: TenantPolicyCaps | None,
+    ) -> RetrievalResult:
         t0 = time.perf_counter()
 
         async def _single(chain_mode: str, chain_ms: int | None = None) -> RetrievalResult:

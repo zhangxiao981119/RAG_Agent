@@ -207,25 +207,26 @@
 **文件**
 - 新增 `code/apps/api/app/services/capacity.py`
   - 常量：`M_SHARED_DECLARED_MB = 8192`、`M_CONTROL_PG_LOWER_MB = 128`、`M_SCENE_PG_MB = 300`、`UNBOUNDED_SERVICES = (...)`。
-  - `def compute_m_a(n_hot_effective: int) -> int`：纯函数，返回 `M_SHARED_DECLARED_MB + M_CONTROL_PG_LOWER_MB + n_hot_effective * M_SCENE_PG_MB`。
+  - `def compute_m_a(n_hot_effective: int, *, m_shared_mb=..., m_scene_pg_mb=..., control_pg_mb=...) -> int`：纯函数，默认入参即三个声明常量。
   - `async def capacity_snapshot(session) -> dict`：
     - `SELECT tier, count(*) FROM scenarios GROUP BY tier`；
     - `SELECT datname, pg_database_size(datname), blks_hit, blks_read FROM pg_stat_database`，按已注册库名过滤；
     - `current_setting('shared_buffers')` 解析为 MiB；
-    - 进程级 P95 从 `app.infra.metrics` 读取，标注 `scope=process-wide`；
-    - 阈值四条逐条 `{name, threshold, unit, calibrated:false, evaluable, over, reason}`；
-    - 返回 `n_hot_declared`、`n_hot_effective`（本期恒 0）、`hot_unsupported:true`。
+    - 进程级 P95 从 `app.infra.metrics` 读取：HTTP `http.request.duration`（`scope=process-wide`）与检索 `rag.retrieve.total`；
+    - 常量与阈值按请求从 `CAPACITY_*`（settings）读取；
+    - 阈值四条逐条 `{name, threshold, unit, calibrated, evaluable, over, reason}`，`calibrated` 仅在配置 `CAPACITY_CALIBRATION_REF` 时为 true；
+    - 返回 `calibration_ref`、`n_hot_declared`、`n_hot_effective`（本期恒 0）、`hot_unsupported:true`。
 - 修改 `code/apps/api/app/config/placeholders.py`：登记 `CAPACITY_M_SHARED_DECLARED_MB`、`CAPACITY_M_CONTROL_PG_LOWER_MB`、`CAPACITY_M_SCENE_PG_MB`，并加导入期断言（镜像值必须与本模块一致）。
 - 修改 `code/apps/api/app/infra/db_router.py`：新增 `database_name_for(db_key: str) -> str`，从已注册 DSN 解析库名；未知键抛既有 `DbRouteError`。
 - 修改 `code/apps/api/app/api/system.py`：新增 `GET /system/capacity`，`require_admin`，返回 `capacity_snapshot`。
 
 **测试** `code/apps/api/tests/scenario/test_step7_capacity.py`
 - `compute_m_a(0)` 与 `compute_m_a(2)` 按固定输入复算正确。
-- 返回结构含公式、输入、`result.postgres_side_lower_mb`、`calibrated=false`。
-- `M_SCENE_PG_MB` 明确标注未标定；`n_hot_declared=1` 时 `n_hot_effective=0` 且 `hot_unsupported=true`。
+- 返回结构含公式、输入、`result.postgres_side_lower_mb`、`result.calibrated`（无 ref 时为 false）。
+- `M_SCENE_PG_MB` 默认标注未标定；`n_hot_declared=1` 时 `n_hot_effective=0` 且 `hot_unsupported=true`。
 - 真库：`pg_stat_database` 返回的库名集合包含 `current_database()`；命中率计算与原始值一致。
 - 非管理员 403。
-- 不出现“假基线”：命中率阈值的 `calibrated=false`；无基线时延迟阈值 `evaluable=false`。
+- 不出现“假基线”：未填 `CAPACITY_CALIBRATION_REF` 时三条数值阈值 `calibrated=false`；实例内存或检索基线未提供时对应阈值 `evaluable=false`、`over=None`。
 
 **完成判据**：验收“容量看板按 M_A(N) 算内存”可复算；所有占位值都带来源与标定状态。
 
