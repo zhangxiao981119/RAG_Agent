@@ -4,7 +4,6 @@ import os
 import time
 import traceback
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -152,6 +151,16 @@ async def lifespan(_: FastAPI):
     )
 
     check_connection_budget()
+
+    # ── schema 版本启动闸门（T1）──────────────────────────────────────
+    # ★ 必须在任何治理查询之前：治理开启而库停在 0030 时，`check_scenario_data`
+    #   与后续请求路径都会读到 0031 才有的列，缺列是**请求期 500**。
+    #   版本错位是部署动作没做完，应在启动时拒绝，而不是等用户提问才暴露。
+    #   API 与 worker 共用同一函数（见 app/infra/schema_guard.py）。
+    from app.infra.schema_guard import assert_schema_matches_code
+
+    await assert_schema_matches_code(context="api")
+
     register_from_settings()
 
     async with SessionLocal() as _scenario_check_session:
@@ -278,41 +287,6 @@ async def lifespan(_: FastAPI):
     except Exception:
         # 首次启动表可能尚未迁移 / DB 未就绪 —— 检查失败不阻断启动，仅告警
         logger.warning("索引口径启动检查跳过", exc_info=True)
-
-    # ── schema 版本一致性启动检查（发布流程固化）──────────
-    # 迁移由编排中的 migrate 一次性服务保证「先迁移后启动」；此处只做兜底：
-    # 漏跑 migrate、手工改库、或回滚只换了镜像没降级时，让版本错位在启动时可见，
-    # 而不是等某次查询抛 UndefinedColumn 才暴露。不阻断启动（旧数据仍需在线服务）。
-    try:
-        from alembic.config import Config as _AlembicConfig
-        from alembic.script import ScriptDirectory
-        from sqlalchemy import text as _sa_text
-
-        from app.database import SessionLocal
-
-        _alembic_ini = Path(__file__).resolve().parents[1] / "alembic.ini"
-        _code_heads = set(
-            ScriptDirectory.from_config(_AlembicConfig(str(_alembic_ini))).get_heads()
-        )
-        async with SessionLocal() as _session:
-            _db_rev = (
-                await _session.execute(_sa_text("SELECT version_num FROM alembic_version"))
-            ).scalar_one_or_none()
-        if _db_rev not in _code_heads:
-            logger.warning(
-                "启动检查：数据库 schema 版本与代码不一致",
-                extra={
-                    "db_revision": _db_rev,
-                    "code_heads": sorted(_code_heads),
-                    "hint": "执行 docker compose -p kagent -f docker-compose.prod.yml "
-                    "run --rm migrate alembic upgrade head",
-                },
-            )
-        else:
-            logger.info("启动检查：schema 版本一致", extra={"revision": _db_rev})
-    except Exception:
-        # alembic.ini 缺失 / 表尚未创建 —— 不阻断启动，仅告警
-        logger.warning("schema 版本启动检查跳过", exc_info=True)
 
     try:
         yield

@@ -664,6 +664,7 @@ class WorkerSettings:
         """
         from app.config.capabilities import log_capability_banner
         from app.config.self_check_ext import check_capabilities
+        from app.infra.schema_guard import assert_schema_matches_code
         from app.services.scenario.self_check import check_scenario_constants
 
         decisions.self_check()
@@ -675,6 +676,11 @@ class WorkerSettings:
         from app.infra.db_router import check_connection_budget, register_from_settings
         check_connection_budget()
         register_from_settings()
+        # ── schema 版本启动闸门（与 api 共用同一函数）──
+        # ★ worker 侧同样会执行治理任务（execute_governance_job / scan_and_enqueue），
+        #   治理开启而库停在 0030 时，任务会在运行期因缺列失败且无人看见。
+        #   与 api 一致：治理关闭只 warning，开启且版本不匹配直接拒绝启动。
+        await assert_schema_matches_code(context="worker")
         # 场景化配置的**常量类**自检（Step 3）：纯内存、无 DB，api 与 worker 两侧都跑。
         # ★ 只跑常量类（T1），不跑数据类（T2）：worker 不检索、不读任何策略，
         #   跑全场景扫描是纯加启动成本与 DB 压力，且它没有一条路径能从那结论受益。
