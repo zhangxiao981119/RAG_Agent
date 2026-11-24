@@ -24,6 +24,7 @@ from app.schemas.tenant_governance import (
     GovernanceUpdate,
     ScenarioGovernanceDetail,
     ScenarioGovernanceOut,
+    ScenarioTierIn,
 )
 from app.services.tenant import governance
 from app.services.tenant.governance import GovernanceError
@@ -138,6 +139,40 @@ async def read_scenario_governance(
     session: AsyncSession = Depends(get_db),
 ) -> ScenarioGovernanceDetail:
     try:
+        row = await governance.get_scenario_governance(
+            session, tenant_id=user.tenant_id, scenario_id=scenario_id
+        )
+    except GovernanceError as error:
+        raise _http_exception(error) from error
+    return _detail_out(row)
+
+
+@router.put(
+    "/scenario-governance/{scenario_id}/tier",
+    response_model=ScenarioGovernanceDetail,
+)
+async def write_scenario_tier(
+    scenario_id: uuid.UUID,
+    payload: ScenarioTierIn,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(get_db),
+) -> ScenarioGovernanceDetail:
+    """搬库完成后的分级登记（tier 与 db_binding 同句写入）。
+
+    ★ 本接口**不搬数据**：搬库仍按 Step 6 SOP 执行，这里只登记「数据已搬完」。
+      `cold` 必须 `db_binding=null`；`warm` 的库位必须已注册且在本租户白名单内；
+      `hot` 由服务层拒绝（`TIER_HOT_UNSUPPORTED`）。
+    """
+    try:
+        await governance.update_scenario_tier(
+            session,
+            tenant_id=user.tenant_id,
+            user_id=user.user_id,
+            scenario_id=scenario_id,
+            tier=payload.tier,
+            db_binding=payload.db_binding,
+        )
+        # 写后响应必须与 GET 逐字段一致（复用读侧组装）。
         row = await governance.get_scenario_governance(
             session, tenant_id=user.tenant_id, scenario_id=scenario_id
         )

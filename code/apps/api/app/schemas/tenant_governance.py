@@ -1,6 +1,6 @@
 """租户治理面（S7-5）的请求 / 响应模型（pydantic v2，写侧 `extra="forbid"`）。
 
-★ 为什么 `GovernanceUpdate` 的六个字段全部允许 `None`：`None` 在这里是**两种**
+★ 为什么 `GovernanceUpdate` 的策略字段全部允许 `None`：`None` 在这里是**两种**
   不同语义，靠「键是否出现在请求体里」区分（路由层用 `model_fields_set` 过滤）：
     · 键不出现 → 这个字段不动（稀疏更新，与 `ScenarioPolicy` 同思想）；
     · 键出现且为 `null` → 清除该上限 / 解除钉定。
@@ -61,8 +61,8 @@ class GovernanceUpdate(BaseModel):
     """PUT /admin/scenario-governance/{id} 请求体。
 
     `db_binding` 刻意**不在**这里：它是部署事实，改它必须走搬库流程。
-    `tier` 显式传 `null` 由服务层判为非法（不是「不动」）—— 传 null 说明
-    调用方以为这个字段可以清空，而分级没有「未分级」这个状态。
+    分级同样不在此接口：改用 `PUT /admin/scenario-governance/{id}/tier`（搬库登记），
+    因为 tier 与 db_binding 受 `ck_scenarios_tier_binding` 约束必须同句写入。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -72,7 +72,21 @@ class GovernanceUpdate(BaseModel):
     threshold_vector_min: float | None = None
     threshold_rerank_min: float | None = None
     rerank_allowed: bool | None = None
-    tier: Literal["cold", "warm", "hot"] | None = None
+
+
+class ScenarioTierIn(BaseModel):
+    """PUT /admin/scenario-governance/{id}/tier 请求体（搬库完成登记）。
+
+    `tier` 与 `db_binding` 都必须出现（显式 null 才表示清空）：
+      · cold 必须 null、warm 必须非 null（`ck_scenarios_tier_binding` 同口径）；
+      · hot 由服务层拒绝并保留稳定错误码 `TIER_HOT_UNSUPPORTED`。
+    此接口只登记「数据已搬完」的事实，**不搬数据**；搬库仍走 Step 6 SOP。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tier: Literal["cold", "warm", "hot"]
+    db_binding: str | None
 
 
 class EffectiveKeyOut(BaseModel):

@@ -150,7 +150,12 @@ async def test_governance_actions_are_audited(api, monkeypatch):
     assert governance_detail["after"]["pinned_version"] == 1
     assert governance_detail["after"]["recall_top_k_max"] == 8
 
-    # ── ③ 分级变化：单独一条 tier.change，before/after 是旧/新 tier ──
+    # ── ③ 分级变化：走专用搬库登记端点，单独一条 tier.change ──────
+    from app.services.tenant import governance as governance_mod
+
+    monkeypatch.setattr(
+        governance_mod, "registered_db_keys", lambda: ("default", "kb_finance")
+    )
     await _exec_committed(
         "UPDATE scenarios SET tier='warm', db_binding='kb_finance' WHERE id=$1",
         scenario_id,
@@ -159,14 +164,15 @@ async def test_governance_actions_are_audited(api, monkeypatch):
         "UPDATE scenarios SET tier='hot' WHERE id=$1", scenario_id
     )
     tier = await api.client.put(
-        f"{SCENARIO_GOVERNANCE_URL}/{scenario_id}", json={"tier": "warm"}
+        f"{SCENARIO_GOVERNANCE_URL}/{scenario_id}/tier",
+        json={"tier": "warm", "db_binding": "kb_finance"},
     )
     assert tier.status_code == 200, tier.text
 
     tier_details = await _audit_rows("scenario.tier.change", str(scenario_id))
     assert len(tier_details) == 1, tier_details
-    assert tier_details[0]["before"] == "hot"
-    assert tier_details[0]["after"] == "warm"
+    assert tier_details[0]["before"] == {"tier": "hot", "db_binding": "kb_finance"}
+    assert tier_details[0]["after"] == {"tier": "warm", "db_binding": "kb_finance"}
 
 
 # ══════════════════════════════════════════════════════════════════════

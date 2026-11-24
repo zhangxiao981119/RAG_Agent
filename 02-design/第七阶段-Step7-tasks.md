@@ -166,15 +166,23 @@
   - `GET /scenario-governance/{scenario_id}` → 详情 + `effective` 预览：
     - 每个策略键返回 `scenario / cap / effective / source`；
     - `source` 复用 `effective_retrieval` 的 `sources`。
-  - `PUT /scenario-governance/{scenario_id}` body 允许字段：`pinned_version / recall_top_k_max / threshold_vector_min / threshold_rerank_min / rerank_allowed / tier`；用 `model_fields_set` 区分“未传”和“显式 null”。
+  - `PUT /scenario-governance/{scenario_id}` body 允许字段：`pinned_version / recall_top_k_max / threshold_vector_min / threshold_rerank_min / rerank_allowed`；用 `model_fields_set` 区分“未传”和“显式 null”。
     - 关闭开关 → 400 `GOVERNANCE_DISABLED`；
     - 场景不属本租户 → 404；
     - pin 版本不存在或 state != published → 400 `PIN_VERSION_NOT_PUBLISHED`；
-    - `tier='hot'` → 400 `TIER_HOT_UNSUPPORTED`；
-    - tier 与 `db_binding` 不一致 → 400 `TIER_BINDING_MISMATCH`；
     - caps 区间：`recall_top_k_max ∈ [1, policy_spec.RECALL_TOP_K_MAX]`；两个阈值 ∈ `[0,1]` 且复用 `policy_spec` 的字段区间（不手抄第二份）；
-    - 审计 `scenario.governance.update`；tier 变化另写 `scenario.tier.change`；
+    - 审计 `scenario.governance.update`；
     - 失效 resolver 缓存。
+    - `tier` 与 `db_binding` **不在**本接口（契约里没有这两个字段，传了即 422）。
+  - `PUT /scenario-governance/{scenario_id}/tier` body `{tier, db_binding}`（搬库完成登记）：
+    - `tier` 与 `db_binding` 必须同时提交，**同一句 UPDATE** 写两列（`ck_scenarios_tier_binding` 行级即时校验，拆两条必违约）；
+    - 只登记“数据已搬完”的事实，不搬数据；搬库仍走 Step 6 SOP；
+    - `tier='hot'` → 400 `TIER_HOT_UNSUPPORTED`；
+    - `cold` 必须 `db_binding=null`、`warm` 必须非 null，否则 400 `TIER_BINDING_MISMATCH`；
+    - 库位格式非法（含保留虚拟键 `default`）→ 400 `DB_SCOPE_INVALID`；
+    - 库位未在当前进程注册 → 400 `DB_BINDING_UNREGISTERED`；不在租户白名单 → 400 `DB_BINDING_NOT_ALLOWED`；
+    - 审计只写一条 `scenario.tier.change`（同值重复 PUT 也写），detail 为 `{before: {tier, db_binding}, after: {tier, db_binding}}`；
+    - 提交后失效 resolver 缓存。
 - 修改 `code/apps/api/app/main.py:459` 附近：`app.include_router(tenant_governance_router, prefix="/api")`。
 - `code/apps/api/app/services/tenant/governance.py`：上述写操作实现，审计用 `audit.record_with_session` 同事务。
 
@@ -183,7 +191,8 @@
 - 关闭开关下任意写 → 400 `GOVERNANCE_DISABLED`。
 - 库白名单非法元素 → 400；合法 → 200 且审计行存在。
 - pin 到 draft → 400；pin 到 published → 200；发布新版后老客户端仍解析 pin。
-- tier hot → 400；tier warm 但 `db_binding` 为空 → 400。
+- 通用 PUT 传 `tier` → 422；改用策略字段仍 200。
+- 搬库登记：cold→warm / warm→cold 成功且 DB 行同步；hot → 400；cold+非空 / warm+空 → 400；格式非法 / 未注册 / 白名单拒绝 → 400；跨租户或不存在 → 404；同值重复 PUT 两次都留 `scenario.tier.change`。
 - `effective` 预览的 source 与 S7-4 单测一致。
 - 同一请求重复写相同值：幂等 200，审计记录 before==after（仍写审计，因为治理动作可追溯）。
 

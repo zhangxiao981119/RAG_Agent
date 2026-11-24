@@ -108,6 +108,20 @@ def validate_db_key(value: str) -> bool:
     return value == DEFAULT_DB_KEY or bool(DB_KEY_RE.match(value))
 
 
+def registered_db_keys() -> tuple[str, ...]:
+    """当前进程已注册的库位键（代理 `app.infra.db_router.registered_db_keys`）。
+
+    ★ 延迟到调用时 import：`db_router` 顶层 import 会拉进 `app.database`，
+      而后者在 import 期就 `create_async_engine`；本模块在启动早期被 snapshot
+      引入，不该因为一次分级登记就把引擎构建提前。
+    ★ 保留模块级别名而不是函数内直接 import：测试可以用猴补丁替换本函数，
+      模拟「目标库位已注册」这一外部事实（不碰真实配置）。
+    """
+    from app.infra.db_router import registered_db_keys as _registered
+
+    return _registered()
+
+
 def invalidate_allowed_db_keys(tenant_id: uuid.UUID | None = None) -> None:
     """失效缓存：`None` 清全部；否则只清该租户。
 
@@ -171,6 +185,8 @@ class GovernanceCode(str, Enum):
     PIN_NOT_PUBLISHED = "PIN_VERSION_NOT_PUBLISHED"
     TIER_HOT = "TIER_HOT_UNSUPPORTED"
     TIER_MISMATCH = "TIER_BINDING_MISMATCH"
+    DB_BINDING_UNREGISTERED = "DB_BINDING_UNREGISTERED"
+    DB_BINDING_NOT_ALLOWED = "DB_BINDING_NOT_ALLOWED"
 
 
 _GOVERNANCE_HTTP: Final[dict[GovernanceCode, int]] = {
@@ -183,6 +199,8 @@ _GOVERNANCE_HTTP: Final[dict[GovernanceCode, int]] = {
     GovernanceCode.PIN_NOT_PUBLISHED: 400,
     GovernanceCode.TIER_HOT: 400,
     GovernanceCode.TIER_MISMATCH: 400,
+    GovernanceCode.DB_BINDING_UNREGISTERED: 400,
+    GovernanceCode.DB_BINDING_NOT_ALLOWED: 400,
 }
 
 _GOVERNANCE_MSG: Final[dict[GovernanceCode, str]] = {
@@ -193,6 +211,8 @@ _GOVERNANCE_MSG: Final[dict[GovernanceCode, str]] = {
     GovernanceCode.PIN_NOT_PUBLISHED: "只能钉定已发布的版本",
     GovernanceCode.TIER_HOT: "暂不支持 hot 分级",
     GovernanceCode.TIER_MISMATCH: "分级与库绑定状态不一致",
+    GovernanceCode.DB_BINDING_UNREGISTERED: "目标库位未在当前进程注册",
+    GovernanceCode.DB_BINDING_NOT_ALLOWED: "目标库位不在租户白名单内",
 }
 
 
@@ -266,6 +286,14 @@ _SCENARIO_LOCK_SQL = text(
     "WHERE s.id = :scenario_id AND s.tenant_id = :tenant_id FOR UPDATE"
 )
 
+_SCENARIO_TIER_UPDATE_SQL = text(
+    "UPDATE scenarios SET tier = :tier, db_binding = :db_binding "
+    "WHERE id = :scenario_id AND tenant_id = :tenant_id"
+)
+"""分级 / 绑定**同一句**写入：`ck_scenarios_tier_binding` 是行级即时校验，
+拆成两条 UPDATE（先清绑定、再改 tier）中间态必然违约。列名写死在常量里，
+不由请求键拼装（注入防线）。"""
+
 _SCENARIO_VERSION_STATE_SQL = text(
     "SELECT state FROM scenario_versions "
     "WHERE tenant_id = :tenant_id AND scenario_id = :scenario_id AND version = :version"
@@ -315,7 +343,6 @@ _FIELD_COLUMNS: Final[dict[str, str]] = {
     "threshold_vector_min": "threshold_vector_min",
     "threshold_rerank_min": "threshold_rerank_min",
     "rerank_allowed": "rerank_allowed",
-    "tier": "tier",
 }
 
 _GOVERNANCE_FIELDS: Final[tuple[str, ...]] = tuple(_FIELD_COLUMNS)
@@ -577,8 +604,9 @@ async def update_scenario_governance(
 ) -> dict[str, object]:
     """按 `fields` 中**显式传入**的键更新场景治理列（未传的不动）。
 
-    `db_binding` 不在此接口范围内：它是部署事实（哪个库位承载这个场景），
-    不是租户管理员能改的策略上限。改它必须走搬库流程（同事务改 `tier`）。
+    `db_binding` 与 `tier` 都不在此接口范围内：前者是部署事实（哪个库位承载
+    这个场景），后者与前者受 `ck_scenarios_tier_binding` 约束必须同句写入。
+    分级 / 绑定变更走 `update_scenario_tier`（搬库完成登记），本接口只收策略字段。
 
     ★ 幂等：同样值重复 PUT 仍 200，并照写审计（before == after）——
       审计的用途是「谁在什么时候对哪个场景提交过什么」，不是只记差异。
@@ -621,24 +649,6 @@ async def update_scenario_governance(
                 field="pinned_version",
                 context={"version": pinned, "state": actual_state},
             )
-
-    # ── 分级：hot 未支持；tier 必须与 db_binding 一致（DB CHECK 同口径）──
-    if "tier" in fields:
-        tier_value = fields["tier"]
-        if tier_value is None:
-            raise GovernanceError(GovernanceCode.INVALID, field="tier")
-        if tier_value == "hot":
-            raise GovernanceError(GovernanceCode.TIER_HOT, field="tier")
-    target_tier = fields.get("tier", row["tier"])
-    db_binding = row["db_binding"]
-    if (db_binding is None) != (target_tier == "cold"):
-        # cold ⇔ db_binding IS NULL。两边的两种错都归到同一个码：
-        # 管理员能做的处置完全相同（先搬库或先解除绑定），拆码只会让他多读一条文档。
-        raise GovernanceError(
-            GovernanceCode.TIER_MISMATCH,
-            field="tier",
-            context={"tier": target_tier, "db_binding": db_binding},
-        )
 
     # ── caps：非 None 才校验（None = 清除上限）──────────────────────
     for name in (
@@ -691,19 +701,122 @@ async def update_scenario_governance(
         detail={"before": before, "after": after},
         ip=ip,
     )
-    if before["tier"] != after["tier"]:
-        # 单独一条：分级变化会影响「这个场景的数据在哪台库上」，审计要能独立筛出来，
-        # 而不是在 governance.update 的整份 before/after 里翻。
-        await audit.record_with_session(
-            session,
-            tenant_id,
-            user_id,
-            "scenario.tier.change",
-            object_type="scenario",
-            object_id=str(scenario_id),
-            detail={"before": before["tier"], "after": after["tier"]},
-            ip=ip,
+
+    await session.commit()
+
+    # 提交后失效解析缓存：事务内失效会在回滚时留下「缓存空、库里旧」的错位。
+    from app.services.scenario import resolver
+
+    resolver.invalidate(tenant_id, scenario_id)
+    return _scenario_payload(after_row)
+
+
+async def update_scenario_tier(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    scenario_id: uuid.UUID,
+    tier: str,
+    db_binding: str | None,
+    ip: str | None = None,
+) -> dict[str, object]:
+    """搬库完成后的分级登记：**同一句** UPDATE 写入 `tier` 与 `db_binding`。
+
+    ★ 只登记事实，不搬数据：数据搬迁仍按 Step 6 SOP 执行，本函数只在
+      「数据已经落在目标库位」之后被调用。这里不会猜库位，也不会自动选 `default`。
+
+    四类拒绝（全部 fail-closed，不改库）：
+      · `TIER_HOT_UNSUPPORTED` —— hot 是保留枚举，本期无实例注册表；
+      · `TIER_BINDING_MISMATCH` —— cold 必须 null、非 cold 必须非 null；
+      · `DB_SCOPE_INVALID` —— 库位键格式非法（含保留虚拟键 `default`）；
+      · `DB_BINDING_UNREGISTERED` / `DB_BINDING_NOT_ALLOWED` —— 目标库位未注册，
+        或不在租户白名单内。
+
+    ★ 审计只写一条 `scenario.tier.change`：同值重复 PUT 也写（幂等 + 留痕），
+      不额外写 `scenario.governance.update`（本接口不碰策略字段）。
+    """
+    if not get_settings().tenant_governance_enabled:
+        raise GovernanceError(GovernanceCode.DISABLED)
+
+    lock = await session.execute(
+        _SCENARIO_LOCK_SQL, {"tenant_id": tenant_id, "scenario_id": scenario_id}
+    )
+    row = lock.mappings().first()
+    if row is None:
+        raise GovernanceError(GovernanceCode.NOT_FOUND)
+
+    if tier == "hot":
+        raise GovernanceError(GovernanceCode.TIER_HOT, field="tier")
+
+    # cold ⇔ db_binding IS NULL —— 与 `ck_scenarios_tier_binding` 同口径，
+    # 在触库前就拒绝，避免把「约束违规」这种 500 形态抛给调用方。
+    if (db_binding is None) != (tier == "cold"):
+        raise GovernanceError(
+            GovernanceCode.TIER_MISMATCH,
+            field="tier",
+            context={"tier": tier, "db_binding": db_binding},
         )
+
+    if tier != "cold":
+        if not isinstance(db_binding, str) or not DB_KEY_RE.match(db_binding):
+            # `DB_KEY_RE` 只认 `kb_*`，保留虚拟键 `default` 会在这里被拒
+            # （场景不能整体落在控制库上，那是非分流的形态）。
+            raise GovernanceError(
+                GovernanceCode.DB_SCOPE_INVALID,
+                field="db_binding",
+                context={"value": db_binding},
+            )
+
+        registered = registered_db_keys()
+        if db_binding not in registered:
+            raise GovernanceError(
+                GovernanceCode.DB_BINDING_UNREGISTERED,
+                field="db_binding",
+                context={"db_binding": db_binding, "registered": list(registered)},
+            )
+
+        allowed = await get_allowed_db_keys(session, tenant_id)
+        if allowed is not None and db_binding not in allowed:
+            raise GovernanceError(
+                GovernanceCode.DB_BINDING_NOT_ALLOWED,
+                field="db_binding",
+                context={
+                    "allowed": sorted(allowed),
+                    "denied": db_binding,
+                },
+            )
+
+    before = {"tier": row["tier"], "db_binding": row["db_binding"]}
+
+    await session.execute(
+        _SCENARIO_TIER_UPDATE_SQL,
+        {"tier": tier, "db_binding": db_binding, "scenario_id": scenario_id,
+         "tenant_id": tenant_id},
+    )
+
+    after_row = (
+        await session.execute(
+            _SCENARIO_ROW_SQL, {"scenario_id": scenario_id, "tenant_id": tenant_id}
+        )
+    ).mappings().first()
+    if after_row is None:
+        # 同一事务里刚锁过的行不可能消失；按数据事故处理，不返回编造的行。
+        raise GovernanceError(GovernanceCode.NOT_FOUND)
+    after = {"tier": after_row["tier"], "db_binding": after_row["db_binding"]}
+
+    from app.services import audit
+
+    await audit.record_with_session(
+        session,
+        tenant_id,
+        user_id,
+        "scenario.tier.change",
+        object_type="scenario",
+        object_id=str(scenario_id),
+        detail={"before": before, "after": after},
+        ip=ip,
+    )
 
     await session.commit()
 

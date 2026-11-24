@@ -5,10 +5,12 @@
   2. 开关关闭 → 写接口 400 `GOVERNANCE_DISABLED`、详情 `governance_enabled=false`；
   3. 库白名单：非法元素 / 合法值 / 审计 before-after / GET 回读；
   4. 钉定：draft 拒 / published 接受 / 解析按钉定、关闭开关按 published；
-  5. 分级：hot 拒绝 / 缺 db_binding 拒 / 有 db_binding 通过；
+  5. 分级：专用搬库登记端点（cold→warm / warm→cold / hot 拒绝 / 一致性 / 格式 /
+     未注册 / 租户白名单 / 404）；
   6. effective 预览：租户 cap 收紧与放开后的来源（tenant / scenario）；
-  7. 幂等：同值重复 PUT 仍 200，审计照写（before == after）；
-  8. 失败请求不写成功审计。
+  7. 幂等：分级同值重复 PUT 仍 200，审计照写（before == after）；
+  8. 通用 PUT 契约收窄：传 `tier` → 422，策略字段仍 200；
+  9. 失败请求不写成功审计，DB 行保持原值。
 
 ★ 库读一律用独立连接（`committed_rows` / `committed_scalar`），不读响应体自证。
 ★ 所有断言写**字面量**码值，不写枚举成员：枚举值改错时用例要能变红。
@@ -33,6 +35,7 @@ from tests.scenario.pg_helpers import (
     committed_rows,
     committed_scalar,
     committed_scenario,
+    committed_tenant,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -91,6 +94,20 @@ async def _put_governance(api, scenario_id: uuid.UUID, body: dict):
     )
 
 
+async def _put_tier(api, scenario_id: uuid.UUID, body: dict):
+    """搬库登记端点（tier 与 db_binding 必须同时提交）。"""
+    return await api.client.put(
+        f"{SCENARIO_GOVERNANCE_URL}/{scenario_id}/tier", json=body
+    )
+
+
+def _register_db_keys(monkeypatch, *keys: str) -> None:
+    """把「当前进程已注册库位」替换成本用例需要的集合（测试边界替身）。"""
+    from app.services.tenant import governance as governance_mod
+
+    monkeypatch.setattr(governance_mod, "registered_db_keys", lambda: tuple(keys))
+
+
 def _set_governance(monkeypatch, enabled: bool) -> None:
     monkeypatch.setattr(
         get_settings(), "tenant_governance_enabled", enabled
@@ -129,6 +146,7 @@ async def test_governance_router_is_mounted():
         "/api/admin/tenant/db-scope": {"get", "put"},
         "/api/admin/scenario-governance": {"get"},
         "/api/admin/scenario-governance/{scenario_id}": {"get", "put"},
+        "/api/admin/scenario-governance/{scenario_id}/tier": {"put"},
     }
     actual = {
         path: set(methods)
@@ -320,35 +338,323 @@ async def test_pin_requires_published_and_drives_resolution(api, monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 五、分级 tier
+# 五、分级 / 搬库登记（PUT .../{id}/tier）
 # ══════════════════════════════════════════════════════════════════════
 
 
-async def test_tier_hot_rejected_and_warm_requires_binding(api, monkeypatch):
+async def _tier_row(scenario_id: uuid.UUID) -> dict:
+    """独立连接回读场景的分级两列（不读响应体自证）。"""
+    rows = await committed_rows(
+        "SELECT tier, db_binding FROM scenarios WHERE id = $1", scenario_id
+    )
+    assert rows, "场景行不存在"
+    return rows[0]
+
+
+def _capture_invalidate(monkeypatch) -> list[tuple]:
+    """猴补丁解析缓存失效，记录 (tenant_id, scenario_id) 调用。"""
+    calls: list[tuple] = []
+
+    def _record(tenant_id, scenario_id=None):  # noqa: ANN001
+        calls.append((tenant_id, scenario_id))
+
+    monkeypatch.setattr(resolver_mod, "invalidate", _record)
+    return calls
+
+
+async def test_tier_cold_to_warm_updates_row_and_invalidates_cache(api, monkeypatch):
+    """cold → warm：响应 / DB 行 / 解析缓存失效三者同时成立。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default", "kb_finance")
+    scenario_id = await committed_scenario(api.tenant_id)
+    invalidated = _capture_invalidate(monkeypatch)
+
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
+
+    response = await _put_tier(
+        api, scenario_id, {"tier": "warm", "db_binding": "kb_finance"}
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["tier"] == "warm"
+    assert body["db_binding"] == "kb_finance"
+    assert await _tier_row(scenario_id) == {
+        "tier": "warm",
+        "db_binding": "kb_finance",
+    }
+    # 提交后才失效；参数必须是本场景
+    assert invalidated == [(api.tenant_id, scenario_id)]
+
+    # 写后响应必须与 GET 逐字段一致
+    readback = await api.client.get(f"{SCENARIO_GOVERNANCE_URL}/{scenario_id}")
+    assert readback.status_code == 200, readback.text
+    assert readback.json() == body
+
+
+async def test_tier_warm_to_cold_clears_binding(api, monkeypatch):
+    """warm → cold：db_binding 必须置 NULL。"""
     _set_governance(monkeypatch, True)
     scenario_id = await committed_scenario(api.tenant_id)
-
-    hot = await _put_governance(api, scenario_id, {"tier": "hot"})
-    assert hot.status_code == 400, hot.text
-    assert hot.json()["detail"]["code"] == "TIER_HOT_UNSUPPORTED"
-
-    warm_without_binding = await _put_governance(api, scenario_id, {"tier": "warm"})
-    assert warm_without_binding.status_code == 400, warm_without_binding.text
-    detail = warm_without_binding.json()["detail"]
-    assert detail["code"] == "TIER_BINDING_MISMATCH"
-    assert detail["context"]["db_binding"] is None
-
-    # ★ 任务书给的 `UPDATE scenarios SET db_binding=...` 会违反 0031 的
-    #   `ck_scenarios_tier_binding`（cold ⇔ db_binding IS NULL），
-    #   因此必须同一条语句把 tier 一起改成 warm。
     await _exec_committed(
-        "UPDATE scenarios SET db_binding = 'kb_finance', tier = 'warm' WHERE id = $1",
+        "UPDATE scenarios SET tier = 'warm', db_binding = 'kb_finance' WHERE id = $1",
         scenario_id,
     )
 
-    accepted = await _put_governance(api, scenario_id, {"tier": "warm"})
-    assert accepted.status_code == 200, accepted.text
-    assert accepted.json()["tier"] == "warm"
+    response = await _put_tier(api, scenario_id, {"tier": "cold", "db_binding": None})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tier"] == "cold"
+    assert response.json()["db_binding"] is None
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
+
+
+@pytest.mark.parametrize(
+    "db_binding", ["kb_finance", None], ids=["with-binding", "without-binding"]
+)
+async def test_tier_hot_is_rejected(api, monkeypatch, db_binding):
+    """hot 在一致性检查之前就被拒：binding 有无都必须返回 TIER_HOT_UNSUPPORTED。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default", "kb_finance")
+    scenario_id = await committed_scenario(api.tenant_id)
+
+    response = await _put_tier(
+        api, scenario_id, {"tier": "hot", "db_binding": db_binding}
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"]["code"] == "TIER_HOT_UNSUPPORTED"
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
+
+
+@pytest.mark.parametrize(
+    ("tier", "db_binding"),
+    [("cold", "kb_finance"), ("warm", None)],
+    ids=["cold-with-binding", "warm-without-binding"],
+)
+async def test_tier_binding_mismatch_rejected(api, monkeypatch, tier, db_binding):
+    _set_governance(monkeypatch, True)
+    scenario_id = await committed_scenario(api.tenant_id)
+
+    response = await _put_tier(
+        api, scenario_id, {"tier": tier, "db_binding": db_binding}
+    )
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "TIER_BINDING_MISMATCH"
+    assert detail["context"] == {"tier": tier, "db_binding": db_binding}
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
+
+
+@pytest.mark.parametrize(
+    "db_binding", ["default", "kb_a", "KB_FINANCE", "finance"],
+    ids=["reserved-default", "too-short", "uppercase", "no-prefix"],
+)
+async def test_tier_rejects_invalid_db_key(api, monkeypatch, db_binding):
+    """库位键格式非法（含保留虚拟键 `default`）→ DB_SCOPE_INVALID，不碰库。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default", db_binding)
+    scenario_id = await committed_scenario(api.tenant_id)
+
+    response = await _put_tier(
+        api, scenario_id, {"tier": "warm", "db_binding": db_binding}
+    )
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "DB_SCOPE_INVALID"
+    assert detail["field"] == "db_binding"
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
+
+
+async def test_tier_rejects_unregistered_db_key(api, monkeypatch):
+    """格式合法但本进程没注册 → DB_BINDING_UNREGISTERED，context 带已注册集合。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default")
+    scenario_id = await committed_scenario(api.tenant_id)
+
+    response = await _put_tier(
+        api, scenario_id, {"tier": "warm", "db_binding": "kb_finance"}
+    )
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "DB_BINDING_UNREGISTERED"
+    assert detail["field"] == "db_binding"
+    assert detail["context"] == {
+        "db_binding": "kb_finance",
+        "registered": ["default"],
+    }
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
+
+
+async def test_tier_rejects_db_key_outside_tenant_whitelist(api, monkeypatch):
+    """已注册但不在租户白名单 → DB_BINDING_NOT_ALLOWED，context 带白名单。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default", "kb_finance", "kb_hr")
+    scenario_id = await committed_scenario(api.tenant_id)
+
+    scope = await api.client.put(DB_SCOPE_URL, json={"allowed_db_keys": ["kb_hr"]})
+    assert scope.status_code == 200, scope.text
+
+    response = await _put_tier(
+        api, scenario_id, {"tier": "warm", "db_binding": "kb_finance"}
+    )
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "DB_BINDING_NOT_ALLOWED"
+    assert detail["field"] == "db_binding"
+    assert detail["context"] == {
+        "allowed": ["kb_hr"],
+        "denied": "kb_finance",
+    }
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
+
+
+async def test_tier_accepted_when_whitelist_contains_key(api, monkeypatch):
+    """正向对照：键在白名单内就通过（防「一律拒绝」的假实现）。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default", "kb_finance")
+    scenario_id = await committed_scenario(api.tenant_id)
+    await api.client.put(DB_SCOPE_URL, json={"allowed_db_keys": ["kb_finance"]})
+
+    response = await _put_tier(
+        api, scenario_id, {"tier": "warm", "db_binding": "kb_finance"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["db_binding"] == "kb_finance"
+
+
+@pytest.mark.parametrize("other_tenant", [False, True], ids=["missing", "cross-tenant"])
+async def test_tier_scenario_not_found(api, monkeypatch, other_tenant):
+    """不存在与跨租户共用 404 `SCENARIO_NOT_FOUND`（状态码差异就是存在性探针）。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default", "kb_finance")
+    if other_tenant:
+        # 真实的另一个租户（FK 要求 tenant 行存在），用 A 租户身份访问
+        scenario_id = await committed_scenario(await committed_tenant())
+    else:
+        scenario_id = uuid.uuid4()
+
+    response = await _put_tier(
+        api, scenario_id, {"tier": "warm", "db_binding": "kb_finance"}
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"]["code"] == "SCENARIO_NOT_FOUND"
+
+
+async def test_tier_rejected_when_governance_disabled(api, monkeypatch):
+    _set_governance(monkeypatch, False)
+    _register_db_keys(monkeypatch, "default", "kb_finance")
+    scenario_id = await committed_scenario(api.tenant_id)
+    invalidated = _capture_invalidate(monkeypatch)
+
+    response = await _put_tier(
+        api, scenario_id, {"tier": "warm", "db_binding": "kb_finance"}
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"]["code"] == "GOVERNANCE_DISABLED"
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
+    assert invalidated == []
+
+
+async def test_tier_repeated_put_is_idempotent_and_audited(api, monkeypatch):
+    """同值重复 PUT：两次都 200，且**每条**都留下 scenario.tier.change。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default", "kb_finance")
+    scenario_id = await committed_scenario(api.tenant_id)
+
+    first = await _put_tier(
+        api, scenario_id, {"tier": "warm", "db_binding": "kb_finance"}
+    )
+    second = await _put_tier(
+        api, scenario_id, {"tier": "warm", "db_binding": "kb_finance"}
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+
+    rows = await _audit_rows(api, "scenario.tier.change", object_id=str(scenario_id))
+    assert len(rows) == 2
+    assert rows[0]["detail"] == {
+        "before": {"tier": "cold", "db_binding": None},
+        "after": {"tier": "warm", "db_binding": "kb_finance"},
+    }
+    # 同值重放：before == after（但仍留痕）
+    assert rows[1]["detail"]["before"] == rows[1]["detail"]["after"] == {
+        "tier": "warm",
+        "db_binding": "kb_finance",
+    }
+    # 本接口不写 governance.update
+    assert await _audit_rows(
+        api, "scenario.governance.update", object_id=str(scenario_id)
+    ) == []
+
+
+async def test_tier_omitting_db_binding_is_422(api, monkeypatch):
+    """`db_binding` 是必填键（可显式 null）：省略（而非 null）→ 422，不碰库。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default", "kb_finance")
+    scenario_id = await committed_scenario(api.tenant_id)
+
+    response = await _put_tier(api, scenario_id, {"tier": "warm"})
+
+    assert response.status_code == 422, response.text
+    assert "db_binding" in response.text
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
+    assert await _audit_rows(
+        api, "scenario.tier.change", object_id=str(scenario_id)
+    ) == []
+
+
+async def test_tier_warm_to_warm_changes_binding_only(api, monkeypatch):
+    """仅绑定变化（tier 不变）：同一端点覆盖，审计 before/after 只差 db_binding。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default", "kb_finance", "kb_hr")
+    scenario_id = await committed_scenario(api.tenant_id)
+    await _exec_committed(
+        "UPDATE scenarios SET tier = 'warm', db_binding = 'kb_finance' WHERE id = $1",
+        scenario_id,
+    )
+
+    response = await _put_tier(
+        api, scenario_id, {"tier": "warm", "db_binding": "kb_hr"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tier"] == "warm"
+    assert response.json()["db_binding"] == "kb_hr"
+    assert await _tier_row(scenario_id) == {"tier": "warm", "db_binding": "kb_hr"}
+
+    rows = await _audit_rows(api, "scenario.tier.change", object_id=str(scenario_id))
+    assert len(rows) == 1
+    assert rows[0]["detail"] == {
+        "before": {"tier": "warm", "db_binding": "kb_finance"},
+        "after": {"tier": "warm", "db_binding": "kb_hr"},
+    }
+
+
+async def test_tier_failed_paths_do_not_invalidate_cache(api, monkeypatch):
+    """失败路径在提交前返回：不失效 resolver 缓存（缓存与库不会错位）。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default", "kb_finance")
+    scenario_id = await committed_scenario(api.tenant_id)
+    invalidated = _capture_invalidate(monkeypatch)
+
+    for body in (
+        {"tier": "hot", "db_binding": "kb_finance"},
+        {"tier": "warm", "db_binding": "default"},
+        {"tier": "warm", "db_binding": "kb_hr"},
+    ):
+        response = await _put_tier(api, scenario_id, body)
+        assert response.status_code == 400, (body, response.text)
+
+    assert invalidated == []
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -394,41 +700,55 @@ async def test_effective_preview_reflects_tenant_cap(api, monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 七、幂等：同值重复 PUT
+# 七、通用 PUT 契约收窄：tier 已移出，策略字段照旧
 # ══════════════════════════════════════════════════════════════════════
 
 
-async def test_repeated_put_is_idempotent_and_audited(api, monkeypatch):
+async def test_governance_update_rejects_tier_field(api, monkeypatch):
+    """`tier` 已从通用 PUT 契约移除（extra=forbid）→ 422，且不碰库。"""
     _set_governance(monkeypatch, True)
     scenario_id = await committed_scenario(api.tenant_id)
-    # db_binding 非空 ⇒ tier 必须是 warm/hot（0031 的 CHECK）
-    await _exec_committed(
-        "UPDATE scenarios SET db_binding = 'kb_finance', tier = 'hot' WHERE id = $1",
-        scenario_id,
-    )
 
-    first = await _put_governance(api, scenario_id, {"tier": "warm"})
-    second = await _put_governance(api, scenario_id, {"tier": "warm"})
+    response = await _put_governance(api, scenario_id, {"tier": "warm"})
 
-    assert first.status_code == 200, first.text
-    assert second.status_code == 200, second.text
-    assert second.json()["tier"] == "warm"
+    assert response.status_code == 422, response.text
+    assert "tier" in response.text
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
 
-    updates = await _audit_rows(
-        api, "scenario.governance.update", object_id=str(scenario_id)
-    )
-    assert len(updates) == 2
-    # 第二次是同值重放：before 必须等于 after
-    assert updates[1]["detail"]["before"] == updates[1]["detail"]["after"]
-    assert updates[1]["detail"]["before"]["tier"] == "warm"
 
-    # ★ 与任务书的偏差（已登记）：tier 审计按「仅改变时写一条」实现，
-    #   因此第二次同值 PUT 不会产生第二条 tier.change；这里断言真实发生过的那一条。
-    tier_changes = await _audit_rows(
+async def test_governance_update_still_accepts_policy_fields(api, monkeypatch):
+    """策略字段仍走通用 PUT（收窄只针对 tier / db_binding）。"""
+    _set_governance(monkeypatch, True)
+    scenario_id = await committed_scenario(api.tenant_id)
+
+    response = await _put_governance(api, scenario_id, {"recall_top_k_max": 8})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["caps"]["recall_top_k_max"] == 8
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
+
+
+async def test_tier_failed_paths_leave_row_and_audit_untouched(api, monkeypatch):
+    """所有拒绝路径都在提交前返回：DB 行保持原值，且一条 tier.change 都不写。"""
+    _set_governance(monkeypatch, True)
+    _register_db_keys(monkeypatch, "default", "kb_finance")
+    scenario_id = await committed_scenario(api.tenant_id)
+
+    failures = [
+        {"tier": "hot", "db_binding": "kb_finance"},
+        {"tier": "cold", "db_binding": "kb_finance"},
+        {"tier": "warm", "db_binding": None},
+        {"tier": "warm", "db_binding": "default"},
+        {"tier": "warm", "db_binding": "kb_hr"},
+    ]
+    for body in failures:
+        response = await _put_tier(api, scenario_id, body)
+        assert response.status_code == 400, (body, response.text)
+
+    assert await _tier_row(scenario_id) == {"tier": "cold", "db_binding": None}
+    assert await _audit_rows(
         api, "scenario.tier.change", object_id=str(scenario_id)
-    )
-    assert len(tier_changes) == 1
-    assert tier_changes[0]["detail"] == {"before": "hot", "after": "warm"}
+    ) == []
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -259,6 +259,14 @@ Step 7 不是“再加一张租户表”，而是把已有三件资产收紧成�
 - 回滚：`UPDATE scenarios SET tier = CASE WHEN db_binding IS NULL THEN 'cold' ELSE 'warm' END`，回到“按库位推导”的基线。**注意**：框架写的回滚是“全部温”，但本部署的默认场景在控制库，实际基线是冷；这里按事实写，不照抄。
 - 新增场景默认 `cold`（创建时没有 `db_binding`）；部署搬库时同语句置 `warm`。
 
+**写入路径（实现期收窄，已落地）**：分级写入走专用端点
+`PUT /admin/scenario-governance/{scenario_id}/tier`（搬库完成登记），通用 PUT
+只收策略字段（`tier` 已从契约移除，传了即 422）。专用端点要求 `tier` 与
+`db_binding` 同时提交并**同一句 UPDATE** 写入 —— CHECK 是行级即时校验，拆成
+两条语句的中间态必然违约，这正是通用 PUT 无法完成分级转换的根因。该端点只登记
+“数据已搬完”的事实，不搬数据；审计动作仍为 `scenario.tier.change`（同值重复
+PUT 也写，detail 为 `{before: {tier, db_binding}, after: {tier, db_binding}}`）。
+
 ### 3.10 推荐方案汇总
 
 | 裁决 | 推荐 | 分数 |
