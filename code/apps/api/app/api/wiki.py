@@ -189,7 +189,9 @@ async def get_wiki_page(
     # （关闭态零 SQL），再在数据面会话执行 wiki_pages / chunks 的可见性查询；
     # 控制面表留在控制会话，控制副本不返回给客户端。
     try:
-        db_key = await resolve_wiki_page_db_key(session, page_id)
+        db_key = await resolve_wiki_page_db_key(
+            session, page_id, tenant_id=user.tenant_id
+        )
     except DbScopeError as exc:
         if exc.code == DB_SCOPE_NOT_ALLOWED:
             raise  # 租户库白名单拒绝 → 全局 handler 400

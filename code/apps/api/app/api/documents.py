@@ -145,14 +145,20 @@ async def _doc_provenance(
     }
 
 
-async def _locate_doc_db_key(session: AsyncSession, doc_id: uuid.UUID) -> str:
+async def _locate_doc_db_key(
+    session: AsyncSession,
+    doc_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+) -> str:
     """按控制面文档副本的 kb_id 推导数据面库位：0 命中 → 404；解析冲突 → 500。
 
     关闭态下 `resolve_document_db_key` 直接返回 "default"（零 SQL），行为与接线前等价。
+    `tenant_id` 只用于「控制副本缺失 → 探测场景库」时过滤租户白名单：
+    被白名单拒绝的库位不探测，全部被拒 → 404。
     控制副本只用于取 kb_id/归属，不返回给客户端，内容仍从库位会话读。
     """
     try:
-        db_key = await resolve_document_db_key(session, doc_id)
+        db_key = await resolve_document_db_key(session, doc_id, tenant_id=tenant_id)
     except DbScopeError as exc:
         if exc.code == DB_SCOPE_NOT_ALLOWED:
             raise  # 租户库白名单拒绝 → 全局 handler 400
@@ -171,7 +177,7 @@ async def get_document(
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> DocumentDetail:
-    db_key = await _locate_doc_db_key(session, doc_id)
+    db_key = await _locate_doc_db_key(session, doc_id, user.tenant_id)
 
     # 数据面：文档 + chunk 预览（前 20 条）—— P-a：chunk 级 G1/G3/G4 过滤
     # （admin 豁免），只回有权片段；is_latest 限定最新版本
@@ -232,7 +238,7 @@ async def get_document_governance(
     session: AsyncSession = Depends(get_db),
 ) -> GovernanceDetail:
     """单文档四维审查结论（M7 REST 清单：可见该文档即可读）。"""
-    db_key = await _locate_doc_db_key(session, doc_id)
+    db_key = await _locate_doc_db_key(session, doc_id, user.tenant_id)
     async with open_data_session(session, db_key) as data_plane:
         doc = await _get_visible_document(doc_id, user, data_plane)
         return GovernanceDetail(
@@ -267,7 +273,7 @@ async def rerun_document_governance(
     """
     if user.clearance < 40:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="FORBIDDEN")
-    db_key = await _locate_doc_db_key(session, doc_id)
+    db_key = await _locate_doc_db_key(session, doc_id, user.tenant_id)
     async with open_data_session(session, db_key) as data_plane:
         doc = await _get_visible_document(doc_id, user, data_plane)
         if doc.status != "indexed":
@@ -329,7 +335,7 @@ async def get_document_raw(
     ★ 响应只含对象字节 / 渲染结果，不出现 S3_ENDPOINT / 签名串 ——
       MinIO 直连地址与 presigned URL 一律不出网（INV-M-16 红线）。
     """
-    db_key = await _locate_doc_db_key(session, doc_id)
+    db_key = await _locate_doc_db_key(session, doc_id, user.tenant_id)
     async with open_data_session(session, db_key) as data_plane:
         doc = await _get_visible_document(doc_id, user, data_plane)
         # P-b：整份原文（字节/逐页渲染/提取文本）需文档全可见 —— 任一片段
@@ -405,7 +411,7 @@ async def get_document_parse_preview(
       视觉调用，且与库内结果可能因口径漂移不一致）。
     ★ raw_url 一律相对路径（INV-M-16），多页扫描件逐页给 page_raw_urls。
     """
-    db_key = await _locate_doc_db_key(session, doc_id)
+    db_key = await _locate_doc_db_key(session, doc_id, user.tenant_id)
     async with open_data_session(session, db_key) as data_plane:
         doc = await _get_visible_document(doc_id, user, data_plane)
 
@@ -468,7 +474,7 @@ async def delete_document(
 ) -> None:
     # G1/G2/租户校验 + 管理权判定（P-c）：可见 ≠ 可删 —— 仅 admin /
     # 库 owner / 上传者本人可删，普通只读成员 403
-    db_key = await _locate_doc_db_key(session, doc_id)
+    db_key = await _locate_doc_db_key(session, doc_id, user.tenant_id)
     # 数据面①：可见性校验
     async with open_data_session(session, db_key) as data_plane:
         doc = await _get_visible_document(doc_id, user, data_plane)

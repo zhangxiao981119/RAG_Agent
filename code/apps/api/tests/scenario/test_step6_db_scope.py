@@ -433,7 +433,12 @@ async def _run_control_copy_same_id() -> None:
             factory = async_sessionmaker(engine, expire_on_commit=False)
             async with factory() as session:
                 # 只读控制副本的 kb_id 推导：返回绑定库位，不因场景库同 id 报歧义
-                assert await db_scope.resolve_document_db_key(session, doc_id) == "kb_probe"
+                assert (
+                    await db_scope.resolve_document_db_key(
+                        session, doc_id, tenant_id=tenant_id
+                    )
+                    == "kb_probe"
+                )
         finally:
             await engine.dispose()
     finally:
@@ -571,16 +576,22 @@ async def _run_scene_probe_cases() -> None:
             async with factory() as session:
                 # 文档/页只在场景库：按主键探测返回该场景键
                 assert (
-                    await db_scope.resolve_document_db_key(session, doc_unique)
+                    await db_scope.resolve_document_db_key(
+                        session, doc_unique, tenant_id=tenant_id
+                    )
                     == "kb_scene_a"
                 )
                 assert (
-                    await db_scope.resolve_wiki_page_db_key(session, page_unique)
+                    await db_scope.resolve_wiki_page_db_key(
+                        session, page_unique, tenant_id=tenant_id
+                    )
                     == "kb_scene_a"
                 )
                 # 两个场景库同 id：歧义，不替调用方挑一个
                 with pytest.raises(DbScopeError) as excinfo:
-                    await db_scope.resolve_document_db_key(session, doc_shared)
+                    await db_scope.resolve_document_db_key(
+                        session, doc_shared, tenant_id=tenant_id
+                    )
                 assert excinfo.value.code == "DB_SCOPE_AMBIGUOUS"
                 assert excinfo.value.detail["db_keys"] == [
                     "kb_scene_a",

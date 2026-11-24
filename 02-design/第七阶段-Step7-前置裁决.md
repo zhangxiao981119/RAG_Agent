@@ -183,7 +183,7 @@ Step 7 不是“再加一张租户表”，而是把已有三件资产收紧成�
 | C 只在治理面展示，不拦截 | 12 | 16 | 10 | 15 | 10 | 6 | 69 |
 
 **推荐 A（96）。**
-- 校验点放在 `db_scope.resolve_kb_db_key`：它是请求层唯一“kb→库位”映射入口，`resolve_document_db_key / resolve_wiki_page_db_key` 都从它派生。
+- 校验点放在 `db_scope.resolve_kb_db_key`：它是请求层唯一“kb→库位”映射入口；`resolve_document_db_key / resolve_wiki_page_db_key` 的控制副本命中路径由它派生，控制副本缺失时的场景库探测同样先按 `allowed_db_keys` 过滤已注册库位（被拒库位不打开，全部被拒 → 404）。
 - 不在 `db_router` 校验：那一层没有租户上下文，硬塞参数会把部署层和治理层耦合。
 - 语义：`allowed_db_keys IS NULL` 不限；`'{}'` 全部禁止；数组为白名单。映射结果里任一库位不在白名单 → `400 DB_SCOPE_NOT_ALLOWED`，不是回落 default、不是静默过滤。
 - 关闭开关：不读 `tenants`，零查询。

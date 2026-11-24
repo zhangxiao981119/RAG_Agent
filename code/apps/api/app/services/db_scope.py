@@ -22,7 +22,8 @@
     `fn_kb_db_binding_conflicts` 同口径），显式报错，不替调用方挑一个。
   · 按 ID 寻址（文档 / wiki 页）**控制面副本优先**：控制副本命中即按其 `kb_id`
     推导库位，不再探测（迁移 §4.3 第 12 步是 COPY，控制库与场景库同 id 属正常
-    状态）；只有控制副本缺失时才按主键探测已注册场景库（0→404、≥2→歧义）。
+    状态）；只有控制副本缺失时才按主键探测**白名单内**的已注册场景库 ——
+    被拒绝的库位一次都不打开，全部被拒 → `None`（0→404、≥2→歧义）。
 """
 from __future__ import annotations
 
@@ -257,16 +258,26 @@ async def open_job_session(db_key: str) -> AsyncIterator[AsyncSession]:
         yield session
 
 
-async def _probe_scene_db_key(model: type, pk: uuid.UUID) -> str | None:
-    """控制库无副本时，按主键探测**已注册场景库**（default 由控制会话覆盖，跳过）。
+async def _probe_scene_db_key(
+    model: type,
+    pk: uuid.UUID,
+    *,
+    allowed_db_keys: frozenset[str] | None,
+) -> str | None:
+    """控制库无副本时，按主键探测**白名单内已注册的场景库**（default 跳过）。
 
     只在控制库查不到副本时调用；控制库命中一律不探测（见两个 resolve 入口）。
-    0 → None（调用方 404）；1 → 该键；≥2 → `DB_SCOPE_AMBIGUOUS`（同一主键
-    出现在多个场景库，不替调用方挑一个）。
+    `allowed_db_keys is None`（治理关闭 / 白名单 NULL）表示不限制，遍历全部
+    已注册场景库；否则只遍历集合内的键 —— **被白名单拒绝的库位一次都不打开**
+    （连 `data_session` 都不调用）。
+    0 → None（调用方按 404）；1 → 该键；≥2 → `DB_SCOPE_AMBIGUOUS`（歧义只在
+    被允许的库位之间判定，不替调用方挑一个）。
     """
     hits: list[str] = []
     for db_key in registered_db_keys():
         if db_key == DEFAULT_DB_KEY:
+            continue
+        if allowed_db_keys is not None and db_key not in allowed_db_keys:
             continue
         async with data_session(db_key) as session:
             if await session.get(model, pk) is not None:
@@ -285,13 +296,17 @@ async def _probe_scene_db_key(model: type, pk: uuid.UUID) -> str | None:
 async def resolve_document_db_key(
     control_session: AsyncSession,
     doc_id: uuid.UUID,
+    *,
+    tenant_id: uuid.UUID,
 ) -> str | None:
-    """按 ID 推导文档库位：控制面副本优先，缺失时探测已注册场景库。
+    """按 ID 推导文档库位：控制面副本优先，缺失时探测白名单内已注册场景库。
 
-    - 关闭态：直接返回 `"default"`，零 SQL；
+    - 关闭态：直接返回 `"default"`，零 SQL（不读白名单）；
     - 开启态：`control_session.get(Document, doc_id)` 命中 → 用其 kb_id 经
       `resolve_kb_db_key` 推导（**不探测**：控制库+场景库同 id 是迁移 COPY 的
-      正常状态）；未命中 → 按主键探测场景库（0→None、1→该键、≥2→歧义）。
+      正常状态；该函数自带白名单校验）；未命中 → 取本租户白名单后按主键探测
+      场景库：被白名单拒绝的库位不探测；全部被拒 → `None`，调用方按 404 处理；
+      1 → 该键；≥2 → 歧义。
     """
     if not get_settings().scene_db_split_enabled:
         return DEFAULT_DB_KEY
@@ -300,32 +315,39 @@ async def resolve_document_db_key(
         return await resolve_kb_db_key(
             control_session, document.tenant_id, [document.kb_id]
         )
-    return await _probe_scene_db_key(Document, doc_id)
+    allowed = await get_allowed_db_keys(control_session, tenant_id)
+    return await _probe_scene_db_key(Document, doc_id, allowed_db_keys=allowed)
 
 
 async def resolve_wiki_page_db_key(
     control_session: AsyncSession,
     page_id: uuid.UUID,
+    *,
+    tenant_id: uuid.UUID,
 ) -> str | None:
-    """按 ID 推导 wiki 页库位：控制面副本优先，缺失时探测已注册场景库。
+    """按 ID 推导 wiki 页库位：控制面副本优先，缺失时探测白名单内已注册场景库。
 
-    - 关闭态：直接返回 `"default"`，零 SQL；
-    - 开启态：控制库有页副本 → 取其 document_id；控制库有该文档 → 按 kb 解析；
-      文档副本缺失 → 按 document_id 探测场景库；页副本缺失 → 按 page_id
-      探测场景库（0→None、1→该键、≥2→歧义）。任何路径都不回落 default。
+    - 关闭态：直接返回 `"default"`，零 SQL（不读白名单）；
+    - 开启态：控制库有页副本 → 取其 document_id；控制库有该文档 → 按 kb 解析
+      （自带白名单校验，不探测）；文档副本缺失 → 取白名单后按 document_id
+      探测场景库；页副本缺失 → 取白名单后按 page_id 探测场景库。
+      被白名单拒绝的库位不探测；全部被拒 → `None`，调用方按 404 处理；
+      任何路径都不回落 default。
     """
     if not get_settings().scene_db_split_enabled:
         return DEFAULT_DB_KEY
     page = await control_session.get(WikiPage, page_id)
     if page is None:
-        return await _probe_scene_db_key(WikiPage, page_id)
+        allowed = await get_allowed_db_keys(control_session, tenant_id)
+        return await _probe_scene_db_key(WikiPage, page_id, allowed_db_keys=allowed)
 
     document = await control_session.get(Document, page.document_id)
     if document is not None:
         return await resolve_kb_db_key(
             control_session, document.tenant_id, [document.kb_id]
         )
-    return await _probe_scene_db_key(Document, page.document_id)
+    allowed = await get_allowed_db_keys(control_session, tenant_id)
+    return await _probe_scene_db_key(Document, page.document_id, allowed_db_keys=allowed)
 
 
 def error_detail(exc: DbScopeError) -> dict[str, object]:
