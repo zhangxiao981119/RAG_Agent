@@ -1,4 +1,4 @@
-"""场景配置自检 S-2 ~ S-9 —— 三个执行时机，两种失败动作。
+"""场景配置自检 S-2 ~ S-10 —— 三个执行时机，两种失败动作。
 
 **动作选择的统一判据**（设计文档 §C.3，一句话）：
 
@@ -7,7 +7,7 @@
 | 判据来源 | 时机 | 动作 | 为什么 |
 |---|---|---|---|
 | **代码常量之间**的关系（S-2a / S-4a / S-6） | T1 启动（无 DB） | `RuntimeError`（拒绝启动） | 不含数据依赖，错了就是代码 bug，启动时必现；没有理由降级 |
-| **库里的数据**（S-2b / S-3 / S-4b / S-5 / S-7 / S-8 / S-9） | T2 启动（有 DB，仅 api 侧） | WARN + metric，**永不 raise** | 数据是运维/用户改出来的。让它拒绝启动 = 一个场景的错配置拖垮整个实例，且形成死锁：坏数据在库里 → 实例起不来 → 接口不可用 → 只能手写 SQL 改库。**fail-closed 用错地方就是可用性事故** |
+| **库里的数据**（S-2b / S-3 / S-4b / S-5 / S-7 / S-8 / S-9 / S-10） | T2 启动（有 DB，仅 api 侧） | WARN + metric，**永不 raise** | 数据是运维/用户改出来的。让它拒绝启动 = 一个场景的错配置拖垮整个实例，且形成死锁：坏数据在库里 → 实例起不来 → 接口不可用 → 只能手写 SQL 改库。**fail-closed 用错地方就是可用性事故** |
 | 能否在**写入时**拒绝（S-2b / S-3 的硬约束） | T4 发布（Step 4 的写接口调用） | `PolicyValidationError` → 400 | 这是唯一能真正阻止坏配置进入系统的位置。函数本步就交付，避免 Step 4 的人自己发明一套判据 |
 
 ★ T2 **不放进 `check_capabilities()`**：`self_check_ext.check_capabilities()` 在
@@ -196,16 +196,24 @@ SELECT
     v.kb_ids        AS kb_ids,
     v.binding_mode  AS binding_mode,
     v.dna_declared  AS dna_declared,
-    v.checksum      AS checksum
+    v.checksum      AS checksum,
+    s.tier          AS tier
 FROM scenarios s
 JOIN scenario_versions v
   ON v.scenario_id = s.id
  AND v.state = 'published'
 ORDER BY s.tenant_id, s.scenario_key
 """
-"""启动扫描的唯一 SQL。列别名与 `resolver.LOOKUP_SQL` **逐字相同**，因此结果行可以
-直接喂给同一个 `ScenarioRow` 解析器（自检与运行时用同一份解析逻辑 —— 若自检自己写
-一套，「自检说合法、请求时 500」就成了必然）。
+"""治理关闭时的启动扫描 SQL。
+
+列别名与 `resolver.LOOKUP_SQL` 保持一致，因此结果行可以直接喂给同一个
+`ScenarioRow` 解析器（自检与运行时用同一份解析逻辑 —— 若自检自己写一套，
+「自检说合法、请求时 500」就成了必然）。
+
+★ `s.tier` 是自检**额外读取**的列，运行时解析不用它：它只为 S-10
+  （hot 档声明了却不生效）与容量观测服务，所以 `LOOKUP_SQL` 里没有这一列。
+★ 扫描口径随开关分两套：本 SQL 只扫 `published` 版本，与关闭治理时的请求期口径一致；
+  开启治理时改用 `SCAN_GOVERNED_SQL`（钉定场景可能读到 archived）。
 
 ★ 这里是全仓**唯一**不带 `tenant_id` 条件的场景读取，三条约束让它安全：
   ① 只在启动期执行一次（不在任何请求路径上）；
@@ -221,6 +229,51 @@ ORDER BY s.tenant_id, s.scenario_key
        去翻库对比 —— 一条无法定位的告警等于没有告警。数值型配置的敏感度低于
        排查成本，这是有意的取舍（`test_warn_payload_policy` 锁住这条口径）。
   场景的量级是「个位数到十几个」，逐租户查询没有任何收益。
+"""
+
+SCAN_GOVERNED_SQL: Final[str] = """
+SELECT
+    s.id            AS scenario_id,
+    s.tenant_id     AS tenant_id,
+    s.scenario_key  AS scenario_key,
+    s.status        AS status,
+    s.is_builtin    AS is_builtin,
+    s.db_binding    AS db_binding,
+    s.pinned_version        AS pinned_version,
+    s.recall_top_k_max      AS recall_top_k_max,
+    s.threshold_vector_min  AS threshold_vector_min,
+    s.threshold_rerank_min  AS threshold_rerank_min,
+    s.rerank_allowed        AS rerank_allowed,
+    v.version       AS version,
+    v.state         AS version_state,
+    v.policy        AS policy,
+    v.kb_ids        AS kb_ids,
+    v.binding_mode  AS binding_mode,
+    v.dna_declared  AS dna_declared,
+    v.checksum      AS checksum,
+    s.tier          AS tier
+FROM scenarios s
+JOIN scenario_versions v
+  ON v.scenario_id = s.id
+ AND (
+      (s.pinned_version IS NULL AND v.state = 'published')
+   OR (s.pinned_version IS NOT NULL
+       AND v.version = s.pinned_version
+       AND v.state IN ('published','archived'))
+ )
+ORDER BY s.tenant_id, s.scenario_key
+"""
+"""治理开启（`TENANT_GOVERNANCE_ENABLED=true`）时的启动扫描 SQL。
+
+版本选择与 `resolver.LOOKUP_GOVERNED_SQL` **逐字同规则**：
+  · 未钉定 → 只扫已发布版本；
+  · 已钉定 → 只扫该版本号，`published` / `archived` 都扫。
+否则「钉定到归档版本、请求期能正常解析」的场景会被自检漏扫（这正是本 SQL 存在的理由）。
+
+★ 与 `LOOKUP_GOVERNED_SQL` 的唯一差别：这里不带 `:tenant_id` 参数，启动期全量扫描
+  （三条安全约束见 `SCAN_SQL` 的 docstring）。
+★ 四个 caps 列与 `pinned_version` / `version_state` 都是 `ScenarioRow` 的既有字段，
+  自检据此在不改变解析逻辑的前提下看到治理数据。
 """
 
 _DNA_FIELD_MAP: Final[tuple[tuple[str, str], ...]] = (
@@ -252,6 +305,7 @@ _CHECK_METRICS: Final[dict[str, str]] = {
     "db_binding_configured": "rag.scenario.db_binding_configured",
     "builtin_policy_not_empty": "rag.scenario.builtin_policy_not_empty",
     "dna_declared_drift": _DRIFT_METRIC,
+    "tier_hot_unsupported": "rag.scenario.tier_hot_unsupported",
     "selfcheck_unparsable": "rag.scenario.selfcheck_unparsable",
     "selfcheck_query_failed": "rag.scenario.selfcheck_query_failed",
 }
@@ -259,13 +313,13 @@ _CHECK_METRICS: Final[dict[str, str]] = {
 
 _EMPTY_COUNTS: Final[dict[str, int]] = {
     **{key: 0 for key in _CHECK_METRICS},
-    "published_versions_scanned": 0,
+    "scanned_versions": 0,
 }
 """全 0 的基线计数。
 
-★ `published_versions_scanned` **不计入** `_CHECK_METRICS`：它不是判据，而是
-  「这次到底扫了多少行」的事实。有它才能区分「全绿」与「一个 published 版本都没扫到」——
-  后者看起来同样是 8 个 0，但含义是「自检没生效」而不是「配置没问题」。
+★ `scanned_versions` **不计入** `_CHECK_METRICS`：它不是判据，而是
+  「这次实际扫到多少版本行」的事实；0 表示自检没生效（而不是「配置没问题」）。
+  没有它，N 个 0 既可能是全绿，也可能是自检根本没跑。
 """
 
 
@@ -278,28 +332,29 @@ async def check_scenario_data(
     是否还没到生效的步骤）。用参数而不是 import 常量，是为了让「Step 3 之后
     Step 4/5/6 各改一个调用点」成为可能，而不必回头改判据。
 
-    一次 SQL 拉全量 published 版本，Python 侧跑 S-2b/S-3/S-4b/S-5/S-7/S-8/S-9 ——
-    场景数量级是「个位数到十几个」，N 条查询没有任何收益。
+    一次 SQL 按治理开关选口径拉全量版本行，Python 侧跑
+    S-2b/S-3/S-4b/S-5/S-7/S-8/S-9/S-10 —— 场景数量级是「个位数到十几个」，
+    N 条查询没有任何收益。
     """
     counts = dict(_EMPTY_COUNTS)
     platform = get_settings()
     platform_rerank_on = bool(platform.rerank_enabled)
 
     try:
-        rows = await _load_all_published(session)
+        rows = await _load_all_for_scan(session)
     except Exception:  # noqa: BLE001 —— 见 docstring：永不 raise
         # ★ 查询失败（迁移没跑 / 连接断）**不能**当成「全 0 = 全绿」。
         #   单独计一个键并打 ERROR：这是运维必须当场处理的事，不是配置漂移。
         counts["selfcheck_query_failed"] = 1
         metrics.incr(_CHECK_METRICS["selfcheck_query_failed"])
         logger.error(
-            "场景自检查询失败（不阻断启动，但结论无效）：请确认 0028 迁移已应用",
+            "场景自检查询失败（不阻断启动，但结论无效）：请确认 0028 / 0031 迁移已应用",
             exc_info=True,
-            extra={"check": "S-2b/S-3/S-4b/S-5/S-7/S-8/S-9"},
+            extra={"check": "S-2b/S-3/S-4b/S-5/S-7/S-8/S-9/S-10"},
         )
         return counts
 
-    counts["published_versions_scanned"] = len(rows)
+    counts["scanned_versions"] = len(rows)
 
     for row in rows:
         try:
@@ -324,13 +379,19 @@ async def check_scenario_data(
     return counts
 
 
-async def _load_all_published(session: AsyncSession) -> list[ScenarioRow]:
-    """读出全部已发布版本行（跨租户，启动期一次性扫描；见 `SCAN_SQL` 的三条约束）。"""
-    result = await session.execute(text(SCAN_SQL))
+async def _load_all_for_scan(session: AsyncSession) -> list[ScenarioRow]:
+    """按治理开关选扫描口径，读出全量版本行（跨租户，启动期一次性扫描）。
+
+    关闭态用 `SCAN_SQL`（只扫 published），开启态用 `SCAN_GOVERNED_SQL`
+    （钉定场景可读到 archived）—— 与请求期 `resolver._load_published` 的选择同源，
+    否则「请求能解析、自检扫不到」。
+    """
+    governed = get_settings().tenant_governance_enabled
+    sql = SCAN_GOVERNED_SQL if governed else SCAN_SQL
+    result = await session.execute(text(sql))
     # 复用 resolver 的行折叠：别名一致 ⇒ 解析逻辑必须只有一份。
-    # `governed=True`：自检本来就该看到治理列（SCAN_SQL 未选时 `.get` 返回 None，
-    # 与「未配置治理」同义）；若传 False 会把已选中的钉定/上限当作不存在。
-    return [resolver._row_from(row._mapping, governed=True) for row in result.all()]  # noqa: SLF001
+    # `governed` 透传：关闭态即便结果里带了治理列也不得让钉定生效（开关语义只由一处兜住）。
+    return [resolver._row_from(row._mapping, governed=governed) for row in result.all()]  # noqa: SLF001
 
 
 def _scan_one(
@@ -340,7 +401,11 @@ def _scan_one(
     platform_rerank_on: bool,
     max_step: int,
 ) -> None:
-    """对一行已发布版本跑全部数据类判据（纯函数，除 `counts` 外无副作用）。"""
+    """对一行扫描结果跑全部数据类判据（纯函数，除 `counts` 外无副作用）。"""
+    # S-10 放在最前面：tier 是物理列，不依赖 policy 能否解析 ——
+    # 让「hot 声明了却不生效」在 policy 坏行上也能报警。
+    _check_tier_hot(row, counts)
+
     try:
         policy = row.to_policy()
     except ScenarioError:
@@ -609,6 +674,28 @@ def _check_dna_drift(
             "tenant_id": str(row.tenant_id),
             "scenario_key": row.scenario_key,
             "drift": drift,
+        },
+    )
+
+
+def _check_tier_hot(row: ScenarioRow, counts: dict[str, int]) -> None:
+    """S-10：场景声明 `tier='hot'`，但本期没有 hot 档的实例注册表 —— hot **不会生效**。
+
+    ★ hot 是 CHECK 允许的保留枚举，运维可以用 SQL 强写进去（写接口
+      `governance.py` 已经明确拒绝 `tier=hot`）。它配了不生效，正是本判据要喊出来的事。
+    ★ 不按温档计算：容量接口会分列返回 `n_hot_declared`（库里 hot 场景数）
+      与 `n_hot_effective`（实际生效数，本期恒 0），不把 hot 折算成 warm。
+    """
+    if row.tier != "hot":
+        return
+    counts["tier_hot_unsupported"] += 1
+    logger.warning(
+        "场景自检：tier=hot 是保留枚举，但本期没有独立实例注册表，hot 不会生效；"
+        "容量接口会分列返回 n_hot_declared 与 n_hot_effective，不按温档计算",
+        extra={
+            "tenant_id": str(row.tenant_id),
+            "scenario_key": row.scenario_key,
+            "tier": row.tier,
         },
     )
 

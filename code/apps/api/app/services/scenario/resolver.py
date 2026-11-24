@@ -208,6 +208,8 @@ def _row_from(mapping, *, governed: bool) -> ScenarioRow:
         threshold_rerank_min=mapping.get("threshold_rerank_min") if governed else None,
         rerank_allowed=mapping.get("rerank_allowed") if governed else None,
         version_state=(mapping.get("version_state") if governed else None) or "published",
+        # tier 是物理列，不属于治理开关管辖：不论 governed 与否都按原值读取
+        tier=(mapping.get("tier") or "cold"),
     )
 
 

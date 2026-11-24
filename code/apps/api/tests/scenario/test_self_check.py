@@ -1,10 +1,10 @@
-"""Step 3 自检 S-2 ~ S-9：判据 / 动作分流 / 计数（**无 PG、无模型**）。
+"""Step 3 自检 S-2 ~ S-10：判据 / 动作分流 / 计数（**无 PG、无模型**）。
 
 三条主线：
 
   1. **常量类（T1）违反 → RuntimeError**：S-2a / S-4a / S-6。
      它们判断的是「代码与代码」的关系，错了就是代码 bug，每台机器启动都必现。
-  2. **数据类（T2）违反 → 只 WARN + metric，永不 raise**：S-2b/S-3/S-4b/S-5/S-7/S-8/S-9。
+  2. **数据类（T2）违反 → 只 WARN + metric，永不 raise**：S-2b/S-3/S-4b/S-5/S-7/S-8/S-9/S-10。
      这是与 Step 1–2 原稿**相反**的决定（附录 A-1/A-2/A-3 登记）：数据是运维改出来的，
      让它拒绝启动 = 一个场景的错配置拖垮整个实例，且形成死锁
      （坏数据在库里 → 实例起不来 → 接口不可用 → 只能手写 SQL 改库）。
@@ -12,7 +12,7 @@
      位置。本步只有测试调它，函数现在就交付，Step 4 的写接口直接调。
 
 数据层用 `tests/scenario/conftest.py` 现成的 `FakeSession` + `build_row`：
-它们只实现 `execute → all → _mapping`，而 `_load_all_published` 恰好只需要这一面。
+它们只实现 `execute → all → _mapping`，而 `_load_all_for_scan` 恰好只需要这一面。
 **不需要 PG，也不需要改 conftest。**
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ import ast
 import dataclasses
 import logging
 import pathlib
+import re
 import uuid
 from types import SimpleNamespace
 
@@ -33,20 +34,30 @@ from tests.scenario.conftest import FakeSession, build_row, load_migration
 _API_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 # 平台开关的可变状态：由 `default_settings(...)` 写入，被测代码无参 `get_settings()` 读出。
-_STATE: dict[str, bool] = {"rerank_enabled": False}
+_STATE: dict[str, bool] = {
+    "rerank_enabled": False,
+    "tenant_governance_enabled": False,
+}
 
 
 @pytest.fixture(autouse=True)
 def default_settings(monkeypatch):
-    """默认把平台重排开关置为**关**（本机真实默认），需要开的用例自己覆盖。
+    """默认把平台重排与租户治理开关都置为**关**（本机真实默认），需要开的用例自己覆盖。
 
     ★ 不用真实 `get_settings()`：那会读本仓 `.env`，让「平台开/关」两条判据的
       结果取决于跑测试的机器 —— 这类测试一旦随环境变，就会在某台机器上假绿。
+    ★ `tenant_governance_enabled` 必须出现在替身里：`_load_all_for_scan` 会读它
+      决定扫描口径，缺失会让所有用例落进「查询失败」分支。
     """
 
     _STATE["rerank_enabled"] = False  # 每条用例都从「平台关」这个真实默认起步
+    _STATE["tenant_governance_enabled"] = False  # 扫描口径默认按关闭态
 
-    def _settings(*, rerank_enabled: bool | None = None):
+    def _settings(
+        *,
+        rerank_enabled: bool | None = None,
+        tenant_governance_enabled: bool | None = None,
+    ):
         """设置并**返回**一个 settings 替身（无参调用只读当前状态）。
 
         ★ 必须带状态：`default_settings(rerank_enabled=True)` 之后再让被测函数
@@ -55,7 +66,12 @@ def default_settings(monkeypatch):
         """
         if rerank_enabled is not None:
             _STATE["rerank_enabled"] = rerank_enabled
-        return SimpleNamespace(rerank_enabled=_STATE["rerank_enabled"])
+        if tenant_governance_enabled is not None:
+            _STATE["tenant_governance_enabled"] = tenant_governance_enabled
+        return SimpleNamespace(
+            rerank_enabled=_STATE["rerank_enabled"],
+            tenant_governance_enabled=_STATE["tenant_governance_enabled"],
+        )
 
     monkeypatch.setattr(self_check, "get_settings", _settings)
     return _settings
@@ -210,9 +226,9 @@ async def test_clean_row_produces_all_zero(monkeypatch):
     ★ 没有这条，所有「计数 == 1」的用例都可能因为「什么都命中」而假绿。
     """
     counts = await _scan([build_row(policy={}, dna_declared=_dna())])
-    assert counts["published_versions_scanned"] == 1
+    assert counts["scanned_versions"] == 1
     for key, value in counts.items():
-        if key == "published_versions_scanned":
+        if key == "scanned_versions":
             continue
         assert value == 0, f"{key} 不该命中：{counts}"
 
@@ -414,7 +430,7 @@ async def test_bad_dna_declared_never_raises(bad_dna):  # noqa: D401
 
     assert counts["selfcheck_unparsable"] == 1
     assert counts["dna_declared_drift"] == 0
-    assert counts["published_versions_scanned"] == 1
+    assert counts["scanned_versions"] == 1
 
 
 @pytest.mark.asyncio
@@ -441,7 +457,7 @@ async def test_bad_dna_declared_does_not_stop_scanning():
         "两行都配了 recall_top_k < 取用条数：坏 dna 那行的 S-2b 也必须照跑"
         "（整行一把兜会漏成 1）"
     )
-    assert counts["published_versions_scanned"] == 2
+    assert counts["scanned_versions"] == 2
 
 
 @pytest.mark.asyncio
@@ -459,24 +475,24 @@ async def test_unexpected_check_exception_is_contained(monkeypatch):
     counts = await _scan([build_row(policy={}, dna_declared=_dna())])
 
     assert counts["selfcheck_unparsable"] == 1
-    assert counts["published_versions_scanned"] == 1
+    assert counts["scanned_versions"] == 1
 
 
 @pytest.mark.asyncio
 async def test_data_check_counts_scan_size():
-    """`published_versions_scanned` 让「全绿」与「一行都没扫到」可区分。
+    """`scanned_versions` 让「全绿」与「一行都没扫到」可区分。
 
     ★ 没有它，8 个 0 既可能是「配置没问题」，也可能是「自检没生效」。
     """
     empty = await _scan([])
-    assert empty["published_versions_scanned"] == 0
+    assert empty["scanned_versions"] == 0
     assert set(empty) == set(self_check._EMPTY_COUNTS)
 
     two = await _scan([
         build_row(policy={}, dna_declared=_dna()),
         build_row(scenario_id=__import__("uuid").uuid4(), policy={}, dna_declared=_dna()),
     ])
-    assert two["published_versions_scanned"] == 2
+    assert two["scanned_versions"] == 2
 
 
 @pytest.mark.asyncio
@@ -489,7 +505,7 @@ async def test_data_check_query_failure_is_not_green(monkeypatch):
 
     counts = await self_check.check_scenario_data(_Broken(), max_step=3)
     assert counts["selfcheck_query_failed"] == 1
-    assert counts["published_versions_scanned"] == 0
+    assert counts["scanned_versions"] == 0
 
 
 @pytest.mark.asyncio
@@ -508,7 +524,7 @@ async def test_data_check_never_raises_across_all_violations(default_settings):
         dna_declared=_dna(chunker_version="c-changed"),
     )
     counts = await _scan([row])
-    hits = {k: v for k, v in counts.items() if v and k != "published_versions_scanned"}
+    hits = {k: v for k, v in counts.items() if v and k != "scanned_versions"}
     assert set(hits) == {
         "recall_below_final_top_n",
         "rerank_open_but_platform_off",
@@ -518,6 +534,186 @@ async def test_data_check_never_raises_across_all_violations(default_settings):
         "builtin_policy_not_empty",
         "dna_declared_drift",
     }, hits
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Step 7：扫描口径随治理开关分两套 + S-10（hot 声明不生效）
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _row_with_tier(tier: str, **kwargs) -> dict:
+    """`build_row` 之外补一个 `tier` 键（`ScenarioRow.tier` 读的就是它）。"""
+    row = build_row(**kwargs)
+    row["tier"] = tier
+    return row
+
+
+def _last_sql(session: FakeSession) -> str:
+    assert session.statements, "自检没有执行任何 SQL"
+    return str(session.statements[-1])
+
+
+@pytest.mark.parametrize("tier, expected", [("hot", 1), ("warm", 0), ("cold", 0)])
+@pytest.mark.asyncio
+async def test_s10_counts_hot_declared_but_unsupported(tier, expected, caplog):
+    """S-10：`tier='hot'` ⇒ 计数 1 + WARN（hot 是保留枚举，本期没有实例注册表）。
+
+    ★ warm / cold 必须为 0：否则「一律命中」的实现也能过，等于没测。
+    """
+    caplog.set_level(logging.WARNING, logger="app.services.scenario.self_check")
+    key = f"sc_{tier}"
+
+    counts = await _scan([_row_with_tier(tier, scenario_key=key, policy={}, dna_declared=_dna())])
+
+    assert counts["tier_hot_unsupported"] == expected
+    hot_records = [
+        record
+        for record in caplog.records
+        if record.name == "app.services.scenario.self_check"
+        and getattr(record, "tier", None) == "hot"
+    ]
+    if expected:
+        assert hot_records, "tier=hot 必须留下 WARN（配了不生效不能静默）"
+        assert hot_records[0].scenario_key == key
+        assert "不会生效" in hot_records[0].getMessage()
+        assert "n_hot_declared" in hot_records[0].getMessage()
+    else:
+        assert not hot_records, f"tier={tier} 不该报 hot 告警"
+
+
+@pytest.mark.asyncio
+async def test_s10_fires_even_when_policy_is_broken():
+    """S-10 必须在 `to_policy()` **之前**执行：policy 坏行也要能报 hot。
+
+    ★ 这条守的是调用位置，不是判据本身：把 `_check_tier_hot` 挪到 `to_policy()`
+      之后，坏行会先 return，hot 声明就永远沉默。
+    """
+    row = _row_with_tier("hot", policy={"recall_top_k": "abc"}, dna_declared=_dna())
+
+    counts = await _scan([row])
+
+    assert counts["tier_hot_unsupported"] == 1
+    assert counts["selfcheck_unparsable"] == 1
+
+
+@pytest.mark.asyncio
+async def test_s10_reads_tier_even_when_governance_on(monkeypatch):
+    """tier 是物理列：治理开启时也必须读出（`_row_from` 不按开关裁剪 tier）。
+
+    ★ 反向守护：关闭态用例对「只在 governed=False 时读 tier」同样会绿，
+      只有本用例能抓住「把 tier 也塞进 governed 分支」的回归（承诺 3 的双向性）。
+    """
+    monkeypatch.setattr(
+        self_check,
+        "get_settings",
+        lambda: SimpleNamespace(tenant_governance_enabled=True, rerank_enabled=False),
+    )
+
+    counts = await _scan([_row_with_tier("hot", policy={}, dna_declared=_dna())])
+
+    assert counts["tier_hot_unsupported"] == 1
+    assert counts["scanned_versions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_governance_off_scan_sql_is_published_only():
+    """治理关闭：扫描 SQL 不含钉定列，但必须选 `s.tier`（S-10 的数据来源）。"""
+    session = FakeSession([build_row(policy={}, dna_declared=_dna())])
+
+    counts = await self_check.check_scenario_data(session, max_step=3)
+
+    sql = _last_sql(session)
+    assert "pinned_version" not in sql
+    assert "'archived'" not in sql
+    assert "s.tier" in sql
+    assert counts["scanned_versions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_governance_on_scan_sql_uses_pinned_rule(monkeypatch):
+    """治理开启：扫描 SQL 同时含钉定列、archived 分支与四项 caps 列。"""
+    monkeypatch.setattr(
+        self_check,
+        "get_settings",
+        lambda: SimpleNamespace(tenant_governance_enabled=True, rerank_enabled=False),
+    )
+    session = FakeSession([build_row(policy={}, dna_declared=_dna())])
+
+    await self_check.check_scenario_data(session, max_step=3)
+
+    sql = _last_sql(session)
+    assert "pinned_version" in sql
+    assert "'archived'" in sql
+    for column in (
+        "recall_top_k_max",
+        "threshold_vector_min",
+        "threshold_rerank_min",
+        "rerank_allowed",
+    ):
+        assert column in sql, f"开启态扫描必须选 {column}"
+
+
+@pytest.mark.asyncio
+async def test_governance_on_folds_archived_pinned_row(monkeypatch):
+    """钉定到归档版本的行必须能正常折叠并被扫描（不自检成 unparsable）。"""
+    monkeypatch.setattr(
+        self_check,
+        "get_settings",
+        lambda: SimpleNamespace(tenant_governance_enabled=True, rerank_enabled=False),
+    )
+    row = build_row(policy={}, dna_declared=_dna())
+    row.update(
+        {
+            "pinned_version": 1,
+            "version_state": "archived",
+            "recall_top_k_max": 50,
+            "threshold_vector_min": 0.42,
+            "threshold_rerank_min": 0.51,
+            "rerank_allowed": False,
+        }
+    )
+    session = FakeSession([row])
+
+    folded = await self_check._load_all_for_scan(session)
+
+    assert len(folded) == 1
+    assert folded[0].version_state == "archived"
+    assert folded[0].pinned_version == 1
+    caps = folded[0].to_caps()
+    assert caps.recall_top_k_max == 50
+    assert caps.threshold_vector_min == 0.42
+    assert caps.threshold_rerank_min == 0.51
+    assert caps.rerank_allowed is False
+
+    counts = await self_check.check_scenario_data(session, max_step=3)
+    assert counts["scanned_versions"] == 1
+    assert counts["selfcheck_unparsable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_governance_off_ignores_governance_columns_even_if_fed():
+    """开关兜底不被 SQL 选择绕过：关闭态即便喂来钉定/caps 键也必须全部忽略。"""
+    row = build_row(policy={}, dna_declared=_dna())
+    row.update(
+        {
+            "pinned_version": 3,
+            "version_state": "archived",
+            "recall_top_k_max": 5,
+            "threshold_vector_min": 0.9,
+            "threshold_rerank_min": 0.9,
+            "rerank_allowed": True,
+        }
+    )
+
+    folded = await self_check._load_all_for_scan(FakeSession([row]))
+
+    assert folded[0].version_state == "published"
+    assert folded[0].pinned_version is None
+    caps = folded[0].to_caps()
+    assert caps.recall_top_k_max is None
+    assert caps.threshold_vector_min is None
+    assert caps.threshold_rerank_min is None
+    assert caps.rerank_allowed is None
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -640,56 +836,24 @@ def test_lifespan_passes_wired_step_not_a_literal():
 
 
 def test_scan_sql_columns_match_migration_and_lookup():
-    """`SCAN_SQL` 的每一列都必须在 0028 迁移里真实存在，且别名与 `LOOKUP_SQL` 一致。
+    """两套扫描 SQL 的每一列都必须在迁移里真实存在，且与对应的运行时 SQL 对齐。
 
     ★ 为什么需要静态守护：这条 SQL **从未在真库上跑过**（自检的测试全用 FakeSession）。
       列名写错（例如 `v.checksum` → `v.checksum_xx`）的唯一表现是
-      `selfcheck_query_failed=1` —— 也就是 T2 **静默失明**：8 个判据全部不报，
-      日志里只有一条「查询失败」，运维很容易当成临时抖动。验证者实测：改成
-      `checksum_xx` 后 177 条测试全绿。
-    ★ 两层对账：
-      ① 别名闭集相等 —— 一条 SQL 加列、另一条漏加，会让两条路径命中不同的
-         `ScenarioRow` 字段；
-      ② 每个 `alias.column` 都能在迁移的建表/加列里找到 —— 这是唯一能在无 PG
-         环境下证明「列名没打错」的手段。
+      `selfcheck_query_failed=1` —— 也就是 T2 **静默失明**：判据全部不报，
+      日志里只有一条「查询失败」，运维很容易当成临时抖动。
+    ★ 三层对账：
+      ① 关闭态扫描 = `LOOKUP_SQL` 的列 + 自检专用的 `tier`（运行时解析不读 tier）；
+      ② 开启态扫描 = `LOOKUP_GOVERNED_SQL` 的列 + `tier`；
+      ③ 两处「钉定 / 归档」的版本选择条件必须**逐字同规则** —— 否则自检会漏扫
+         「钉定到归档版本、请求期能正常解析」的场景（本判据存在的理由）。
+    ★ 列来源必须同时解析 0028 与 0031：`scenarios.tier` 是 0031 加的，只解析 0028
+      会把一条合法列误判成「迁移里不存在」。
     """
-    import re
-
     from app.services.scenario import resolver
 
-    # ── 迁移里两张表的真实列（AST 解析，不用正则猜 sa.Column 的换行形态）──
-    migration = ast.parse(
-        (_API_ROOT / "alembic" / "versions" / "0028_add_scenarios.py").read_text(
-            encoding="utf-8"
-        )
-    )
-    columns: dict[str, set[str]] = {}
-    for node in ast.walk(migration):
-        if not isinstance(node, ast.Call):
-            continue
-        fname = getattr(node.func, "attr", None)
-        if fname not in ("create_table", "add_column"):
-            continue
-        args = node.args
-        if fname == "create_table":
-            table = _const_str(args[0])
-            if table is None:
-                continue
-            cols = columns.setdefault(table, set())
-            # create_table 里一般隐式带 id 主键，但本迁移是显式 sa.Column("id", ...)
-            for extra in args[1:]:
-                name = _column_name(extra)
-                if name:
-                    cols.add(name)
-        else:  # add_column
-            table = _const_str(args[0])
-            name = _column_name(args[1]) if len(args) > 1 else None
-            if table and name:
-                columns.setdefault(table, set()).add(name)
+    columns = _migration_columns()
 
-    assert "scenarios" in columns and "scenario_versions" in columns, columns
-
-    # ── 两条 SQL 的列引用 ──
     def _columns_of(sql: str) -> dict[str, str]:
         """{输出别名: 列名}，并校验 `alias.column AS out` 里的 alias 已声明。"""
         aliases = dict(
@@ -701,20 +865,78 @@ def test_scan_sql_columns_match_migration_and_lookup():
             assert alias in aliases, f"未知别名 {alias}（正文：{sql[:60]}）"
             table = aliases[alias]
             assert column in columns[table], (
-                f"{table}.{column} 在 0028 迁移里不存在 —— SQL 只会在真库上失败，"
+                f"{table}.{column} 在迁移里不存在 —— SQL 只会在真库上失败，"
                 f"表现为 selfcheck_query_failed=1（T2 静默失明）"
             )
             out[name] = column
         return out
 
-    scan = _columns_of(self_check.SCAN_SQL)
-    lookup = _columns_of(resolver.LOOKUP_SQL)
-
-    assert scan == lookup, (
-        "SCAN_SQL 与 LOOKUP_SQL 的列/别名必须逐字一致（同一个 ScenarioRow 解析器）\n"
-        f"只在 SCAN：{set(scan) - set(lookup)}\n只在 LOOKUP：{set(lookup) - set(scan)}\n"
-        f"列不同：{ {k: (scan[k], lookup[k]) for k in set(scan) & set(lookup) if scan[k] != lookup[k]} }"
+    scan_closed = _columns_of(self_check.SCAN_SQL)
+    lookup_closed = _columns_of(resolver.LOOKUP_SQL)
+    assert scan_closed == {**lookup_closed, "tier": "tier"}, (
+        "关闭态 SCAN_SQL 必须是 LOOKUP_SQL 的列 + 自检专用的 tier\n"
+        f"只在 SCAN：{set(scan_closed) - set(lookup_closed)}\n"
+        f"只在 LOOKUP：{set(lookup_closed) - set(scan_closed)}\n"
+        f"列不同：{ {k: (scan_closed[k], lookup_closed[k]) for k in set(scan_closed) & set(lookup_closed) if scan_closed[k] != lookup_closed[k]} }"
     )
+
+    scan_governed = _columns_of(self_check.SCAN_GOVERNED_SQL)
+    lookup_governed = _columns_of(resolver.LOOKUP_GOVERNED_SQL)
+    assert scan_governed == {**lookup_governed, "tier": "tier"}, (
+        "开启态 SCAN_GOVERNED_SQL 必须是 LOOKUP_GOVERNED_SQL 的列 + 自检专用的 tier\n"
+        f"只在 SCAN：{set(scan_governed) - set(lookup_governed)}\n"
+        f"只在 LOOKUP：{set(lookup_governed) - set(scan_governed)}\n"
+        f"列不同：{ {k: (scan_governed[k], lookup_governed[k]) for k in set(scan_governed) & set(lookup_governed) if scan_governed[k] != lookup_governed[k]} }"
+    )
+
+    # ★ 版本选择「逐字同规则」：自检不得自创第三种口径
+    version_rule = (
+        "(s.pinned_version IS NULL AND v.state = 'published') "
+        "OR (s.pinned_version IS NOT NULL AND v.version = s.pinned_version "
+        "AND v.state IN ('published','archived'))"
+    )
+    assert version_rule in " ".join(self_check.SCAN_GOVERNED_SQL.split())
+    assert version_rule in " ".join(resolver.LOOKUP_GOVERNED_SQL.split())
+
+
+def _migration_columns() -> dict[str, set[str]]:
+    """0028 + 0031 里两张场景表的真实列。
+
+    0028 用 `sa.Column` 建表，0031 用 `ALTER TABLE ... ADD COLUMN` 字符串加列 ——
+    两种形态都要解析，否则 0031 的列会被误判成不存在。
+    """
+    columns: dict[str, set[str]] = {}
+    for path in (
+        _API_ROOT / "alembic" / "versions" / "0028_add_scenarios.py",
+        _API_ROOT / "alembic" / "versions" / "0031_step7_tenant_governance.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        for table, column in re.findall(r"ALTER TABLE (\w+) ADD COLUMN (\w+)", source):
+            columns.setdefault(table, set()).add(column)
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            fname = getattr(node.func, "attr", None)
+            if fname not in ("create_table", "add_column"):
+                continue
+            args = node.args
+            if fname == "create_table":
+                table = _const_str(args[0])
+                if table is None:
+                    continue
+                cols = columns.setdefault(table, set())
+                # create_table 里一般隐式带 id 主键，但本迁移是显式 sa.Column("id", ...)
+                for extra in args[1:]:
+                    name = _column_name(extra)
+                    if name:
+                        cols.add(name)
+            else:  # add_column
+                table = _const_str(args[0])
+                name = _column_name(args[1]) if len(args) > 1 else None
+                if table and name:
+                    columns.setdefault(table, set()).add(name)
+    assert "scenarios" in columns and "scenario_versions" in columns, columns
+    return columns
 
 
 def _const_str(node: ast.AST) -> str | None:

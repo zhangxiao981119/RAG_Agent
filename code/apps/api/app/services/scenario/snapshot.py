@@ -167,6 +167,8 @@ class ScenarioRow:
     rerank_allowed: bool | None = None
     # 实际解析到的版本状态；未开启治理时恒为 'published'
     version_state: str = "published"
+    # 场景分级；运行时不消费，仅自检/容量观测使用
+    tier: str = "cold"
 
     def to_caps(self) -> TenantPolicyCaps:
         """把四个租户上限列折叠成值对象（全 None = 不限制）。"""
